@@ -44,6 +44,24 @@ struct dlfrz_loader_info {
     uint64_t payload_foff;     /* file-offset where payload starts    */
 };
 
+/*
+ * Per-library metadata for the in-process loader (-d mode).
+ * One entry per dlfrz_entry, same index.
+ * Written by the packer right before the footer.
+ * The footer's pad[0..7] holds the file offset of this array (0 if absent).
+ */
+struct dlfrz_lib_meta {
+    uint64_t base_addr;     /* pre-assigned load address              */
+    uint64_t vaddr_lo;      /* lowest PT_LOAD p_vaddr                 */
+    uint64_t vaddr_hi;      /* highest (p_vaddr + p_memsz)            */
+    uint64_t entry;         /* e_entry (raw value from ELF header)    */
+    uint32_t phdr_off;      /* e_phoff                                */
+    uint16_t phdr_num;      /* e_phnum                                */
+    uint16_t phdr_entsz;    /* e_phentsize                            */
+    uint32_t flags;         /* DLFRZ_FLAG_*                           */
+    uint32_t _reserved;
+};
+
 #define ALIGN_UP(x, align) (((x) + (align) - 1) & ~((uint64_t)(align) - 1))
 
 #endif /* DLFREEZE_COMMON_H */

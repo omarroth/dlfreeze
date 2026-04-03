@@ -33,6 +33,7 @@ static void usage(const char *prog)
         "Usage: %s [options] <executable> [-- trace-args...]\n\n"
         "Options:\n"
         "  -o <path>   Output file  (default: <name>.frozen)\n"
+        "  -d          Direct-load mode (in-process loader, no tmpdir)\n"
         "  -t          Trace dlopen calls by running the program\n"
         "  -v          Verbose\n"
         "  -h          Help\n\n"
@@ -86,14 +87,15 @@ static char *resolve_exe(const char *name)
 int main(int argc, char **argv)
 {
     const char *out_path = NULL;
-    int do_trace = 0, verbose = 0;
+    int do_trace = 0, verbose = 0, direct_load = 0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "+o:tvh")) != -1) {
+    while ((opt = getopt(argc, argv, "+o:dtvh")) != -1) {
         switch (opt) {
-        case 'o': out_path = optarg; break;
-        case 't': do_trace = 1;     break;
-        case 'v': verbose  = 1;     break;
+        case 'o': out_path = optarg;  break;
+        case 'd': direct_load = 1;   break;
+        case 't': do_trace = 1;      break;
+        case 'v': verbose  = 1;      break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 1;
         }
@@ -205,6 +207,7 @@ int main(int argc, char **argv)
         .output_path    = out_path,
         .bootstrap_path = bootstrap,
         .deps           = &deps,
+        .direct_load    = direct_load,
     };
     int rc = pack_frozen(&po);
 

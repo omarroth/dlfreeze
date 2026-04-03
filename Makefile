@@ -28,9 +28,9 @@ $(BUILD)/%.o: $(SRC)/%.c | $(BUILD)
 $(DLFREEZE): $(TOOL_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-# ── bootstrap (statically linked) ──────────────────────────────────
-$(BOOTSTRAP): $(SRC)/bootstrap.c | $(BUILD)
-	$(CC) $(CFLAGS) -static -o $@ $<
+# ── bootstrap (statically linked, includes in-process loader) ──────
+$(BOOTSTRAP): $(SRC)/bootstrap.c $(SRC)/loader.c $(SRC)/common.h $(SRC)/loader.h | $(BUILD)
+	$(CC) $(CFLAGS) -static -o $@ $(SRC)/bootstrap.c $(SRC)/loader.c
 
 # ── LD_PRELOAD library for tracing dlopen ──────────────────────────
 $(PRELOAD): $(SRC)/dlopen_preload.c | $(BUILD)

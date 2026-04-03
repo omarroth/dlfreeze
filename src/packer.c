@@ -7,6 +7,9 @@
 #include <stdint.h>
 #include <elf.h>
 
+/* Starting base address for direct-loaded objects (above bootstrap VA) */
+#define DIRECT_LOAD_BASE  0x200000000ULL
+
 /* ------------------------------------------------------------------ */
 static int append_file(FILE *out, const char *path, size_t *written)
 {
@@ -41,6 +44,57 @@ static size_t filesize(const char *path)
 {
     struct stat st;
     return (stat(path, &st) == 0) ? (size_t)st.st_size : 0;
+}
+
+/* ---- compute per-library metadata for direct loading ------------- */
+static int compute_lib_meta(const char *path, uint64_t base, uint32_t flags,
+                            struct dlfrz_lib_meta *meta)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) { perror(path); return -1; }
+
+    Elf64_Ehdr ehdr;
+    if (fread(&ehdr, 1, sizeof(ehdr), f) != sizeof(ehdr)) {
+        fclose(f); return -1;
+    }
+    if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0 ||
+        ehdr.e_ident[EI_CLASS] != ELFCLASS64) {
+        fprintf(stderr, "dlfreeze: %s: not a 64-bit ELF\n", path);
+        fclose(f); return -1;
+    }
+
+    meta->base_addr  = base;
+    meta->entry      = ehdr.e_entry;
+    meta->phdr_off   = (uint32_t)ehdr.e_phoff;
+    meta->phdr_num   = ehdr.e_phnum;
+    meta->phdr_entsz = ehdr.e_phentsize;
+    meta->flags      = flags;
+    meta->_reserved  = 0;
+
+    /* Read program headers to get VA span */
+    size_t phsz = ehdr.e_phnum * ehdr.e_phentsize;
+    uint8_t *phdrs = malloc(phsz);
+    if (!phdrs) { fclose(f); return -1; }
+    fseek(f, ehdr.e_phoff, SEEK_SET);
+    if (fread(phdrs, 1, phsz, f) != phsz) {
+        free(phdrs); fclose(f); return -1;
+    }
+
+    uint64_t lo = UINT64_MAX, hi = 0;
+    for (int i = 0; i < ehdr.e_phnum; i++) {
+        Elf64_Phdr *ph = (Elf64_Phdr *)(phdrs + i * ehdr.e_phentsize);
+        if (ph->p_type != PT_LOAD) continue;
+        if (ph->p_vaddr < lo) lo = ph->p_vaddr;
+        uint64_t end = ph->p_vaddr + ph->p_memsz;
+        if (end > hi) hi = end;
+    }
+    free(phdrs);
+    fclose(f);
+
+    if (lo > hi) { lo = hi = 0; }
+    meta->vaddr_lo = lo;
+    meta->vaddr_hi = hi;
+    return 0;
 }
 
 /* ---- ELF patching for UPX compatibility -------------------------- */
@@ -169,6 +223,8 @@ int pack_frozen(const struct pack_options *opts)
     /* total entries: main-exe + interpreter? + libs */
     int nent = 1 + (opts->deps->interp_path ? 1 : 0) + opts->deps->count;
     struct dlfrz_entry *entries = calloc(nent, sizeof(*entries));
+    /* Parallel array of source paths for lib_meta computation */
+    const char **src_paths = calloc(nent, sizeof(char *));
 
     /* build string table ------------------------------------------- */
     size_t strsz = 0;
@@ -198,6 +254,7 @@ int pack_frozen(const struct pack_options *opts)
     strcpy(strtab + stroff, exe_base); stroff += strlen(exe_base) + 1;
     if (append_file(out, opts->exe_path, &written) < 0) goto fail2;
     entries[eidx].data_size = written;
+    src_paths[eidx] = opts->exe_path;
     off += written; eidx++;
 
     /* 3. interpreter ----------------------------------------------- */
@@ -209,6 +266,7 @@ int pack_frozen(const struct pack_options *opts)
         strcpy(strtab + stroff, interp_base); stroff += strlen(interp_base) + 1;
         if (append_file(out, opts->deps->interp_path, &written) < 0) goto fail2;
         entries[eidx].data_size = written;
+        src_paths[eidx] = opts->deps->interp_path;
         off += written; eidx++;
     }
 
@@ -224,6 +282,7 @@ int pack_frozen(const struct pack_options *opts)
         stroff += strlen(opts->deps->libs[i].name) + 1;
         if (append_file(out, opts->deps->libs[i].path, &written) < 0) goto fail2;
         entries[eidx].data_size = written;
+        src_paths[eidx] = opts->deps->libs[i].path;
         off += written; eidx++;
     }
 
@@ -240,6 +299,34 @@ int pack_frozen(const struct pack_options *opts)
     if (fwrite(entries, 1, manifest_sz, out) != manifest_sz) goto fail2;
     off += manifest_sz;
 
+    /* 6b. loader metadata (direct-load mode) ----------------------- */
+    size_t meta_off = 0;
+    if (opts->direct_load) {
+        struct dlfrz_lib_meta *metas = calloc(eidx, sizeof(*metas));
+        if (!metas) goto fail2;
+
+        uint64_t base = DIRECT_LOAD_BASE;
+        for (int i = 0; i < eidx; i++) {
+            if (compute_lib_meta(src_paths[i], base, entries[i].flags,
+                                  &metas[i]) < 0) {
+                free(metas); goto fail2;
+            }
+            uint64_t span = metas[i].vaddr_hi - (metas[i].vaddr_lo & ~0xFFFULL);
+            base += ALIGN_UP(span, 0x200000); /* 2 MB gap between objects */
+        }
+
+        write_pad(out, off, 8); off = ALIGN_UP(off, 8);
+        meta_off = off;
+        size_t metasz = eidx * sizeof(struct dlfrz_lib_meta);
+        if (fwrite(metas, 1, metasz, out) != metasz) {
+            free(metas); goto fail2;
+        }
+        off += metasz;
+        free(metas);
+
+        printf("  mode       : direct-load (in-process loader)\n");
+    }
+
     /* 7. footer ---------------------------------------------------- */
     struct dlfrz_footer ft;
     memset(&ft, 0, sizeof(ft));
@@ -249,10 +336,14 @@ int pack_frozen(const struct pack_options *opts)
     ft.manifest_offset = manifest_off;
     ft.strtab_offset   = strtab_off;
     ft.strtab_size     = strsz;
+    /* pad[0..7] = loader metadata offset (0 if not in direct-load mode) */
+    if (meta_off)
+        memcpy(ft.pad, &meta_off, sizeof(meta_off));
     if (fwrite(&ft, 1, sizeof(ft), out) != sizeof(ft)) goto fail2;
 
     free(entries);
     free(strtab);
+    free(src_paths);
     fclose(out);
     chmod(opts->output_path, 0755);
 
@@ -273,6 +364,7 @@ int pack_frozen(const struct pack_options *opts)
 fail2:
     free(entries);
     free(strtab);
+    free(src_paths);
 fail:
     fprintf(stderr, "dlfreeze: packing failed\n");
     fclose(out);

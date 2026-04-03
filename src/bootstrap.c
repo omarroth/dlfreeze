@@ -3,8 +3,10 @@
  *
  * This small binary IS the frozen executable.  It:
  *   1. Reads the embedded payload from /proc/self/exe
- *   2. Extracts all files to a temporary directory
- *   3. Forks: child execve()s the real program via the bundled ld.so,
+ *   2. If direct-load metadata is present, maps libraries in-process
+ *      and transfers control without ld.so (no tmpdir).
+ *   3. Otherwise, extracts all files to a temporary directory and
+ *      forks: child execve()s the real program via the bundled ld.so,
  *      parent waits and cleans up the tmpdir.
  */
 #include <stdio.h>
@@ -18,48 +20,11 @@
 #include <limits.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/mman.h>
 #include <stdint.h>
 
-/* ---- payload format (must match common.h) ------------------------ */
-#define DLFRZ_MAGIC   "DLFREEZ"
-#define DLFRZ_VERSION 1
-
-#define DLFRZ_FLAG_MAIN_EXE  0x01
-#define DLFRZ_FLAG_INTERP    0x02
-#define DLFRZ_FLAG_SHLIB     0x04
-
-struct dlfrz_entry {
-    uint64_t data_offset;
-    uint64_t data_size;
-    uint32_t flags;
-    uint32_t name_offset;
-};
-
-struct dlfrz_footer {
-    char     magic[8];
-    uint32_t version;
-    uint32_t num_entries;
-    uint64_t manifest_offset;
-    uint64_t strtab_offset;
-    uint64_t strtab_size;
-    uint8_t  pad[24];
-};
-
-/*
- * Loader-info sentinel — patched by the packer.
- * Lives in .data so it survives UPX compression/decompression.
- * The packer scans for "DLFRZLDR" and writes the payload virtual address
- * and the base file-offset so the bootstrap can locate the payload even
- * when /proc/self/exe has been compressed by UPX.
- */
-#define DLFRZ_LOADER_MAGIC "DLFRZLDR"
-
-struct dlfrz_loader_info {
-    char     magic[8];         /* "DLFRZLDR"                              */
-    uint64_t payload_vaddr;    /* VA where packer mapped the payload      */
-    uint64_t payload_filesz;   /* total bytes in the payload PT_LOAD      */
-    uint64_t payload_foff;     /* original file offset of payload start   */
-};
+#include "common.h"
+#include "loader.h"
 
 /* Packer scans the binary for this sentinel and patches it. */
 static volatile struct dlfrz_loader_info g_loader_info
@@ -232,13 +197,70 @@ int main(int argc, char **argv)
         }
     }
 
-    /* 5. create tmpdir */
+    /* 5. check for direct-load metadata in footer pad[0..7] */
+    uint64_t meta_off = 0;
+    memcpy(&meta_off, ft.pad, sizeof(meta_off));
+    if (meta_off != 0) {
+        /* Direct-load mode: map libraries in-process, no tmpdir */
+        size_t metasz = ft.num_entries * sizeof(struct dlfrz_lib_meta);
+        struct dlfrz_lib_meta *metas = malloc(metasz);
+        if (!metas) {
+            fprintf(stderr, "dlfreeze-bootstrap: cannot alloc lib_meta\n");
+            free(ent); free(strtab); close(sfd); return 127;
+        }
+
+        if (from_memory) {
+            memcpy(metas,
+                   mem_base + (meta_off - g_loader_info.payload_foff),
+                   metasz);
+        } else {
+            if (pread(sfd, metas, metasz, meta_off) != (ssize_t)metasz) {
+                fprintf(stderr, "dlfreeze-bootstrap: cannot read lib_meta\n");
+                free(metas); free(ent); free(strtab); close(sfd);
+                return 127;
+            }
+        }
+
+        /* Set up mem/mem_foff for the loader.
+         * Normal path: mmap the entire file.
+         * UPX path: payload is already in virtual memory. */
+        const uint8_t *ldr_mem;
+        uint64_t ldr_mem_foff;
+
+        if (from_memory) {
+            ldr_mem = mem_base;
+            ldr_mem_foff = g_loader_info.payload_foff;
+        } else {
+            void *file_map = mmap(NULL, st.st_size, PROT_READ,
+                                  MAP_PRIVATE, sfd, 0);
+            if (file_map == MAP_FAILED) {
+                perror("mmap");
+                free(metas); free(ent); free(strtab); close(sfd);
+                return 127;
+            }
+            ldr_mem = (const uint8_t *)file_map;
+            ldr_mem_foff = 0;
+        }
+
+        close(sfd);
+
+        /* loader_run() does NOT return on success */
+        loader_run(ldr_mem, ldr_mem_foff, metas, ent, strtab,
+                   ft.num_entries, argc, argv, environ);
+
+        /* If we get here, the loader failed */
+        fprintf(stderr, "dlfreeze-bootstrap: in-process loader failed\n");
+        free(metas); free(ent); free(strtab);
+        return 127;
+    }
+
+    /* 6. create tmpdir (fallback extraction path) */
     snprintf(g_tmpdir, sizeof(g_tmpdir), "/tmp/dlfreeze.XXXXXX");
     if (!mkdtemp(g_tmpdir)) {
         perror("mkdtemp"); close(sfd); return 127;
     }
 
-    /* 6. extract all files */
+    /* 7. extract all files */
     char exe_path[PATH_MAX + 256]    = {0};
     char interp_path[PATH_MAX + 256] = {0};
 
@@ -276,7 +298,7 @@ int main(int argc, char **argv)
         rmtree(g_tmpdir); return 127;
     }
 
-    /* 7. build argv for the real program
+    /* 8. build argv for the real program
      *    format: <interp> --library-path <tmpdir> <exe> [user-args …] */
     int nac; char **nav;
     if (interp_path[0]) {
@@ -294,7 +316,7 @@ int main(int argc, char **argv)
         for (int i = 1; i < argc; i++) nav[i] = argv[i];
     }
 
-    /* 8. set LD_LIBRARY_PATH */
+    /* 9. set LD_LIBRARY_PATH */
     const char *oldlp = getenv("LD_LIBRARY_PATH");
     char lp[PATH_MAX * 2];
     if (oldlp && oldlp[0])
@@ -304,7 +326,7 @@ int main(int argc, char **argv)
     setenv("LD_LIBRARY_PATH", lp, 1);
     setenv("DLFREEZE_TMPDIR", g_tmpdir, 1);
 
-    /* 9. fork→exec, parent waits + cleans up */
+    /* 10. fork→exec, parent waits + cleans up */
     g_child = fork();
     if (g_child < 0) {
         perror("fork"); rmtree(g_tmpdir); return 127;

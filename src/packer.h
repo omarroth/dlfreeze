@@ -8,6 +8,7 @@ struct pack_options {
     const char      *output_path;     /* frozen output file            */
     const char      *bootstrap_path;  /* statically-linked bootstrap   */
     struct dep_list *deps;            /* resolved dependencies         */
+    int              direct_load;     /* 1 = embed loader metadata     */
 };
 
 /* Create a frozen (self-extracting) ELF binary. */
