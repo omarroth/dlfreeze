@@ -28,6 +28,22 @@ struct dlfrz_footer {
     uint8_t  pad[24];
 };
 
+/*
+ * Loader-info sentinel — lives in the bootstrap's .data section.
+ * The packer patches payload_vaddr / payload_filesz after writing the frozen
+ * binary.  At runtime the bootstrap checks these fields; when UPX (or a
+ * similar tool) has compressed the binary, the footer at EOF may be damaged,
+ * but this struct is inside a PT_LOAD segment and survives decompression.
+ */
+#define DLFRZ_LOADER_MAGIC "DLFRZLDR"
+
+struct dlfrz_loader_info {
+    char     magic[8];         /* "DLFRZLDR"                          */
+    uint64_t payload_vaddr;    /* VA where the payload is mapped      */
+    uint64_t payload_filesz;   /* bytes from payload start to EOF     */
+    uint64_t payload_foff;     /* file-offset where payload starts    */
+};
+
 #define ALIGN_UP(x, align) (((x) + (align) - 1) & ~((uint64_t)(align) - 1))
 
 #endif /* DLFREEZE_COMMON_H */

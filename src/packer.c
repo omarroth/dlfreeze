@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <stdint.h>
+#include <elf.h>
 
 /* ------------------------------------------------------------------ */
 static int append_file(FILE *out, const char *path, size_t *written)
@@ -41,6 +43,116 @@ static size_t filesize(const char *path)
     return (stat(path, &st) == 0) ? (size_t)st.st_size : 0;
 }
 
+/* ---- ELF patching for UPX compatibility -------------------------- */
+/*
+ * After writing the frozen binary (bootstrap + payload), we patch the
+ * ELF headers so that:
+ *
+ *  1. The "DLFRZLDR" sentinel in .data is filled with the payload VA
+ *     and size.  This survives UPX decompression because it lives in a
+ *     PT_LOAD segment.
+ *
+ *  2. A spare program-header entry (PT_GNU_STACK) is converted into a
+ *     PT_LOAD that maps the payload region.  UPX compresses all PT_LOAD
+ *     segments and decompresses them back at runtime, so the payload
+ *     becomes accessible in virtual memory even after UPX.
+ *
+ *  3. Section-header metadata is zeroed out (UPX strips it anyway).
+ */
+static int patch_elf_for_upx(const char *path, size_t bootstrap_sz,
+                              size_t payload_off, size_t total_sz)
+{
+    FILE *f = fopen(path, "r+b");
+    if (!f) { perror(path); return -1; }
+
+    /* Read enough of the bootstrap to get ELF + phdr + scan for sentinel */
+    /* We need to read the full bootstrap to find DLFRZLDR in .data */
+    uint8_t *hdr = malloc(bootstrap_sz);
+    if (!hdr) { fclose(f); return -1; }
+    if (fread(hdr, 1, bootstrap_sz, f) != bootstrap_sz) {
+        free(hdr); fclose(f); return -1;
+    }
+
+    Elf64_Ehdr *ehdr = (Elf64_Ehdr *)hdr;
+
+    /* --- Find the highest VA used by existing PT_LOAD segments --- */
+    uint64_t max_va = 0;
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        Elf64_Phdr *ph = (Elf64_Phdr *)(hdr + ehdr->e_phoff + i * ehdr->e_phentsize);
+        if (ph->p_type == PT_LOAD) {
+            uint64_t end = ph->p_vaddr + ph->p_memsz;
+            if (end > max_va) max_va = end;
+        }
+    }
+
+    /* Payload VA: next page-aligned address after the last PT_LOAD */
+    uint64_t payload_vaddr = ALIGN_UP(max_va, 4096);
+    size_t payload_filesz = total_sz - payload_off;
+
+    /* --- Find and repurpose PT_GNU_STACK → PT_LOAD for payload --- */
+    int found_stack = 0;
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        Elf64_Phdr *ph = (Elf64_Phdr *)(hdr + ehdr->e_phoff + i * ehdr->e_phentsize);
+        if (ph->p_type == PT_GNU_STACK) {
+            ph->p_type   = PT_LOAD;
+            ph->p_flags  = PF_R;
+            ph->p_offset = payload_off;
+            ph->p_vaddr  = payload_vaddr;
+            ph->p_paddr  = payload_vaddr;
+            ph->p_filesz = payload_filesz;
+            ph->p_memsz  = payload_filesz;
+            ph->p_align  = 4096;
+            found_stack = 1;
+            break;
+        }
+    }
+    if (!found_stack) {
+        fprintf(stderr, "dlfreeze: warning: no PT_GNU_STACK to repurpose\n");
+        /* Continue anyway — file-based path will still work */
+    }
+
+    /* --- Strip section-header table --- */
+    ehdr->e_shoff     = 0;
+    ehdr->e_shentsize = 0;
+    ehdr->e_shnum     = 0;
+    ehdr->e_shstrndx  = 0;
+
+    /* --- Patch the DLFRZLDR sentinel in .data --- */
+    const char sentinel[] = "DLFRZLDR";
+    int patched = 0;
+    for (size_t i = 0; i + sizeof(struct dlfrz_loader_info) <= bootstrap_sz; i++) {
+        if (memcmp(hdr + i, sentinel, 8) == 0) {
+            /* Verify this is our struct (followed by three zero uint64s) */
+            uint64_t v1, v2, v3;
+            memcpy(&v1, hdr + i + 8, 8);
+            memcpy(&v2, hdr + i + 16, 8);
+            memcpy(&v3, hdr + i + 24, 8);
+            if (v1 == 0 && v2 == 0 && v3 == 0) {
+                /* Patch with real values */
+                uint64_t foff = payload_off;
+                memcpy(hdr + i + 8, &payload_vaddr, 8);
+                memcpy(hdr + i + 16, &payload_filesz, 8);
+                memcpy(hdr + i + 24, &foff, 8);
+                patched = 1;
+                break;
+            }
+        }
+    }
+    if (!patched) {
+        fprintf(stderr, "dlfreeze: warning: DLFRZLDR sentinel not found\n");
+    }
+
+    /* --- Write modified header back --- */
+    rewind(f);
+    if (fwrite(hdr, 1, bootstrap_sz, f) != bootstrap_sz) {
+        free(hdr); fclose(f); return -1;
+    }
+
+    free(hdr);
+    fclose(f);
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 int pack_frozen(const struct pack_options *opts)
 {
@@ -51,6 +163,7 @@ int pack_frozen(const struct pack_options *opts)
 
     /* 1. bootstrap binary ------------------------------------------ */
     if (append_file(out, opts->bootstrap_path, &written) < 0) goto fail;
+    size_t bootstrap_sz = written;
     off += written;
 
     /* total entries: main-exe + interpreter? + libs */
@@ -78,6 +191,7 @@ int pack_frozen(const struct pack_options *opts)
 
     /* 2. main executable ------------------------------------------- */
     write_pad(out, off, 4096); off = ALIGN_UP(off, 4096);
+    size_t payload_off = off;   /* start of the payload region */
     entries[eidx].data_offset = off;
     entries[eidx].flags       = DLFRZ_FLAG_MAIN_EXE;
     entries[eidx].name_offset = stroff;
@@ -142,10 +256,18 @@ int pack_frozen(const struct pack_options *opts)
     fclose(out);
     chmod(opts->output_path, 0755);
 
+    /* 8. patch ELF for UPX compatibility --------------------------- */
+    size_t total_sz = filesize(opts->output_path);
+    if (patch_elf_for_upx(opts->output_path, bootstrap_sz,
+                           payload_off, total_sz) < 0) {
+        fprintf(stderr, "dlfreeze: ELF patching failed\n");
+        return -1;
+    }
+
     printf("Frozen binary: %s\n", opts->output_path);
-    printf("  bootstrap  : %zu bytes\n", filesize(opts->bootstrap_path));
+    printf("  bootstrap  : %zu bytes\n", bootstrap_sz);
     printf("  embedded   : %d files\n", eidx);
-    printf("  total size : %zu bytes\n", filesize(opts->output_path));
+    printf("  total size : %zu bytes\n", total_sz);
     return 0;
 
 fail2:

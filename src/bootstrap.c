@@ -45,6 +45,27 @@ struct dlfrz_footer {
     uint8_t  pad[24];
 };
 
+/*
+ * Loader-info sentinel — patched by the packer.
+ * Lives in .data so it survives UPX compression/decompression.
+ * The packer scans for "DLFRZLDR" and writes the payload virtual address
+ * and the base file-offset so the bootstrap can locate the payload even
+ * when /proc/self/exe has been compressed by UPX.
+ */
+#define DLFRZ_LOADER_MAGIC "DLFRZLDR"
+
+struct dlfrz_loader_info {
+    char     magic[8];         /* "DLFRZLDR"                              */
+    uint64_t payload_vaddr;    /* VA where packer mapped the payload      */
+    uint64_t payload_filesz;   /* total bytes in the payload PT_LOAD      */
+    uint64_t payload_foff;     /* original file offset of payload start   */
+};
+
+/* Packer scans the binary for this sentinel and patches it. */
+static volatile struct dlfrz_loader_info g_loader_info
+    __attribute__((used, section(".data")))
+    = { {'D','L','F','R','Z','L','D','R'}, 0, 0, 0 };
+
 /* ---- globals ----------------------------------------------------- */
 static volatile pid_t g_child;
 static char g_tmpdir[PATH_MAX];
@@ -105,6 +126,25 @@ static int extract(int srcfd, const char *dst,
     return 0;
 }
 
+/* ---- extract from memory (UPX path) to a file -------------------- */
+static int extract_mem(const uint8_t *base, uint64_t base_foff,
+                       const char *dst, uint64_t off, uint64_t sz, int exec)
+{
+    int dfd = open(dst, O_WRONLY | O_CREAT | O_TRUNC, exec ? 0755 : 0644);
+    if (dfd < 0) { perror(dst); return -1; }
+    const uint8_t *src = base + (off - base_foff);
+    uint64_t rem = sz;
+    while (rem > 0) {
+        size_t want = rem > 65536 ? 65536 : rem;
+        ssize_t w = write(dfd, src, want);
+        if (w <= 0) { close(dfd); return -1; }
+        src += w;
+        rem -= w;
+    }
+    close(dfd);
+    return 0;
+}
+
 /* ---- main -------------------------------------------------------- */
 extern char **environ;
 
@@ -122,16 +162,35 @@ int main(int argc, char **argv)
     struct stat st;
     if (fstat(sfd, &st) < 0) { perror("fstat"); close(sfd); return 127; }
 
-    /* 2. read footer */
+    /* 2. read footer — try from end of file first (normal path) */
     struct dlfrz_footer ft;
-    if (pread(sfd, &ft, sizeof(ft), st.st_size - sizeof(ft)) != sizeof(ft)) {
-        fprintf(stderr, "dlfreeze-bootstrap: cannot read footer\n");
-        close(sfd); return 127;
-    }
-    if (memcmp(ft.magic, DLFRZ_MAGIC, 8) != 0) {
+    int from_memory = 0;
+    const uint8_t *mem_base = NULL;
+
+    if (pread(sfd, &ft, sizeof(ft), st.st_size - sizeof(ft)) == sizeof(ft) &&
+        memcmp(ft.magic, DLFRZ_MAGIC, 8) == 0) {
+        /* normal path — /proc/self/exe is intact */
+    } else if (g_loader_info.payload_vaddr != 0 &&
+               g_loader_info.payload_filesz != 0) {
+        /* UPX path — payload is decompressed in our virtual memory.
+         * The packer mapped the payload into a PT_LOAD segment at
+         * payload_vaddr; after UPX decompression, it's at that VA.
+         * File offsets in the manifest need to be translated:
+         *   mem_ptr = mem_base + (file_offset - payload_foff)       */
+        mem_base = (const uint8_t *)(uintptr_t)g_loader_info.payload_vaddr;
+        const uint8_t *footer_ptr =
+            mem_base + g_loader_info.payload_filesz - sizeof(ft);
+        memcpy(&ft, footer_ptr, sizeof(ft));
+        if (memcmp(ft.magic, DLFRZ_MAGIC, 8) != 0) {
+            fprintf(stderr, "dlfreeze-bootstrap: no embedded payload\n");
+            close(sfd); return 127;
+        }
+        from_memory = 1;
+    } else {
         fprintf(stderr, "dlfreeze-bootstrap: no embedded payload\n");
         close(sfd); return 127;
     }
+
     if (ft.version != DLFRZ_VERSION) {
         fprintf(stderr, "dlfreeze-bootstrap: unsupported version %u\n", ft.version);
         close(sfd); return 127;
@@ -139,18 +198,38 @@ int main(int argc, char **argv)
 
     /* 3. read string table */
     char *strtab = malloc(ft.strtab_size);
-    if (!strtab ||
-        pread(sfd, strtab, ft.strtab_size, ft.strtab_offset) != (ssize_t)ft.strtab_size) {
+    if (!strtab) {
         fprintf(stderr, "dlfreeze-bootstrap: cannot read strtab\n");
         close(sfd); return 127;
+    }
+    if (from_memory) {
+        memcpy(strtab,
+               mem_base + (ft.strtab_offset - g_loader_info.payload_foff),
+               ft.strtab_size);
+    } else {
+        if (pread(sfd, strtab, ft.strtab_size, ft.strtab_offset) !=
+            (ssize_t)ft.strtab_size) {
+            fprintf(stderr, "dlfreeze-bootstrap: cannot read strtab\n");
+            close(sfd); return 127;
+        }
     }
 
     /* 4. read manifest */
     size_t msz = ft.num_entries * sizeof(struct dlfrz_entry);
     struct dlfrz_entry *ent = malloc(msz);
-    if (!ent || pread(sfd, ent, msz, ft.manifest_offset) != (ssize_t)msz) {
+    if (!ent) {
         fprintf(stderr, "dlfreeze-bootstrap: cannot read manifest\n");
         close(sfd); return 127;
+    }
+    if (from_memory) {
+        memcpy(ent,
+               mem_base + (ft.manifest_offset - g_loader_info.payload_foff),
+               msz);
+    } else {
+        if (pread(sfd, ent, msz, ft.manifest_offset) != (ssize_t)msz) {
+            fprintf(stderr, "dlfreeze-bootstrap: cannot read manifest\n");
+            close(sfd); return 127;
+        }
     }
 
     /* 5. create tmpdir */
@@ -169,7 +248,17 @@ int main(int argc, char **argv)
         snprintf(dst, sizeof(dst), "%s/%s", g_tmpdir, name);
 
         int is_exec = (ent[i].flags & (DLFRZ_FLAG_MAIN_EXE | DLFRZ_FLAG_INTERP));
-        if (extract(sfd, dst, ent[i].data_offset, ent[i].data_size, is_exec) < 0) {
+
+        int rc;
+        if (from_memory) {
+            rc = extract_mem(mem_base, g_loader_info.payload_foff,
+                             dst, ent[i].data_offset, ent[i].data_size,
+                             is_exec);
+        } else {
+            rc = extract(sfd, dst, ent[i].data_offset,
+                         ent[i].data_size, is_exec);
+        }
+        if (rc < 0) {
             fprintf(stderr, "dlfreeze-bootstrap: extract failed: %s\n", name);
             rmtree(g_tmpdir);
             close(sfd); return 127;
