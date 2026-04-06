@@ -46,6 +46,112 @@ static size_t filesize(const char *path)
     return (stat(path, &st) == 0) ? (size_t)st.st_size : 0;
 }
 
+static uint64_t find_named_symbol(FILE *f, const Elf64_Ehdr *ehdr,
+                                  const char *target)
+{
+    if (ehdr->e_shoff == 0 || ehdr->e_shnum == 0 || ehdr->e_shentsize == 0)
+        return 0;
+
+    size_t shsz = (size_t)ehdr->e_shnum * ehdr->e_shentsize;
+    uint8_t *shdrs = malloc(shsz);
+    if (!shdrs) return 0;
+
+    if (fseek(f, ehdr->e_shoff, SEEK_SET) != 0 ||
+        fread(shdrs, 1, shsz, f) != shsz) {
+        free(shdrs);
+        return 0;
+    }
+
+    uint64_t found = 0;
+    for (int i = 0; i < ehdr->e_shnum; i++) {
+        Elf64_Shdr *sh = (Elf64_Shdr *)(shdrs + i * ehdr->e_shentsize);
+        if (sh->sh_type != SHT_SYMTAB && sh->sh_type != SHT_DYNSYM) continue;
+        if (sh->sh_link >= ehdr->e_shnum || sh->sh_entsize != sizeof(Elf64_Sym))
+            continue;
+
+        Elf64_Shdr *str_sh = (Elf64_Shdr *)(shdrs + sh->sh_link * ehdr->e_shentsize);
+        char *strtab = malloc(str_sh->sh_size ? (size_t)str_sh->sh_size : 1);
+        Elf64_Sym *syms = malloc(sh->sh_size ? (size_t)sh->sh_size : 1);
+        if (!strtab || !syms) {
+            free(strtab);
+            free(syms);
+            continue;
+        }
+
+        if (fseek(f, str_sh->sh_offset, SEEK_SET) != 0 ||
+            fread(strtab, 1, str_sh->sh_size, f) != str_sh->sh_size ||
+            fseek(f, sh->sh_offset, SEEK_SET) != 0 ||
+            fread(syms, 1, sh->sh_size, f) != sh->sh_size) {
+            free(strtab);
+            free(syms);
+            continue;
+        }
+
+        size_t nsyms = sh->sh_size / sizeof(Elf64_Sym);
+        for (size_t j = 0; j < nsyms; j++) {
+            Elf64_Sym *sym = &syms[j];
+            if (sym->st_name >= str_sh->sh_size) continue;
+            if (sym->st_shndx == SHN_UNDEF) continue;
+            if (strcmp(strtab + sym->st_name, target) != 0) continue;
+            found = sym->st_value;
+            break;
+        }
+
+        free(strtab);
+        free(syms);
+        if (found) break;
+    }
+
+    free(shdrs);
+    return found;
+}
+
+/*
+ * Extract `main` address from _start for stripped PIE binaries.
+ * Scans the entry point code for `lea disp32(%rip), %rdi` (48 8d 3d XX XX XX XX)
+ * which loads the `main` pointer before calling __libc_start_main.
+ */
+static uint64_t find_main_from_entry(FILE *f, const Elf64_Ehdr *ehdr,
+                                     const uint8_t *phdrs)
+{
+    uint64_t entry_va = ehdr->e_entry;
+
+    /* Map entry VA to file offset */
+    uint64_t entry_foff = 0;
+    int found_seg = 0;
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        Elf64_Phdr *ph = (Elf64_Phdr *)(phdrs + i * ehdr->e_phentsize);
+        if (ph->p_type != PT_LOAD) continue;
+        if (entry_va >= ph->p_vaddr &&
+            entry_va < ph->p_vaddr + ph->p_filesz) {
+            entry_foff = ph->p_offset + (entry_va - ph->p_vaddr);
+            found_seg = 1;
+            break;
+        }
+    }
+    if (!found_seg) return 0;
+
+    /* Read 64 bytes at entry point */
+    uint8_t code[64];
+    if (fseek(f, entry_foff, SEEK_SET) != 0) return 0;
+    size_t nr = fread(code, 1, sizeof(code), f);
+    if (nr < 16) return 0;
+
+    /* Scan for: 48 8d 3d XX XX XX XX  (lea disp32(%rip), %rdi) */
+    for (size_t i = 0; i + 7 <= nr; i++) {
+        if (code[i] == 0x48 && code[i+1] == 0x8d && code[i+2] == 0x3d) {
+            int32_t disp;
+            memcpy(&disp, &code[i+3], 4);
+            /* RIP at time of lea = entry_va + i + 7 */
+            uint64_t main_va = entry_va + i + 7 + (int64_t)disp;
+            fprintf(stderr, "dlfreeze: extracted main=0x%lx from _start\n",
+                    (unsigned long)main_va);
+            return main_va;
+        }
+    }
+    return 0;
+}
+
 /* ---- compute per-library metadata for direct loading ------------- */
 static int compute_lib_meta(const char *path, uint64_t base, uint32_t flags,
                             struct dlfrz_lib_meta *meta)
@@ -65,6 +171,7 @@ static int compute_lib_meta(const char *path, uint64_t base, uint32_t flags,
 
     meta->base_addr  = base;
     meta->entry      = ehdr.e_entry;
+    meta->main_sym   = 0;
     meta->phdr_off   = (uint32_t)ehdr.e_phoff;
     meta->phdr_num   = ehdr.e_phnum;
     meta->phdr_entsz = ehdr.e_phentsize;
@@ -88,6 +195,13 @@ static int compute_lib_meta(const char *path, uint64_t base, uint32_t flags,
         uint64_t end = ph->p_vaddr + ph->p_memsz;
         if (end > hi) hi = end;
     }
+
+    if (flags & DLFRZ_FLAG_MAIN_EXE) {
+        meta->main_sym = find_named_symbol(f, &ehdr, "main");
+        if (!meta->main_sym)
+            meta->main_sym = find_main_from_entry(f, &ehdr, phdrs);
+    }
+
     free(phdrs);
     fclose(f);
 

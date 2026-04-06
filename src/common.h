@@ -55,6 +55,7 @@ struct dlfrz_lib_meta {
     uint64_t vaddr_lo;      /* lowest PT_LOAD p_vaddr                 */
     uint64_t vaddr_hi;      /* highest (p_vaddr + p_memsz)            */
     uint64_t entry;         /* e_entry (raw value from ELF header)    */
+    uint64_t main_sym;      /* st_value for main if found, else 0     */
     uint32_t phdr_off;      /* e_phoff                                */
     uint16_t phdr_num;      /* e_phnum                                */
     uint16_t phdr_entsz;    /* e_phentsize                            */

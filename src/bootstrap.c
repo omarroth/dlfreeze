@@ -35,6 +35,14 @@ static volatile struct dlfrz_loader_info g_loader_info
 static volatile pid_t g_child;
 static char g_tmpdir[PATH_MAX];
 
+/* ---- tmpdir selection -------------------------------------------- */
+static int make_workdir(char *out, size_t out_sz)
+{
+    if (snprintf(out, out_sz, "/tmp/dlfreeze.XXXXXX") >= (int)out_sz)
+        return -1;
+    return mkdtemp(out) ? 0 : -1;
+}
+
 /* ---- signal forwarding ------------------------------------------- */
 static void fwd_signal(int sig) {
     if (g_child > 0) kill(g_child, sig);
@@ -201,7 +209,8 @@ int main(int argc, char **argv)
     uint64_t meta_off = 0;
     memcpy(&meta_off, ft.pad, sizeof(meta_off));
     if (meta_off != 0) {
-        /* Direct-load mode: map libraries in-process, no tmpdir */
+        /* Direct-load mode: try in a child first so we can fall back to
+         * extraction if the in-process loader fails for this binary. */
         size_t metasz = ft.num_entries * sizeof(struct dlfrz_lib_meta);
         struct dlfrz_lib_meta *metas = malloc(metasz);
         if (!metas) {
@@ -226,10 +235,12 @@ int main(int argc, char **argv)
          * UPX path: payload is already in virtual memory. */
         const uint8_t *ldr_mem;
         uint64_t ldr_mem_foff;
+        int ldr_srcfd;
 
         if (from_memory) {
             ldr_mem = mem_base;
             ldr_mem_foff = g_loader_info.payload_foff;
+            ldr_srcfd = -1;
         } else {
             void *file_map = mmap(NULL, st.st_size, PROT_READ,
                                   MAP_PRIVATE, sfd, 0);
@@ -240,23 +251,50 @@ int main(int argc, char **argv)
             }
             ldr_mem = (const uint8_t *)file_map;
             ldr_mem_foff = 0;
+            ldr_srcfd = sfd;
         }
 
-        close(sfd);
+        pid_t lpid = fork();
+        if (lpid < 0) {
+            perror("fork");
+            free(metas); free(ent); free(strtab); close(sfd);
+            return 127;
+        }
 
-        /* loader_run() does NOT return on success */
-        loader_run(ldr_mem, ldr_mem_foff, metas, ent, strtab,
-                   ft.num_entries, argc, argv, environ);
+        if (lpid == 0) {
+            /* loader_run() does NOT return on success */
+            loader_run(ldr_mem, ldr_mem_foff, ldr_srcfd, metas, ent, strtab,
+                       ft.num_entries, argc, argv, environ);
+            close(sfd);
+            fprintf(stderr, "dlfreeze-bootstrap: in-process loader failed\n");
+            _exit(127);
+        }
 
-        /* If we get here, the loader failed */
-        fprintf(stderr, "dlfreeze-bootstrap: in-process loader failed\n");
-        free(metas); free(ent); free(strtab);
-        return 127;
+        int lst = 0;
+        while (waitpid(lpid, &lst, 0) < 0)
+            if (errno != EINTR) break;
+
+        if (from_memory == 0 && ldr_mem_foff == 0 && ldr_mem)
+            munmap((void *)ldr_mem, st.st_size);
+
+        free(metas);
+
+        if (WIFEXITED(lst)) {
+            int rc = WEXITSTATUS(lst);
+            if (rc != 127) {
+                free(ent); free(strtab); close(sfd);
+                return rc;
+            }
+        } else if (WIFSIGNALED(lst)) {
+            /* Crash in direct mode — try the extraction fallback. */
+        }
+
+        fprintf(stderr,
+                "dlfreeze-bootstrap: direct-load failed, falling back to extraction\n");
     }
 
-    /* 6. create tmpdir (fallback extraction path) */
-    snprintf(g_tmpdir, sizeof(g_tmpdir), "/tmp/dlfreeze.XXXXXX");
-    if (!mkdtemp(g_tmpdir)) {
+    /* 6. create workdir for extraction fallback (/tmp only). */
+    if (make_workdir(g_tmpdir, sizeof(g_tmpdir)) < 0) {
         perror("mkdtemp"); close(sfd); return 127;
     }
 

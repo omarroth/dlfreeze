@@ -28,7 +28,7 @@ struct dlfrz_entry;
  * On success this function does NOT return — it transfers control to the
  * loaded executable.  On failure it returns -1.
  */
-int loader_run(const uint8_t *mem, uint64_t mem_foff,
+int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
                const struct dlfrz_lib_meta *metas,
                const struct dlfrz_entry *entries,
                const char *strtab,
