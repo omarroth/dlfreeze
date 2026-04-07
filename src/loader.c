@@ -16,6 +16,7 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <elf.h>
+#include <link.h>
 #include <stdint.h>
 #include <fcntl.h>
 
@@ -92,6 +93,16 @@ static void crash_handler(int sig, siginfo_t *info, void *ucontext)
     ldr_hex("", (uint64_t)(uintptr_t)info->si_addr);
     ucontext_t *uc = (ucontext_t *)ucontext;
     ldr_hex("[loader] RIP=0x", (uint64_t)uc->uc_mcontext.gregs[REG_RIP]);
+    /* Print RSP and the return address (caller) from the stack */
+    uint64_t rsp = (uint64_t)uc->uc_mcontext.gregs[REG_RSP];
+    ldr_hex("[loader] RSP=0x", rsp);
+    if (rsp > 0x1000) {
+        for (int f = 0; f < 10; f++)
+            ldr_hex("[loader] stack: ", *(uint64_t *)(rsp + f * 8));
+    }
+    ldr_hex("[loader] RBP=0x", (uint64_t)uc->uc_mcontext.gregs[REG_RBP]);
+    ldr_hex("[loader] RAX=0x", (uint64_t)uc->uc_mcontext.gregs[REG_RAX]);
+    ldr_hex("[loader] RDI=0x", (uint64_t)uc->uc_mcontext.gregs[REG_RDI]);
     if (sig == SIGABRT && g_arena_addr) {
         uintptr_t a = g_arena_addr;
         uintptr_t top = *(uint64_t *)(a + 0x08);
@@ -129,6 +140,7 @@ static void crash_handler(int sig, siginfo_t *info, void *ucontext)
 /* _rtld_global (2120 bytes on glibc 2.43 x86-64) */
 #define GL_SIZE          4096                /* generous allocation     */
 #define GL_DL_NNS_OFF         0x700          /* _dl_nns                 */
+#define GL_DL_STACK_FLAGS_OFF 0x7b8          /* _dl_stack_flags         */
 #define GL_DL_TLS_GENERATION_OFF 0x7f0       /* _dl_tls_generation      */
 #define GL_DL_STACK_USED_OFF  0x800          /* _dl_stack_used (list_t) */
 #define GL_DL_STACK_USER_OFF  0x810          /* _dl_stack_user (list_t) */
@@ -184,12 +196,23 @@ static void glro_dl_error_free(void *ptr) { (void)ptr; }
 /* _dl_debug_printf — no-op (suppress ld.so debug spew) */
 static void glro_dl_debug_printf(const char *fmt, ...) { (void)fmt; }
 
+/* _dl_find_object — forward declaration (impl after struct loaded_obj) */
+static int glro_dl_find_object(void *pc, void *result);
+
+/* _dl_mcount — no-op profiling hook */
+static void glro_dl_mcount(uintptr_t from, uintptr_t to)
+{
+    (void)from; (void)to;
+}
+
 /* Offsets of function pointers in struct rtld_global_ro (glibc 2.43 x86-64) */
 #define GLRO_DL_DEBUG_PRINTF_OFF  816
+#define GLRO_DL_MCOUNT_OFF        824
 #define GLRO_DL_OPEN_OFF          840
 #define GLRO_DL_CLOSE_OFF         848
 #define GLRO_DL_CATCH_ERROR_OFF   856
 #define GLRO_DL_ERROR_FREE_OFF    864
+#define GLRO_DL_FIND_OBJECT_OFF   888
 
 /* make a list_t {next, prev} point to itself (empty circular list) */
 static void init_empty_list(uint8_t *base, size_t off)
@@ -345,6 +368,7 @@ static int init_fake_rtld(void)
 
     /* _rtld_global critical fields */
     *(size_t *)(g_fake_rtld_global + GL_DL_NNS_OFF)            = 1;
+    *(int    *)(g_fake_rtld_global + GL_DL_STACK_FLAGS_OFF)     = 3; /* PROT_READ|PROT_WRITE */
     *(size_t *)(g_fake_rtld_global + GL_DL_TLS_GENERATION_OFF) = 1;
 
     /* Empty circular lists for stack tracking */
@@ -359,6 +383,8 @@ static int init_fake_rtld(void)
     *(void **)(g_fake_rtld_global_ro + GLRO_DL_CLOSE_OFF)        = (void *)glro_dl_close;
     *(void **)(g_fake_rtld_global_ro + GLRO_DL_CATCH_ERROR_OFF)  = (void *)glro_dl_catch_error;
     *(void **)(g_fake_rtld_global_ro + GLRO_DL_ERROR_FREE_OFF)   = (void *)glro_dl_error_free;
+    *(void **)(g_fake_rtld_global_ro + GLRO_DL_FIND_OBJECT_OFF)  = (void *)glro_dl_find_object;
+    *(void **)(g_fake_rtld_global_ro + GLRO_DL_MCOUNT_OFF)       = (void *)glro_dl_mcount;
 
     return 0;
 }
@@ -433,10 +459,17 @@ static void *stub_tls_get_addr(struct tls_index *ti)
     if (dtv) {
         /* dtv[module * 2] = pointer to start of that module's TLS block */
         uintptr_t tls_block = dtv[ti->ti_module * 2];
-        if (tls_block)
+        if (tls_block) {
             return (void *)(tls_block + ti->ti_offset);
+        }
+        if (g_debug) {
+            ldr_msg("[tls] DTV slot empty mod=");
+            ldr_hex("", ti->ti_module);
+        }
     }
     /* Fallback: single-module approximation */
+    if (g_debug)
+        ldr_hex("[tls] FALLBACK off=", ti->ti_offset);
     return (void *)(tp + ti->ti_offset);
 }
 
@@ -491,6 +524,7 @@ static uint64_t lookup_fake_object(const char *name)
 #define TCB_OFF_SELF2       16    /* void *self             */
 #define TCB_OFF_STACK_GUARD 40    /* uintptr_t stack_guard  (0x28) */
 #define TCB_OFF_PTR_GUARD   48    /* uintptr_t pointer_guard (0x30) */
+#define TCB_OFF_TID        720    /* pid_t tid (0x2D0) — thread ID */
 
 /* ---- per-object runtime state ----------------------------------------- */
 struct obj_tls {
@@ -529,6 +563,13 @@ struct loaded_obj {
     /* Entry point (exe only) */
     uint64_t          entry;
 
+    /* Program headers (for dl_iterate_phdr / _dl_find_object) */
+    const Elf64_Phdr *phdr;
+    uint16_t          phdr_num;
+    uintptr_t         map_start;   /* base + vaddr_lo (first mapped byte) */
+    uintptr_t         map_end;     /* base + vaddr_hi (past-the-end) */
+    const void       *eh_frame_hdr; /* mapped PT_GNU_EH_FRAME, or NULL */
+
     /* TLS */
     struct obj_tls    tls;
 };
@@ -543,6 +584,38 @@ static int g_nobj;
 
 /* Per-object metadata for dlopen'd objects (used by protect_object) */
 static struct dlfrz_lib_meta g_dl_metas[MAX_TOTAL_OBJS];
+
+/* ---- _dl_find_object implementation ---------------------------------- */
+
+/* _dl_find_object — used by libgcc_s DWARF unwinder to find FDE info.
+ * Searches g_all_objs[] for the object containing `pc` and returns
+ * the .eh_frame_hdr pointer so the unwinder can locate FDE entries. */
+static int glro_dl_find_object(void *pc, void *result)
+{
+    uintptr_t addr = (uintptr_t)pc;
+    for (int i = 0; i < g_nobj; i++) {
+        if (addr >= g_all_objs[i].map_start && addr < g_all_objs[i].map_end) {
+            /* struct dl_find_object layout on x86-64 (glibc 2.35+):
+             *   0: dlfo_flags           (unsigned long long)
+             *   8: dlfo_map_start       (void *)
+             *  16: dlfo_map_end         (void *)
+             *  24: dlfo_link_map        (struct link_map *)
+             *  32: dlfo_eh_frame        (void *) — .eh_frame_hdr
+             *  40: dlfo_sframe          (void *)
+             *  48: __dlfo_reserved[6]
+             */
+            uint8_t *r = (uint8_t *)result;
+            memset(r, 0, 96);  /* zero the whole struct */
+            *(unsigned long long *)(r + 0)  = 0;  /* flags */
+            *(void **)(r + 8)  = (void *)g_all_objs[i].map_start;
+            *(void **)(r + 16) = (void *)g_all_objs[i].map_end;
+            *(void **)(r + 24) = NULL;  /* no link_map */
+            *(void **)(r + 32) = (void *)g_all_objs[i].eh_frame_hdr;
+            return 0;
+        }
+    }
+    return -1;
+}
 
 /* argc/argv/envp saved for init functions of dlopen'd objects */
 static int g_argc;
@@ -733,15 +806,20 @@ static void *my_dlopen(const char *path, int flags);
 static void *my_dlsym(void *handle, const char *symbol);
 static int   my_dlclose(void *handle);
 static char *my_dlerror(void);
+static int   my_dl_iterate_phdr(
+                 int (*callback)(struct dl_phdr_info *, size_t, void *),
+                 void *data);
 
 /* Override table — these symbols take priority over libc's exports
  * so that dlopen/dlsym/dlclose/dlerror go through our implementation
  * which can load .so files from the filesystem at runtime. */
 static const struct stub_sym g_overrides[] = {
-    { "dlopen",  (void *)my_dlopen  },
-    { "dlsym",   (void *)my_dlsym   },
-    { "dlclose", (void *)my_dlclose },
-    { "dlerror", (void *)my_dlerror },
+    { "dlopen",          (void *)my_dlopen          },
+    { "dlsym",           (void *)my_dlsym           },
+    { "dlclose",         (void *)my_dlclose         },
+    { "dlerror",         (void *)my_dlerror         },
+    { "dl_iterate_phdr", (void *)my_dl_iterate_phdr },
+    { "__tls_get_addr",  (void *)stub_tls_get_addr  },
     { NULL, NULL }
 };
 
@@ -1025,6 +1103,13 @@ static int apply_relocs_rela(struct loaded_obj *obj,
                 if (ELF64_ST_TYPE(obj->dynsym[sidx].st_info) == STT_OBJECT
                     && g_null_page)
                     addr = (uint64_t)(uintptr_t)g_null_page;
+                else if (g_debug) {
+                    ldr_dbg("[loader] unresolved: ");
+                    ldr_dbg(name);
+                    ldr_dbg(" in ");
+                    ldr_dbg(obj->name);
+                    ldr_dbg("\n");
+                }
             }
             *slot = addr + r->r_addend;
             break;
@@ -1087,9 +1172,24 @@ static int apply_relocs_rela(struct loaded_obj *obj,
             break;
 
         case R_X86_64_DTPOFF64:
-            if (sidx != 0)
-                *slot = obj->dynsym[sidx].st_value + r->r_addend;
-            else
+            if (sidx != 0) {
+                /* If the symbol is undefined locally (imported), look it
+                 * up in the defining library to get the correct TLS offset. */
+                uint64_t off = obj->dynsym[sidx].st_value;
+                if (obj->dynsym[sidx].st_shndx == 0) {
+                    const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
+                    for (int j = 0; j < nobj; j++) {
+                        const Elf64_Sym *ds = all[j].gnu_hash
+                            ? lookup_gnu_hash(&all[j], name, gnu_hash_calc(name))
+                            : lookup_linear(&all[j], name);
+                        if (ds && ds->st_shndx != 0) {
+                            off = ds->st_value;
+                            break;
+                        }
+                    }
+                }
+                *slot = off + r->r_addend;
+            } else
                 *slot = r->r_addend;
             break;
 
@@ -1507,6 +1607,18 @@ static struct loaded_obj *load_elf_from_file(const char *path)
     obj->base  = base;
     obj->name  = dl_store_name(path);
     obj->flags = LDR_FLAG_SHLIB;
+    obj->phdr  = (const Elf64_Phdr *)(base + ehdr.e_phoff);
+    obj->phdr_num  = ehdr.e_phnum;
+    obj->map_start = base + lo;
+    obj->map_end   = base + hi;
+    /* Find PT_GNU_EH_FRAME */
+    obj->eh_frame_hdr = NULL;
+    for (int p = 0; p < ehdr.e_phnum; p++) {
+        if (phdr_buf[p].p_type == PT_GNU_EH_FRAME) {
+            obj->eh_frame_hdr = (const void *)(base + phdr_buf[p].p_vaddr);
+            break;
+        }
+    }
 
     /* Build metadata for parse_dynamic / protect_object */
     struct dlfrz_lib_meta *meta = &g_dl_metas[idx];
@@ -1617,6 +1729,29 @@ static char *my_dlerror(void)
     return NULL;
 }
 
+/* ---------- dl_iterate_phdr override ---------------------------------- */
+
+static int my_dl_iterate_phdr(
+        int (*callback)(struct dl_phdr_info *, size_t, void *),
+        void *data)
+{
+    int ret = 0;
+    for (int i = 0; i < g_nobj; i++) {
+        if (!g_all_objs[i].phdr) continue;
+        struct dl_phdr_info info;
+        memset(&info, 0, sizeof(info));
+        info.dlpi_addr    = (ElfW(Addr))g_all_objs[i].base;
+        info.dlpi_name    = g_all_objs[i].name ? g_all_objs[i].name : "";
+        info.dlpi_phdr    = g_all_objs[i].phdr;
+        info.dlpi_phnum   = g_all_objs[i].phdr_num;
+        info.dlpi_adds    = (unsigned long long)g_nobj;
+        info.dlpi_subs    = 0;
+        ret = callback(&info, sizeof(info), data);
+        if (ret != 0) return ret;
+    }
+    return ret;
+}
+
 /* ==== TLS setup ======================================================== */
 
 static uintptr_t get_auxval(char **envp, unsigned long type)
@@ -1683,6 +1818,10 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
     /* Initialize TCB header */
     *(uintptr_t *)(tp + TCB_OFF_SELF)  = tp;
     *(uintptr_t *)(tp + TCB_OFF_SELF2) = tp;
+
+    /* Set thread ID so pthread_mutex_lock ERRORCHECK doesn't
+     * falsely detect deadlock (owner==0 vs tid==0). */
+    *(int32_t *)(tp + TCB_OFF_TID) = (int32_t)syscall(SYS_gettid);
 
     /*
      * Minimal DTV (Dynamic Thread Vector).
@@ -1901,6 +2040,18 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         int mi = idx_map[i];
         if (map_object(mem, mem_foff, srcfd, &metas[mi], &entries[mi], &objs[i]) < 0)
             return -1;
+        objs[i].phdr      = (const Elf64_Phdr *)(objs[i].base + metas[mi].phdr_off);
+        objs[i].phdr_num  = metas[mi].phdr_num;
+        objs[i].map_start = objs[i].base + metas[mi].vaddr_lo;
+        objs[i].map_end   = objs[i].base + metas[mi].vaddr_hi;
+        /* Find PT_GNU_EH_FRAME for DWARF unwinder */
+        objs[i].eh_frame_hdr = NULL;
+        for (int p = 0; p < objs[i].phdr_num; p++) {
+            if (objs[i].phdr[p].p_type == PT_GNU_EH_FRAME) {
+                objs[i].eh_frame_hdr = (const void *)(objs[i].base + objs[i].phdr[p].p_vaddr);
+                break;
+            }
+        }
         ldr_dbg("  ");
         ldr_dbg(objs[i].name);
         ldr_dbg_hex("  base=0x", objs[i].base);
