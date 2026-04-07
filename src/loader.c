@@ -516,6 +516,17 @@ static uint64_t lookup_fake_object(const char *name)
     return 0;
 }
 
+/* ---- Unified special-symbol hash table --------------------------------
+ * Declared here, populated later after g_overrides is defined. */
+#define SPECIAL_TAB_SIZE 64  /* must be power of 2, > total special syms */
+static struct { uint32_t hash; const char *name; uint64_t addr; uint8_t used; }
+    g_special_tab[SPECIAL_TAB_SIZE];
+static int g_special_tab_ready;
+
+/* Forward declarations — defined after g_overrides and gnu_hash_calc */
+static void build_special_table(void);
+static uint64_t lookup_special(const char *name, uint32_t gh);
+
 /* ---- TLS / arch constants --------------------------------------------- */
 #define ARCH_SET_FS   0x1002
 #define TCB_ALLOC     4096     /* generous TCB allocation */
@@ -842,6 +853,49 @@ static uint64_t lookup_override(const char *name)
     return 0;
 }
 
+/* ---- build_special_table / lookup_special implementations ------------- */
+
+static void build_special_table(void)
+{
+    if (g_special_tab_ready) return;
+    memset(g_special_tab, 0, sizeof(g_special_tab));
+
+    #define SPEC_INSERT(n, a) do { \
+        uint32_t _h = gnu_hash_calc(n); \
+        uint32_t _i = _h & (SPECIAL_TAB_SIZE - 1); \
+        while (g_special_tab[_i].used) _i = (_i + 1) & (SPECIAL_TAB_SIZE - 1); \
+        g_special_tab[_i].hash = _h; \
+        g_special_tab[_i].name = (n); \
+        g_special_tab[_i].addr = (uint64_t)(uintptr_t)(a); \
+        g_special_tab[_i].used = 1; \
+    } while (0)
+
+    for (const struct stub_sym *o = g_overrides; o->name; o++)
+        SPEC_INSERT(o->name, o->addr);
+    for (const struct stub_sym *s = g_stubs; s->name; s++)
+        SPEC_INSERT(s->name, s->addr);
+    if (g_fake_rtld_global)
+        SPEC_INSERT("_rtld_global", g_fake_rtld_global);
+    if (g_fake_rtld_global_ro)
+        SPEC_INSERT("_rtld_global_ro", g_fake_rtld_global_ro);
+    #undef SPEC_INSERT
+
+    g_special_tab_ready = 1;
+}
+
+static uint64_t lookup_special(const char *name, uint32_t gh)
+{
+    uint32_t idx = gh & (SPECIAL_TAB_SIZE - 1);
+    for (uint32_t n = 0; n < SPECIAL_TAB_SIZE; n++) {
+        if (!g_special_tab[idx].used) return 0;
+        if (g_special_tab[idx].hash == gh &&
+            strcmp(g_special_tab[idx].name, name) == 0)
+            return g_special_tab[idx].addr;
+        idx = (idx + 1) & (SPECIAL_TAB_SIZE - 1);
+    }
+    return 0;
+}
+
 /*
  * Global symbol search — exe first, then libs in load order.
  * Returns resolved virtual address or 0.
@@ -856,11 +910,20 @@ static uint64_t resolve_sym(struct loaded_obj *objs, int nobj,
     if (c == 1) return cached;
     if (c == -1) return 0;
 
-    /* Override stubs (dlopen, dlsym, etc.) take priority */
-    uint64_t ovr = lookup_override(name);
-    if (ovr) {
-        sym_cache_store(name, gh, CACHE_FOUND, ovr);
-        return ovr;
+    /* Check unified special-symbol table (overrides, stubs, fake rtld) */
+    if (g_special_tab_ready) {
+        uint64_t ovr = lookup_special(name, gh);
+        if (ovr) {
+            sym_cache_store(name, gh, CACHE_FOUND, ovr);
+            return ovr;
+        }
+    } else {
+        /* Fallback to linear lookup before table is built */
+        uint64_t ovr = lookup_override(name);
+        if (ovr) {
+            sym_cache_store(name, gh, CACHE_FOUND, ovr);
+            return ovr;
+        }
     }
 
     for (int i = 0; i < nobj; i++) {
@@ -880,11 +943,15 @@ static uint64_t resolve_sym(struct loaded_obj *objs, int nobj,
     }
 
     /* Check stubs and fake objects before giving up */
-    uint64_t stub = lookup_stub(name);
-    if (!stub) stub = lookup_fake_object(name);
-    if (stub) {
-        sym_cache_store(name, gh, CACHE_FOUND, stub);
-        return stub;
+    if (g_special_tab_ready) {
+        /* Already checked in unified table above */
+    } else {
+        uint64_t stub = lookup_stub(name);
+        if (!stub) stub = lookup_fake_object(name);
+        if (stub) {
+            sym_cache_store(name, gh, CACHE_FOUND, stub);
+            return stub;
+        }
     }
 
     sym_cache_store(name, gh, CACHE_MISS, 0);
@@ -922,6 +989,36 @@ static int resolve_tpoff(struct loaded_obj *objs, int nobj,
 
 /* ==== Map one object's PT_LOAD segments ================================ */
 
+/*
+ * Reserve the entire virtual address range for all objects in a single
+ * mmap call.  Individual objects are then mapped on top with MAP_FIXED.
+ * Returns 0 on success, -1 on failure.
+ */
+static int reserve_address_range(const struct dlfrz_lib_meta *metas,
+                                  const int *idx_map, int nobj)
+{
+    /* Find lowest and highest addresses across all objects */
+    uint64_t range_lo = UINT64_MAX, range_hi = 0;
+    for (int i = 0; i < nobj; i++) {
+        int mi = idx_map[i];
+        uint64_t lo = metas[mi].base_addr + (metas[mi].vaddr_lo & ~0xFFFULL);
+        uint64_t hi = metas[mi].base_addr + ALIGN_UP(metas[mi].vaddr_hi, 4096);
+        if (lo < range_lo) range_lo = lo;
+        if (hi > range_hi) range_hi = hi;
+    }
+    if (range_lo >= range_hi) return -1;
+
+    /* Add guard pages at the end */
+    range_hi += 4 * 4096;
+
+    void *mapped = mmap((void *)range_lo, range_hi - range_lo,
+                        PROT_READ | PROT_WRITE | PROT_EXEC,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+                        -1, 0);
+    if (mapped == MAP_FAILED) return -1;
+    return 0;
+}
+
 static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
                       const struct dlfrz_lib_meta *meta,
                       const struct dlfrz_entry *ent,
@@ -930,26 +1027,22 @@ static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     uint64_t base = meta->base_addr;
     uint64_t lo   = meta->vaddr_lo & ~0xFFFULL;
     uint64_t hi   = ALIGN_UP(meta->vaddr_hi, 4096);
-    uint64_t span = hi - lo;
-    /* Add guard pages to cover glibc's optimised memcpy/memset which
-     * prefetch up to 0x3040 bytes ahead of the source pointer.  When
-     * a buffer ends near the last mapped page of an object, these
-     * speculative reads would fault on the unmapped page after it.
-     * 4 pages (16 KiB) covers the largest observed prefetch. */
-    span += 4 * 4096;
+    (void)lo; (void)hi;
 
-    void *mapped = mmap((void *)(base + lo), span,
-                        PROT_READ | PROT_WRITE | PROT_EXEC,
-                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
-                        -1, 0);
-    if (mapped == MAP_FAILED) {
-        ldr_err("mmap failed", obj->name);
-        return -1;
+    /* If address range not pre-reserved (e.g. lazy dlopen), reserve it now */
+    {
+        uint64_t span = hi - lo + 4 * 4096;
+        /* Try NOREPLACE first — succeeds if not yet reserved */
+        void *m = mmap((void *)(base + lo), span,
+                       PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+                       -1, 0);
+        if (m == MAP_FAILED) {
+            /* Already reserved by reserve_address_range — that's fine */
+        }
     }
 
-    /* Copy/map each PT_LOAD segment from the payload.
-     * If we have a real source fd for the frozen ELF (normal non-UPX path),
-     * map file-backed pages directly to reduce copying and disk writes. */
+    /* Copy/map each PT_LOAD segment from the payload. */
     const uint8_t *elf_base = mem + (ent->data_offset - mem_foff);
     const uint8_t *phdr_base = elf_base + meta->phdr_off;
     for (int i = 0; i < meta->phdr_num; i++) {
@@ -2210,8 +2303,15 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         oi++;
     }
 
-    /* 2. Map all objects into memory at pre-assigned addresses */
+    /* 2. Map all objects into memory at pre-assigned addresses.
+     *    Reserve the entire VA range in one mmap call first, then
+     *    map individual segments on top.  This reduces mmap syscalls
+     *    from N*M (objects*segments) to 1 + N*M_file-backed. */
     ldr_dbg("[loader] mapping objects...\n");
+    if (reserve_address_range(metas, idx_map, nobj) < 0) {
+        ldr_err("failed to reserve address range", NULL);
+        return -1;
+    }
     for (int i = 0; i < nobj; i++) {
         int mi = idx_map[i];
         if (map_object(mem, mem_foff, srcfd, &metas[mi], &entries[mi], &objs[i]) < 0)
@@ -2262,53 +2362,57 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
 
     if (prelinked) {
         ldr_dbg("[loader] pre-linked: patching overrides...\n");
-        /* Patch GOT entries for symbols that point into the bootstrap
-         * binary (overrides, stubs, fake rtld objects).  These addresses
-         * weren't known at freeze time.  Also resolve IFUNC GLOB_DAT
-         * entries that the pre-linker skipped (they need _rtld_global_ro
-         * from the bootstrap, which is now set up by preseed_rtld_got). */
+        /* Build the unified special-symbol hash table (overrides, stubs,
+         * fake rtld objects) for fast O(1) lookup per relocation. */
+        build_special_table();
+
+        for (int i = 0; i < nobj; i++)
+            preseed_rtld_got(&objs[i]);  /* seed _rtld_global_ro in all objects first */
+
         for (int i = 0; i < nobj; i++) {
-                preseed_rtld_got(&objs[i]);  /* seed _rtld_global_ro in all objects first */
-            }
-            for (int i = 0; i < nobj; i++) {
-                const Elf64_Rela *tabs[] = { objs[i].rela, objs[i].jmprel };
+            const Elf64_Rela *tabs[] = { objs[i].rela, objs[i].jmprel };
             size_t counts[] = { objs[i].rela_count, objs[i].jmprel_count };
             for (int t = 0; t < 2; t++) {
                 for (size_t r = 0; r < counts[t]; r++) {
                     const Elf64_Rela *rel = &tabs[t][r];
                     uint32_t type = ELF64_R_TYPE(rel->r_info);
-                    uint32_t sidx = ELF64_R_SYM(rel->r_info);
                     if (type != R_X86_64_GLOB_DAT &&
                         type != R_X86_64_JUMP_SLOT) continue;
+                    uint32_t sidx = ELF64_R_SYM(rel->r_info);
                     if (sidx == 0) continue;
-                    const char *name = objs[i].dynstr + objs[i].dynsym[sidx].st_name;
-                    uint64_t ovr = lookup_override(name);
-                    if (!ovr) ovr = lookup_stub(name);
-                    if (!ovr) ovr = lookup_fake_object(name);
-                    if (ovr) {
-                        uint64_t *slot = (uint64_t *)(objs[i].base + rel->r_offset);
-                        *slot = ovr + rel->r_addend;
+
+                    uint64_t *slot = (uint64_t *)(objs[i].base + rel->r_offset);
+
+                    if (*slot != 0) {
+                        /* Fast path: pre-linker already resolved this.
+                         * Only patch if it's a special symbol (override/
+                         * stub/fake_rtld) whose address is runtime-only.
+                         * First-char filter avoids hashing most names. */
+                        const char *name = objs[i].dynstr + objs[i].dynsym[sidx].st_name;
+                        char c = name[0];
+                        if (c == 'd' || c == '_') {
+                            uint32_t gh = gnu_hash_calc(name);
+                            uint64_t ovr = lookup_special(name, gh);
+                            if (ovr) *slot = ovr + rel->r_addend;
+                        }
+                    } else {
+                        /* Slot is 0: IFUNC (left by pre-linker) or truly
+                         * unresolved.  Try special table, then full resolve. */
+                        const char *name = objs[i].dynstr + objs[i].dynsym[sidx].st_name;
+                        uint32_t gh = gnu_hash_calc(name);
+                        uint64_t ovr = lookup_special(name, gh);
+                        if (ovr) {
+                            *slot = ovr + rel->r_addend;
                         } else {
-                            /* Re-resolve slots the pre-linker left as 0.
-                             * This covers IFUNC symbols (e.g. strrchr, memcpy)
-                             * where the defining library uses STT_GNU_IFUNC but
-                             * the importing library's dynsym shows STT_FUNC.
-                             * resolve_sym() calls the IFUNC resolver correctly
-                             * now that _rtld_global_ro is seeded. */
-                            uint64_t *slot = (uint64_t *)(objs[i].base + rel->r_offset);
-                            if (*slot == 0) {
-                                uint64_t addr = resolve_sym(objs, nobj, name);
-                                    if (addr) {
-                                        *slot = addr + rel->r_addend;
-                                    } else if (ELF64_ST_BIND(objs[i].dynsym[sidx].st_info) != STB_WEAK
-                                               && ELF64_ST_TYPE(objs[i].dynsym[sidx].st_info) == STT_OBJECT
-                                               && g_null_page) {
-                                        /* Unresolved OBJECT (e.g. __libc_enable_secure from ld.so):
-                                         * point to zero page so reads return 0, matching the
-                                         * non-prelinked path behaviour in apply_relocs_rela(). */
-                                        *slot = (uint64_t)(uintptr_t)g_null_page + rel->r_addend;
-                                    }
+                            uint64_t addr = resolve_sym(objs, nobj, name);
+                            if (addr) {
+                                *slot = addr + rel->r_addend;
+                            } else if (ELF64_ST_BIND(objs[i].dynsym[sidx].st_info) != STB_WEAK
+                                       && ELF64_ST_TYPE(objs[i].dynsym[sidx].st_info) == STT_OBJECT
+                                       && g_null_page) {
+                                *slot = (uint64_t)(uintptr_t)g_null_page + rel->r_addend;
                             }
+                        }
                     }
                 }
             }
@@ -2463,6 +2567,12 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         ldr_dbg("[loader] calling main() directly...\n");
         int rc = ((main_fn_t)(uintptr_t)main_addr)(argc, argv, envp);
         ldr_dbg("[loader] main() returned\n");
+        /* Flush all stdio streams before _exit — _exit doesn't run atexit
+         * handlers or flush stdio.  When stdout is a pipe (e.g. captured
+         * by $(cmd)), libc uses full buffering so output would be lost. */
+        uint64_t fflush_addr = resolve_sym(objs, nobj, "fflush");
+        if (fflush_addr)
+            ((int (*)(void *))(uintptr_t)fflush_addr)(NULL);
         _exit(rc);
     }
 

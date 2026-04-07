@@ -308,24 +308,65 @@ static const Elf64_Sym *pl_lookup_linear(const struct prelink_obj *obj,
     return fallback;
 }
 
+/* ---- Prelinker symbol resolution cache -------------------------------- */
+#define PL_CACHE_SIZE 4096  /* must be power of 2 */
+static struct {
+    const char *name;
+    uint32_t    hash;
+    uint64_t    value;
+    uint8_t     used;
+} pl_sym_cache[PL_CACHE_SIZE];
+
+static void pl_cache_init(void)
+{
+    memset(pl_sym_cache, 0, sizeof(pl_sym_cache));
+}
+
 static uint64_t pl_resolve_sym(struct prelink_obj *objs, int nobj,
                                 const char *name)
 {
     uint32_t gh = pl_gnu_hash(name);
+
+    /* Check cache */
+    uint32_t ci = gh & (PL_CACHE_SIZE - 1);
+    for (uint32_t n = 0; n < PL_CACHE_SIZE; n++) {
+        if (!pl_sym_cache[ci].used) break;
+        if (pl_sym_cache[ci].hash == gh &&
+            strcmp(pl_sym_cache[ci].name, name) == 0)
+            return pl_sym_cache[ci].value;
+        ci = (ci + 1) & (PL_CACHE_SIZE - 1);
+    }
+
+    /* Cache miss — do full lookup */
+    uint64_t result = 0;
     for (int i = 0; i < nobj; i++) {
         const Elf64_Sym *sym = objs[i].gnu_hash
             ? pl_lookup_gnu(&objs[i], name, gh)
             : pl_lookup_linear(&objs[i], name);
         if (sym) {
-            /* Don't call IFUNC resolvers at pre-link time — they need
-             * _rtld_global_ro from the embedded GOT which isn't seeded
-             * yet.  Return 0; the loader will resolve IFUNC at runtime. */
-            if (ELF64_ST_TYPE(sym->st_info) == STT_GNU_IFUNC)
-                return 0;
-            return objs[i].base + sym->st_value;
+            if (ELF64_ST_TYPE(sym->st_info) == STT_GNU_IFUNC) {
+                result = 0;
+            } else {
+                result = objs[i].base + sym->st_value;
+            }
+            break;
         }
     }
-    return 0;
+
+    /* Store in cache */
+    ci = gh & (PL_CACHE_SIZE - 1);
+    for (uint32_t n = 0; n < PL_CACHE_SIZE; n++) {
+        if (!pl_sym_cache[ci].used) {
+            pl_sym_cache[ci].name  = name;
+            pl_sym_cache[ci].hash  = gh;
+            pl_sym_cache[ci].value = result;
+            pl_sym_cache[ci].used  = 1;
+            break;
+        }
+        ci = (ci + 1) & (PL_CACHE_SIZE - 1);
+    }
+
+    return result;
 }
 
 static void pl_parse_dynamic(struct prelink_obj *obj, uint64_t base,
@@ -565,6 +606,8 @@ static int prelink_objects(const char *output_path,
 
     FILE *outf = fopen(output_path, "r+b");
     if (!outf) _exit(1);
+
+    pl_cache_init();
 
     struct prelink_obj *objs = calloc(nobj, sizeof(*objs));
     if (!objs) _exit(1);
