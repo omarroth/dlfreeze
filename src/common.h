@@ -10,6 +10,7 @@
 #define DLFRZ_FLAG_INTERP      0x02
 #define DLFRZ_FLAG_SHLIB       0x04
 #define DLFRZ_FLAG_DLOPEN      0x08
+#define DLFRZ_FLAG_PRELINKED   0x10  /* segments contain pre-applied relocations */
 
 struct dlfrz_entry {
     uint64_t data_offset;

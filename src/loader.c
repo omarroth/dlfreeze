@@ -24,9 +24,10 @@
 #include "loader.h"
 
 /* ---- flag constants (must match common.h) ----------------------------- */
-#define LDR_FLAG_MAIN_EXE  0x01
-#define LDR_FLAG_INTERP    0x02
-#define LDR_FLAG_SHLIB     0x04
+#define LDR_FLAG_MAIN_EXE    0x01
+#define LDR_FLAG_INTERP      0x02
+#define LDR_FLAG_SHLIB       0x04
+#define LDR_FLAG_PRELINKED   0x10
 
 /* Zeroed page used as target for unresolved OBJECT symbols.
  * Prevents NULL dereference crashes in IFUNC resolvers. */
@@ -2076,28 +2077,100 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     /* 5. Apply relocations for all objects.
      *    Two-pass: first apply all non-IRELATIVE relocations across all
      *    objects so that GOT entries (e.g. _rtld_global_ro) are populated,
-     *    then apply IRELATIVE whose resolvers depend on those GOT entries. */
-    ldr_dbg("[loader] applying relocations...\n");
+     *    then apply IRELATIVE whose resolvers depend on those GOT entries.
+     *
+     *    If the frozen binary was pre-linked, segments already contain
+     *    resolved relocations.  We only need to patch GOT entries for
+     *    runtime-only symbols (overrides like dlopen, __tls_get_addr,
+     *    and the fake _rtld_global/_rtld_global_ro). */
+    int prelinked = (metas[idx_map[0]].flags & LDR_FLAG_PRELINKED) != 0;
 
-    /* Pre-seed _rtld_global/_rtld_global_ro GOT entries so IFUNC
-     * resolvers called during GLOB_DAT processing work correctly. */
-    for (int i = 0; i < nobj; i++)
-        preseed_rtld_got(&objs[i]);
-
-    for (int i = 0; i < nobj; i++) {
-        if (apply_all_relocs(&objs[i], objs, nobj, 0) < 0) {
-            ldr_msg("dlfreeze-loader: relocation failed for ");
-            ldr_msg(objs[i].name);
-            ldr_msg("\n");
-            _exit(127);
+    if (prelinked) {
+        ldr_dbg("[loader] pre-linked: patching overrides...\n");
+        /* Patch GOT entries for symbols that point into the bootstrap
+         * binary (overrides, stubs, fake rtld objects).  These addresses
+         * weren't known at freeze time.  Also resolve IFUNC GLOB_DAT
+         * entries that the pre-linker skipped (they need _rtld_global_ro
+         * from the bootstrap, which is now set up by preseed_rtld_got). */
+        for (int i = 0; i < nobj; i++) {
+                preseed_rtld_got(&objs[i]);  /* seed _rtld_global_ro in all objects first */
+            }
+            for (int i = 0; i < nobj; i++) {
+                const Elf64_Rela *tabs[] = { objs[i].rela, objs[i].jmprel };
+            size_t counts[] = { objs[i].rela_count, objs[i].jmprel_count };
+            for (int t = 0; t < 2; t++) {
+                for (size_t r = 0; r < counts[t]; r++) {
+                    const Elf64_Rela *rel = &tabs[t][r];
+                    uint32_t type = ELF64_R_TYPE(rel->r_info);
+                    uint32_t sidx = ELF64_R_SYM(rel->r_info);
+                    if (type != R_X86_64_GLOB_DAT &&
+                        type != R_X86_64_JUMP_SLOT) continue;
+                    if (sidx == 0) continue;
+                    const char *name = objs[i].dynstr + objs[i].dynsym[sidx].st_name;
+                    uint64_t ovr = lookup_override(name);
+                    if (!ovr) ovr = lookup_stub(name);
+                    if (!ovr) ovr = lookup_fake_object(name);
+                    if (ovr) {
+                        uint64_t *slot = (uint64_t *)(objs[i].base + rel->r_offset);
+                        *slot = ovr + rel->r_addend;
+                        } else {
+                            /* Re-resolve slots the pre-linker left as 0.
+                             * This covers IFUNC symbols (e.g. strrchr, memcpy)
+                             * where the defining library uses STT_GNU_IFUNC but
+                             * the importing library's dynsym shows STT_FUNC.
+                             * resolve_sym() calls the IFUNC resolver correctly
+                             * now that _rtld_global_ro is seeded. */
+                            uint64_t *slot = (uint64_t *)(objs[i].base + rel->r_offset);
+                            if (*slot == 0) {
+                                uint64_t addr = resolve_sym(objs, nobj, name);
+                                    if (addr) {
+                                        *slot = addr + rel->r_addend;
+                                    } else if (ELF64_ST_BIND(objs[i].dynsym[sidx].st_info) != STB_WEAK
+                                               && ELF64_ST_TYPE(objs[i].dynsym[sidx].st_info) == STT_OBJECT
+                                               && g_null_page) {
+                                        /* Unresolved OBJECT (e.g. __libc_enable_secure from ld.so):
+                                         * point to zero page so reads return 0, matching the
+                                         * non-prelinked path behaviour in apply_relocs_rela(). */
+                                        *slot = (uint64_t)(uintptr_t)g_null_page + rel->r_addend;
+                                    }
+                            }
+                    }
+                }
+            }
         }
-    }
-    for (int i = 0; i < nobj; i++) {
-        if (apply_all_relocs(&objs[i], objs, nobj, 1) < 0) {
-            ldr_msg("dlfreeze-loader: IRELATIVE failed for ");
-            ldr_msg(objs[i].name);
-            ldr_msg("\n");
-            _exit(127);
+        /* Run IRELATIVE pass — resolvers skipped at pre-link time. */
+        ldr_dbg("[loader] pre-linked: resolving IRELATIVE...\n");
+        for (int i = 0; i < nobj; i++) {
+            if (apply_all_relocs(&objs[i], objs, nobj, 1) < 0) {
+                ldr_msg("dlfreeze-loader: IRELATIVE failed for ");
+                ldr_msg(objs[i].name);
+                ldr_msg("\n");
+                _exit(127);
+            }
+        }
+    } else {
+        ldr_dbg("[loader] applying relocations...\n");
+
+        /* Pre-seed _rtld_global/_rtld_global_ro GOT entries so IFUNC
+         * resolvers called during GLOB_DAT processing work correctly. */
+        for (int i = 0; i < nobj; i++)
+            preseed_rtld_got(&objs[i]);
+
+        for (int i = 0; i < nobj; i++) {
+            if (apply_all_relocs(&objs[i], objs, nobj, 0) < 0) {
+                ldr_msg("dlfreeze-loader: relocation failed for ");
+                ldr_msg(objs[i].name);
+                ldr_msg("\n");
+                _exit(127);
+            }
+        }
+        for (int i = 0; i < nobj; i++) {
+            if (apply_all_relocs(&objs[i], objs, nobj, 1) < 0) {
+                ldr_msg("dlfreeze-loader: IRELATIVE failed for ");
+                ldr_msg(objs[i].name);
+                ldr_msg("\n");
+                _exit(127);
+            }
         }
     }
 
