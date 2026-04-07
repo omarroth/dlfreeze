@@ -1474,19 +1474,21 @@ static void init_libc_process_state(struct loaded_obj *objs, int nobj,
      * tcache_init() which allocates a real tcache via malloc. This is the
      * normal glibc initialization path — no manual tcache setup needed.
      */
+
+    /* Pre-initialize __curbrk in the mapped libc so that sbrk() has
+     * the correct kernel brk value from the start.  Must be done
+     * BEFORE __libc_early_init in case any init code uses malloc. */
+    addr = resolve_sym(objs, nobj, "__curbrk");
+    if (addr) {
+        void *cur = (void *)syscall(SYS_brk, 0);
+        *(void **)(uintptr_t)addr = cur;
+    }
+
     addr = resolve_sym(objs, nobj, "__libc_early_init");
     if (addr) {
         ldr_dbg("[loader] calling __libc_early_init...\n");
         ((void(*)(int))(uintptr_t)addr)(1);
         ldr_dbg("[loader] __libc_early_init done\n");
-    }
-
-    /* Pre-initialize __curbrk in the mapped libc so that sbrk() has
-     * the correct kernel brk value from the start. */
-    addr = resolve_sym(objs, nobj, "__curbrk");
-    if (addr) {
-        void *cur = (void *)syscall(SYS_brk, 0);
-        *(void **)(uintptr_t)addr = cur;
     }
 }
 
@@ -2545,18 +2547,11 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         main_addr = resolve_sym(objs, nobj, "main");
 
     if (main_addr) {
-        /* Configure the mapped libc's allocator.
-         * Set M_MMAP_THRESHOLD=0 so that all allocations use mmap instead
-         * of sbrk.  This works around a top-chunk corruption that occurs
-         * in the direct-load environment when the bootstrap's static libc
-         * and the mapped libc share the kernel program break.  With
-         * mmap-based allocation, the arena's top stays at initial_top
-         * (size 0) and the corruption is harmless.
-         * M_MMAP_THRESHOLD = mallopt parameter -3. */
-        uint64_t libc_mallopt_addr = resolve_sym(objs, nobj, "mallopt");
-        if (libc_mallopt_addr)
-            ((int(*)(int,int))(uintptr_t)libc_mallopt_addr)(-3, 0);
-
+        /* Warm up the mapped libc's allocator with a small malloc/free
+         * cycle.  This forces __ptmalloc_init's first sbrk() call to
+         * happen before we enter user code, establishing main_arena's
+         * top chunk in the brk region.  After fork, parent and child
+         * have independent brk spaces so there is no collision. */
         uint64_t libc_malloc_addr = resolve_sym(objs, nobj, "malloc");
         uint64_t libc_free_addr = resolve_sym(objs, nobj, "free");
         if (libc_malloc_addr && libc_free_addr) {
