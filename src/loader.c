@@ -57,13 +57,32 @@ static void ldr_err(const char *ctx, const char *detail)
 
 /* SIGSEGV handler for debugging */
 #include <signal.h>
-static void sigsegv_handler(int sig, siginfo_t *info, void *ucontext)
+/* Pointer to mapped libc's main_arena, set during init for crash diagnostics */
+static uintptr_t g_arena_addr;
+
+static void crash_handler(int sig, siginfo_t *info, void *ucontext)
 {
-    (void)sig; (void)ucontext;
-    ldr_msg("[loader] SIGSEGV at addr=");
+    (void)ucontext;
+    const char *name = "UNKNOWN";
+    if (sig == SIGSEGV) name = "SIGSEGV";
+    else if (sig == SIGABRT) name = "SIGABRT";
+    else if (sig == SIGBUS)  name = "SIGBUS";
+    else if (sig == SIGFPE)  name = "SIGFPE";
+    else if (sig == SIGILL)  name = "SIGILL";
+    ldr_msg("[loader] ");
+    ldr_msg(name);
+    ldr_msg(" at addr=");
     ldr_hex("", (uint64_t)(uintptr_t)info->si_addr);
     ucontext_t *uc = (ucontext_t *)ucontext;
     ldr_hex("[loader] RIP=0x", (uint64_t)uc->uc_mcontext.gregs[REG_RIP]);
+    if (sig == SIGABRT && g_arena_addr) {
+        uintptr_t a = g_arena_addr;
+        uintptr_t top = *(uint64_t *)(a + 0x08);
+        ldr_hex("[loader] arena_top=0x", top);
+        if (top > 0x1000) {
+            ldr_hex("[loader] top_size=0x", *(uint64_t *)(top + 8));
+        }
+    }
     _exit(127);
 }
 
@@ -83,8 +102,12 @@ static void sigsegv_handler(int sig, siginfo_t *info, void *ucontext)
 /* _rtld_global_ro (928 bytes on glibc 2.43 x86-64) */
 #define GLRO_SIZE        4096                /* generous allocation     */
 #define GLRO_DL_PAGESIZE_OFF  24             /* offset 0x18             */
+#define GLRO_DL_MINSIGSTKSZ_OFF 32           /* _dl_minsigstacksize     */
 #define GLRO_DL_CLKTCK_OFF    64             /* offset 0x40             */
 #define GLRO_DL_FPU_CONTROL_OFF 0x58           /* _dl_fpu_control         */
+#define GLRO_DL_AUXV_OFF      104            /* _dl_auxv                */
+#define GLRO_DL_TLS_STATIC_SIZE_OFF  672     /* 0x2a0                   */
+#define GLRO_DL_TLS_STATIC_ALIGN_OFF 680     /* 0x2a8                   */
 
 /* _rtld_global (2120 bytes on glibc 2.43 x86-64) */
 #define GL_SIZE          4096                /* generous allocation     */
@@ -119,10 +142,135 @@ static int init_fake_rtld(void)
 
     /* _rtld_global_ro critical fields */
     *(size_t *)(g_fake_rtld_global_ro + GLRO_DL_PAGESIZE_OFF) = 4096;
+    /* _dl_minsigstacksize: minimum signal stack size needed by the kernel
+     * plus space for XSAVE.  glibc asserts this is non-zero in sysconf().
+     * MINSIGSTKSZ (2048) + typical XSAVE area (2688) ≈ 4736.  Use the
+     * kernel AT_MINSIGSTKSZ if available, otherwise a conservative default. */
+    *(size_t *)(g_fake_rtld_global_ro + GLRO_DL_MINSIGSTKSZ_OFF) = 6144;
     *(int    *)(g_fake_rtld_global_ro + GLRO_DL_CLKTCK_OFF)   = 100;
     /* FPU control word — default x87 CW (0x037f).  Must match the
      * actual CW or _init_first will call __setfpucw. */
     *(int    *)(g_fake_rtld_global_ro + GLRO_DL_FPU_CONTROL_OFF) = 0x037f;
+    /* TLS static fields needed by __libc_early_init → thread stack guard
+     * computation.  Without these, __libc_early_init divides by zero. */
+    *(size_t *)(g_fake_rtld_global_ro + GLRO_DL_TLS_STATIC_SIZE_OFF)  = 0x1080;
+    *(size_t *)(g_fake_rtld_global_ro + GLRO_DL_TLS_STATIC_ALIGN_OFF) = 0x40;
+
+    /*
+     * Populate _dl_x86_cpu_features from CPUID so that IFUNC resolvers
+     * (memcpy, memset, strcmp, etc.) pick CPU-appropriate implementations.
+     * Without this, resolvers see all-zero features and fall back to
+     * a generic SSE2 variant that prefetches 12 KiB ahead, causing
+     * SIGSEGV on buffer boundaries.
+     *
+     * struct cpu_features layout (glibc 2.43 x86-64):
+     *   +0x70  _dl_x86_cpu_features  (528 bytes)
+     *     +0   cpu_features_basic (20 bytes: kind, max_cpuid, family, model, stepping)
+     *     +20  cpuid_feature_internal features[10] (32 bytes each: cpuid + usable)
+     *     +340 preferred[1]
+     *     +344 isa_1
+     *     ...
+     */
+#define CPUF_BASE       0x70   /* _dl_x86_cpu_features in _rtld_global_ro */
+#define CPUF_BASIC      (CPUF_BASE + 0)
+#define CPUF_FEATURES(i) (CPUF_BASE + 20 + 32*(i))
+#define CPUF_PREFERRED  (CPUF_BASE + 340)
+    {
+        uint32_t eax, ebx, ecx, edx;
+
+        /* CPUID(0) — max leaf & vendor */
+        __asm__ volatile("cpuid" : "=a"(eax),"=b"(ebx),"=c"(ecx),"=d"(edx)
+                         : "a"(0), "c"(0));
+        uint32_t max_leaf = eax;
+        /* basic.kind = 1 (x86-64 arch), basic.max_cpuid = max_leaf */
+        *(uint32_t *)(g_fake_rtld_global_ro + CPUF_BASIC + 0)  = 1;
+        *(uint32_t *)(g_fake_rtld_global_ro + CPUF_BASIC + 4)  = max_leaf;
+
+        /* CPUID(1) — family/model/stepping + feature flags */
+        if (max_leaf >= 1) {
+            __asm__ volatile("cpuid" : "=a"(eax),"=b"(ebx),"=c"(ecx),"=d"(edx)
+                             : "a"(1), "c"(0));
+            /* Decode family/model/stepping */
+            uint32_t family = (eax >> 8) & 0xf;
+            uint32_t model  = (eax >> 4) & 0xf;
+            if (family == 6 || family == 15)
+                model += ((eax >> 16) & 0xf) << 4;
+            if (family == 15)
+                family += (eax >> 20) & 0xff;
+            *(uint32_t *)(g_fake_rtld_global_ro + CPUF_BASIC + 8)  = family;
+            *(uint32_t *)(g_fake_rtld_global_ro + CPUF_BASIC + 12) = model;
+            *(uint32_t *)(g_fake_rtld_global_ro + CPUF_BASIC + 16) = eax & 0xf;
+
+            /* features[0].cpuid = raw CPUID(1) output */
+            uint8_t *f0 = g_fake_rtld_global_ro + CPUF_FEATURES(0);
+            *(uint32_t *)(f0 + 0)  = eax;
+            *(uint32_t *)(f0 + 4)  = ebx;
+            *(uint32_t *)(f0 + 8)  = ecx;
+            *(uint32_t *)(f0 + 12) = edx;
+            /* features[0].usable — copy cpuid results.
+             * For AVX: only mark usable if OS supports XSAVE (ECX bit 27). */
+            uint32_t usable_ecx = ecx;
+            uint32_t usable_edx = edx;
+            if (!(ecx & (1u << 27)))   /* OSXSAVE not set by OS */
+                usable_ecx &= ~(1u << 28);  /* clear AVX */
+            *(uint32_t *)(f0 + 16) = eax;
+            *(uint32_t *)(f0 + 20) = ebx;
+            *(uint32_t *)(f0 + 24) = usable_ecx;
+            *(uint32_t *)(f0 + 28) = usable_edx;
+        }
+
+        /* CPUID(7,0) — extended features (ERMS, AVX2, AVX512, etc.) */
+        if (max_leaf >= 7) {
+            __asm__ volatile("cpuid" : "=a"(eax),"=b"(ebx),"=c"(ecx),"=d"(edx)
+                             : "a"(7), "c"(0));
+            uint8_t *f1 = g_fake_rtld_global_ro + CPUF_FEATURES(1);
+            *(uint32_t *)(f1 + 0)  = eax;
+            *(uint32_t *)(f1 + 4)  = ebx;
+            *(uint32_t *)(f1 + 8)  = ecx;
+            *(uint32_t *)(f1 + 12) = edx;
+            /* usable = same as cpuid for leaf 7 features */
+            *(uint32_t *)(f1 + 16) = eax;
+            *(uint32_t *)(f1 + 20) = ebx;
+            *(uint32_t *)(f1 + 24) = ecx;
+            *(uint32_t *)(f1 + 28) = edx;
+        }
+
+        /* preferred[0] = 0 — let resolvers use raw feature checks
+         * rather than model-specific tuning preferences. */
+
+        /*
+         * Non-temporal thresholds: glibc's optimised memcpy/memset use
+         * non-temporal (streaming) stores for copies larger than
+         * non_temporal_threshold.  Non-temporal stores bypass the cache
+         * and write in large aligned chunks (e.g. 96 bytes per iteration
+         * with MOVNTPS).  When the threshold is 0 (our default from the
+         * zero-filled mmap), the condition "size >= 0" is always true,
+         * so EVERY copy — even 67 bytes — takes the non-temporal path.
+         * Those large-chunk writes overrun the destination buffer and
+         * corrupt adjacent allocations (pymalloc pool headers, etc.).
+         *
+         * Set thresholds to SIZE_MAX to disable non-temporal stores
+         * entirely.  This matches normal behaviour for most workloads
+         * (non-temporal copies are only beneficial for multi-MB buffers).
+         *
+         * cpu_features layout (glibc 2.43):
+         *   +384  non_temporal_threshold         (8 bytes)
+         *   +392  memset_non_temporal_threshold   (8 bytes)
+         *   +400  rep_movsb_threshold             (8 bytes)
+         *   +408  rep_movsb_stop_threshold        (8 bytes)
+         *   +416  rep_stosb_threshold             (8 bytes)
+         */
+#define CPUF_NON_TEMPORAL_THRESHOLD  (CPUF_BASE + 384)
+#define CPUF_MEMSET_NT_THRESHOLD     (CPUF_BASE + 392)
+#define CPUF_REP_MOVSB_THRESHOLD     (CPUF_BASE + 400)
+#define CPUF_REP_MOVSB_STOP          (CPUF_BASE + 408)
+#define CPUF_REP_STOSB_THRESHOLD     (CPUF_BASE + 416)
+        *(size_t *)(g_fake_rtld_global_ro + CPUF_NON_TEMPORAL_THRESHOLD) = (size_t)-1;
+        *(size_t *)(g_fake_rtld_global_ro + CPUF_MEMSET_NT_THRESHOLD)    = (size_t)-1;
+        *(size_t *)(g_fake_rtld_global_ro + CPUF_REP_MOVSB_THRESHOLD)    = (size_t)-1;
+        *(size_t *)(g_fake_rtld_global_ro + CPUF_REP_MOVSB_STOP)         = (size_t)-1;
+        *(size_t *)(g_fake_rtld_global_ro + CPUF_REP_STOSB_THRESHOLD)    = (size_t)-1;
+    }
 
     /* _rtld_global critical fields */
     *(size_t *)(g_fake_rtld_global + GL_DL_NNS_OFF)            = 1;
@@ -195,13 +343,21 @@ static void  stub_dl_deallocate_tls(void *mem) { (void)mem; }
 /* _dl_rtld_di_serinfo — no-op */
 static int stub_dl_rtld_di_serinfo(void) { return -1; }
 
-/* __tls_get_addr — GD/LD TLS model accessor.  For simple cases with
- * a single TLS module, ti_offset is the offset from TP. */
+/* __tls_get_addr — GD/LD TLS model accessor.
+ * Looks up the DTV entry for the module and adds the offset. */
 struct tls_index { unsigned long ti_module; unsigned long ti_offset; };
 static void *stub_tls_get_addr(struct tls_index *ti)
 {
     uintptr_t tp;
     __asm__ volatile("mov %%fs:0, %0" : "=r"(tp));
+    uintptr_t *dtv = *(uintptr_t **)(tp + 8 /* TCB_OFF_DTV */);
+    if (dtv) {
+        /* dtv[module * 2] = pointer to start of that module's TLS block */
+        uintptr_t tls_block = dtv[ti->ti_module * 2];
+        if (tls_block)
+            return (void *)(tls_block + ti->ti_offset);
+    }
+    /* Fallback: single-module approximation */
     return (void *)(tp + ti->ti_offset);
 }
 
@@ -263,6 +419,7 @@ struct obj_tls {
     uint64_t filesz;      /* .tdata initialization size             */
     uint64_t memsz;       /* total TLS block (tdata + tbss)         */
     uint64_t vaddr;       /* p_vaddr of PT_TLS (in loaded image)    */
+    size_t   modid;       /* DTV module ID (1-indexed)              */
 };
 
 struct loaded_obj {
@@ -275,6 +432,7 @@ struct loaded_obj {
     const char       *dynstr;
     uint32_t          dynsym_count;
     const uint32_t   *gnu_hash;
+    const uint16_t   *versym;
 
     /* Relocations */
     const Elf64_Rela *rela;
@@ -431,18 +589,24 @@ static const Elf64_Sym *lookup_gnu_hash(const struct loaded_obj *obj,
     uint32_t idx = buckets[gh % nbuckets];
     if (idx < symoffset) return NULL;
 
+    const Elf64_Sym *fallback = NULL;
     for (;;) {
         uint32_t ch = chain[idx - symoffset];
         if ((ch | 1) == (gh | 1)) {
             const Elf64_Sym *sym = &obj->dynsym[idx];
             if (sym->st_shndx != SHN_UNDEF &&
-                strcmp(obj->dynstr + sym->st_name, name) == 0)
-                return sym;
+                strcmp(obj->dynstr + sym->st_name, name) == 0) {
+                /* Prefer default version (versym without HIDDEN bit) */
+                if (!obj->versym || !(obj->versym[idx] & 0x8000))
+                    return sym;
+                if (!fallback)
+                    fallback = sym;
+            }
         }
         if (ch & 1) break;
         idx++;
     }
-    return NULL;
+    return fallback;
 }
 
 static const Elf64_Sym *lookup_linear(const struct loaded_obj *obj,
@@ -541,6 +705,12 @@ static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     uint64_t lo   = meta->vaddr_lo & ~0xFFFULL;
     uint64_t hi   = ALIGN_UP(meta->vaddr_hi, 4096);
     uint64_t span = hi - lo;
+    /* Add guard pages to cover glibc's optimised memcpy/memset which
+     * prefetch up to 0x3040 bytes ahead of the source pointer.  When
+     * a buffer ends near the last mapped page of an object, these
+     * speculative reads would fault on the unmapped page after it.
+     * 4 pages (16 KiB) covers the largest observed prefetch. */
+    span += 4 * 4096;
 
     void *mapped = mmap((void *)(base + lo), span,
                         PROT_READ | PROT_WRITE | PROT_EXEC,
@@ -620,6 +790,7 @@ static void parse_dynamic(struct loaded_obj *obj,
     uint64_t relr = 0, relr_sz = 0;
     uint64_t hash_addr = 0;
     uint64_t init = 0, init_array = 0, init_array_sz = 0;
+    uint64_t versym_addr = 0;
 
     for (size_t i = 0; i < dyn_count && dyn[i].d_tag != DT_NULL; i++) {
         switch (dyn[i].d_tag) {
@@ -636,12 +807,14 @@ static void parse_dynamic(struct loaded_obj *obj,
         case DT_INIT_ARRAYSZ: init_array_sz = dyn[i].d_un.d_val; break;
         case 36: /* DT_RELR */   relr = dyn[i].d_un.d_ptr;      break;
         case 35: /* DT_RELRSZ */ relr_sz = dyn[i].d_un.d_val;   break;
+        case DT_VERSYM:       versym_addr = dyn[i].d_un.d_ptr;  break;
         }
     }
 
     if (symtab)    obj->dynsym   = (const Elf64_Sym *)(base + symtab);
     if (strtab)    obj->dynstr   = (const char *)(base + strtab);
     if (hash_addr) obj->gnu_hash = (const uint32_t *)(base + hash_addr);
+    if (versym_addr) obj->versym  = (const uint16_t *)(base + versym_addr);
 
     /* Count symbols via GNU hash table */
     if (obj->gnu_hash) {
@@ -755,8 +928,25 @@ static int apply_relocs_rela(struct loaded_obj *obj,
         }
 
         case R_X86_64_DTPMOD64:
-            /* Module ID — for TLSDESC/GD model.  Set to 1 (main module). */
-            *slot = 1;
+            /* Module ID — for GD/LD TLS model.  Use the correct module ID
+             * so __tls_get_addr indexes the right DTV slot. */
+            if (sidx != 0) {
+                const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
+                /* Find the defining object's module ID */
+                size_t mid = obj->tls.modid ? obj->tls.modid : 1;
+                for (int j = 0; j < nobj; j++) {
+                    const Elf64_Sym *ds = all[j].gnu_hash
+                        ? lookup_gnu_hash(&all[j], name, gnu_hash_calc(name))
+                        : lookup_linear(&all[j], name);
+                    if (ds && ds->st_shndx != 0) {
+                        mid = all[j].tls.modid ? all[j].tls.modid : (size_t)(j + 1);
+                        break;
+                    }
+                }
+                *slot = mid;
+            } else {
+                *slot = obj->tls.modid ? obj->tls.modid : 1;
+            }
             break;
 
         case R_X86_64_DTPOFF64:
@@ -904,107 +1094,58 @@ static void init_libc_process_state(struct loaded_obj *objs, int nobj,
     addr = resolve_sym(objs, nobj, "stderr");
     if (addr && io_stderr) *(void **)(uintptr_t)addr = (void *)(uintptr_t)io_stderr;
 
-    /* NOTE: __libc_init_first is already called via DT_INIT_ARRAY
-     * (it IS _init_first, the first init_array entry).  Do not call
-     * it again — doing so is redundant and harmless, but we skip it
-     * to keep the flow clear. */
+    /* Record arena address for crash diagnostics */
+    if (io_stdin)
+        g_arena_addr = io_stdin + 0x1e0;
 
-    /* __libc_early_init sets up ctype tables, tunables, and
-     * __libc_single_threaded.  It calls __tunables_init which
-     * references ld.so internals; do the essential parts manually. */
-
-    /* Initialize main_arena bins, tcache, and set single-threaded mode.
-     *
-     * glibc's main_arena bins must be initialized (each bin's fd/bk
-     * pointing to itself = empty circular list).  Additionally, the
-     * per-thread tcache struct must be pre-allocated so tcache_init
-     * is never called.  Finally, __libc_single_threaded = 1 avoids
-     * all arena mutex locking (which hangs without ld.so thread setup).
-     *
-     * main_arena layout (glibc 2.43 x86-64):
-     *   +0x00: mutex (4 bytes)
-     *   +0x08: top chunk pointer
-     *   +0x10: last_remainder
-     *   +0x18: bins[254] (127 fd/bk pairs)
-     *   +0x808: binmap[4]
-     *   +0x818: next (self-pointer)
-     *   +0x828: attached_threads
-     *
-     * tcache struct (glibc 2.43 x86-64):
-     *   counts[76] at offset 0x00 (76 x uint16_t = 152 bytes)
-     *   entries[76] at offset 0x98 (76 x 8 = 608 bytes)
-     *   total: 0x2f8 = 760 bytes
-     */
-    uint64_t io_stdin_addr = resolve_sym(objs, nobj, "_IO_2_1_stdin_");
-    if (io_stdin_addr) {
-        uintptr_t arena = io_stdin_addr + 0x1e0;
-
-        /* Initialize all 127 bins to empty (self-referential fd/bk) */
-        for (int i = 1; i <= 127; i++) {
-            uintptr_t bin = arena + 0x08 + (i - 1) * 16;
-            *(uint64_t *)(arena + 0x18 + (i - 1) * 16) = bin;  /* fd */
-            *(uint64_t *)(arena + 0x20 + (i - 1) * 16) = bin;  /* bk */
-        }
-
-        /* Set top chunk = initial_top = bin_at(arena,1) = arena + 0x08.
-         * With size 0, sysmalloc will allocate real memory on first use. */
-        *(uint64_t *)(arena + 0x08) = arena + 0x08;  /* top = initial_top */
-
-        ldr_msg("[loader] arena bins initialized\n");
-    }
-
-    /* Pre-allocate tcache struct so tcache_init is never called.
-     * tcache_init internally calls malloc, which with single_threaded=1
-     * can trigger sysmalloc before the arena is fully ready, causing hangs.
-     * By allocating tcache ourselves and setting the TLS pointer,
-     * all malloc/free calls use the fast tcache path immediately. */
+    /* Set _dl_auxv in _rtld_global_ro so that getauxval() works.
+     * The real auxiliary vector lives on the stack just after envp's
+     * NULL terminator. */
     {
-        void *tcache_mem = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
-                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (tcache_mem != MAP_FAILED) {
-            /* tcache struct is 0x2f8 bytes, all zeros = empty tcache.
-             * counts[] = 0 (all bins empty), entries[] = NULL. */
-            /* Set the tcache TLS variable to point to our pre-allocated struct.
-             * The tcache TLS offset was resolved during relocation and is stored
-             * in the GOT-like entry at libc offset 0x1e6c88.  Reading it from
-             * TLS, then writing back the new pointer. */
-            /* Find the libc base address */
-            for (int i = 0; i < nobj; i++) {
-                if (objs[i].flags & LDR_FLAG_MAIN_EXE) continue;
-                /* The tcache TLS variable is at fs:(tpoff), where tpoff
-                 * was set by R_X86_64_TPOFF64 relocation.  For libc on
-                 * glibc 2.43, it's at TLS offset 0x20 → TP-0x60.
-                 * We write our tcache pointer at fs:-0x60. */
-                if (objs[i].tls.memsz > 0) {
-                    /* tcache is at tdata offset 0x20 → tpoff = -0x60 */
-                    int64_t tcache_tpoff = -0x60;  /* hardcoded for glibc 2.43 */
-                    uintptr_t tp;
-                    __asm__ volatile("mov %%fs:0, %0" : "=r"(tp));  /* TP self-pointer */
-                    *(void **)(tp + tcache_tpoff) = tcache_mem;
-                    ldr_msg("[loader] tcache pre-allocated\n");
-                    break;
-                }
-            }
-        }
+        char **p = envp;
+        while (*p) p++;
+        p++;  /* skip NULL terminator of envp */
+        *(Elf64_auxv_t **)(g_fake_rtld_global_ro + GLRO_DL_AUXV_OFF) =
+            (Elf64_auxv_t *)p;
     }
 
-    /* Set single-threaded mode so malloc/free skip all mutex locking */
-    addr = resolve_sym(objs, nobj, "__libc_single_threaded");
-    if (addr) *(char *)(uintptr_t)addr = 1;
+    /* Call __libc_early_init(1) which performs all critical libc setup:
+     *   - __ctype_init (ctype table pointers in TLS)
+     *   - __libc_single_threaded = 1 (skip mutex locking)
+     *   - __libc_initial = 1 (allow sbrk-based allocation)
+     *   - Thread stack size computation (reads _rtld_global_ro TLS fields)
+     *   - __pthread_tunables_init
+     *   - __getrandom_early_init
+     *   - Tail-calls __ptmalloc_init which:
+     *     - Initializes tcache_key via getrandom syscall
+     *     - Sets thread_arena TLS = &main_arena
+     *     - Initializes all arena bins (self-referential fd/bk)
+     *     - Sets top = initial_top
+     *     - Processes malloc tunables (via our __tunable_get_val stub)
+     *
+     * Requires fake _rtld_global_ro to have:
+     *   +0x18  _dl_pagesize = 4096
+     *   +0x2a0 _dl_tls_static_size (non-zero, e.g. 0x1080)
+     *   +0x2a8 _dl_tls_static_align (non-zero, e.g. 0x40)
+     *
+     * tcache TLS is already initialized from .tdata to &__tcache_dummy.
+     * On first free(), glibc detects tcache == __tcache_dummy and calls
+     * tcache_init() which allocates a real tcache via malloc. This is the
+     * normal glibc initialization path — no manual tcache setup needed.
+     */
+    addr = resolve_sym(objs, nobj, "__libc_early_init");
+    if (addr) {
+        ldr_msg("[loader] calling __libc_early_init...\n");
+        ((void(*)(int))(uintptr_t)addr)(1);
+        ldr_msg("[loader] __libc_early_init done\n");
+    }
 
-    /* Initialize tcache_key to a non-zero value.
-     * tcache_key (at libc offset 0x1ee1c0 on glibc 2.43) is compared
-     * with chunk->key (at ptr+8) during free() for double-free detection.
-     * If tcache_key is 0 (BSS default), freshly mmap'd/sbrk'd memory
-     * (also zero) triggers a false double-free detection loop.
-     * Use a value derived from the stack guard for randomness. */
-    if (io_stdin_addr) {
-        /* tcache_key is at a known offset from _IO_2_1_stdin_:
-         * 0x1ee1c0 - 0x1e78e0 = 0x68e0 */
-        uintptr_t tcache_key_addr = io_stdin_addr + 0x68e0;
-        uintptr_t canary;
-        __asm__ volatile("mov %%fs:0x28, %0" : "=r"(canary));
-        *(uintptr_t *)tcache_key_addr = canary | 1;  /* ensure non-zero */
+    /* Pre-initialize __curbrk in the mapped libc so that sbrk() has
+     * the correct kernel brk value from the start. */
+    addr = resolve_sym(objs, nobj, "__curbrk");
+    if (addr) {
+        void *cur = (void *)syscall(SYS_brk, 0);
+        *(void **)(uintptr_t)addr = cur;
     }
 }
 
@@ -1075,6 +1216,7 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
             objs[oi].tls.filesz = phdrs[j].p_filesz;
             objs[oi].tls.memsz  = phdrs[j].p_memsz;
             objs[oi].tls.vaddr  = phdrs[j].p_vaddr;
+            objs[oi].tls.modid  = (size_t)(oi + 1);
             break;
         }
     }
@@ -1249,12 +1391,16 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
 {
     clear_resolution_caches();
 
-    /* Install SIGSEGV handler for debugging crashes */
+    /* Install crash handlers for debugging */
     {
         struct sigaction sa = {0};
-        sa.sa_sigaction = sigsegv_handler;
+        sa.sa_sigaction = crash_handler;
         sa.sa_flags = SA_SIGINFO;
         sigaction(SIGSEGV, &sa, NULL);
+        sigaction(SIGABRT, &sa, NULL);
+        sigaction(SIGBUS,  &sa, NULL);
+        sigaction(SIGFPE,  &sa, NULL);
+        sigaction(SIGILL,  &sa, NULL);
     }
 
     /* 1. Count non-INTERP libraries and build object array */
@@ -1301,6 +1447,9 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         int mi = idx_map[i];
         if (map_object(mem, mem_foff, srcfd, &metas[mi], &entries[mi], &objs[i]) < 0)
             return -1;
+        ldr_msg("  ");
+        ldr_msg(objs[i].name);
+        ldr_hex("  base=0x", objs[i].base);
     }
 
     /* 3. Parse PT_DYNAMIC for each object */
@@ -1357,14 +1506,26 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     for (int i = 0; i < nobj; i++)
         protect_object(&objs[i], &metas[idx_map[i]]);
 
-    /* 7. Call shared library init functions (libc first, then others).
+    /* 7. Initialise libc process state (environ, arena, tcache) BEFORE
+     *    calling any init functions — init_array entries in libraries
+     *    (e.g. libpython) may call malloc, so the arena must be ready. */
+    init_libc_process_state(objs, nobj, argc, argv, envp);
+
+    /* 7b. Call shared library init functions (libc first, then others).
      *    Skip the exe — its constructors are called later.
      *    Now safe because _rtld_global/_rtld_global_ro stubs are in place
      *    and __tunable_get_val etc. resolve to our no-op stubs. */
     ldr_msg("[loader] calling init functions...\n");
     typedef void (*init_fn_t)(int, char **, char **);
-    for (int i = 0; i < nobj; i++) {
+    /* Call in reverse order: libraries without dependents first (libc, libm,
+     * etc.) then libraries that depend on them (libpython, etc.).
+     * The packer stores objects as: exe, direct-deps, transitive-deps...
+     * so reversing gives a correct dependency-leaf-first order. */
+    for (int i = nobj - 1; i >= 0; i--) {
         if (objs[i].flags & LDR_FLAG_MAIN_EXE) continue;
+        ldr_msg("[loader] init: ");
+        ldr_msg(objs[i].name);
+        ldr_msg("\n");
         if (objs[i].init_func)
             ((init_fn_t)objs[i].init_func)(argc, argv, envp);
         for (size_t j = 0; j < objs[i].init_array_sz; j++)
@@ -1409,9 +1570,26 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     if (!main_addr)
         main_addr = resolve_sym(objs, nobj, "main");
 
-    init_libc_process_state(objs, nobj, argc, argv, envp);
-
     if (main_addr) {
+        /* Configure the mapped libc's allocator.
+         * Set M_MMAP_THRESHOLD=0 so that all allocations use mmap instead
+         * of sbrk.  This works around a top-chunk corruption that occurs
+         * in the direct-load environment when the bootstrap's static libc
+         * and the mapped libc share the kernel program break.  With
+         * mmap-based allocation, the arena's top stays at initial_top
+         * (size 0) and the corruption is harmless.
+         * M_MMAP_THRESHOLD = mallopt parameter -3. */
+        uint64_t libc_mallopt_addr = resolve_sym(objs, nobj, "mallopt");
+        if (libc_mallopt_addr)
+            ((int(*)(int,int))(uintptr_t)libc_mallopt_addr)(-3, 0);
+
+        uint64_t libc_malloc_addr = resolve_sym(objs, nobj, "malloc");
+        uint64_t libc_free_addr = resolve_sym(objs, nobj, "free");
+        if (libc_malloc_addr && libc_free_addr) {
+            void *p = ((void *(*)(size_t))(uintptr_t)libc_malloc_addr)(64);
+            if (p)
+                ((void (*)(void *))(uintptr_t)libc_free_addr)(p);
+        }
         ldr_msg("[loader] calling main() directly...\n");
         int rc = ((main_fn_t)(uintptr_t)main_addr)(argc, argv, envp);
         ldr_msg("[loader] main() returned\n");

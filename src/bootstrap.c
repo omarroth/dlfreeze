@@ -254,6 +254,15 @@ int main(int argc, char **argv)
             ldr_srcfd = sfd;
         }
 
+        /* DLFREEZE_NO_FORK=1 → run loader_run() directly (for debugging) */
+        if (getenv("DLFREEZE_NO_FORK")) {
+            loader_run(ldr_mem, ldr_mem_foff, ldr_srcfd, metas, ent, strtab,
+                       ft.num_entries, argc, argv, environ);
+            fprintf(stderr, "dlfreeze-bootstrap: in-process loader failed\n");
+            close(sfd);
+            return 127;
+        }
+
         pid_t lpid = fork();
         if (lpid < 0) {
             perror("fork");
