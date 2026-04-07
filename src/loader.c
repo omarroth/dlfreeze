@@ -27,6 +27,7 @@
 #define LDR_FLAG_MAIN_EXE    0x01
 #define LDR_FLAG_INTERP      0x02
 #define LDR_FLAG_SHLIB       0x04
+#define LDR_FLAG_DLOPEN      0x08
 #define LDR_FLAG_PRELINKED   0x10
 
 /* Zeroed page used as target for unresolved OBJECT symbols.
@@ -622,6 +623,15 @@ static int glro_dl_find_object(void *pc, void *result)
 static int g_argc;
 static char **g_argv;
 static char **g_envp;
+
+/* Frozen image context — saved by loader_run for lazy dlopen loading */
+static const uint8_t *g_frozen_mem;
+static uint64_t g_frozen_mem_foff;
+static int g_frozen_srcfd;
+static const struct dlfrz_lib_meta *g_frozen_metas;
+static const struct dlfrz_entry *g_frozen_entries;
+static const char *g_frozen_strtab;
+static uint32_t g_frozen_num_entries;
 
 /* dlerror support */
 static char g_dlerror_msg[512];
@@ -1439,8 +1449,9 @@ static void dl_set_error(const char *a, const char *b)
     g_dlerror_valid = 1;
 }
 
-/* Forward declaration — dl_load_needed calls load_elf_from_file recursively */
+/* Forward declarations — recursive loading between these functions */
 static struct loaded_obj *load_elf_from_file(const char *path);
+static struct loaded_obj *load_embedded_object(uint32_t mi);
 
 /*
  * Load DT_NEEDED dependencies of a just-loaded object.
@@ -1678,6 +1689,147 @@ static struct loaded_obj *load_elf_from_file(const char *path)
 /* Pseudo-handle for dlopen(NULL) — search all loaded objects */
 #define DL_GLOBAL_HANDLE ((void *)(uintptr_t)1)
 
+/*
+ * Load an object from the frozen image (for DLFRZ_FLAG_DLOPEN entries).
+ * Uses the same map/parse/relocate/init flow as load_elf_from_file but
+ * reads data from the frozen payload instead of the filesystem.
+ */
+static struct loaded_obj *load_embedded_object(uint32_t mi)
+{
+    int idx = g_nobj;
+    if (idx >= MAX_TOTAL_OBJS) {
+        dl_set_error("too many loaded objects", NULL);
+        return NULL;
+    }
+
+    const struct dlfrz_lib_meta *emeta = &g_frozen_metas[mi];
+    const struct dlfrz_entry *eent = &g_frozen_entries[mi];
+    const char *ename = g_frozen_strtab + eent->name_offset;
+
+    struct loaded_obj *obj = &g_all_objs[idx];
+    memset(obj, 0, sizeof(*obj));
+
+    /* Map segments from the frozen image at the pre-assigned base */
+    if (map_object(g_frozen_mem, g_frozen_mem_foff, g_frozen_srcfd,
+                   emeta, eent, obj) < 0) {
+        dl_set_error(ename, ": mmap failed");
+        return NULL;
+    }
+
+    obj->name     = ename;
+    obj->flags    = emeta->flags;
+    obj->phdr     = (const Elf64_Phdr *)(obj->base + emeta->phdr_off);
+    obj->phdr_num = emeta->phdr_num;
+    obj->map_start = obj->base + emeta->vaddr_lo;
+    obj->map_end   = obj->base + emeta->vaddr_hi;
+
+    /* Find PT_GNU_EH_FRAME */
+    for (int p = 0; p < obj->phdr_num; p++) {
+        if (obj->phdr[p].p_type == PT_GNU_EH_FRAME) {
+            obj->eh_frame_hdr = (const void *)(obj->base + obj->phdr[p].p_vaddr);
+            break;
+        }
+    }
+
+    /* Store metadata for protect_object */
+    struct dlfrz_lib_meta *meta = &g_dl_metas[idx];
+    *meta = *emeta;
+
+    parse_dynamic(obj, meta);
+
+    /* Bump count so symbol resolution includes this object */
+    g_nobj = idx + 1;
+
+    /* Load DT_NEEDED dependencies from frozen image (or filesystem) */
+    if (obj->dynstr) {
+        const Elf64_Phdr *dyn_ph = NULL;
+        for (int p = 0; p < obj->phdr_num; p++) {
+            if (obj->phdr[p].p_type == PT_DYNAMIC) { dyn_ph = &obj->phdr[p]; break; }
+        }
+        if (dyn_ph) {
+            const Elf64_Dyn *dyn = (const Elf64_Dyn *)(obj->base + dyn_ph->p_vaddr);
+            size_t dc = dyn_ph->p_memsz / sizeof(Elf64_Dyn);
+            for (size_t di = 0; di < dc && dyn[di].d_tag != DT_NULL; di++) {
+                if (dyn[di].d_tag != DT_NEEDED) continue;
+                const char *needed = obj->dynstr + dyn[di].d_un.d_val;
+                /* Skip if already loaded */
+                int found = 0;
+                for (int j = 0; j < g_nobj; j++) {
+                    if (!g_all_objs[j].name && !g_all_objs[j].base) continue;
+                    if (g_all_objs[j].name &&
+                        strcmp(dl_basename(g_all_objs[j].name), needed) == 0) {
+                        found = 1; break;
+                    }
+                }
+                if (found) continue;
+                /* Try to find in frozen image */
+                int dep_found = 0;
+                for (uint32_t fi = 0; fi < g_frozen_num_entries; fi++) {
+                    const char *fn = g_frozen_strtab + g_frozen_entries[fi].name_offset;
+                    if (strcmp(dl_basename(fn), needed) == 0) {
+                        load_embedded_object(fi);
+                        dep_found = 1;
+                        break;
+                    }
+                }
+                if (!dep_found) {
+                    /* Try filesystem */
+                    static const char *dirs[] = {
+                        "/usr/lib/", "/lib/", "/usr/lib64/", "/lib64/", NULL
+                    };
+                    for (const char **d = dirs; *d; d++) {
+                        char path[512];
+                        char *pp = path;
+                        const char *s = *d;
+                        while (*s) *pp++ = *s++;
+                        s = needed;
+                        while (*s && pp < path + sizeof(path) - 1) *pp++ = *s++;
+                        *pp = '\0';
+                        int fd = open(path, O_RDONLY);
+                        if (fd >= 0) {
+                            close(fd);
+                            load_elf_from_file(path);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /* Clear cached misses — new objects may provide previously-missing symbols */
+    clear_resolution_caches();
+
+    /* Apply relocations */
+    preseed_rtld_got(obj);
+    if (apply_all_relocs(obj, g_all_objs, g_nobj, 0) < 0) {
+        dl_set_error(ename, ": relocation failed");
+        g_nobj = idx;
+        return NULL;
+    }
+    if (apply_all_relocs(obj, g_all_objs, g_nobj, 1) < 0) {
+        dl_set_error(ename, ": IRELATIVE failed");
+        g_nobj = idx;
+        return NULL;
+    }
+
+    /* Set final memory protections */
+    protect_object(obj, meta);
+
+    /* Call init functions */
+    typedef void (*init_fn_t)(int, char **, char **);
+    if (obj->init_func)
+        ((init_fn_t)obj->init_func)(g_argc, g_argv, g_envp);
+    for (size_t j = 0; j < obj->init_array_sz; j++)
+        ((init_fn_t)obj->init_array[j])(g_argc, g_argv, g_envp);
+
+    ldr_dbg("[loader] dlopen (embedded): ");
+    ldr_dbg(dl_basename(ename));
+    ldr_dbg_hex(" base=0x", obj->base);
+
+    return obj;
+}
+
 static void *my_dlopen(const char *path, int flags)
 {
     (void)flags;
@@ -1693,6 +1845,26 @@ static void *my_dlopen(const char *path, int flags)
         if (strcmp(dl_basename(g_all_objs[i].name), bn) == 0)
             return &g_all_objs[i];
     }
+
+    /* Check embedded DLOPEN objects in the frozen image */
+    if (g_frozen_metas) {
+        for (uint32_t i = 0; i < g_frozen_num_entries; i++) {
+            if (!(g_frozen_metas[i].flags & LDR_FLAG_DLOPEN)) continue;
+            if (g_frozen_metas[i].flags & LDR_FLAG_INTERP) continue;
+            const char *ename = g_frozen_strtab + g_frozen_entries[i].name_offset;
+            if (strcmp(dl_basename(ename), bn) == 0) {
+                struct loaded_obj *obj = load_embedded_object(i);
+                if (obj) return obj;
+                /* Fall through to filesystem on error */
+                break;
+            }
+        }
+    }
+
+    /* Warn when loading from filesystem — this library wasn't captured */
+    ldr_msg("dlfreeze: warning: dlopen loading '");
+    ldr_msg(bn);
+    ldr_msg("' from disk (not in frozen image)\n");
 
     return load_elf_from_file(path);
 }
@@ -2006,7 +2178,8 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
 
     int nobj = 0;
     for (uint32_t i = 0; i < num_entries; i++)
-        if (!(metas[i].flags & LDR_FLAG_INTERP)) nobj++;
+        if (!(metas[i].flags & LDR_FLAG_INTERP) &&
+            !(metas[i].flags & LDR_FLAG_DLOPEN)) nobj++;
 
     if (nobj == 0) { ldr_err("no objects to load", NULL); return -1; }
     if (nobj > MAX_TOTAL_OBJS) { ldr_err("too many objects", NULL); return -1; }
@@ -2016,10 +2189,11 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     int idx_map[nobj];    /* idx_map[oi] = manifest index */
     memset(objs, 0, nobj * sizeof(struct loaded_obj));
 
-    /* Build in order: exe first, then shared libs */
+    /* Build in order: exe first, then shared libs (skip DLOPEN) */
     int oi = 0;
     for (uint32_t i = 0; i < num_entries; i++) {
         if (metas[i].flags & LDR_FLAG_INTERP) continue;
+        if (metas[i].flags & LDR_FLAG_DLOPEN) continue;
         if (!(metas[i].flags & LDR_FLAG_MAIN_EXE)) continue;
         objs[oi].name  = strtab + entries[i].name_offset;
         objs[oi].flags = metas[i].flags;
@@ -2028,6 +2202,7 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     }
     for (uint32_t i = 0; i < num_entries; i++) {
         if (metas[i].flags & LDR_FLAG_INTERP) continue;
+        if (metas[i].flags & LDR_FLAG_DLOPEN) continue;
         if (metas[i].flags & LDR_FLAG_MAIN_EXE) continue;
         objs[oi].name  = strtab + entries[i].name_offset;
         objs[oi].flags = metas[i].flags;
@@ -2190,6 +2365,16 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     g_argc = argc;
     g_argv = argv;
     g_envp = envp;
+
+    /* Save frozen image context for lazy dlopen loading of embedded
+     * DLFRZ_FLAG_DLOPEN objects. */
+    g_frozen_mem         = mem;
+    g_frozen_mem_foff    = mem_foff;
+    g_frozen_srcfd       = srcfd;
+    g_frozen_metas       = metas;
+    g_frozen_entries     = entries;
+    g_frozen_strtab      = strtab;
+    g_frozen_num_entries = num_entries;
 
     /* 7. Initialise libc process state (environ, arena, tcache) BEFORE
      *    calling any init functions — init_array entries in libraries

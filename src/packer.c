@@ -576,6 +576,8 @@ static int prelink_objects(const char *output_path,
 
             /* Skip ld.so — the loader never maps it at runtime */
             if (m->flags & DLFRZ_FLAG_INTERP) continue;
+            /* Skip dlopen'd objects — loaded lazily at runtime */
+            if (m->flags & DLFRZ_FLAG_DLOPEN) continue;
 
         uint64_t lo   = m->vaddr_lo & ~0xFFFULL;
         uint64_t hi   = ALIGN_UP(m->vaddr_hi, 4096);
@@ -620,12 +622,13 @@ static int prelink_objects(const char *output_path,
 
     /* 3. Compute TLS layout (same algorithm as loader).
      * modid must match the loader's scheme: modid = (non-INTERP index) + 1.
-     * The loader iterates only non-INTERP objects and assigns oi+1, so we
-     * must count the same way — INTERP objects don't occupy an oi slot. */
+     * The loader iterates only non-INTERP, non-DLOPEN objects and assigns
+     * oi+1, so we must count the same way. */
     uint64_t total_tls = 0;
-    int oi = 0;  /* non-INTERP object counter; matches loader's oi */
+    int oi = 0;  /* non-INTERP, non-DLOPEN object counter; matches loader's oi */
     for (int i = 0; i < nobj; i++) {
-        if (metas[i].flags & DLFRZ_FLAG_INTERP) continue;  /* no oi slot */
+        if (metas[i].flags & DLFRZ_FLAG_INTERP) continue;
+        if (metas[i].flags & DLFRZ_FLAG_DLOPEN) continue;
         if (objs[i].tls_memsz > 0) {
             uint64_t align = objs[i].tls_align;
             total_tls = ALIGN_UP(total_tls + objs[i].tls_memsz, align);
@@ -639,6 +642,7 @@ static int prelink_objects(const char *output_path,
     /* Pass 0: all except IRELATIVE */
     for (int i = 0; i < nobj; i++) {
             if (metas[i].flags & DLFRZ_FLAG_INTERP) continue;
+            if (metas[i].flags & DLFRZ_FLAG_DLOPEN) continue;
         pl_apply_relr(&objs[i]);
         if (objs[i].rela_count > 0)
             pl_apply_rela(&objs[i], objs[i].rela, objs[i].rela_count,
@@ -650,6 +654,7 @@ static int prelink_objects(const char *output_path,
     /* Pass 1: IRELATIVE (resolvers can read populated GOTs) */
     for (int i = 0; i < nobj; i++) {
             if (metas[i].flags & DLFRZ_FLAG_INTERP) continue;
+            if (metas[i].flags & DLFRZ_FLAG_DLOPEN) continue;
         if (objs[i].rela_count > 0)
             pl_apply_rela(&objs[i], objs[i].rela, objs[i].rela_count,
                           objs, nobj, 1);
@@ -662,6 +667,7 @@ static int prelink_objects(const char *output_path,
     for (int i = 0; i < nobj; i++) {
         const struct dlfrz_lib_meta *m = &metas[i];
             if (m->flags & DLFRZ_FLAG_INTERP) continue;
+            if (m->flags & DLFRZ_FLAG_DLOPEN) continue;
         uint64_t base = objs[i].base;
         const uint8_t *phdr_mem = (const uint8_t *)(base + m->phdr_off);
 
