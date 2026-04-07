@@ -29,8 +29,15 @@ $(DLFREEZE): $(TOOL_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 # ── bootstrap (statically linked, includes in-process loader) ──────
+# Use musl-gcc for much smaller static binary (fewer page faults).
+# Fall back to system gcc if musl-gcc isn't available.
+# -fno-stack-protector: the loader changes FS register (TLS) which
+# invalidates the stack canary, so SSP must be disabled.
+BOOTSTRAP_CC := $(shell command -v musl-gcc 2>/dev/null || echo $(CC))
 $(BOOTSTRAP): $(SRC)/bootstrap.c $(SRC)/loader.c $(SRC)/common.h $(SRC)/loader.h | $(BUILD)
-	$(CC) $(CFLAGS) -static -o $@ $(SRC)/bootstrap.c $(SRC)/loader.c
+	$(BOOTSTRAP_CC) -Wall -Wextra -O2 -D_GNU_SOURCE -fno-stack-protector \
+	    -ffunction-sections -fdata-sections \
+	    -static -Wl,--gc-sections -o $@ $(SRC)/bootstrap.c $(SRC)/loader.c
 
 # ── LD_PRELOAD library for tracing dlopen ──────────────────────────
 $(PRELOAD): $(SRC)/dlopen_preload.c | $(BUILD)

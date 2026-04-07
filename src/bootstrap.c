@@ -263,6 +263,27 @@ int main(int argc, char **argv)
             return 127;
         }
 
+        /* Pre-linked binaries: run loader in-process (no fork), since
+         * pre-linking makes the loader path very reliable and the fork
+         * adds >1ms of overhead.  Non-prelinked binaries still use
+         * fork for crash-recovery fallback to extraction mode. */
+        int is_prelinked = 0;
+        for (uint32_t pi = 0; pi < ft.num_entries; pi++) {
+            if (metas[pi].flags & DLFRZ_FLAG_PRELINKED) {
+                is_prelinked = 1;
+                break;
+            }
+        }
+
+        if (is_prelinked) {
+            loader_run(ldr_mem, ldr_mem_foff, ldr_srcfd, metas, ent, strtab,
+                       ft.num_entries, argc, argv, environ);
+            /* loader_run returns only on failure */
+            fprintf(stderr, "dlfreeze-bootstrap: in-process loader failed\n");
+            close(sfd);
+            return 127;
+        }
+
         pid_t lpid = fork();
         if (lpid < 0) {
             perror("fork");

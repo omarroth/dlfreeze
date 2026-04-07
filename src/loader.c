@@ -1012,7 +1012,7 @@ static int reserve_address_range(const struct dlfrz_lib_meta *metas,
     range_hi += 4 * 4096;
 
     void *mapped = mmap((void *)range_lo, range_hi - range_lo,
-                        PROT_READ | PROT_WRITE | PROT_EXEC,
+                        PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
                         -1, 0);
     if (mapped == MAP_FAILED) return -1;
@@ -1022,23 +1022,27 @@ static int reserve_address_range(const struct dlfrz_lib_meta *metas,
 static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
                       const struct dlfrz_lib_meta *meta,
                       const struct dlfrz_entry *ent,
-                      struct loaded_obj *obj)
+                      struct loaded_obj *obj,
+                      _Bool pre_reserved)
 {
     uint64_t base = meta->base_addr;
     uint64_t lo   = meta->vaddr_lo & ~0xFFFULL;
     uint64_t hi   = ALIGN_UP(meta->vaddr_hi, 4096);
-    (void)lo; (void)hi;
 
-    /* If address range not pre-reserved (e.g. lazy dlopen), reserve it now */
-    {
+    if (!pre_reserved) {
+        /* Lazy dlopen path — reserve the object's address range now */
         uint64_t span = hi - lo + 4 * 4096;
-        /* Try NOREPLACE first — succeeds if not yet reserved */
         void *m = mmap((void *)(base + lo), span,
                        PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
                        -1, 0);
         if (m == MAP_FAILED) {
-            /* Already reserved by reserve_address_range — that's fine */
+            /* Already mapped (shouldn't happen on this path) — try MAP_FIXED */
+            m = mmap((void *)(base + lo), span,
+                     PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                     -1, 0);
+            if (m == MAP_FAILED) return -1;
         }
     }
 
@@ -1056,8 +1060,15 @@ static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
             uint64_t map_len        = ALIGN_UP(page_delta + ph->p_filesz, 4096);
             uint64_t file_off       = ent->data_offset + seg_page_off;
 
+            /* Map with correct ELF permissions + PROT_WRITE for
+             * writable segments (relocation targets live here).
+             * Text/rodata get their final perms immediately. */
+            int prot = PROT_READ;
+            if (ph->p_flags & PF_X) prot |= PROT_EXEC;
+            if (ph->p_flags & PF_W) prot |= PROT_WRITE;
+
             void *m = mmap((void *)(base + seg_page_vaddr), map_len,
-                           PROT_READ | PROT_WRITE | PROT_EXEC,
+                           prot,
                            MAP_PRIVATE | MAP_FIXED,
                            srcfd, file_off);
             if (m == MAP_FAILED) {
@@ -1806,7 +1817,7 @@ static struct loaded_obj *load_embedded_object(uint32_t mi)
 
     /* Map segments from the frozen image at the pre-assigned base */
     if (map_object(g_frozen_mem, g_frozen_mem_foff, g_frozen_srcfd,
-                   emeta, eent, obj) < 0) {
+                   emeta, eent, obj, 0) < 0) {
         dl_set_error(ename, ": mmap failed");
         return NULL;
     }
@@ -2135,6 +2146,15 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
         *(uintptr_t *)(tp + TCB_OFF_PTR_GUARD) = ptr_guard;
     }
 
+    /* Preserve the bootstrap libc's stack canary so that SSP checks in
+     * the static libc (musl or glibc) continue to work after we change FS.
+     * Both musl and glibc store the canary at FS:0x28. */
+    {
+        uintptr_t old_canary;
+        __asm__ volatile("mov %%fs:0x28, %0" : "=r"(old_canary));
+        *(uintptr_t *)(tp + TCB_OFF_STACK_GUARD) = old_canary;
+    }
+
     /* NOTE: .tdata is NOT copied here — it must be copied AFTER
      * relocations are applied so that RELATIVE/RELR-relocated
      * pointers in the TLS template have their final values. */
@@ -2316,7 +2336,7 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     }
     for (int i = 0; i < nobj; i++) {
         int mi = idx_map[i];
-        if (map_object(mem, mem_foff, srcfd, &metas[mi], &entries[mi], &objs[i]) < 0)
+        if (map_object(mem, mem_foff, srcfd, &metas[mi], &entries[mi], &objs[i], 1) < 0)
             return -1;
         objs[i].phdr      = (const Elf64_Phdr *)(objs[i].base + metas[mi].phdr_off);
         objs[i].phdr_num  = metas[mi].phdr_num;
@@ -2460,10 +2480,15 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     if (tp)
         copy_tdata(objs, nobj, tp);
 
-    /* 6. Set final memory protections */
+    /* 6. Set final memory protections.
+     *    For pre-linked objects, segments were already mapped with their
+     *    correct ELF permissions from map_object, so no mprotect needed.
+     *    Only non-prelinked objects need post-relocation protection. */
     ldr_dbg("[loader] setting protections...\n");
-    for (int i = 0; i < nobj; i++)
-        protect_object(&objs[i], &metas[idx_map[i]]);
+    if (!prelinked) {
+        for (int i = 0; i < nobj; i++)
+            protect_object(&objs[i], &metas[idx_map[i]]);
+    }
 
     /* Set dlopen support globals before init functions or main() can
      * call dlopen.  g_nobj is the count of objects in g_all_objs. */
