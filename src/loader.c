@@ -11,11 +11,13 @@
 #define _GNU_SOURCE
 #endif
 #include <string.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <elf.h>
 #include <stdint.h>
+#include <fcntl.h>
 
 #include "common.h"
 #include "loader.h"
@@ -29,10 +31,20 @@
  * Prevents NULL dereference crashes in IFUNC resolvers. */
 static void *g_null_page;
 
+/* Debug verbosity — enabled by DLFREEZE_DEBUG=1 env var.
+ * Set before TLS swap (getenv is safe in bootstrap's libc). */
+static int g_debug;
+
 /* ---- error output (no stdio — bootstrap may break after TLS swap) ----- */
 static void ldr_msg(const char *s)
 {
     if (s) write(STDERR_FILENO, s, strlen(s));
+}
+
+/* Debug-only output — silent unless DLFREEZE_DEBUG is set. */
+static void ldr_dbg(const char *s)
+{
+    if (g_debug) ldr_msg(s);
 }
 
 static void ldr_hex(const char *prefix, uint64_t val)
@@ -45,6 +57,11 @@ static void ldr_hex(const char *prefix, uint64_t val)
     else { do { hx[hn++] = "0123456789abcdef"[val & 0xf]; val >>= 4; } while (val); while (hn > 0) buf[n++] = hx[--hn]; }
     buf[n++] = '\n'; buf[n] = 0;
     ldr_msg(buf);
+}
+
+static void ldr_dbg_hex(const char *prefix, uint64_t val)
+{
+    if (g_debug) ldr_hex(prefix, val);
 }
 
 static void ldr_err(const char *ctx, const char *detail)
@@ -119,6 +136,60 @@ static void crash_handler(int sig, siginfo_t *info, void *ucontext)
 
 static uint8_t *g_fake_rtld_global;
 static uint8_t *g_fake_rtld_global_ro;
+
+/* ---- _rtld_global_ro function-pointer stubs (dl* wrappers) ----------- */
+/*
+ * glibc's libc.so calls dlopen / dlsym / dlclose / dlerror through
+ * function pointers stored in _rtld_global_ro (the real pointers are
+ * set by ld-linux.so at process startup).  Without the real dynamic
+ * linker these slots are NULL.  When Python does "import _json", libc's
+ * dlopen → _dlerror_run → GLRO(dl_catch_error)(…) dereferences offset
+ * 856 → calls address 0 → SIGSEGV at RIP=0x0.
+ *
+ * Providing minimal stubs that return "error" makes dlopen() return
+ * NULL and dlerror() return an explanatory message, so Python (and
+ * other programs) fall back to pure-Python code gracefully.
+ */
+
+/* _dl_catch_error — called by _dlerror_run for every dl* function.
+ * Return non-zero immediately (error) without invoking operate(). */
+static int glro_dl_catch_error(const char **objname, const char **errstring,
+                               _Bool *malloced,
+                               void (*operate)(void *), void *args)
+{
+    (void)operate; (void)args;
+    static const char msg[] = "dlopen/dlsym not available (frozen binary)";
+    if (objname)   *objname   = "";
+    if (errstring) *errstring = msg;
+    if (malloced)  *malloced  = 0;
+    return 1; /* non-zero = error */
+}
+
+/* _dl_open — should never be reached (caught by _dl_catch_error above)
+ * but provide a stub just in case. */
+static void *glro_dl_open(const char *name, int mode, const void *caller,
+                           long ns, int argc, char **argv, char **env)
+{
+    (void)name; (void)mode; (void)caller; (void)ns;
+    (void)argc; (void)argv; (void)env;
+    return NULL;
+}
+
+/* _dl_close — no-op */
+static void glro_dl_close(void *map) { (void)map; }
+
+/* _dl_error_free — no-op (our error strings are static) */
+static void glro_dl_error_free(void *ptr) { (void)ptr; }
+
+/* _dl_debug_printf — no-op (suppress ld.so debug spew) */
+static void glro_dl_debug_printf(const char *fmt, ...) { (void)fmt; }
+
+/* Offsets of function pointers in struct rtld_global_ro (glibc 2.43 x86-64) */
+#define GLRO_DL_DEBUG_PRINTF_OFF  816
+#define GLRO_DL_OPEN_OFF          840
+#define GLRO_DL_CLOSE_OFF         848
+#define GLRO_DL_CATCH_ERROR_OFF   856
+#define GLRO_DL_ERROR_FREE_OFF    864
 
 /* make a list_t {next, prev} point to itself (empty circular list) */
 static void init_empty_list(uint8_t *base, size_t off)
@@ -280,6 +351,14 @@ static int init_fake_rtld(void)
     init_empty_list(g_fake_rtld_global, GL_DL_STACK_USED_OFF);
     init_empty_list(g_fake_rtld_global, GL_DL_STACK_USER_OFF);
     init_empty_list(g_fake_rtld_global, GL_DL_STACK_CACHE_OFF);
+
+    /* dl* function pointer stubs — makes dlopen/dlsym/dlclose return
+     * error/NULL instead of SIGSEGV-ing through a NULL pointer. */
+    *(void **)(g_fake_rtld_global_ro + GLRO_DL_DEBUG_PRINTF_OFF) = (void *)glro_dl_debug_printf;
+    *(void **)(g_fake_rtld_global_ro + GLRO_DL_OPEN_OFF)         = (void *)glro_dl_open;
+    *(void **)(g_fake_rtld_global_ro + GLRO_DL_CLOSE_OFF)        = (void *)glro_dl_close;
+    *(void **)(g_fake_rtld_global_ro + GLRO_DL_CATCH_ERROR_OFF)  = (void *)glro_dl_catch_error;
+    *(void **)(g_fake_rtld_global_ro + GLRO_DL_ERROR_FREE_OFF)   = (void *)glro_dl_error_free;
 
     return 0;
 }
@@ -454,6 +533,30 @@ struct loaded_obj {
     struct obj_tls    tls;
 };
 
+/* ---- dlopen support globals ------------------------------------------ */
+
+#define MAX_TOTAL_OBJS 256
+
+/* Global object table — populated by loader_run, extended by my_dlopen. */
+static struct loaded_obj g_all_objs[MAX_TOTAL_OBJS];
+static int g_nobj;
+
+/* Per-object metadata for dlopen'd objects (used by protect_object) */
+static struct dlfrz_lib_meta g_dl_metas[MAX_TOTAL_OBJS];
+
+/* argc/argv/envp saved for init functions of dlopen'd objects */
+static int g_argc;
+static char **g_argv;
+static char **g_envp;
+
+/* dlerror support */
+static char g_dlerror_msg[512];
+static int g_dlerror_valid;
+
+/* String pool for dlopen'd object names */
+static char g_dl_strbuf[8192];
+static size_t g_dl_strbuf_used;
+
 /* ==== Resolution cache ================================================ */
 
 #define RESOLVE_CACHE_SIZE 8192U  /* must be power-of-two */
@@ -623,6 +726,33 @@ static const Elf64_Sym *lookup_linear(const struct loaded_obj *obj,
     return NULL;
 }
 
+/* ---- dlopen override ------------------------------------------------- */
+
+/* Forward declarations for dlopen replacements */
+static void *my_dlopen(const char *path, int flags);
+static void *my_dlsym(void *handle, const char *symbol);
+static int   my_dlclose(void *handle);
+static char *my_dlerror(void);
+
+/* Override table — these symbols take priority over libc's exports
+ * so that dlopen/dlsym/dlclose/dlerror go through our implementation
+ * which can load .so files from the filesystem at runtime. */
+static const struct stub_sym g_overrides[] = {
+    { "dlopen",  (void *)my_dlopen  },
+    { "dlsym",   (void *)my_dlsym   },
+    { "dlclose", (void *)my_dlclose },
+    { "dlerror", (void *)my_dlerror },
+    { NULL, NULL }
+};
+
+static uint64_t lookup_override(const char *name)
+{
+    for (const struct stub_sym *o = g_overrides; o->name; o++)
+        if (strcmp(name, o->name) == 0)
+            return (uint64_t)(uintptr_t)o->addr;
+    return 0;
+}
+
 /*
  * Global symbol search — exe first, then libs in load order.
  * Returns resolved virtual address or 0.
@@ -636,6 +766,13 @@ static uint64_t resolve_sym(struct loaded_obj *objs, int nobj,
     int c = sym_cache_lookup(name, gh, &cached);
     if (c == 1) return cached;
     if (c == -1) return 0;
+
+    /* Override stubs (dlopen, dlsym, etc.) take priority */
+    uint64_t ovr = lookup_override(name);
+    if (ovr) {
+        sym_cache_store(name, gh, CACHE_FOUND, ovr);
+        return ovr;
+    }
 
     for (int i = 0; i < nobj; i++) {
         const Elf64_Sym *sym = objs[i].gnu_hash
@@ -1135,9 +1272,9 @@ static void init_libc_process_state(struct loaded_obj *objs, int nobj,
      */
     addr = resolve_sym(objs, nobj, "__libc_early_init");
     if (addr) {
-        ldr_msg("[loader] calling __libc_early_init...\n");
+        ldr_dbg("[loader] calling __libc_early_init...\n");
         ((void(*)(int))(uintptr_t)addr)(1);
-        ldr_msg("[loader] __libc_early_init done\n");
+        ldr_dbg("[loader] __libc_early_init done\n");
     }
 
     /* Pre-initialize __curbrk in the mapped libc so that sbrk() has
@@ -1168,6 +1305,316 @@ static void protect_object(struct loaded_obj *obj,
         uint64_t pe = ALIGN_UP(obj->base + ph->p_vaddr + ph->p_memsz, 4096);
         mprotect((void *)ps, pe - ps, prot);
     }
+}
+
+/* ==== dlopen implementation ============================================ */
+
+static const char *dl_basename(const char *path)
+{
+    const char *base = path;
+    while (*path) { if (*path == '/') base = path + 1; path++; }
+    return base;
+}
+
+static const char *dl_store_name(const char *s)
+{
+    size_t n = 0;
+    while (s[n]) n++;
+    n++;  /* include NUL */
+    if (g_dl_strbuf_used + n > sizeof(g_dl_strbuf)) return "?";
+    char *d = g_dl_strbuf + g_dl_strbuf_used;
+    memcpy(d, s, n);
+    g_dl_strbuf_used += n;
+    return d;
+}
+
+static void dl_set_error(const char *a, const char *b)
+{
+    char *d = g_dlerror_msg;
+    char *end = g_dlerror_msg + sizeof(g_dlerror_msg) - 1;
+    if (a) while (*a && d < end) *d++ = *a++;
+    if (b) while (*b && d < end) *d++ = *b++;
+    *d = '\0';
+    g_dlerror_valid = 1;
+}
+
+/* Forward declaration — dl_load_needed calls load_elf_from_file recursively */
+static struct loaded_obj *load_elf_from_file(const char *path);
+
+/*
+ * Load DT_NEEDED dependencies of a just-loaded object.
+ * Searches /usr/lib/ and /lib/ for each needed library.
+ * Recursive: loading a dependency may trigger loading its own deps.
+ */
+static void dl_load_needed(struct loaded_obj *obj,
+                            const struct dlfrz_lib_meta *meta)
+{
+    /* Find PT_DYNAMIC in loaded memory */
+    const uint8_t *phdr_start = (const uint8_t *)(obj->base + meta->phdr_off);
+    const Elf64_Phdr *dyn_ph = NULL;
+    for (int i = 0; i < meta->phdr_num; i++) {
+        const Elf64_Phdr *ph = (const Elf64_Phdr *)(phdr_start + i * meta->phdr_entsz);
+        if (ph->p_type == PT_DYNAMIC) { dyn_ph = ph; break; }
+    }
+    if (!dyn_ph || !obj->dynstr) return;
+
+    const Elf64_Dyn *dyn = (const Elf64_Dyn *)(obj->base + dyn_ph->p_vaddr);
+    size_t dyn_count = dyn_ph->p_memsz / sizeof(Elf64_Dyn);
+
+    for (size_t i = 0; i < dyn_count && dyn[i].d_tag != DT_NULL; i++) {
+        if (dyn[i].d_tag != DT_NEEDED) continue;
+        const char *needed = obj->dynstr + dyn[i].d_un.d_val;
+
+        /* Skip if already loaded (basename match) */
+        int found = 0;
+        for (int j = 0; j < g_nobj; j++) {
+            if (!g_all_objs[j].name) continue;
+            if (strcmp(dl_basename(g_all_objs[j].name), needed) == 0) {
+                found = 1;
+                break;
+            }
+        }
+        if (found) continue;
+
+        /* Build path and try standard locations */
+        static const char *search_dirs[] = {
+            "/usr/lib/", "/lib/", "/usr/lib64/", "/lib64/", NULL
+        };
+        for (const char **dir = search_dirs; *dir; dir++) {
+            char path[512];
+            char *d = path;
+            const char *p = *dir;
+            while (*p) *d++ = *p++;
+            const char *n = needed;
+            while (*n && d < path + sizeof(path) - 1) *d++ = *n++;
+            *d = '\0';
+
+            int fd = open(path, O_RDONLY);
+            if (fd >= 0) {
+                close(fd);
+                load_elf_from_file(path);
+                break;
+            }
+        }
+    }
+}
+
+/*
+ * Load an ELF shared object from the filesystem.
+ * Maps PT_LOAD segments, resolves symbols, applies relocations,
+ * calls init functions.  Returns pointer to loaded_obj or NULL.
+ */
+static struct loaded_obj *load_elf_from_file(const char *path)
+{
+    int idx = g_nobj;
+    if (idx >= MAX_TOTAL_OBJS) {
+        dl_set_error("too many loaded objects", NULL);
+        return NULL;
+    }
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        dl_set_error(path, ": cannot open");
+        return NULL;
+    }
+
+    /* Read ELF header */
+    Elf64_Ehdr ehdr;
+    if (read(fd, &ehdr, sizeof(ehdr)) != (ssize_t)sizeof(ehdr)) {
+        close(fd);
+        dl_set_error(path, ": cannot read ELF header");
+        return NULL;
+    }
+
+    if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0 ||
+        ehdr.e_ident[EI_CLASS] != ELFCLASS64 ||
+        ehdr.e_type != ET_DYN) {
+        close(fd);
+        dl_set_error(path, ": not a 64-bit shared object");
+        return NULL;
+    }
+
+    /* Read program headers */
+    Elf64_Phdr phdr_buf[64];
+    if (ehdr.e_phnum > 64) {
+        close(fd);
+        dl_set_error(path, ": too many program headers");
+        return NULL;
+    }
+    size_t phdr_size = (size_t)ehdr.e_phnum * ehdr.e_phentsize;
+    if (pread(fd, phdr_buf, phdr_size, ehdr.e_phoff) != (ssize_t)phdr_size) {
+        close(fd);
+        dl_set_error(path, ": cannot read program headers");
+        return NULL;
+    }
+
+    /* Determine vaddr range from PT_LOAD segments */
+    uint64_t lo = UINT64_MAX, hi = 0;
+    for (int i = 0; i < ehdr.e_phnum; i++) {
+        if (phdr_buf[i].p_type != PT_LOAD) continue;
+        if (phdr_buf[i].p_vaddr < lo) lo = phdr_buf[i].p_vaddr;
+        uint64_t end = phdr_buf[i].p_vaddr + phdr_buf[i].p_memsz;
+        if (end > hi) hi = end;
+    }
+    if (lo >= hi) {
+        close(fd);
+        dl_set_error(path, ": no PT_LOAD segments");
+        return NULL;
+    }
+
+    lo &= ~0xFFFULL;
+    hi = ALIGN_UP(hi, 4096);
+    uint64_t span = hi - lo + 4 * 4096;  /* + guard pages */
+
+    /* Map anonymous for the entire load range */
+    void *mapped = mmap(NULL, span, PROT_READ | PROT_WRITE | PROT_EXEC,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapped == MAP_FAILED) {
+        close(fd);
+        dl_set_error(path, ": mmap failed");
+        return NULL;
+    }
+
+    uint64_t base = (uint64_t)mapped - lo;
+
+    /* Map/copy each PT_LOAD segment from the file */
+    for (int i = 0; i < ehdr.e_phnum; i++) {
+        if (phdr_buf[i].p_type != PT_LOAD) continue;
+        if (phdr_buf[i].p_filesz > 0) {
+            uint64_t seg_lo  = phdr_buf[i].p_vaddr & ~0xFFFULL;
+            uint64_t seg_off = phdr_buf[i].p_offset & ~0xFFFULL;
+            uint64_t delta   = phdr_buf[i].p_vaddr - seg_lo;
+            uint64_t map_len = ALIGN_UP(delta + phdr_buf[i].p_filesz, 4096);
+
+            void *m = mmap((void *)(base + seg_lo), map_len,
+                           PROT_READ | PROT_WRITE | PROT_EXEC,
+                           MAP_PRIVATE | MAP_FIXED, fd, seg_off);
+            if (m == MAP_FAILED)
+                pread(fd, (void *)(base + phdr_buf[i].p_vaddr),
+                      phdr_buf[i].p_filesz, phdr_buf[i].p_offset);
+        }
+        /* Zero BSS tail */
+        if (phdr_buf[i].p_memsz > phdr_buf[i].p_filesz)
+            memset((void *)(base + phdr_buf[i].p_vaddr + phdr_buf[i].p_filesz),
+                   0, phdr_buf[i].p_memsz - phdr_buf[i].p_filesz);
+    }
+
+    close(fd);
+
+    /* Set up loaded_obj entry */
+    struct loaded_obj *obj = &g_all_objs[idx];
+    memset(obj, 0, sizeof(*obj));
+    obj->base  = base;
+    obj->name  = dl_store_name(path);
+    obj->flags = LDR_FLAG_SHLIB;
+
+    /* Build metadata for parse_dynamic / protect_object */
+    struct dlfrz_lib_meta *meta = &g_dl_metas[idx];
+    memset(meta, 0, sizeof(*meta));
+    meta->base_addr  = base;
+    meta->vaddr_lo   = lo;
+    meta->vaddr_hi   = hi;
+    meta->phdr_off   = ehdr.e_phoff;
+    meta->phdr_num   = ehdr.e_phnum;
+    meta->phdr_entsz = ehdr.e_phentsize;
+    meta->flags      = LDR_FLAG_SHLIB;
+
+    parse_dynamic(obj, meta);
+
+    /* Bump count so symbol resolution includes this object */
+    g_nobj = idx + 1;
+
+    /* Load DT_NEEDED dependencies before applying relocations.
+     * This may recursively call load_elf_from_file and increase g_nobj. */
+    dl_load_needed(obj, meta);
+
+    /* Clear cached misses — new objects may provide symbols
+     * that were previously unresolvable. */
+    clear_resolution_caches();
+
+    /* Apply relocations */
+    preseed_rtld_got(obj);
+    if (apply_all_relocs(obj, g_all_objs, g_nobj, 0) < 0) {
+        dl_set_error(path, ": relocation failed");
+        g_nobj = idx;  /* roll back */
+        return NULL;
+    }
+    if (apply_all_relocs(obj, g_all_objs, g_nobj, 1) < 0) {
+        dl_set_error(path, ": IRELATIVE failed");
+        g_nobj = idx;
+        return NULL;
+    }
+
+    /* Set final memory protections */
+    protect_object(obj, meta);
+
+    /* Call init functions */
+    typedef void (*init_fn_t)(int, char **, char **);
+    if (obj->init_func)
+        ((init_fn_t)obj->init_func)(g_argc, g_argv, g_envp);
+    for (size_t j = 0; j < obj->init_array_sz; j++)
+        ((init_fn_t)obj->init_array[j])(g_argc, g_argv, g_envp);
+
+    ldr_dbg("[loader] dlopen: ");
+    ldr_dbg(dl_basename(path));
+    ldr_dbg_hex(" base=0x", base);
+
+    return obj;
+}
+
+/* Pseudo-handle for dlopen(NULL) — search all loaded objects */
+#define DL_GLOBAL_HANDLE ((void *)(uintptr_t)1)
+
+static void *my_dlopen(const char *path, int flags)
+{
+    (void)flags;
+    g_dlerror_valid = 0;
+
+    if (!path)
+        return DL_GLOBAL_HANDLE;
+
+    /* Check if already loaded (basename match) */
+    const char *bn = dl_basename(path);
+    for (int i = 0; i < g_nobj; i++) {
+        if (!g_all_objs[i].name) continue;
+        if (strcmp(dl_basename(g_all_objs[i].name), bn) == 0)
+            return &g_all_objs[i];
+    }
+
+    return load_elf_from_file(path);
+}
+
+static void *my_dlsym(void *handle, const char *symbol)
+{
+    (void)handle;
+    g_dlerror_valid = 0;
+
+    if (!symbol) {
+        dl_set_error("dlsym: NULL symbol name", NULL);
+        return NULL;
+    }
+
+    /* Search all loaded objects regardless of handle */
+    uint64_t addr = resolve_sym(g_all_objs, g_nobj, symbol);
+    if (addr) return (void *)(uintptr_t)addr;
+
+    dl_set_error("undefined symbol: ", symbol);
+    return NULL;
+}
+
+static int my_dlclose(void *handle)
+{
+    (void)handle;
+    return 0;  /* no-op — never unload */
+}
+
+static char *my_dlerror(void)
+{
+    if (g_dlerror_valid) {
+        g_dlerror_valid = 0;
+        return g_dlerror_msg;
+    }
+    return NULL;
 }
 
 /* ==== TLS setup ======================================================== */
@@ -1389,6 +1836,12 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
                uint32_t num_entries,
                int argc, char **argv, char **envp)
 {
+    /* Check debug flag before TLS swap (getenv uses bootstrap's libc) */
+    {
+        const char *dbg = getenv("DLFREEZE_DEBUG");
+        g_debug = (dbg && dbg[0] != '0' && dbg[0] != '\0');
+    }
+
     clear_resolution_caches();
 
     /* Install crash handlers for debugging */
@@ -1416,11 +1869,12 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         if (!(metas[i].flags & LDR_FLAG_INTERP)) nobj++;
 
     if (nobj == 0) { ldr_err("no objects to load", NULL); return -1; }
+    if (nobj > MAX_TOTAL_OBJS) { ldr_err("too many objects", NULL); return -1; }
 
-    /* alloca-like: use a VLA for the small arrays */
-    struct loaded_obj objs[nobj];
+    /* Use global object table so dlopen'd objects can extend it */
+    struct loaded_obj *objs = g_all_objs;
     int idx_map[nobj];    /* idx_map[oi] = manifest index */
-    memset(objs, 0, sizeof(objs));
+    memset(objs, 0, nobj * sizeof(struct loaded_obj));
 
     /* Build in order: exe first, then shared libs */
     int oi = 0;
@@ -1442,25 +1896,25 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     }
 
     /* 2. Map all objects into memory at pre-assigned addresses */
-    ldr_msg("[loader] mapping objects...\n");
+    ldr_dbg("[loader] mapping objects...\n");
     for (int i = 0; i < nobj; i++) {
         int mi = idx_map[i];
         if (map_object(mem, mem_foff, srcfd, &metas[mi], &entries[mi], &objs[i]) < 0)
             return -1;
-        ldr_msg("  ");
-        ldr_msg(objs[i].name);
-        ldr_hex("  base=0x", objs[i].base);
+        ldr_dbg("  ");
+        ldr_dbg(objs[i].name);
+        ldr_dbg_hex("  base=0x", objs[i].base);
     }
 
     /* 3. Parse PT_DYNAMIC for each object */
-    ldr_msg("[loader] parsing dynamic sections...\n");
+    ldr_dbg("[loader] parsing dynamic sections...\n");
     for (int i = 0; i < nobj; i++)
         parse_dynamic(&objs[i], &metas[idx_map[i]]);
 
     /* 4. Set up TLS (must happen before relocations that reference TLS,
      *    and definitely before calling any IRELATIVE resolvers that might
      *    touch TLS / stack guard) */
-    ldr_msg("[loader] setting up TLS...\n");
+    ldr_dbg("[loader] setting up TLS...\n");
     uintptr_t at_random = get_auxval(envp, 25 /* AT_RANDOM */);
     uintptr_t tp = setup_tls(objs, nobj, mem, mem_foff, metas, entries,
                               idx_map, num_entries, at_random);
@@ -1472,7 +1926,7 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
      *    Two-pass: first apply all non-IRELATIVE relocations across all
      *    objects so that GOT entries (e.g. _rtld_global_ro) are populated,
      *    then apply IRELATIVE whose resolvers depend on those GOT entries. */
-    ldr_msg("[loader] applying relocations...\n");
+    ldr_dbg("[loader] applying relocations...\n");
 
     /* Pre-seed _rtld_global/_rtld_global_ro GOT entries so IFUNC
      * resolvers called during GLOB_DAT processing work correctly. */
@@ -1502,9 +1956,16 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         copy_tdata(objs, nobj, tp);
 
     /* 6. Set final memory protections */
-    ldr_msg("[loader] setting protections...\n");
+    ldr_dbg("[loader] setting protections...\n");
     for (int i = 0; i < nobj; i++)
         protect_object(&objs[i], &metas[idx_map[i]]);
+
+    /* Set dlopen support globals before init functions or main() can
+     * call dlopen.  g_nobj is the count of objects in g_all_objs. */
+    g_nobj = nobj;
+    g_argc = argc;
+    g_argv = argv;
+    g_envp = envp;
 
     /* 7. Initialise libc process state (environ, arena, tcache) BEFORE
      *    calling any init functions — init_array entries in libraries
@@ -1515,7 +1976,7 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
      *    Skip the exe — its constructors are called later.
      *    Now safe because _rtld_global/_rtld_global_ro stubs are in place
      *    and __tunable_get_val etc. resolve to our no-op stubs. */
-    ldr_msg("[loader] calling init functions...\n");
+    ldr_dbg("[loader] calling init functions...\n");
     typedef void (*init_fn_t)(int, char **, char **);
     /* Call in reverse order: libraries without dependents first (libc, libm,
      * etc.) then libraries that depend on them (libpython, etc.).
@@ -1523,15 +1984,15 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
      * so reversing gives a correct dependency-leaf-first order. */
     for (int i = nobj - 1; i >= 0; i--) {
         if (objs[i].flags & LDR_FLAG_MAIN_EXE) continue;
-        ldr_msg("[loader] init: ");
-        ldr_msg(objs[i].name);
-        ldr_msg("\n");
+        ldr_dbg("[loader] init: ");
+        ldr_dbg(objs[i].name);
+        ldr_dbg("\n");
         if (objs[i].init_func)
             ((init_fn_t)objs[i].init_func)(argc, argv, envp);
         for (size_t j = 0; j < objs[i].init_array_sz; j++)
             ((init_fn_t)objs[i].init_array[j])(argc, argv, envp);
     }
-    ldr_msg("[loader] init functions done\n");
+    ldr_dbg("[loader] init functions done\n");
 
     /* 8. Find the exe's entry point and transfer control */
     uintptr_t entry = 0;
@@ -1556,7 +2017,7 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
      *    - stdio FILE structs are statically initialized in libc's .data
      *    - __libc_single_threaded is 1 (from .data, no locking needed)
      *    - __environ gets set by us below */
-    ldr_msg("[loader] resolving main...\n");
+    ldr_dbg("[loader] resolving main...\n");
     typedef int (*main_fn_t)(int, char **, char **);
     uint64_t main_addr = 0;
     for (int i = 0; i < nobj; i++) {
@@ -1590,14 +2051,14 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
             if (p)
                 ((void (*)(void *))(uintptr_t)libc_free_addr)(p);
         }
-        ldr_msg("[loader] calling main() directly...\n");
+        ldr_dbg("[loader] calling main() directly...\n");
         int rc = ((main_fn_t)(uintptr_t)main_addr)(argc, argv, envp);
-        ldr_msg("[loader] main() returned\n");
+        ldr_dbg("[loader] main() returned\n");
         _exit(rc);
     }
 
     /* Fallback: transfer control via _start → __libc_start_main. */
-    ldr_msg("[loader] transferring to _start...\n");
+    ldr_dbg("[loader] transferring to _start...\n");
     transfer_to_entry(entry, argc, argv, envp,
                       exe_phdr, exe_phnum, entry, at_random);
     /* NOTREACHED */
