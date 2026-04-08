@@ -93,8 +93,10 @@ static char *resolve_from_ldconfig(const char *name)
 {
     load_ldconfig_cache();
     for (int i = 0; i < ldc_count; i++)
-        if (strcmp(ldc_cache[i].name, name) == 0)
-            return strdup(ldc_cache[i].path);
+        if (strcmp(ldc_cache[i].name, name) == 0) {
+            char *rp = realpath(ldc_cache[i].path, NULL);
+            return rp ? rp : strdup(ldc_cache[i].path);
+        }
     return NULL;
 }
 

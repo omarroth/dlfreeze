@@ -442,9 +442,11 @@ static int stub_dl_catch_exception(void *exc, void (*operate)(void *), void *arg
 /* _dl_audit_symbind_alt / _dl_audit_preinit — no-ops */
 static void stub_dl_audit_noop(void) { /* no-op */ }
 
-/* _dl_allocate_tls / _dl_allocate_tls_init / _dl_deallocate_tls — stubs */
-static void *stub_dl_allocate_tls(void *mem) { return mem; }
-static void *stub_dl_allocate_tls_init(void *mem) { return mem; }
+/* _dl_allocate_tls / _dl_allocate_tls_init / _dl_deallocate_tls
+ * Called by glibc's pthread_create to initialise TLS for new threads.
+ * Implementations are below g_all_objs/g_nobj declarations. */
+static void *stub_dl_allocate_tls(void *mem);       /* impl below */
+static void *stub_dl_allocate_tls_init(void *mem);   /* impl below */
 static void  stub_dl_deallocate_tls(void *mem) { (void)mem; }
 
 /* _dl_rtld_di_serinfo — no-op */
@@ -589,7 +591,7 @@ struct loaded_obj {
 
 /* ---- dlopen support globals ------------------------------------------ */
 
-#define MAX_TOTAL_OBJS 256
+#define MAX_TOTAL_OBJS 512
 
 /* Global object table — populated by loader_run, extended by my_dlopen. */
 static struct loaded_obj g_all_objs[MAX_TOTAL_OBJS];
@@ -597,6 +599,60 @@ static int g_nobj;
 
 /* Per-object metadata for dlopen'd objects (used by protect_object) */
 static struct dlfrz_lib_meta g_dl_metas[MAX_TOTAL_OBJS];
+
+/* _dl_allocate_tls_init — copy .tdata for every TLS module into a
+ * new thread's TLS block.  Called by glibc's pthread_create. */
+static void *stub_dl_allocate_tls_init(void *mem)
+{
+    uintptr_t tp = (uintptr_t)mem;
+    ldr_dbg("[loader] _dl_allocate_tls_init called\n");
+    for (int i = 0; i < g_nobj; i++) {
+        if (g_all_objs[i].tls.memsz == 0) continue;
+        uint8_t *dst = (uint8_t *)(tp + g_all_objs[i].tls.tpoff);
+        const uint8_t *src = (const uint8_t *)(
+            g_all_objs[i].base + g_all_objs[i].tls.vaddr);
+        ldr_dbg("[loader] tls_init: ");
+        ldr_dbg(g_all_objs[i].name ? g_all_objs[i].name : "?");
+        ldr_dbg_hex(" tpoff=", (uintptr_t)g_all_objs[i].tls.tpoff);
+        ldr_dbg_hex(" filesz=", g_all_objs[i].tls.filesz);
+        ldr_dbg_hex(" src[0]=", g_all_objs[i].tls.filesz >= 8 ? *(uint64_t *)src : 0);
+        memcpy(dst, src, g_all_objs[i].tls.filesz);
+        /* Zero the .tbss portion */
+        size_t bss = g_all_objs[i].tls.memsz - g_all_objs[i].tls.filesz;
+        if (bss > 0)
+            memset(dst + g_all_objs[i].tls.filesz, 0, bss);
+    }
+    return mem;
+}
+
+/* _dl_allocate_tls — allocate DTV and copy .tdata for a new thread. */
+static void *stub_dl_allocate_tls(void *mem)
+{
+    if (!mem) return NULL;
+    uintptr_t tp = (uintptr_t)mem;
+
+    /* Set up a minimal DTV for the new thread so __tls_get_addr works. */
+    size_t dtv_slots = 2 + (size_t)g_nobj;
+    size_t dtv_bytes = dtv_slots * 2 * sizeof(uintptr_t);
+    uintptr_t *dtv = mmap(NULL, (dtv_bytes + 4095) & ~4095UL,
+        PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (dtv != MAP_FAILED) {
+        dtv[0] = 1;  /* generation */
+        dtv[1] = 0;
+        for (int i = 0; i < g_nobj; i++) {
+            if (g_all_objs[i].tls.memsz == 0) continue;
+            size_t slot = g_all_objs[i].tls.modid;
+            if (slot < dtv_slots) {
+                dtv[slot * 2]     = tp + (uintptr_t)g_all_objs[i].tls.tpoff;
+                dtv[slot * 2 + 1] = 0;
+            }
+        }
+        *(uintptr_t *)(tp + 8 /* TCB_OFF_DTV */) = (uintptr_t)dtv;
+    }
+
+    /* Copy .tdata for all TLS modules */
+    return stub_dl_allocate_tls_init(mem);
+}
 
 /* ---- _dl_find_object implementation ---------------------------------- */
 
@@ -1977,7 +2033,6 @@ static void *my_dlopen(const char *path, int flags)
 
 static void *my_dlsym(void *handle, const char *symbol)
 {
-    (void)handle;
     g_dlerror_valid = 0;
 
     if (!symbol) {
@@ -1985,7 +2040,26 @@ static void *my_dlsym(void *handle, const char *symbol)
         return NULL;
     }
 
-    /* Search all loaded objects regardless of handle */
+    /* Handle-specific lookup: search the specific object first */
+    if (handle && handle != DL_GLOBAL_HANDLE &&
+        handle != (void *)(uintptr_t)-1L /* RTLD_DEFAULT */ &&
+        handle != (void *)(uintptr_t)-2L /* RTLD_NEXT    */) {
+        struct loaded_obj *obj = (struct loaded_obj *)handle;
+        uint32_t gh = gnu_hash_calc(symbol);
+        const Elf64_Sym *sym = obj->gnu_hash
+            ? lookup_gnu_hash(obj, symbol, gh)
+            : lookup_linear(obj, symbol);
+        if (sym && sym->st_value) {
+            uint64_t addr = obj->base + sym->st_value;
+            if (ELF64_ST_TYPE(sym->st_info) == STT_GNU_IFUNC) {
+                typedef uint64_t (*ifunc_t)(void);
+                addr = ((ifunc_t)addr)();
+            }
+            return (void *)(uintptr_t)addr;
+        }
+    }
+
+    /* Fallback: search all loaded objects */
     uint64_t addr = resolve_sym(g_all_objs, g_nobj, symbol);
     if (addr) return (void *)(uintptr_t)addr;
 
@@ -2080,6 +2154,18 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
             objs[oi].tls.modid  = (size_t)(oi + 1);
             break;
         }
+    }
+
+    /* Update _rtld_global_ro._dl_tls_static_size so glibc's nptl
+     * reserves enough TLS space when creating new threads.
+     * glibc formula: roundup(total_tls + surplus + sizeof(struct pthread), 64)
+     * sizeof(struct pthread) ≈ 2304 (0x900) on glibc 2.43 x86-64.
+     * TLS_STATIC_SURPLUS ≈ 1664.  We use 0x1800 as a safe combined margin. */
+    {
+        size_t tls_static =
+            ALIGN_UP(total_tls + 0x1800, 64);
+        *(size_t *)(g_fake_rtld_global_ro + GLRO_DL_TLS_STATIC_SIZE_OFF)
+            = tls_static;
     }
 
     /* Allocate TLS block + TCB */
@@ -2270,6 +2356,14 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     }
 
     clear_resolution_caches();
+
+    /* Kick off asynchronous readahead of the frozen binary so that
+     * page faults during segment mapping hit warm page cache. */
+    if (srcfd >= 0) {
+        off_t end = lseek(srcfd, 0, SEEK_END);
+        if (end > 0)
+            syscall(SYS_readahead, srcfd, (off_t)0, (size_t)end);
+    }
 
     /* Install crash handlers for debugging */
     {

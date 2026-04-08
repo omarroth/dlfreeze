@@ -325,6 +325,226 @@ test_python3_advanced() {
 }
 
 # ===================================================================
+# Test 8: direct-mode dlopen from frozen image (embedded loading)
+# ===================================================================
+test_direct_dlopen_embedded() {
+    echo "--- direct dlopen (embedded) ---"
+    local shlib_src="$BUILD/emb_lib.c"  shlib="$BUILD/libemb.so"
+    local prog_src="$BUILD/use_emb.c"   prog="$BUILD/use_emb"
+    local out="$BUILD/use_emb.frozen"
+
+    cat > "$shlib_src" <<'C'
+#include <stdio.h>
+int emb_add(int a, int b) { return a + b; }
+const char *emb_greet(void) { return "hello from embedded"; }
+C
+    gcc -shared -fPIC -o "$shlib" "$shlib_src"
+
+    cat > "$prog_src" <<'C'
+#include <stdio.h>
+#include <dlfcn.h>
+int main(void) {
+    void *h = dlopen("libemb.so", RTLD_NOW);
+    if (!h) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }
+    int (*add)(int,int) = dlsym(h, "emb_add");
+    const char *(*greet)(void) = dlsym(h, "emb_greet");
+    if (!add || !greet) { fprintf(stderr, "dlsym: %s\n", dlerror()); return 1; }
+    printf("%s\n", greet());
+    printf("10+20=%d\n", add(10,20));
+    dlclose(h);
+    return 0;
+}
+C
+    gcc -o "$prog" "$prog_src" -ldl
+
+    local expect
+    expect=$(LD_LIBRARY_PATH="$BUILD" "$prog" 2>&1)
+
+    # Freeze with -d (direct) and -t (trace dlopen)
+    if ! LD_LIBRARY_PATH="$BUILD" "$DLFREEZE" -d -t -o "$out" "$prog" -- \
+            2>/dev/null; then
+        fail "direct-dlopen-embedded" "dlfreeze failed"; return
+    fi
+
+    # Run frozen binary — should load libemb.so from embedded image,
+    # NOT from the filesystem.  Remove the .so to prove it.
+    mv "$shlib" "${shlib}.bak"
+    local actual rc=0
+    actual=$(unset LD_LIBRARY_PATH; "$out" 2>&1) || rc=$?
+    mv "${shlib}.bak" "$shlib"
+
+    if [ "$expect" = "$actual" ] && [ "$rc" -eq 0 ]; then
+        pass "direct-dlopen embedded"
+    else
+        fail "direct-dlopen embedded" "output differs or failed (rc=$rc)"
+        echo "  expect: $expect"
+        echo "  actual: $actual"
+    fi
+
+    rm -f "$shlib_src" "$shlib" "$prog_src" "$prog" "$out"
+}
+
+# ===================================================================
+# Test 9: direct-mode dlopen with transitive DT_NEEDED deps
+# ===================================================================
+test_direct_dlopen_deps() {
+    echo "--- direct dlopen (deps) ---"
+    local dep_src="$BUILD/dep_lib.c"  dep="$BUILD/libdep.so"
+    local top_src="$BUILD/top_lib.c"  top="$BUILD/libtop.so"
+    local prog_src="$BUILD/use_dep.c" prog="$BUILD/use_dep"
+    local out="$BUILD/use_dep.frozen"
+
+    # Dependency library
+    cat > "$dep_src" <<'C'
+int dep_mul(int a, int b) { return a * b; }
+C
+    gcc -shared -fPIC -o "$dep" "$dep_src"
+
+    # Top-level library that depends on libdep.so
+    cat > "$top_src" <<'C'
+extern int dep_mul(int a, int b);
+int top_compute(int x) { return dep_mul(x, x); }
+C
+    gcc -shared -fPIC -o "$top" "$top_src" -L"$BUILD" -ldep
+
+    cat > "$prog_src" <<'C'
+#include <stdio.h>
+#include <dlfcn.h>
+int main(void) {
+    void *h = dlopen("libtop.so", RTLD_NOW);
+    if (!h) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }
+    int (*compute)(int) = dlsym(h, "top_compute");
+    if (!compute) { fprintf(stderr, "dlsym: %s\n", dlerror()); return 1; }
+    printf("7^2=%d\n", compute(7));
+    dlclose(h);
+    return 0;
+}
+C
+    gcc -o "$prog" "$prog_src" -ldl
+
+    local expect
+    expect=$(LD_LIBRARY_PATH="$BUILD" "$prog" 2>&1)
+
+    # Freeze with -d -t — both libtop.so and libdep.so should be captured
+    if ! LD_LIBRARY_PATH="$BUILD" "$DLFREEZE" -d -t -o "$out" "$prog" -- \
+            2>/dev/null; then
+        fail "direct-dlopen-deps" "dlfreeze failed"; return
+    fi
+
+    # Remove both .so files to prove they load from frozen image
+    mv "$dep" "${dep}.bak"
+    mv "$top" "${top}.bak"
+    local actual rc=0
+    actual=$(unset LD_LIBRARY_PATH; "$out" 2>&1) || rc=$?
+    mv "${dep}.bak" "$dep"
+    mv "${top}.bak" "$top"
+
+    if [ "$expect" = "$actual" ] && [ "$rc" -eq 0 ]; then
+        pass "direct-dlopen deps"
+    else
+        fail "direct-dlopen deps" "output differs or failed (rc=$rc)"
+        echo "  expect: $expect"
+        echo "  actual: $actual"
+    fi
+
+    rm -f "$dep_src" "$dep" "$top_src" "$top" "$prog_src" "$prog" "$out"
+}
+
+# ===================================================================
+# Test 10: direct-mode dlopen fallback warning (lib not in image)
+# ===================================================================
+test_direct_dlopen_fallback() {
+    echo "--- direct dlopen (fallback) ---"
+    local shlib_src="$BUILD/fb2_lib.c"  shlib="$BUILD/libfb2.so"
+    local prog_src="$BUILD/use_fb2.c"   prog="$BUILD/use_fb2"
+    local out="$BUILD/use_fb2.frozen"
+
+    cat > "$shlib_src" <<'C'
+int fb2_double(int x) { return x * 2; }
+C
+    gcc -shared -fPIC -o "$shlib" "$shlib_src"
+    local shlib_abs
+    shlib_abs=$(realpath "$shlib")
+
+    # Program loads via absolute path — will NOT be captured during trace
+    # because we trace with a different command that doesn't trigger this dlopen
+    cat > "$prog_src" <<C
+#include <stdio.h>
+#include <dlfcn.h>
+int main(void) {
+    printf("before\n");
+    void *h = dlopen("$shlib_abs", RTLD_NOW);
+    if (!h) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }
+    int (*dbl)(int) = dlsym(h, "fb2_double");
+    if (!dbl) { fprintf(stderr, "dlsym: %s\n", dlerror()); return 1; }
+    printf("double(21)=%d\n", dbl(21));
+    dlclose(h);
+    return 0;
+}
+C
+    gcc -o "$prog" "$prog_src" -ldl
+
+    local expect
+    expect=$("$prog" 2>&1)
+
+    # Freeze with -d but WITHOUT -t — no dlopen tracing, lib won't be embedded
+    if ! "$DLFREEZE" -d -o "$out" "$prog" 2>/dev/null; then
+        fail "direct-dlopen-fallback" "dlfreeze failed"; return
+    fi
+
+    # Run — should see warning on stderr but succeed
+    local actual stderr_out rc=0
+    actual=$("$out" 2>/tmp/dlfreeze_test_stderr) || rc=$?
+    stderr_out=$(cat /tmp/dlfreeze_test_stderr)
+
+    if [ "$expect" = "$actual" ] && [ "$rc" -eq 0 ]; then
+        if echo "$stderr_out" | grep -q "warning.*not in frozen image" 2>/dev/null; then
+            pass "direct-dlopen fallback+warning"
+        else
+            pass "direct-dlopen fallback (no warning)"
+        fi
+    else
+        fail "direct-dlopen fallback" "output differs or failed (rc=$rc)"
+        echo "  expect: $expect"
+        echo "  actual: $actual"
+    fi
+
+    rm -f "$shlib_src" "$shlib" "$prog_src" "$prog" "$out" /tmp/dlfreeze_test_stderr
+}
+
+# ===================================================================
+# Test 11: direct-mode python with C extensions (hashlib, sqlite3)
+# ===================================================================
+test_python3_direct() {
+    echo "--- python3 direct-load ---"
+    if ! command -v python3 &>/dev/null; then skip "python3-direct" "not installed"; return; fi
+
+    local pypath out="$BUILD/python3d.frozen"
+    pypath=$(readlink -f "$(which python3)")
+
+    # Freeze with -d (direct) and -t (trace dlopen) to capture C extensions
+    if ! "$DLFREEZE" -d -t -o "$out" "$pypath" -- -c \
+         'import hashlib,sqlite3; print("traced")' 2>/dev/null; then
+        fail "python3-direct" "dlfreeze failed"; return
+    fi
+
+    # hashlib — C extension that loads libcrypto.so via DT_NEEDED
+    local expect actual
+    expect=$(python3 -c 'import hashlib; print(hashlib.sha256(b"hello").hexdigest())' 2>&1)
+    actual=$("$out" -c 'import hashlib; print(hashlib.sha256(b"hello").hexdigest())' 2>&1)
+    if [ "$expect" = "$actual" ]; then pass "python3 direct hashlib"; else
+        fail "python3 direct hashlib" "output differs: expected=$expect actual=$actual"; fi
+
+    # sqlite3 — C extension that loads libsqlite3.so
+    expect=$(python3 -c 'import sqlite3; c=sqlite3.connect(":memory:"); c.execute("CREATE TABLE t(x)"); c.execute("INSERT INTO t VALUES(42)"); print(c.execute("SELECT x FROM t").fetchone()[0])' 2>&1)
+    actual=$("$out" -c 'import sqlite3; c=sqlite3.connect(":memory:"); c.execute("CREATE TABLE t(x)"); c.execute("INSERT INTO t VALUES(42)"); print(c.execute("SELECT x FROM t").fetchone()[0])' 2>&1)
+    if [ "$expect" = "$actual" ]; then pass "python3 direct sqlite3"; else
+        fail "python3 direct sqlite3" "output differs: expected=$expect actual=$actual"; fi
+
+    rm -f "$out"
+}
+
+# ===================================================================
 echo "======== dlfreeze test suite ========"
 echo "build dir: $BUILD"
 echo ""
@@ -337,6 +557,10 @@ test_dlopen_program
 test_dlopen_fallback
 test_python3
 test_python3_advanced
+test_direct_dlopen_embedded
+test_direct_dlopen_deps
+test_direct_dlopen_fallback
+test_python3_direct
 
 echo ""
 echo "======== ${GRN}$PASS passed${RST}, ${RED}$FAIL failed${RST}, ${YLW}$SKIP skipped${RST} ========"
