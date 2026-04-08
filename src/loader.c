@@ -29,6 +29,7 @@
 #define LDR_FLAG_SHLIB       0x04
 #define LDR_FLAG_DLOPEN      0x08
 #define LDR_FLAG_PRELINKED   0x10
+#define LDR_FLAG_NEEDS_RTLD  0x20
 
 /* Zeroed page used as target for unresolved OBJECT symbols.
  * Prevents NULL dereference crashes in IFUNC resolvers. */
@@ -565,6 +566,7 @@ struct loaded_obj {
     /* Relocations */
     const Elf64_Rela *rela;
     size_t            rela_count;
+    size_t            rela_relative_count; /* DT_RELACOUNT: # of leading RELATIVE entries */
     const Elf64_Rela *jmprel;
     size_t            jmprel_count;
     const Elf64_Relr *relr;
@@ -1171,7 +1173,7 @@ static void parse_dynamic(struct loaded_obj *obj,
     size_t dyn_count = dyn_ph->p_memsz / sizeof(Elf64_Dyn);
 
     uint64_t symtab = 0, strtab = 0, strsz = 0;
-    uint64_t rela = 0, rela_sz = 0;
+    uint64_t rela = 0, rela_sz = 0, relacount = 0;
     uint64_t jmprel = 0, pltrelsz = 0;
     uint64_t relr = 0, relr_sz = 0;
     uint64_t hash_addr = 0;
@@ -1194,6 +1196,7 @@ static void parse_dynamic(struct loaded_obj *obj,
         case 36: /* DT_RELR */   relr = dyn[i].d_un.d_ptr;      break;
         case 35: /* DT_RELRSZ */ relr_sz = dyn[i].d_un.d_val;   break;
         case DT_VERSYM:       versym_addr = dyn[i].d_un.d_ptr;  break;
+        case DT_RELACOUNT:   relacount = dyn[i].d_un.d_val;    break;
         }
     }
 
@@ -1220,6 +1223,7 @@ static void parse_dynamic(struct loaded_obj *obj,
 
     if (rela)       obj->rela       = (const Elf64_Rela *)(base + rela);
     obj->rela_count   = rela_sz / sizeof(Elf64_Rela);
+    obj->rela_relative_count = relacount;
     if (jmprel)     obj->jmprel     = (const Elf64_Rela *)(base + jmprel);
     obj->jmprel_count = pltrelsz / sizeof(Elf64_Rela);
     if (relr)       obj->relr       = (const Elf64_Relr *)(base + relr);
@@ -1401,35 +1405,33 @@ static void apply_relr(struct loaded_obj *obj)
  * symbol is processed before _rtld_global_ro's own GLOB_DAT in the
  * same rela table, resolve_sym calls the IFUNC resolver → crash.
  * This pre-pass ensures the GOT slots are already populated.
+ *
+ * Optimised: only matches "_rtld_global" / "_rtld_global_ro" (2 names)
+ * with a first-char + 6th-char filter and early exit once both found.
  */
 static void preseed_rtld_got(struct loaded_obj *obj)
 {
     uint64_t base = obj->base;
+    int found = 0;   /* bitmask: bit 0 = _rtld_global, bit 1 = _rtld_global_ro */
 
-    /* scan rela.dyn */
-    for (size_t i = 0; i < obj->rela_count; i++) {
-        const Elf64_Rela *r = &obj->rela[i];
-        if (ELF64_R_TYPE(r->r_info) != R_X86_64_GLOB_DAT) continue;
-        uint32_t sidx = ELF64_R_SYM(r->r_info);
-        const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
-        uint64_t addr = lookup_fake_object(name);
-        if (addr) {
-            uint64_t *slot = (uint64_t *)(base + r->r_offset);
-            *slot = addr + r->r_addend;
-        }
-    }
-
-    /* scan rela.plt */
-    for (size_t i = 0; i < obj->jmprel_count; i++) {
-        const Elf64_Rela *r = &obj->jmprel[i];
-        uint32_t type = ELF64_R_TYPE(r->r_info);
-        if (type != R_X86_64_JUMP_SLOT && type != R_X86_64_GLOB_DAT) continue;
-        uint32_t sidx = ELF64_R_SYM(r->r_info);
-        const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
-        uint64_t addr = lookup_fake_object(name);
-        if (addr) {
-            uint64_t *slot = (uint64_t *)(base + r->r_offset);
-            *slot = addr + r->r_addend;
+    const Elf64_Rela *tabs[] = { obj->rela, obj->jmprel };
+    size_t counts[] = { obj->rela_count, obj->jmprel_count };
+    for (int t = 0; t < 2 && found != 3; t++) {
+        for (size_t i = 0; i < counts[t]; i++) {
+            const Elf64_Rela *r = &tabs[t][i];
+            uint32_t type = ELF64_R_TYPE(r->r_info);
+            if (type != R_X86_64_GLOB_DAT && type != R_X86_64_JUMP_SLOT)
+                continue;
+            uint32_t sidx = ELF64_R_SYM(r->r_info);
+            const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
+            /* Fast filter: both targets start with '_r' */
+            if (name[0] != '_' || name[1] != 'r') continue;
+            uint64_t addr = lookup_fake_object(name);
+            if (addr) {
+                *(uint64_t *)(base + r->r_offset) = addr + r->r_addend;
+                found |= (name[12] == '_') ? 2 : 1;  /* _ro vs plain */
+                if (found == 3) break;
+            }
         }
     }
 }
@@ -2482,38 +2484,62 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
          * fake rtld objects) for fast O(1) lookup per relocation. */
         build_special_table();
 
+        /* Pre-seed _rtld_global/_rtld_global_ro in every object's GOT
+         * before the merged pass.  IRELATIVE resolvers may call code in
+         * OTHER objects (e.g. libc) that reads _rtld_global_ro through
+         * that object's GOT, so we must patch all GOTs up front.
+         * Only scan objects flagged as importing these symbols. */
         for (int i = 0; i < nobj; i++)
-            preseed_rtld_got(&objs[i]);  /* seed _rtld_global_ro in all objects first */
+            if (objs[i].flags & LDR_FLAG_NEEDS_RTLD)
+                preseed_rtld_got(&objs[i]);
 
+        /* Single merged pass: patch overrides + resolve IRELATIVE.
+         * Skip leading RELATIVE entries in .rela.dyn (DT_RELACOUNT tells
+         * us how many there are) — they were applied at pre-link time. */
         for (int i = 0; i < nobj; i++) {
+            uint64_t base_i = objs[i].base;
             const Elf64_Rela *tabs[] = { objs[i].rela, objs[i].jmprel };
             size_t counts[] = { objs[i].rela_count, objs[i].jmprel_count };
+            size_t starts[] = { objs[i].rela_relative_count, 0 };
             for (int t = 0; t < 2; t++) {
-                for (size_t r = 0; r < counts[t]; r++) {
+                for (size_t r = starts[t]; r < counts[t]; r++) {
                     const Elf64_Rela *rel = &tabs[t][r];
                     uint32_t type = ELF64_R_TYPE(rel->r_info);
+
+                    if (type == R_X86_64_IRELATIVE) {
+                        typedef uint64_t (*ifunc_t)(void);
+                        ifunc_t resolver = (ifunc_t)(base_i + rel->r_addend);
+                        *(uint64_t *)(base_i + rel->r_offset) = resolver();
+                        continue;
+                    }
+
                     if (type != R_X86_64_GLOB_DAT &&
                         type != R_X86_64_JUMP_SLOT) continue;
                     uint32_t sidx = ELF64_R_SYM(rel->r_info);
                     if (sidx == 0) continue;
 
-                    uint64_t *slot = (uint64_t *)(objs[i].base + rel->r_offset);
+                    uint64_t *slot = (uint64_t *)(base_i + rel->r_offset);
 
                     if (*slot != 0) {
                         /* Fast path: pre-linker already resolved this.
                          * Only patch if it's a special symbol (override/
                          * stub/fake_rtld) whose address is runtime-only.
-                         * First-char filter avoids hashing most names. */
+                         * Prefix filter: all specials match dl*, _rt*,
+                         * _dl*, or __t* — reject _Z* (C++ mangled, 95%
+                         * of underscore symbols) and everything else. */
                         const char *name = objs[i].dynstr + objs[i].dynsym[sidx].st_name;
-                        char c = name[0];
-                        if (c == 'd' || c == '_') {
+                        char c0 = name[0], c1 = name[1];
+                        int maybe = (c0 == 'd' && c1 == 'l')
+                                 || (c0 == '_' && (c1 == 'r' || c1 == 'd'
+                                     || (c1 == '_' && name[2] == 't')));
+                        if (maybe) {
                             uint32_t gh = gnu_hash_calc(name);
                             uint64_t ovr = lookup_special(name, gh);
                             if (ovr) *slot = ovr + rel->r_addend;
                         }
                     } else {
-                        /* Slot is 0: IFUNC (left by pre-linker) or truly
-                         * unresolved.  Try special table, then full resolve. */
+                        /* Slot is 0: truly unresolved at pre-link time.
+                         * Try special table, then full resolve. */
                         const char *name = objs[i].dynstr + objs[i].dynsym[sidx].st_name;
                         uint32_t gh = gnu_hash_calc(name);
                         uint64_t ovr = lookup_special(name, gh);
@@ -2533,23 +2559,14 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
                 }
             }
         }
-        /* Run IRELATIVE pass — resolvers skipped at pre-link time. */
-        ldr_dbg("[loader] pre-linked: resolving IRELATIVE...\n");
-        for (int i = 0; i < nobj; i++) {
-            if (apply_all_relocs(&objs[i], objs, nobj, 1) < 0) {
-                ldr_msg("dlfreeze-loader: IRELATIVE failed for ");
-                ldr_msg(objs[i].name);
-                ldr_msg("\n");
-                _exit(127);
-            }
-        }
     } else {
         ldr_dbg("[loader] applying relocations...\n");
 
         /* Pre-seed _rtld_global/_rtld_global_ro GOT entries so IFUNC
          * resolvers called during GLOB_DAT processing work correctly. */
         for (int i = 0; i < nobj; i++)
-            preseed_rtld_got(&objs[i]);
+            if (objs[i].flags & LDR_FLAG_NEEDS_RTLD)
+                preseed_rtld_got(&objs[i]);
 
         for (int i = 0; i < nobj; i++) {
             if (apply_all_relocs(&objs[i], objs, nobj, 0) < 0) {

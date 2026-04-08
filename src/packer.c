@@ -109,6 +109,51 @@ static uint64_t find_named_symbol(FILE *f, const Elf64_Ehdr *ehdr,
     return found;
 }
 
+/* Check if an ELF imports _rtld_global or _rtld_global_ro (undefined refs). */
+static int has_rtld_import(FILE *f, const Elf64_Ehdr *ehdr)
+{
+    if (ehdr->e_shoff == 0 || ehdr->e_shnum == 0) return 0;
+    size_t shsz = (size_t)ehdr->e_shnum * ehdr->e_shentsize;
+    uint8_t *shdrs = malloc(shsz);
+    if (!shdrs) return 0;
+    if (fseek(f, ehdr->e_shoff, SEEK_SET) != 0 ||
+        fread(shdrs, 1, shsz, f) != shsz) { free(shdrs); return 0; }
+
+    int found = 0;
+    for (int i = 0; i < ehdr->e_shnum && !found; i++) {
+        Elf64_Shdr *sh = (Elf64_Shdr *)(shdrs + i * ehdr->e_shentsize);
+        if (sh->sh_type != SHT_DYNSYM) continue;
+        if (sh->sh_link >= ehdr->e_shnum || sh->sh_entsize != sizeof(Elf64_Sym))
+            continue;
+        Elf64_Shdr *str_sh = (Elf64_Shdr *)(shdrs + sh->sh_link * ehdr->e_shentsize);
+        char *strtab = malloc(str_sh->sh_size ? (size_t)str_sh->sh_size : 1);
+        Elf64_Sym *syms = malloc(sh->sh_size ? (size_t)sh->sh_size : 1);
+        if (!strtab || !syms) { free(strtab); free(syms); continue; }
+        if (fseek(f, str_sh->sh_offset, SEEK_SET) != 0 ||
+            fread(strtab, 1, str_sh->sh_size, f) != str_sh->sh_size ||
+            fseek(f, sh->sh_offset, SEEK_SET) != 0 ||
+            fread(syms, 1, sh->sh_size, f) != sh->sh_size) {
+            free(strtab); free(syms); continue;
+        }
+        size_t nsyms = sh->sh_size / sizeof(Elf64_Sym);
+        for (size_t j = 0; j < nsyms; j++) {
+            if (syms[j].st_shndx != SHN_UNDEF) continue;
+            if (syms[j].st_name >= str_sh->sh_size) continue;
+            const char *nm = strtab + syms[j].st_name;
+            if (nm[0] == '_' && nm[1] == 'r' &&
+                (strcmp(nm, "_rtld_global") == 0 ||
+                 strcmp(nm, "_rtld_global_ro") == 0)) {
+                found = 1;
+                break;
+            }
+        }
+        free(strtab);
+        free(syms);
+    }
+    free(shdrs);
+    return found;
+}
+
 /*
  * Extract `main` address from _start for stripped PIE binaries.
  * Scans the entry point code for `lea disp32(%rip), %rdi` (48 8d 3d XX XX XX XX)
@@ -180,6 +225,10 @@ static int compute_lib_meta(const char *path, uint64_t base, uint32_t flags,
     meta->phdr_entsz = ehdr.e_phentsize;
     meta->flags      = flags;
     meta->_reserved  = 0;
+
+    /* Check if this library imports _rtld_global/_rtld_global_ro */
+    if (has_rtld_import(f, &ehdr))
+        meta->flags |= DLFRZ_FLAG_NEEDS_RTLD;
 
     /* Read program headers to get VA span */
     size_t phsz = ehdr.e_phnum * ehdr.e_phentsize;
