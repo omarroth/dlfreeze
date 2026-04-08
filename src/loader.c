@@ -100,12 +100,35 @@ static void crash_handler(int sig, siginfo_t *info, void *ucontext)
     uint64_t rsp = (uint64_t)uc->uc_mcontext.gregs[REG_RSP];
     ldr_hex("[loader] RSP=0x", rsp);
     if (rsp > 0x1000) {
-        for (int f = 0; f < 10; f++)
-            ldr_hex("[loader] stack: ", *(uint64_t *)(rsp + f * 8));
+        /* Walk up the stack using RBP chain */
+        uint64_t rbp = (uint64_t)uc->uc_mcontext.gregs[REG_RBP];
+        ldr_msg("[loader] backtrace:\n");
+        ldr_hex("[loader]  frame0 ret=", *(uint64_t *)(rsp));
+        for (int f = 0; f < 15 && rbp > 0x1000; f++) {
+            ldr_hex("[loader]  frame ret=", *(uint64_t *)(rbp + 8));
+            rbp = *(uint64_t *)(rbp);
+        }
     }
     ldr_hex("[loader] RBP=0x", (uint64_t)uc->uc_mcontext.gregs[REG_RBP]);
     ldr_hex("[loader] RAX=0x", (uint64_t)uc->uc_mcontext.gregs[REG_RAX]);
     ldr_hex("[loader] RDI=0x", (uint64_t)uc->uc_mcontext.gregs[REG_RDI]);
+    /* Show FS:0x10 (thread self pointer) for TLS diagnosis */
+    {
+        uintptr_t fs_base = 0;
+        syscall(SYS_arch_prctl, 0x1003 /*ARCH_GET_FS*/, &fs_base);
+        ldr_hex("[loader] FS_BASE=0x", fs_base);
+        ldr_hex("[loader] gettid=", (uint64_t)syscall(SYS_gettid));
+        /* Dump first 72 bytes of TCB (9 qwords: tcb,dtv,self,...,stack_guard,ptr_guard) */
+        if (fs_base > 0x1000) {
+            ldr_hex("[loader] tcb[0x00]=", *(uint64_t *)(fs_base + 0));
+            ldr_hex("[loader] tcb[0x08]=", *(uint64_t *)(fs_base + 8));
+            ldr_hex("[loader] tcb[0x10]=", *(uint64_t *)(fs_base + 16));
+            ldr_hex("[loader] tcb[0x18]=", *(uint64_t *)(fs_base + 24));
+            ldr_hex("[loader] tcb[0x20]=", *(uint64_t *)(fs_base + 32));
+            ldr_hex("[loader] tcb[0x28]=", *(uint64_t *)(fs_base + 40));
+            ldr_hex("[loader] tcb[0x30]=", *(uint64_t *)(fs_base + 48));
+        }
+    }
     if (sig == SIGABRT && g_arena_addr) {
         uintptr_t a = g_arena_addr;
         uintptr_t top = *(uint64_t *)(a + 0x08);
@@ -151,6 +174,28 @@ static void crash_handler(int sig, siginfo_t *info, void *ucontext)
 
 static uint8_t *g_fake_rtld_global;
 static uint8_t *g_fake_rtld_global_ro;
+
+/* Fake link_map used by __cxa_thread_atexit_impl and other glibc internals
+ * that dereference _rtld_global._dl_ns[0]._ns_loaded (offset 0).
+ * Only the reference counter at link_map + 0x498 needs to be writable. */
+static uint8_t g_fake_link_map[0x500] __attribute__((aligned(64)));
+
+/* ---- rseq stub variables (replace ld-linux's __rseq_*) --------------- */
+/*
+ * glibc 2.35+ uses __rseq_offset / __rseq_size / __rseq_flags (defined
+ * in ld-linux) to register restartable sequences per thread.  Since
+ * ld-linux is not mapped in frozen binaries, libc's GOT slots for these
+ * point to zero-filled anonymous memory, causing rseq to register at
+ * offset 0 (= the TCB itself).  On thread cleanup glibc memsets the
+ * rseq area, destroying the TCB and causing SIGSEGV.
+ *
+ * We provide our own copies.  __rseq_offset = -160 matches glibc 2.43
+ * on x86-64 (offsetof(struct pthread, rseq_area) from the thread pointer).
+ * __rseq_size = 32 is the minimum kernel rseq struct size.
+ */
+static int64_t  g_rseq_offset = -160;
+static uint32_t g_rseq_size   = 32;
+static uint32_t g_rseq_flags  = 0;
 
 /* ---- _rtld_global_ro function-pointer stubs (dl* wrappers) ----------- */
 /*
@@ -374,6 +419,12 @@ static int init_fake_rtld(void)
     *(int    *)(g_fake_rtld_global + GL_DL_STACK_FLAGS_OFF)     = 3; /* PROT_READ|PROT_WRITE */
     *(size_t *)(g_fake_rtld_global + GL_DL_TLS_GENERATION_OFF) = 1;
 
+    /* _dl_ns[0]._ns_loaded — pointer to the head link_map.  Used by
+     * __cxa_thread_atexit_impl when _dl_find_dso_for_object returns NULL:
+     * it falls back to *(_rtld_global+0) to get a link_map and increments
+     * a reference counter at link_map+0x498. */
+    *(uintptr_t *)(g_fake_rtld_global + 0) = (uintptr_t)g_fake_link_map;
+
     /* Empty circular lists for stack tracking */
     init_empty_list(g_fake_rtld_global, GL_DL_STACK_USED_OFF);
     init_empty_list(g_fake_rtld_global, GL_DL_STACK_USER_OFF);
@@ -462,7 +513,9 @@ static void *stub_tls_get_addr(struct tls_index *ti)
     __asm__ volatile("mov %%fs:0, %0" : "=r"(tp));
     uintptr_t *dtv = *(uintptr_t **)(tp + 8 /* TCB_OFF_DTV */);
     if (dtv) {
-        /* dtv[module * 2] = pointer to start of that module's TLS block */
+        /* glibc convention: tcb->dtv points to dtv[1] in the raw array.
+         * dtv[modid] = {val, to_free} — each slot is 2 uintptr_t's.
+         * So dtv[modid * 2] = pointer to start of that module's TLS block */
         uintptr_t tls_block = dtv[ti->ti_module * 2];
         if (tls_block) {
             return (void *)(tls_block + ti->ti_offset);
@@ -604,10 +657,23 @@ static struct dlfrz_lib_meta g_dl_metas[MAX_TOTAL_OBJS];
 
 /* _dl_allocate_tls_init — copy .tdata for every TLS module into a
  * new thread's TLS block.  Called by glibc's pthread_create. */
+static int g_tls_alloc_count;
+static int g_tls_init_count;
 static void *stub_dl_allocate_tls_init(void *mem)
 {
     uintptr_t tp = (uintptr_t)mem;
-    ldr_dbg("[loader] _dl_allocate_tls_init called\n");
+    g_tls_init_count++;
+    ldr_dbg("[loader] _dl_allocate_tls_init #");
+    ldr_dbg_hex("", (uint64_t)g_tls_init_count);
+    ldr_dbg_hex("[loader]   tp=", tp);
+    ldr_dbg_hex("[loader]   tid=", (uint64_t)syscall(SYS_gettid));
+    /* Log caller thread's fs:0x10 for diagnostics */
+    if (g_debug) {
+        uintptr_t fs_self;
+        __asm__ volatile("mov %%fs:0x10, %0" : "=r"(fs_self));
+        ldr_dbg_hex("[loader]   caller fs:0x10=", fs_self);
+        ldr_dbg_hex("[loader]   tp+0x10 before=", *(uintptr_t *)(tp + 16));
+    }
     for (int i = 0; i < g_nobj; i++) {
         if (g_all_objs[i].tls.memsz == 0) continue;
         uint8_t *dst = (uint8_t *)(tp + g_all_objs[i].tls.tpoff);
@@ -616,31 +682,50 @@ static void *stub_dl_allocate_tls_init(void *mem)
         ldr_dbg("[loader] tls_init: ");
         ldr_dbg(g_all_objs[i].name ? g_all_objs[i].name : "?");
         ldr_dbg_hex(" tpoff=", (uintptr_t)g_all_objs[i].tls.tpoff);
-        ldr_dbg_hex(" filesz=", g_all_objs[i].tls.filesz);
-        ldr_dbg_hex(" src[0]=", g_all_objs[i].tls.filesz >= 8 ? *(uint64_t *)src : 0);
         memcpy(dst, src, g_all_objs[i].tls.filesz);
         /* Zero the .tbss portion */
         size_t bss = g_all_objs[i].tls.memsz - g_all_objs[i].tls.filesz;
         if (bss > 0)
             memset(dst + g_all_objs[i].tls.filesz, 0, bss);
     }
+
+    /* Ensure TCB self-pointers survive the TLS re-init (cached stack
+     * reuse path calls _dl_allocate_tls_init without _dl_allocate_tls,
+     * and the stored self-pointer might have been cleared). */
+    *(uintptr_t *)(tp + TCB_OFF_SELF)  = tp;
+    *(uintptr_t *)(tp + TCB_OFF_SELF2) = tp;
+
     return mem;
 }
 
 /* _dl_allocate_tls — allocate DTV and copy .tdata for a new thread. */
+static uintptr_t g_last_tls_tp;
 static void *stub_dl_allocate_tls(void *mem)
 {
+    g_tls_alloc_count++;
+    ldr_dbg("[loader] _dl_allocate_tls #");
+    ldr_dbg_hex("", (uint64_t)g_tls_alloc_count);
+    ldr_dbg_hex("[loader]   tid=", (uint64_t)syscall(SYS_gettid));
     if (!mem) return NULL;
     uintptr_t tp = (uintptr_t)mem;
 
-    /* Set up a minimal DTV for the new thread so __tls_get_addr works. */
+    /* Set up a minimal DTV for the new thread so __tls_get_addr works.
+     * glibc convention: tcbhead.dtv = &raw_dtv[1] (in dtv_t units, each
+     * dtv_t is 2 * sizeof(uintptr_t) = 16 bytes on x86-64).
+     *   raw_dtv[0].counter = generation
+     *   raw_dtv[1]         = unused / nptl bookkeeping
+     *   raw_dtv[modid]     = {val, to_free} for TLS module modid (1-indexed)
+     * So tcbhead.dtv[-1].counter = generation, tcbhead.dtv[modid] = module.
+     */
     size_t dtv_slots = 2 + (size_t)g_nobj;
-    size_t dtv_bytes = dtv_slots * 2 * sizeof(uintptr_t);
-    uintptr_t *dtv = mmap(NULL, (dtv_bytes + 4095) & ~4095UL,
+    size_t raw_dtv_bytes = (1 + dtv_slots) * 2 * sizeof(uintptr_t); /* +1 for dtv[-1] */
+    uintptr_t *raw_dtv = mmap(NULL, (raw_dtv_bytes + 4095) & ~4095UL,
         PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (dtv != MAP_FAILED) {
-        dtv[0] = 1;  /* generation */
-        dtv[1] = 0;
+    if (raw_dtv != MAP_FAILED) {
+        raw_dtv[0] = 1;  /* generation counter at raw_dtv[0] = tcb->dtv[-1] */
+        raw_dtv[1] = 0;
+        /* The pointer stored in tcb->dtv is offset by one dtv_t entry */
+        uintptr_t *dtv = raw_dtv + 2; /* skip dtv_t[0] = 2 uintptr_t's */
         for (int i = 0; i < g_nobj; i++) {
             if (g_all_objs[i].tls.memsz == 0) continue;
             size_t slot = g_all_objs[i].tls.modid;
@@ -652,8 +737,35 @@ static void *stub_dl_allocate_tls(void *mem)
         *(uintptr_t *)(tp + 8 /* TCB_OFF_DTV */) = (uintptr_t)dtv;
     }
 
+    /* Initialize TCB self-pointers so that %fs:0 and %fs:0x10 are valid
+     * as soon as the new thread starts.  glibc's allocate_stack is
+     * expected to set pd->header.self = pd after we return, but on some
+     * builds the store is absent or overwritten, so we ensure it here. */
+    *(uintptr_t *)(tp + TCB_OFF_SELF)  = tp;   /* tcbhead.tcb  (offset 0)  */
+    *(uintptr_t *)(tp + TCB_OFF_SELF2) = tp;   /* tcbhead.self (offset 16) */
+
     /* Copy .tdata for all TLS modules */
-    return stub_dl_allocate_tls_init(mem);
+    void *ret = stub_dl_allocate_tls_init(mem);
+
+    /* Verify our writes survived — debug diagnostics */
+    g_last_tls_tp = tp;
+    if (g_debug) {
+        ldr_dbg_hex("[loader] alloc_tls done tp+0x00=", *(uintptr_t *)(tp + 0));
+        ldr_dbg_hex("[loader] alloc_tls done tp+0x08=", *(uintptr_t *)(tp + 8));
+        ldr_dbg_hex("[loader] alloc_tls done tp+0x10=", *(uintptr_t *)(tp + 16));
+        ldr_dbg_hex("[loader] alloc_tls done tp+0x18=", *(uintptr_t *)(tp + 24));
+        /* Dump libc TPOFF64 GOT entries to verify relocation correctness */
+        for (int i = 0; i < g_nobj; i++) {
+            if (g_all_objs[i].name && strcmp(g_all_objs[i].name, "libc.so.6") == 0) {
+                uintptr_t lb = g_all_objs[i].base;
+                ldr_dbg_hex("[loader] libc GOT[0x1e6ef0] (tpoff+0x00) =", *(int64_t *)(lb + 0x1e6ef0));
+                ldr_dbg_hex("[loader] libc GOT[0x1e6fe0] (tpoff+0x10) =", *(int64_t *)(lb + 0x1e6fe0));
+                ldr_dbg_hex("[loader] libc GOT[0x1e6fc8] (tpoff+0x28) =", *(int64_t *)(lb + 0x1e6fc8));
+                break;
+            }
+        }
+    }
+    return ret;
 }
 
 /* ---- _dl_find_object implementation ---------------------------------- */
@@ -936,6 +1048,9 @@ static void build_special_table(void)
         SPEC_INSERT("_rtld_global", g_fake_rtld_global);
     if (g_fake_rtld_global_ro)
         SPEC_INSERT("_rtld_global_ro", g_fake_rtld_global_ro);
+    SPEC_INSERT("__rseq_offset", &g_rseq_offset);
+    SPEC_INSERT("__rseq_size",   &g_rseq_size);
+    SPEC_INSERT("__rseq_flags",  &g_rseq_flags);
     #undef SPEC_INSERT
 
     g_special_tab_ready = 1;
@@ -2198,15 +2313,24 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
      *   dtv[1].pointer.to_free = NULL
      * We allocate a small array.  Module 1 = libc's TLS block.
      */
+    /* Minimal DTV (Dynamic Thread Vector).
+     * glibc convention: tcbhead.dtv points to raw_dtv[1] (offset by one
+     * dtv_t entry = 16 bytes), so that dtv[-1].counter = generation.
+     *   raw_dtv[0].counter = generation
+     *   dtv = raw_dtv + 1 (in dtv_t units)
+     *   dtv[modid] = {val, to_free} for TLS module modid (1-indexed)
+     */
     size_t dtv_slots = 2 + (size_t)nobj;
-    size_t dtv_bytes = dtv_slots * 2 * sizeof(uintptr_t);
-    uintptr_t *dtv = (uintptr_t *)mmap(NULL, ALIGN_UP(dtv_bytes, 4096),
+    size_t raw_dtv_bytes = (1 + dtv_slots) * 2 * sizeof(uintptr_t);
+    uintptr_t *raw_dtv = (uintptr_t *)mmap(NULL, ALIGN_UP(raw_dtv_bytes, 4096),
         PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (dtv != MAP_FAILED) {
-        /* dtv[0] = generation counter */
-        dtv[0] = 1;   /* generation */
-        dtv[1] = 0;
-        /* dtv[i] for each TLS module: .val = tp + tpoff, .to_free = NULL
+    if (raw_dtv != MAP_FAILED) {
+        /* raw_dtv[0] = generation counter (accessed as dtv[-1]) */
+        raw_dtv[0] = 1;   /* generation */
+        raw_dtv[1] = 0;
+        /* dtv = raw_dtv + one dtv_t entry (2 uintptr_t's) */
+        uintptr_t *dtv = raw_dtv + 2;
+        /* dtv[modid] for each TLS module: .val = tp + tpoff, .to_free = NULL
          * glibc uses 1-indexed modules, dtv[1] = module 1, etc. */
         for (int oi = 0; oi < nobj; oi++) {
             if (objs[oi].tls.memsz == 0) continue;
@@ -2525,13 +2649,13 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
                          * Only patch if it's a special symbol (override/
                          * stub/fake_rtld) whose address is runtime-only.
                          * Prefix filter: all specials match dl*, _rt*,
-                         * _dl*, or __t* — reject _Z* (C++ mangled, 95%
-                         * of underscore symbols) and everything else. */
+                         * _dl*, __t*, or __r* — reject _Z* (C++ mangled,
+                         * 95% of underscore symbols) and everything else. */
                         const char *name = objs[i].dynstr + objs[i].dynsym[sidx].st_name;
                         char c0 = name[0], c1 = name[1];
                         int maybe = (c0 == 'd' && c1 == 'l')
                                  || (c0 == '_' && (c1 == 'r' || c1 == 'd'
-                                     || (c1 == '_' && name[2] == 't')));
+                                     || (c1 == '_' && (name[2] == 't' || name[2] == 'r'))));
                         if (maybe) {
                             uint32_t gh = gnu_hash_calc(name);
                             uint64_t ovr = lookup_special(name, gh);
