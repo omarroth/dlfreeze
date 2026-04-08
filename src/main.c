@@ -183,7 +183,25 @@ int main(int argc, char **argv)
                     if (verbose)
                         printf("trace exit status: %d\n",
                                WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+                    /* Show trace contents before processing */
+                    if (verbose) {
+                        FILE *tf = fopen(tracef, "r");
+                        if (tf) {
+                            char ln[1024];
+                            printf("traced:\n");
+                            while (fgets(ln, sizeof(ln), tf))
+                                printf("  %s", ln);
+                            fclose(tf);
+                        }
+                    }
                     dep_add_dlopen_libs(&deps, tracef);
+                    if (verbose) {
+                        printf("libraries after trace: %d\n", deps.count);
+                        for (int i = 0; i < deps.count; i++)
+                            if (deps.libs[i].from_dlopen)
+                                printf("  (dlopen) %-30s → %s\n",
+                                       deps.libs[i].name, deps.libs[i].path);
+                    }
                 }
                 unlink(tracef);
             }

@@ -2184,12 +2184,13 @@ static void *my_dlopen(const char *path, int flags)
         }
     }
 
-    /* Warn when loading from filesystem — this library wasn't captured */
-    ldr_msg("dlfreeze: warning: dlopen loading '");
-    ldr_msg(bn);
-    ldr_msg("' from disk (not in frozen image)\n");
-
     void *ret = load_elf_from_file(path);
+    if (ret) {
+        /* Loaded from disk — this library should have been captured */
+        ldr_msg("dlfreeze: warning: dlopen loading '");
+        ldr_msg(bn);
+        ldr_msg("' from disk (not in frozen image)\n");
+    }
     restore_ptr_guard();
     return ret;
 }
