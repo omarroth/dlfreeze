@@ -80,6 +80,28 @@ static void ldr_err(const char *ctx, const char *detail)
 #include <signal.h>
 /* Pointer to mapped libc's main_arena, set during init for crash diagnostics */
 static uintptr_t g_arena_addr;
+/* Saved pointer_guard value and its address, for crash diagnostics */
+static uintptr_t g_saved_ptr_guard;
+static uintptr_t g_ptr_guard_addr;
+
+/*
+ * restore_ptr_guard — fix corruption from bootstrap libc's errno writes.
+ *
+ * The bootstrap binary is statically linked with musl, which stores
+ * errno at FS:0x34.  After setup_tls switches FS to a glibc-compatible
+ * TCB, musl's __syscall_ret still writes errno at FS:0x34, which
+ * overlaps with glibc's pointer_guard at FS:0x30 (bytes 4-7 of the
+ * 8-byte field on little-endian x86-64).  Any failing syscall through
+ * the bootstrap's libc corrupts the pointer guard.
+ *
+ * Call this after any section that may invoke failing syscalls through
+ * bootstrap (musl) wrappers (e.g. open, stat, mmap returning error).
+ */
+static inline void restore_ptr_guard(void)
+{
+    if (g_ptr_guard_addr)
+        *(uintptr_t *)g_ptr_guard_addr = g_saved_ptr_guard;
+}
 
 static void crash_handler(int sig, siginfo_t *info, void *ucontext)
 {
@@ -127,6 +149,15 @@ static void crash_handler(int sig, siginfo_t *info, void *ucontext)
             ldr_hex("[loader] tcb[0x20]=", *(uint64_t *)(fs_base + 32));
             ldr_hex("[loader] tcb[0x28]=", *(uint64_t *)(fs_base + 40));
             ldr_hex("[loader] tcb[0x30]=", *(uint64_t *)(fs_base + 48));
+        }
+    }
+    /* Check if pointer_guard was corrupted */
+    if (g_saved_ptr_guard) {
+        ldr_hex("[loader] SAVED ptr_guard=", g_saved_ptr_guard);
+        ldr_hex("[loader] ptr_guard_addr=", g_ptr_guard_addr);
+        if (g_ptr_guard_addr > 0x1000) {
+            ldr_hex("[loader] CURRENT *ptr_guard_addr=",
+                    *(uint64_t *)g_ptr_guard_addr);
         }
     }
     if (sig == SIGABRT && g_arena_addr) {
@@ -746,6 +777,8 @@ static void *stub_dl_allocate_tls(void *mem)
 
     /* Copy .tdata for all TLS modules */
     void *ret = stub_dl_allocate_tls_init(mem);
+
+    restore_ptr_guard();
 
     /* Verify our writes survived — debug diagnostics */
     g_last_tls_tp = tp;
@@ -1951,6 +1984,10 @@ static struct loaded_obj *load_elf_from_file(const char *path)
     /* Set final memory protections */
     protect_object(obj, meta);
 
+    /* Restore pointer_guard before calling init functions — the bootstrap
+     * libc may have corrupted it via errno writes during open/mmap. */
+    restore_ptr_guard();
+
     /* Call init functions */
     typedef void (*init_fn_t)(int, char **, char **);
     if (obj->init_func)
@@ -2095,6 +2132,10 @@ static struct loaded_obj *load_embedded_object(uint32_t mi)
     /* Set final memory protections */
     protect_object(obj, meta);
 
+    /* Restore pointer_guard before init functions — bootstrap libc errno
+     * writes from dependency loading may have corrupted it. */
+    restore_ptr_guard();
+
     /* Call init functions */
     typedef void (*init_fn_t)(int, char **, char **);
     if (obj->init_func)
@@ -2133,7 +2174,10 @@ static void *my_dlopen(const char *path, int flags)
             const char *ename = g_frozen_strtab + g_frozen_entries[i].name_offset;
             if (strcmp(dl_basename(ename), bn) == 0) {
                 struct loaded_obj *obj = load_embedded_object(i);
-                if (obj) return obj;
+                if (obj) {
+                    restore_ptr_guard();
+                    return obj;
+                }
                 /* Fall through to filesystem on error */
                 break;
             }
@@ -2145,7 +2189,9 @@ static void *my_dlopen(const char *path, int flags)
     ldr_msg(bn);
     ldr_msg("' from disk (not in frozen image)\n");
 
-    return load_elf_from_file(path);
+    void *ret = load_elf_from_file(path);
+    restore_ptr_guard();
+    return ret;
 }
 
 static void *my_dlsym(void *handle, const char *symbol)
@@ -2376,6 +2422,10 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
         ldr_err("arch_prctl ARCH_SET_FS failed", NULL);
         return 0;
     }
+
+    /* Save pointer_guard value and address for crash diagnostics */
+    g_ptr_guard_addr = tp + TCB_OFF_PTR_GUARD;
+    g_saved_ptr_guard = *(uintptr_t *)(tp + TCB_OFF_PTR_GUARD);
 
     return tp;
 }
@@ -2712,8 +2762,9 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
 
     /* 5b. Copy .tdata AFTER relocations — the TLS template contains
      *     pointers that need RELATIVE/RELR relocation first. */
-    if (tp)
+    if (tp) {
         copy_tdata(objs, nobj, tp);
+    }
 
     /* 6. Set final memory protections.
      *    For pre-linked objects, segments were already mapped with their
@@ -2753,6 +2804,11 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
      *    and __tunable_get_val etc. resolve to our no-op stubs. */
     ldr_dbg("[loader] calling init functions...\n");
     typedef void (*init_fn_t)(int, char **, char **);
+
+    /* Ensure pointer_guard is correct before init functions — init code
+     * may call PTR_MANGLE-using functions like __cxa_atexit. */
+    restore_ptr_guard();
+
     /* Call in reverse order: libraries without dependents first (libc, libm,
      * etc.) then libraries that depend on them (libpython, etc.).
      * The packer stores objects as: exe, direct-deps, transitive-deps...
@@ -2820,6 +2876,7 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
                 ((void (*)(void *))(uintptr_t)libc_free_addr)(p);
         }
         ldr_dbg("[loader] calling main() directly...\n");
+        restore_ptr_guard();
         int rc = ((main_fn_t)(uintptr_t)main_addr)(argc, argv, envp);
         ldr_dbg("[loader] main() returned\n");
         /* Flush all stdio streams before _exit — _exit doesn't run atexit
@@ -2833,6 +2890,7 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
 
     /* Fallback: transfer control via _start → __libc_start_main. */
     ldr_dbg("[loader] transferring to _start...\n");
+    restore_ptr_guard();
     transfer_to_entry(entry, argc, argv, envp,
                       exe_phdr, exe_phnum, entry, at_random);
     /* NOTREACHED */
