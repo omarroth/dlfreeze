@@ -18,22 +18,40 @@
 /* ------------------------------------------------------------------ */
 void data_file_list_init(struct data_file_list *dl)
 {
-    dl->paths    = NULL;
-    dl->count    = 0;
-    dl->capacity = 0;
+    dl->paths      = NULL;
+    dl->is_virtual = NULL;
+    dl->count      = 0;
+    dl->capacity   = 0;
 }
 
-void data_file_list_add(struct data_file_list *dl, const char *path)
+static void data_file_list_add_ex(struct data_file_list *dl, const char *path,
+                                  int virt)
 {
     /* Deduplicate */
     for (int i = 0; i < dl->count; i++)
         if (strcmp(dl->paths[i], path) == 0) return;
 
     if (dl->count >= dl->capacity) {
-        dl->capacity = dl->capacity ? dl->capacity * 2 : 64;
-        dl->paths = realloc(dl->paths, dl->capacity * sizeof(char *));
+        int newcap = dl->capacity ? dl->capacity * 2 : 64;
+        dl->paths      = realloc(dl->paths, newcap * sizeof(char *));
+        dl->is_virtual = realloc(dl->is_virtual, newcap * sizeof(int));
+        for (int i = dl->capacity; i < newcap; i++)
+            dl->is_virtual[i] = 0;
+        dl->capacity = newcap;
     }
-    dl->paths[dl->count++] = strdup(path);
+    dl->paths[dl->count]      = strdup(path);
+    dl->is_virtual[dl->count] = virt;
+    dl->count++;
+}
+
+void data_file_list_add(struct data_file_list *dl, const char *path)
+{
+    data_file_list_add_ex(dl, path, 0);
+}
+
+void data_file_list_add_virtual(struct data_file_list *dl, const char *path)
+{
+    data_file_list_add_ex(dl, path, 1);
 }
 
 void data_file_list_free(struct data_file_list *dl)
@@ -41,7 +59,9 @@ void data_file_list_free(struct data_file_list *dl)
     for (int i = 0; i < dl->count; i++)
         free(dl->paths[i]);
     free(dl->paths);
+    free(dl->is_virtual);
     dl->paths = NULL;
+    dl->is_virtual = NULL;
     dl->count = dl->capacity = 0;
 }
 
@@ -1597,7 +1617,11 @@ int pack_frozen(const struct pack_options *opts)
         const char *dpath = opts->data_files->paths[i];
         strcpy(strtab + stroff, dpath);
         stroff += strlen(dpath) + 1;
-        if (append_file(out, dpath, &written) < 0) goto fail2;
+        if (opts->data_files->is_virtual && opts->data_files->is_virtual[i]) {
+            written = 0;
+        } else {
+            if (append_file(out, dpath, &written) < 0) goto fail2;
+        }
         entries[eidx].data_size = written;
         src_paths[eidx] = dpath;
         off += written; eidx++;

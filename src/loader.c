@@ -16,6 +16,7 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <elf.h>
 #include <link.h>
 #include <stdint.h>
@@ -872,7 +873,7 @@ static size_t g_dl_strbuf_used;
  * containing the embedded data instead of going to the real filesystem.
  */
 
-#define VFS_HASH_SIZE 1024U  /* must be power-of-two */
+#define VFS_HASH_SIZE 4096U  /* must be power-of-two */
 
 struct vfs_entry {
     const char     *path;      /* absolute path string (in strtab) */
@@ -890,6 +891,8 @@ static uint32_t vfs_hash(const char *s)
         h = h * 33 + (uint8_t)*s;
     return h;
 }
+
+static void vfs_init_dirs(void);
 
 static void vfs_init(const uint8_t *mem, uint64_t mem_foff,
                      const struct dlfrz_entry *entries,
@@ -911,6 +914,8 @@ static void vfs_init(const uint8_t *mem, uint64_t mem_foff,
         ldr_dbg_hex("[loader] vfs: 0x", g_vfs_count);
         ldr_msg(" data files registered\n");
     }
+    if (g_vfs_count > 0)
+        vfs_init_dirs();
 }
 
 static const struct vfs_entry *vfs_lookup(const char *path)
@@ -929,32 +934,375 @@ static const struct vfs_entry *vfs_lookup(const char *path)
 /* The VFS overrides are only populated in the special-table when
  * g_vfs_count > 0, so they are a no-op for non-VFS binaries. */
 
+/* ---- VFS directory table --------------------------------------------- */
+/*
+ * Derived from embedded file paths at init time.  For each file like
+ * /usr/lib/python3.14/json/__init__.py we record all parent directories:
+ *   /usr/lib/python3.14/json
+ *   /usr/lib/python3.14
+ *   /usr/lib
+ *   /usr
+ * This lets stat() report them as directories and opendir() list them.
+ */
+
+#define VFS_DIR_HASH_SIZE 2048U  /* power-of-two */
+
+static const char *g_vfs_dir_table[VFS_DIR_HASH_SIZE];
+static int g_vfs_dir_count;
+static char g_vfs_dir_strbuf[65536];
+static int g_vfs_dir_strpos;
+
+static uint32_t vfs_hash_n(const char *s, int n)
+{
+    uint32_t h = 5381;
+    for (int i = 0; i < n; i++)
+        h = h * 33 + (uint8_t)s[i];
+    return h;
+}
+
+/* Check if a directory path of exactly `len` bytes is already in the table */
+static int vfs_dir_exists_n(const char *path, int len)
+{
+    uint32_t idx = vfs_hash_n(path, len) & (VFS_DIR_HASH_SIZE - 1);
+    for (int p = 0; p < (int)VFS_DIR_HASH_SIZE; p++) {
+        if (!g_vfs_dir_table[idx]) return 0;
+        if (strncmp(g_vfs_dir_table[idx], path, len) == 0 &&
+            g_vfs_dir_table[idx][len] == '\0')
+            return 1;
+        idx = (idx + 1) & (VFS_DIR_HASH_SIZE - 1);
+    }
+    return 0;
+}
+
+static int vfs_dir_exists(const char *path)
+{
+    if (g_vfs_dir_count == 0) return 0;
+    return vfs_dir_exists_n(path, strlen(path));
+}
+
+/* Check if VFS has at least one direct child file in this directory.
+ * Used to distinguish dirs with captured contents from mere ancestor
+ * dirs derived from file paths. */
+
+/* Check if a VFS directory has at least one direct child file
+ * (not counting .dir markers, which are just structural hints). */
+static int vfs_dir_has_children(const char *dirpath)
+{
+    int dlen = strlen(dirpath);
+    for (int i = 0; i < (int)VFS_HASH_SIZE; i++) {
+        if (!g_vfs_table[i].path) continue;
+        const char *fp = g_vfs_table[i].path;
+        if (strncmp(fp, dirpath, dlen) != 0) continue;
+        if (fp[dlen] != '/') continue;
+        const char *rest = fp + dlen + 1;
+        if (strchr(rest, '/')) continue;  /* not direct child */
+        /* Skip .dir markers */
+        if (rest[0] == '.' && rest[1] == 'd' && rest[2] == 'i'
+            && rest[3] == 'r' && rest[4] == '\0') continue;
+        return 1;  /* real direct child file */
+    }
+    return 0;
+}
+
+static void vfs_dir_insert(const char *path, int len)
+{
+    if (g_vfs_dir_strpos + len + 1 > (int)sizeof(g_vfs_dir_strbuf)) return;
+    char *stored = g_vfs_dir_strbuf + g_vfs_dir_strpos;
+    memcpy(stored, path, len);
+    stored[len] = '\0';
+    g_vfs_dir_strpos += len + 1;
+
+    uint32_t idx = vfs_hash_n(path, len) & (VFS_DIR_HASH_SIZE - 1);
+    while (g_vfs_dir_table[idx])
+        idx = (idx + 1) & (VFS_DIR_HASH_SIZE - 1);
+    g_vfs_dir_table[idx] = stored;
+    g_vfs_dir_count++;
+}
+
+/* Build the directory table from all VFS file paths */
+static void vfs_init_dirs(void)
+{
+    g_vfs_dir_count = 0;
+    g_vfs_dir_strpos = 0;
+    for (int i = 0; i < (int)VFS_HASH_SIZE; i++) {
+        if (!g_vfs_table[i].path) continue;
+        const char *path = g_vfs_table[i].path;
+        int len = strlen(path);
+        /* Walk backwards, extracting each parent directory */
+        for (int j = len - 1; j > 0; j--) {
+            if (path[j] != '/') continue;
+            /* path[0..j-1] is a parent directory */
+            if (vfs_dir_exists_n(path, j))
+                break;  /* this dir (and all its parents) already known */
+            vfs_dir_insert(path, j);
+        }
+    }
+    if (g_debug && g_vfs_dir_count > 0) {
+        ldr_dbg_hex("[loader] vfs: 0x", g_vfs_dir_count);
+        ldr_msg(" directories derived\n");
+    }
+}
+
+/* ---- VFS opendir/readdir/closedir ------------------------------------ */
+/*
+ * We replace libc's opendir/readdir/closedir so Python's os.listdir()
+ * sees embedded files even when the real directories don't exist.
+ *
+ * For our fake DIR handles we use a magic sentinel at the start.
+ * glibc's real DIR struct starts with an int fd (small positive number),
+ * so our 8-byte magic is safe to distinguish.
+ *
+ * For real (non-VFS) directories, we implement opendir/readdir on top of
+ * raw syscalls (SYS_openat + SYS_getdents64) since we can't call through
+ * to glibc's implementations after patching the GOT.
+ */
+
+#define VFS_FAKE_DIR_MAGIC 0x564653444952ULL
+#define VFS_MAX_DIR_HANDLES 32
+
+struct vfs_dir_handle {
+    int            fd_compat;   /* offset-0: for dirfd() ABI compat  */
+    int            _pad;
+    uint64_t       magic;       /* VFS_FAKE_DIR_MAGIC                */
+    const char    *vfs_path;    /* NUL-terminated dir path (VFS)     */
+    int            vfs_path_len;
+    int            scan_pos;    /* iteration position                */
+    int            phase;       /* 0=files, 1=subdirs, 2=done        */
+    /* getdents64 buffer for real (non-VFS) dirs: */
+    char           gd_buf[4096];
+    int            gd_pos;
+    int            gd_len;
+    /* Return value for readdir: */
+    struct dirent  result;
+};
+
+static struct vfs_dir_handle g_dir_handles[VFS_MAX_DIR_HANDLES];
+
+static void *vfs_opendir(const char *path)
+{
+    int has_vfs = (path && path[0] == '/' && vfs_dir_exists(path));
+    /* A captured dir has real child files in VFS (not just markers).
+     * These dirs can be served entirely from VFS without opening the
+     * real directory on disk. */
+    int captured = (has_vfs && vfs_dir_has_children(path));
+    int fd = -1;
+
+    if (!captured) {
+        fd = (int)syscall(SYS_openat, AT_FDCWD, path,
+                          O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (fd < 0 && !has_vfs)
+            return NULL;
+    }
+
+    /* Find a free handle */
+    for (int i = 0; i < VFS_MAX_DIR_HANDLES; i++) {
+        if (g_dir_handles[i].magic == VFS_FAKE_DIR_MAGIC) continue;
+        struct vfs_dir_handle *h = &g_dir_handles[i];
+        memset(h, 0, sizeof(*h));
+        h->magic = VFS_FAKE_DIR_MAGIC;
+        h->fd_compat = fd;
+        if (captured) {
+            /* Pure VFS: all files/subdirs from VFS, no real dir fd */
+            h->vfs_path = path;
+            h->vfs_path_len = strlen(path);
+            h->scan_pos = 0;
+            h->phase = 0;
+        } else if (has_vfs) {
+            /* Merged or VFS-only (no real dir) */
+            h->vfs_path = path;
+            h->vfs_path_len = strlen(path);
+            h->scan_pos = 0;
+            h->phase = (fd >= 0) ? -1 : 0;
+        } else {
+            /* Pure real dir, no VFS */
+            h->vfs_path = NULL;
+        }
+        h->gd_pos = 0;
+        h->gd_len = 0;
+        return (void *)h;
+    }
+    /* No free handles */
+    if (fd >= 0) syscall(SYS_close, fd);
+    return NULL;
+}
+
+/* linux_dirent64 as returned by SYS_getdents64 */
+struct ldr_linux_dirent64 {
+    uint64_t       d_ino;
+    int64_t        d_off;
+    unsigned short d_reclen;
+    unsigned char  d_type;
+    char           d_name[];
+};
+
+static struct dirent *vfs_readdir(void *dirp)
+{
+    struct vfs_dir_handle *h = (struct vfs_dir_handle *)dirp;
+    if (!h || h->magic != VFS_FAKE_DIR_MAGIC) return NULL;
+
+    /* ---- Phase -1: drain real directory via getdents64 ---- */
+    if (h->phase == -1) {
+        if (h->fd_compat >= 0) {
+            for (;;) {
+                if (h->gd_pos >= h->gd_len) {
+                    long ret = syscall(SYS_getdents64, h->fd_compat,
+                                       h->gd_buf, sizeof(h->gd_buf));
+                    if (ret <= 0) break;  /* done with real dir */
+                    h->gd_len = (int)ret;
+                    h->gd_pos = 0;
+                }
+                struct ldr_linux_dirent64 *d =
+                    (struct ldr_linux_dirent64 *)(h->gd_buf + h->gd_pos);
+                h->gd_pos += d->d_reclen;
+
+                h->result.d_ino = (ino_t)d->d_ino;
+                h->result.d_off = (off_t)d->d_off;
+                h->result.d_reclen = sizeof(struct dirent);
+                h->result.d_type = d->d_type;
+                int nlen = strlen(d->d_name);
+                if (nlen > 255) nlen = 255;
+                memcpy(h->result.d_name, d->d_name, nlen);
+                h->result.d_name[nlen] = '\0';
+                return &h->result;
+            }
+        }
+        /* Real dir exhausted — move to VFS file phase */
+        h->phase = 0;
+        h->scan_pos = 0;
+    }
+
+    if (h->vfs_path) {
+        /* ---- Phase 0: yield VFS-only child files ----
+         * ---- Phase 1: yield VFS-only child subdirs ----
+         * Skip entries that already exist on disk (real dir covered them). */
+        while (h->phase < 2) {
+            if (h->phase == 0) {
+                while (h->scan_pos < (int)VFS_HASH_SIZE) {
+                    int si = h->scan_pos++;
+                    if (!g_vfs_table[si].path) continue;
+                    const char *fp = g_vfs_table[si].path;
+                    if (strncmp(fp, h->vfs_path, h->vfs_path_len) != 0) continue;
+                    if (fp[h->vfs_path_len] != '/') continue;
+                    const char *rest = fp + h->vfs_path_len + 1;
+                    if (strchr(rest, '/')) continue; /* not direct child */
+                    /* Skip .dir markers — invisible to applications */
+                    if (rest[0] == '.' && rest[1] == 'd' && rest[2] == 'i'
+                        && rest[3] == 'r' && rest[4] == '\0') continue;
+                    /* Skip if real FS already has this file */
+                    if (h->fd_compat >= 0) {
+                        int r = (int)syscall(SYS_faccessat, AT_FDCWD, fp, 0 /*F_OK*/, 0);
+                        if (r == 0) continue;
+                    }
+                    h->result.d_ino = (ino_t)(si + 1);
+                    h->result.d_off = (off_t)h->scan_pos;
+                    h->result.d_reclen = sizeof(struct dirent);
+                    h->result.d_type = DT_REG;
+                    int nlen = strlen(rest);
+                    if (nlen > 255) nlen = 255;
+                    memcpy(h->result.d_name, rest, nlen);
+                    h->result.d_name[nlen] = '\0';
+                    return &h->result;
+                }
+                h->phase = 1;
+                h->scan_pos = 0;
+            }
+            if (h->phase == 1) {
+                while (h->scan_pos < (int)VFS_DIR_HASH_SIZE) {
+                    int si = h->scan_pos++;
+                    if (!g_vfs_dir_table[si]) continue;
+                    const char *dp = g_vfs_dir_table[si];
+                    int dplen = strlen(dp);
+                    if (dplen <= h->vfs_path_len) continue;
+                    if (strncmp(dp, h->vfs_path, h->vfs_path_len) != 0) continue;
+                    if (dp[h->vfs_path_len] != '/') continue;
+                    const char *rest = dp + h->vfs_path_len + 1;
+                    if (strchr(rest, '/')) continue; /* not direct child */
+                    /* Skip if real FS already has this dir */
+                    if (h->fd_compat >= 0) {
+                        int r = (int)syscall(SYS_faccessat, AT_FDCWD, dp, 0, 0);
+                        if (r == 0) continue;
+                    }
+                    h->result.d_ino = (ino_t)(VFS_HASH_SIZE + si + 1);
+                    h->result.d_off = (off_t)(VFS_HASH_SIZE + h->scan_pos);
+                    h->result.d_reclen = sizeof(struct dirent);
+                    h->result.d_type = DT_DIR;
+                    int nlen = strlen(rest);
+                    if (nlen > 255) nlen = 255;
+                    memcpy(h->result.d_name, rest, nlen);
+                    h->result.d_name[nlen] = '\0';
+                    return &h->result;
+                }
+                h->phase = 2;
+            }
+        }
+        return NULL; /* end of merged listing */
+    }
+
+    /* ---- Non-VFS: pure real directory (phase was never -1) ---- */
+    for (;;) {
+        if (h->gd_pos >= h->gd_len) {
+            long ret = syscall(SYS_getdents64, h->fd_compat,
+                               h->gd_buf, sizeof(h->gd_buf));
+            if (ret <= 0) return NULL;
+            h->gd_len = (int)ret;
+            h->gd_pos = 0;
+        }
+        struct ldr_linux_dirent64 *d =
+            (struct ldr_linux_dirent64 *)(h->gd_buf + h->gd_pos);
+        h->gd_pos += d->d_reclen;
+
+        h->result.d_ino = (ino_t)d->d_ino;
+        h->result.d_off = (off_t)d->d_off;
+        h->result.d_reclen = sizeof(struct dirent);
+        h->result.d_type = d->d_type;
+        int nlen = strlen(d->d_name);
+        if (nlen > 255) nlen = 255;
+        memcpy(h->result.d_name, d->d_name, nlen);
+        h->result.d_name[nlen] = '\0';
+        return &h->result;
+    }
+}
+
+static int vfs_closedir(void *dirp)
+{
+    struct vfs_dir_handle *h = (struct vfs_dir_handle *)dirp;
+    if (!h || h->magic != VFS_FAKE_DIR_MAGIC) return -1;
+    if (h->fd_compat >= 0)
+        syscall(SYS_close, h->fd_compat);
+    h->magic = 0;
+    return 0;
+}
+
+/* Helper: create a memfd serving embedded VFS data for a file entry */
+static int vfs_serve_memfd(const struct vfs_entry *ve, const char *path)
+{
+    int fd = (int)syscall(SYS_memfd_create, "dlfrz-vfs", 0);
+    if (fd < 0) return -1;
+    const uint8_t *p = ve->data;
+    uint64_t rem = ve->size;
+    while (rem > 0) {
+        long w = syscall(SYS_write, fd, p, rem);
+        if (w <= 0) { syscall(SYS_close, fd); return -1; }
+        p   += w;
+        rem -= w;
+    }
+    syscall(SYS_lseek, fd, (off_t)0, 0 /* SEEK_SET */);
+    if (g_debug) {
+        ldr_msg("vfs: serving ");
+        ldr_msg(path);
+        ldr_msg("\n");
+    }
+    return fd;
+}
+
 static int vfs_open(const char *path, int flags, int mode)
 {
     /* Only intercept absolute paths for read-only opens */
     if (path && path[0] == '/' && (flags & 3) == 0 /* O_RDONLY */) {
         const struct vfs_entry *ve = vfs_lookup(path);
-        if (ve) {
-            int fd = (int)syscall(SYS_memfd_create, "dlfrz-vfs", 0);
-            if (fd >= 0) {
-                const uint8_t *p = ve->data;
-                uint64_t rem = ve->size;
-                while (rem > 0) {
-                    long w = syscall(SYS_write, fd, p, rem);
-                    if (w <= 0) { syscall(SYS_close, fd); fd = -1; break; }
-                    p   += w;
-                    rem -= w;
-                }
-                if (fd >= 0) {
-                    syscall(SYS_lseek, fd, (off_t)0, 0 /* SEEK_SET */);
-                    if (g_debug) {
-                        ldr_msg("vfs: serving ");
-                        ldr_msg(path);
-                        ldr_msg("\n");
-                    }
-                    return fd;
-                }
-            }
+        if (ve && ve->size > 0) {
+            int fd = vfs_serve_memfd(ve, path);
+            if (fd >= 0) return fd;
         }
     }
     return (int)syscall(SYS_openat, AT_FDCWD, path, flags, mode);
@@ -962,29 +1310,32 @@ static int vfs_open(const char *path, int flags, int mode)
 
 static int vfs_openat(int dirfd, const char *path, int flags, int mode)
 {
-    if (path && path[0] == '/' && (flags & 3) == 0) {
-        const struct vfs_entry *ve = vfs_lookup(path);
-        if (ve) {
-            int fd = (int)syscall(SYS_memfd_create, "dlfrz-vfs", 0);
-            if (fd >= 0) {
-                const uint8_t *p = ve->data;
-                uint64_t rem = ve->size;
-                while (rem > 0) {
-                    long w = syscall(SYS_write, fd, p, rem);
-                    if (w <= 0) { syscall(SYS_close, fd); fd = -1; break; }
-                    p   += w;
-                    rem -= w;
-                }
-                if (fd >= 0) {
-                    syscall(SYS_lseek, fd, (off_t)0, 0 /* SEEK_SET */);
-                    if (g_debug) {
-                        ldr_msg("vfs: serving ");
-                        ldr_msg(path);
-                        ldr_msg("\n");
-                    }
-                    return fd;
-                }
+    if (path && path[0] == '/') {
+        if ((flags & 3) == 0 /* O_RDONLY */) {
+            const struct vfs_entry *ve = vfs_lookup(path);
+            if (ve && ve->size > 0) {
+                int fd = vfs_serve_memfd(ve, path);
+                if (fd >= 0) return fd;
             }
+        }
+        /* O_DIRECTORY: captured dirs (with VFS children) use a dummy fd
+         * to avoid the real openat.  Other VFS dirs try real FS first,
+         * then fall back to dummy if the real dir doesn't exist. */
+        if ((flags & O_DIRECTORY) && vfs_dir_exists(path)) {
+            if (vfs_dir_has_children(path)) {
+                if (g_debug) {
+                    ldr_msg("vfs: dir openat dummy ");
+                    ldr_msg(path);
+                    ldr_msg("\n");
+                }
+                return (int)syscall(SYS_openat, AT_FDCWD, "/",
+                                    O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+            }
+            int real_fd = (int)syscall(SYS_openat, dirfd, path, flags, mode);
+            if (real_fd >= 0) return real_fd;
+            /* Real dir doesn't exist but VFS knows it */
+            return (int)syscall(SYS_openat, AT_FDCWD, "/",
+                                O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
         }
     }
     return (int)syscall(SYS_openat, dirfd, path, flags, mode);
@@ -998,6 +1349,7 @@ static int vfs_openat(int dirfd, const char *path, int flags, int mode)
 static int vfs_stat(const char *path, struct stat *buf)
 {
     if (path && path[0] == '/') {
+        /* Files: VFS takes priority (serve embedded data) */
         const struct vfs_entry *ve = vfs_lookup(path);
         if (ve) {
             __builtin_memset(buf, 0, sizeof(*buf));
@@ -1009,7 +1361,17 @@ static int vfs_stat(const char *path, struct stat *buf)
             return 0;
         }
     }
-    return (int)syscall(SYS_newfstatat, AT_FDCWD, path, buf, 0);
+    /* Directories & everything else: real FS first, VFS fallback */
+    int ret = (int)syscall(SYS_newfstatat, AT_FDCWD, path, buf, 0);
+    if (ret == 0) return 0;
+    if (path && path[0] == '/' && vfs_dir_exists(path)) {
+        __builtin_memset(buf, 0, sizeof(*buf));
+        buf->st_mode  = 040755;  /* directory, rwxr-xr-x */
+        buf->st_nlink = 2;
+        buf->st_blksize = 4096;
+        return 0;
+    }
+    return ret;
 }
 
 static int vfs_fstatat(int dirfd, const char *path, struct stat *buf, int flag)
@@ -1026,7 +1388,39 @@ static int vfs_fstatat(int dirfd, const char *path, struct stat *buf, int flag)
             return 0;
         }
     }
-    return (int)syscall(SYS_newfstatat, dirfd, path, buf, flag);
+    int ret = (int)syscall(SYS_newfstatat, dirfd, path, buf, flag);
+    if (ret == 0) return 0;
+    if (path && path[0] == '/' && vfs_dir_exists(path)) {
+        __builtin_memset(buf, 0, sizeof(*buf));
+        buf->st_mode  = 040755;
+        buf->st_nlink = 2;
+        buf->st_blksize = 4096;
+        return 0;
+    }
+    return ret;
+}
+
+/* vfs_access / vfs_faccessat — Python calls os.access() / os.path.exists() */
+static int vfs_access(const char *path, int amode)
+{
+    if (path && path[0] == '/') {
+        if (vfs_lookup(path)) return 0;
+    }
+    int ret = (int)syscall(SYS_faccessat, AT_FDCWD, path, amode, 0);
+    if (ret == 0) return 0;
+    if (path && path[0] == '/' && vfs_dir_exists(path)) return 0;
+    return ret;
+}
+
+static int vfs_faccessat(int dirfd, const char *path, int amode, int flag)
+{
+    if (path && path[0] == '/') {
+        if (vfs_lookup(path)) return 0;
+    }
+    int ret = (int)syscall(SYS_faccessat, dirfd, path, amode, flag);
+    if (ret == 0) return 0;
+    if (path && path[0] == '/' && vfs_dir_exists(path)) return 0;
+    return ret;
 }
 
 /* ==== Resolution cache ================================================ */
@@ -1234,6 +1628,12 @@ static const struct stub_sym g_vfs_overrides[] = {
     { "stat64",          (void *)vfs_stat           },
     { "fstatat",         (void *)vfs_fstatat        },
     { "fstatat64",       (void *)vfs_fstatat        },
+    { "access",          (void *)vfs_access         },
+    { "faccessat",       (void *)vfs_faccessat      },
+    { "opendir",         (void *)vfs_opendir        },
+    { "readdir",         (void *)vfs_readdir        },
+    { "readdir64",       (void *)vfs_readdir        },
+    { "closedir",        (void *)vfs_closedir       },
     { NULL, NULL }
 };
 
@@ -3030,9 +3430,12 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
                                  || (c0 == '_' && (c1 == 'r' || c1 == 'd'
                                      || (c1 == '_' && (name[2] == 't' || name[2] == 'r'))));
                         if (!maybe && g_vfs_count > 0) {
-                            maybe = (c0 == 'o')  /* open, open64, openat, openat64 */
+                            maybe = (c0 == 'o')  /* open, open64, openat, openat64, opendir */
                                  || (c0 == 's')  /* stat, stat64 */
-                                 || (c0 == 'f')  /* fstatat, fstatat64 */
+                                 || (c0 == 'f')  /* fstatat, fstatat64, faccessat */
+                                 || (c0 == 'a')  /* access */
+                                 || (c0 == 'r')  /* readdir, readdir64 */
+                                 || (c0 == 'c' && c1 == 'l') /* closedir */
                                  || (c0 == '_' && c1 == '_' && name[2] == 'o'); /* __open64_2 */
                         }
                         if (maybe) {

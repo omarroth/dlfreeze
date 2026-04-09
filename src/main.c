@@ -22,6 +22,7 @@
 #include <sys/wait.h>
 #include <fnmatch.h>
 #include <sys/stat.h>
+#include <dirent.h>
 
 #include "elf_parser.h"
 #include "dep_resolver.h"
@@ -88,6 +89,67 @@ static char *resolve_exe(const char *name)
 }
 
 /* ------------------------------------------------------------------ */
+/* Add all regular non-ELF files in a single directory (non-recursive) */
+/* to the data-file list, skipping files already in deps.              */
+/* ------------------------------------------------------------------ */
+static void scan_dir_shallow(const char *dirpath,
+                             struct data_file_list *out,
+                             const struct dep_list *deps,
+                             const char *exe_path)
+{
+    DIR *d = opendir(dirpath);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.' &&
+            (e->d_name[1] == '\0' ||
+             (e->d_name[1] == '.' && e->d_name[2] == '\0')))
+            continue;
+        char child[PATH_MAX];
+        snprintf(child, sizeof(child), "%s/%s", dirpath, e->d_name);
+        char rpath[PATH_MAX];
+        if (!realpath(child, rpath)) continue;
+
+        struct stat sb;
+        if (stat(rpath, &sb) != 0) continue;
+
+        /* Subdirectory: add a virtual .dir marker so the VFS dir table
+         * will include this subdir in the parent's listing. */
+        if (S_ISDIR(sb.st_mode)) {
+            char marker[PATH_MAX];
+            snprintf(marker, sizeof(marker), "%s/.dir", rpath);
+            data_file_list_add_virtual(out, marker);
+            continue;
+        }
+
+        if (!S_ISREG(sb.st_mode)) continue;
+
+        /* Check if this file should be skipped (ELF, dep, empty, exe).
+         * Skipped files are still added as virtual entries (zero-byte,
+         * listed by VFS readdir but not served on open). */
+        int skip = 0;
+        if (sb.st_size == 0) skip = 1;
+        if (!skip && elf_check(rpath)) skip = 1;
+        if (!skip && strcmp(rpath, exe_path) == 0) skip = 1;
+        if (!skip && deps->interp_path &&
+            strcmp(rpath, deps->interp_path) == 0) skip = 1;
+        for (int i = 0; !skip && i < deps->count; i++) {
+            char dpath[PATH_MAX];
+            if (realpath(deps->libs[i].path, dpath) &&
+                strcmp(rpath, dpath) == 0)
+                skip = 1;
+        }
+
+        if (skip) {
+            data_file_list_add_virtual(out, rpath);
+        } else {
+            data_file_list_add(out, rpath);
+        }
+    }
+    closedir(d);
+}
+
+/* ------------------------------------------------------------------ */
 /* Capture data files opened during a traced run using strace.         */
 /* Runs: strace -f -e trace=openat -o <tracefile> <exe> [args...]      */
 /* Then parses the output for successfully opened regular files and     */
@@ -141,9 +203,19 @@ static int capture_data_files(const char *exe_path, int argc, char **argv,
     }
 
     /* Parse strace output for openat() calls that returned a valid fd.
-     * Format: PID openat(AT_FDCWD, "/path/file", O_RDONLY...) = 3 */
+     * Format: PID openat(AT_FDCWD, "/path/file", O_RDONLY...) = 3
+     *
+     * Two kinds of captures:
+     * 1. Regular files matching -f patterns → add to data files.
+     * 2. O_DIRECTORY opens on dirs matching -f patterns → recursively
+     *    capture ALL regular non-ELF files in that directory tree so the
+     *    VFS can serve complete directory listings without hitting disk. */
     FILE *tf = fopen(tracef, "r");
     if (!tf) { unlink(tracef); return -1; }
+
+    /* Collect directories to scan (deferred so we can close the file) */
+    char **cap_dirs = NULL;
+    int ncap_dirs = 0, cap_dirs_cap = 0;
 
     char line[4096];
     while (fgets(line, sizeof(line), tf)) {
@@ -165,12 +237,50 @@ static int capture_data_files(const char *exe_path, int argc, char **argv,
         if (!q2) continue;
         *q2 = '\0';
 
+        /* Check for O_DIRECTORY flag (text after the closing quote) */
+        int is_dir = (strstr(q2 + 1, "O_DIRECTORY") != NULL);
+
         /* Resolve to absolute path */
         char rpath[PATH_MAX];
         if (q1[0] != '/') continue;  /* skip relative paths */
         if (!realpath(q1, rpath)) continue;  /* skip deleted/inaccessible */
 
-        /* Must be a regular file */
+        if (is_dir) {
+            /* Directory open — check if it matches a glob pattern */
+            struct stat sb;
+            if (stat(rpath, &sb) != 0 || !S_ISDIR(sb.st_mode)) continue;
+
+            int matched = 0;
+            for (int i = 0; i < npatterns; i++) {
+                if (fnmatch(patterns[i], rpath, 0) == 0) {
+                    matched = 1; break;
+                }
+                /* Also match if the pattern covers children of this dir,
+                   e.g. pattern "/usr/lib/star" matches "/usr/lib/python3.14" */
+                char probe[PATH_MAX];
+                int plen = snprintf(probe, sizeof(probe), "%s/x", rpath);
+                if (plen > 0 && plen < (int)sizeof(probe) &&
+                    fnmatch(patterns[i], probe, 0) == 0) {
+                    matched = 1; break;
+                }
+            }
+            if (!matched) continue;
+
+            /* Deduplicate */
+            int dup = 0;
+            for (int i = 0; i < ncap_dirs; i++)
+                if (strcmp(cap_dirs[i], rpath) == 0) { dup = 1; break; }
+            if (dup) continue;
+
+            if (ncap_dirs >= cap_dirs_cap) {
+                cap_dirs_cap = cap_dirs_cap ? cap_dirs_cap * 2 : 64;
+                cap_dirs = realloc(cap_dirs, cap_dirs_cap * sizeof(char *));
+            }
+            cap_dirs[ncap_dirs++] = strdup(rpath);
+            continue;
+        }
+
+        /* Regular file */
         struct stat sb;
         if (stat(rpath, &sb) != 0 || !S_ISREG(sb.st_mode)) continue;
 
@@ -209,6 +319,18 @@ static int capture_data_files(const char *exe_path, int argc, char **argv,
 
     fclose(tf);
     unlink(tracef);
+
+    /* Scan captured directories — adds all non-ELF regular files */
+    if (ncap_dirs > 0 && verbose) {
+        printf("  captured dirs: %d\n", ncap_dirs);
+        for (int i = 0; i < ncap_dirs; i++)
+            printf("    %s\n", cap_dirs[i]);
+    }
+    for (int i = 0; i < ncap_dirs; i++) {
+        scan_dir_shallow(cap_dirs[i], out, deps, exe_path);
+        free(cap_dirs[i]);
+    }
+    free(cap_dirs);
 
     if (verbose || out->count > 0) {
         printf("  data files : %d matched\n", out->count);

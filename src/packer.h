@@ -6,12 +6,14 @@
 /* List of data files to embed alongside ELF objects */
 struct data_file_list {
     char **paths;      /* absolute paths of files to embed */
+    int   *is_virtual; /* 1 = dir marker (zero-byte, no file on disk) */
     int    count;
     int    capacity;
 };
 
 void data_file_list_init(struct data_file_list *dl);
 void data_file_list_add(struct data_file_list *dl, const char *path);
+void data_file_list_add_virtual(struct data_file_list *dl, const char *path);
 void data_file_list_free(struct data_file_list *dl);
 
 struct pack_options {
