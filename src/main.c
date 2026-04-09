@@ -88,6 +88,23 @@ static char *resolve_exe(const char *name)
     return NULL;
 }
 
+// Match a path against a glob pattern.  fnmatch's '*' doesn't cross '/',
+// but users expect -f '/usr/lib/*' to match anything under /usr/lib/.
+// If the pattern ends with "/" + "*", we also do a prefix check so that
+// deeply nested paths still match.
+static int match_glob(const char *pattern, const char *path)
+{
+    if (fnmatch(pattern, path, 0) == 0)
+        return 1;
+    /* Prefix match: pattern ending in dir-slash-star */
+    int plen = strlen(pattern);
+    if (plen >= 2 && pattern[plen - 1] == '*' && pattern[plen - 2] == '/') {
+        if (strncmp(path, pattern, plen - 1) == 0)
+            return 1;
+    }
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Add all regular non-ELF files in a single directory (non-recursive) */
 /* to the data-file list, skipping files already in deps.              */
@@ -252,15 +269,15 @@ static int capture_data_files(const char *exe_path, int argc, char **argv,
 
             int matched = 0;
             for (int i = 0; i < npatterns; i++) {
-                if (fnmatch(patterns[i], rpath, 0) == 0) {
+                if (match_glob(patterns[i], rpath)) {
                     matched = 1; break;
                 }
                 /* Also match if the pattern covers children of this dir,
-                   e.g. pattern "/usr/lib/star" matches "/usr/lib/python3.14" */
+                   e.g. pattern '/usr/lib/X' matches '/usr/lib/python3.14' */
                 char probe[PATH_MAX];
                 int plen = snprintf(probe, sizeof(probe), "%s/x", rpath);
                 if (plen > 0 && plen < (int)sizeof(probe) &&
-                    fnmatch(patterns[i], probe, 0) == 0) {
+                    match_glob(patterns[i], probe)) {
                     matched = 1; break;
                 }
             }
@@ -304,7 +321,7 @@ static int capture_data_files(const char *exe_path, int argc, char **argv,
         /* Check against glob patterns */
         int matched = 0;
         for (int i = 0; i < npatterns; i++) {
-            if (fnmatch(patterns[i], rpath, 0) == 0) {
+            if (match_glob(patterns[i], rpath)) {
                 matched = 1;
                 break;
             }

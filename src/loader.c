@@ -884,6 +884,12 @@ struct vfs_entry {
 static struct vfs_entry g_vfs_table[VFS_HASH_SIZE];
 static int g_vfs_count;
 
+/* Saved real libc fopen/fdopen for vfs_fopen fallthrough */
+typedef void *(*fopen_fn)(const char *, const char *);
+typedef void *(*fdopen_fn)(int, const char *);
+static fopen_fn  g_real_fopen;
+static fdopen_fn g_real_fdopen;
+
 static uint32_t vfs_hash(const char *s)
 {
     uint32_t h = 5381;
@@ -1341,6 +1347,25 @@ static int vfs_openat(int dirfd, const char *path, int flags, int mode)
     return (int)syscall(SYS_openat, dirfd, path, flags, mode);
 }
 
+/* vfs_fopen — intercept fopen/fopen64 so that libc's internal openat
+ * (which bypasses our GOT-patched openat) also serves from VFS.
+ * Falls through to real glibc fopen for non-VFS files. */
+static void *vfs_fopen(const char *path, const char *mode)
+{
+    if (path && path[0] == '/' && mode && mode[0] == 'r') {
+        const struct vfs_entry *ve = vfs_lookup(path);
+        if (ve && ve->size > 0) {
+            int fd = vfs_serve_memfd(ve, path);
+            if (fd >= 0 && g_real_fdopen)
+                return g_real_fdopen(fd, mode);
+            if (fd >= 0) syscall(SYS_close, fd);
+        }
+    }
+    if (g_real_fopen)
+        return g_real_fopen(path, mode);
+    return (void *)0;
+}
+
 /*
  * vfs_stat / vfs_fstatat — intercept stat calls for embedded files.
  * Python's import system checks if files exist via stat() before opening.
@@ -1634,6 +1659,8 @@ static const struct stub_sym g_vfs_overrides[] = {
     { "readdir",         (void *)vfs_readdir        },
     { "readdir64",       (void *)vfs_readdir        },
     { "closedir",        (void *)vfs_closedir       },
+    { "fopen",           (void *)vfs_fopen          },
+    { "fopen64",         (void *)vfs_fopen          },
     { NULL, NULL }
 };
 
@@ -3377,6 +3404,29 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
 
     if (prelinked) {
         ldr_dbg("[loader] pre-linked: patching overrides...\n");
+
+        /* Resolve real libc fopen/fdopen BEFORE overrides are applied,
+         * so vfs_fopen can fall through to the real implementation.
+         * Must bypass resolve_sym (which checks g_vfs_overrides and
+         * would return our own vfs_fopen). Scan symbol tables directly. */
+        if (g_vfs_count > 0) {
+            for (int i = 0; i < nobj && (!g_real_fopen || !g_real_fdopen); i++) {
+                if (!objs[i].dynsym || !objs[i].dynstr) continue;
+                for (uint32_t s = 0; s < objs[i].dynsym_count; s++) {
+                    const Elf64_Sym *sym = &objs[i].dynsym[s];
+                    if (sym->st_shndx == 0 || sym->st_value == 0) continue;
+                    if (ELF64_ST_TYPE(sym->st_info) != STT_FUNC) continue;
+                    const char *n = objs[i].dynstr + sym->st_name;
+                    if (!g_real_fopen && n[0] == 'f' && n[1] == 'o'
+                        && strcmp(n, "fopen64") == 0)
+                        g_real_fopen = (fopen_fn)(uintptr_t)(objs[i].base + sym->st_value);
+                    else if (!g_real_fdopen && n[0] == 'f' && n[1] == 'd'
+                             && strcmp(n, "fdopen") == 0)
+                        g_real_fdopen = (fdopen_fn)(uintptr_t)(objs[i].base + sym->st_value);
+                }
+            }
+        }
+
         /* Build the unified special-symbol hash table (overrides, stubs,
          * fake rtld objects) for fast O(1) lookup per relocation. */
         build_special_table();
