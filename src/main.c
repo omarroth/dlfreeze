@@ -175,19 +175,40 @@ static void scan_dir_shallow(const char *dirpath,
 static int capture_data_files(const char *exe_path, int argc, char **argv,
                               int optind_val, const char **patterns,
                               int npatterns, struct data_file_list *out,
-                              const struct dep_list *deps, int verbose)
+                              struct dep_list *deps, int verbose,
+                              const char *preload_path)
 {
     char tracef[] = "/tmp/dlfreeze-strace.XXXXXX";
     int tfd = mkstemp(tracef);
     if (tfd < 0) { perror("mkstemp"); return -1; }
     close(tfd);
 
-    printf("Tracing file access …\n");
+    /* Optional dlopen trace file for combined run */
+    char dlopen_tracef[] = "/tmp/dlfreeze-trace.XXXXXX";
+    int have_preload = 0;
+    if (preload_path) {
+        int dtfd = mkstemp(dlopen_tracef);
+        if (dtfd >= 0) { close(dtfd); have_preload = 1; }
+    }
+
+    printf("Tracing %s …\n",
+           have_preload ? "dlopen calls and file access"
+                        : "file access");
 
     pid_t pid = fork();
-    if (pid < 0) { perror("fork"); unlink(tracef); return -1; }
+    if (pid < 0) {
+        perror("fork"); unlink(tracef);
+        if (have_preload) unlink(dlopen_tracef);
+        return -1;
+    }
 
     if (pid == 0) {
+        /* Set LD_PRELOAD for combined dlopen tracing */
+        if (have_preload) {
+            setenv("LD_PRELOAD", preload_path, 1);
+            setenv("DLFREEZE_TRACE_FILE", dlopen_tracef, 1);
+        }
+
         /* Build: strace -f -e trace=openat -o tracefile -- exe [args...] */
         int tstart = optind_val + 1;
         if (tstart < argc && strcmp(argv[tstart], "--") == 0)
@@ -216,7 +237,32 @@ static int capture_data_files(const char *exe_path, int argc, char **argv,
     if (!WIFEXITED(st) || WEXITSTATUS(st) == 127) {
         fprintf(stderr, "dlfreeze: strace failed (is strace installed?)\n");
         unlink(tracef);
+        if (have_preload) unlink(dlopen_tracef);
         return -1;
+    }
+
+    /* Process dlopen trace first so deps is complete when filtering
+     * strace output (newly discovered libs get skipped properly). */
+    if (have_preload) {
+        if (verbose) {
+            FILE *dtf = fopen(dlopen_tracef, "r");
+            if (dtf) {
+                char ln[1024];
+                printf("dlopen traced:\n");
+                while (fgets(ln, sizeof(ln), dtf))
+                    printf("  %s", ln);
+                fclose(dtf);
+            }
+        }
+        dep_add_dlopen_libs(deps, dlopen_tracef);
+        if (verbose) {
+            printf("libraries after trace: %d\n", deps->count);
+            for (int i = 0; i < deps->count; i++)
+                if (deps->libs[i].from_dlopen)
+                    printf("  (dlopen) %-30s → %s\n",
+                           deps->libs[i].name, deps->libs[i].path);
+        }
+        unlink(dlopen_tracef);
     }
 
     /* Parse strace output for openat() calls that returned a valid fd.
@@ -433,12 +479,23 @@ int main(int argc, char **argv)
                    deps.libs[i].from_dlopen ? " (dlopen)" : "");
     }
 
-    /* optional dlopen tracing */
+    /* optional tracing: dlopen + data-file capture in one run when possible */
+    struct data_file_list data_files;
+    data_file_list_init(&data_files);
     if (do_trace) {
         char *preload = find_sibling(self, "dlfreeze-preload.so");
-        if (!preload) {
-            fprintf(stderr, "dlfreeze: warning: dlfreeze-preload.so not found, skipping trace\n");
-        } else {
+        if (!preload)
+            fprintf(stderr, "dlfreeze: warning: dlfreeze-preload.so not found, "
+                    "skipping dlopen trace\n");
+
+        if (nfile_patterns > 0) {
+            /* Combined: strace captures file access while LD_PRELOAD
+             * captures dlopen calls — single program execution. */
+            capture_data_files(exe_path, argc, argv, optind,
+                               file_patterns, nfile_patterns,
+                               &data_files, &deps, verbose, preload);
+        } else if (preload) {
+            /* dlopen-only tracing (no -f patterns, no strace needed) */
             char tracef[] = "/tmp/dlfreeze-trace.XXXXXX";
             int tfd = mkstemp(tracef);
             if (tfd >= 0) {
@@ -450,10 +507,9 @@ int main(int argc, char **argv)
                     setenv("LD_PRELOAD", preload, 1);
                     setenv("DLFREEZE_TRACE_FILE", tracef, 1);
 
-                    /* build argv: exe + everything after "--" separator */
                     int tstart = optind + 1;
                     if (tstart < argc && strcmp(argv[tstart], "--") == 0)
-                        tstart++;   /* skip the "--" separator */
+                        tstart++;
                     int nargs = 1 + (argc - tstart);
                     char **tav = calloc(nargs + 1, sizeof(char *));
                     tav[0] = exe_path;
@@ -469,7 +525,6 @@ int main(int argc, char **argv)
                     if (verbose)
                         printf("trace exit status: %d\n",
                                WIFEXITED(st) ? WEXITSTATUS(st) : -1);
-                    /* Show trace contents before processing */
                     if (verbose) {
                         FILE *tf = fopen(tracef, "r");
                         if (tf) {
@@ -491,17 +546,8 @@ int main(int argc, char **argv)
                 }
                 unlink(tracef);
             }
-            free(preload);
         }
-    }
-
-    /* capture data files (strace-based, after deps are resolved) */
-    struct data_file_list data_files;
-    data_file_list_init(&data_files);
-    if (do_trace && nfile_patterns > 0) {
-        capture_data_files(exe_path, argc, argv, optind,
-                           file_patterns, nfile_patterns,
-                           &data_files, &deps, verbose);
+        free(preload);
     }
 
     /* output path */
