@@ -889,6 +889,569 @@ static int patch_elf_for_upx(const char *path, size_t bootstrap_sz,
 }
 
 /* ------------------------------------------------------------------ */
+/*
+ * append_combined_symtab - Append a combined .symtab to the frozen binary.
+ *
+ * After packing and pre-linking, the frozen binary's outer ELF has its
+ * section headers zeroed (for UPX compat).  perf and other profiling tools
+ * try to read symbols from the outer ELF and fail.  This function creates a
+ * combined .symtab/.strtab from *all* embedded objects' .dynsym sections,
+ * rebased to their pre-assigned load addresses, and appends it to the file
+ * with proper section headers so that tools can resolve symbols.
+ *
+ * Layout appended to the file (all 8-byte aligned):
+ *   .shstrtab  (section-name string table)
+ *   .strtab    (combined symbol-name string table)
+ *   .symtab    (combined Elf64_Sym array with absolute addresses)
+ *   Elf64_Shdr[4]  (NULL, .shstrtab, .strtab, .symtab)
+ */
+static int append_combined_symtab(const char *path,
+                                   const struct dlfrz_entry *entries,
+                                   const struct dlfrz_lib_meta *metas,
+                                   int nent)
+{
+    /* Per-ELF .text section info — needed so perf can convert symbol VAs
+     * to file offsets.  Each embedded ELF has its own VA-to-file-offset
+     * relationship determined by its executable PT_LOAD segment:
+     *   file_off = (VA - sh_addr) + sh_offset                            */
+    struct {
+        uint64_t sh_addr;   /* base_addr + exec_load.p_vaddr */
+        uint64_t sh_offset; /* data_offset + exec_load.p_offset */
+        uint64_t sh_size;   /* exec_load.p_memsz */
+        int      valid;     /* found an executable PT_LOAD? */
+    } *text_info = calloc(nent, sizeof(*text_info));
+    if (!text_info) return -1;
+
+    /* ---- Pass 1: count symbols and string bytes across all objects ---- */
+    size_t total_syms = 1;   /* slot 0 is the NULL symbol */
+    size_t total_strsz = 1;  /* byte 0 is always '\0' */
+
+    for (int e = 0; e < nent; e++) {
+        FILE *ef = fopen(path, "rb");
+        if (!ef) continue;
+        fseek(ef, entries[e].data_offset, SEEK_SET);
+
+        Elf64_Ehdr ehdr;
+        if (fread(&ehdr, 1, sizeof(ehdr), ef) != sizeof(ehdr)) {
+            fclose(ef); continue;
+        }
+        if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0) {
+            fclose(ef); continue;
+        }
+
+        /* Read phdrs */
+        size_t phsz = ehdr.e_phnum * ehdr.e_phentsize;
+        uint8_t *phdrs = malloc(phsz);
+        if (!phdrs) { fclose(ef); continue; }
+        fseek(ef, entries[e].data_offset + ehdr.e_phoff, SEEK_SET);
+        if (fread(phdrs, 1, phsz, ef) != phsz) {
+            free(phdrs); fclose(ef); continue;
+        }
+
+        /* Find PT_DYNAMIC and executable PT_LOAD */
+        const Elf64_Phdr *dyn_ph = NULL;
+        for (int i = 0; i < ehdr.e_phnum; i++) {
+            const Elf64_Phdr *ph = (const Elf64_Phdr *)(phdrs + i * ehdr.e_phentsize);
+            if (ph->p_type == PT_DYNAMIC) dyn_ph = ph;
+            if (ph->p_type == PT_LOAD && (ph->p_flags & PF_X) &&
+                !text_info[e].valid) {
+                text_info[e].sh_addr   = metas[e].base_addr + ph->p_vaddr;
+                text_info[e].sh_offset = entries[e].data_offset + ph->p_offset;
+                text_info[e].sh_size   = ph->p_memsz;
+                text_info[e].valid     = 1;
+            }
+        }
+        if (!dyn_ph) { free(phdrs); fclose(ef); continue; }
+
+        /* Read PT_DYNAMIC entries */
+        size_t dyn_filesz = dyn_ph->p_filesz;
+        uint8_t *dyn_buf = malloc(dyn_filesz);
+        if (!dyn_buf) { free(phdrs); fclose(ef); continue; }
+        /* p_vaddr in the embedded ELF → file offset within the embedded ELF.
+         * We need to convert vaddr to file offset using PT_LOAD mappings. */
+        uint64_t dyn_foff = 0;
+        for (int i = 0; i < ehdr.e_phnum; i++) {
+            const Elf64_Phdr *ph = (const Elf64_Phdr *)(phdrs + i * ehdr.e_phentsize);
+            if (ph->p_type != PT_LOAD) continue;
+            if (dyn_ph->p_vaddr >= ph->p_vaddr &&
+                dyn_ph->p_vaddr < ph->p_vaddr + ph->p_filesz) {
+                dyn_foff = dyn_ph->p_vaddr - ph->p_vaddr + ph->p_offset;
+                break;
+            }
+        }
+        fseek(ef, entries[e].data_offset + dyn_foff, SEEK_SET);
+        if (fread(dyn_buf, 1, dyn_filesz, ef) != dyn_filesz) {
+            free(dyn_buf); free(phdrs); fclose(ef); continue;
+        }
+
+        /* Extract DT_SYMTAB, DT_STRTAB, DT_STRSZ, DT_GNU_HASH */
+        const Elf64_Dyn *dyn = (const Elf64_Dyn *)dyn_buf;
+        size_t dyn_count = dyn_filesz / sizeof(Elf64_Dyn);
+        uint64_t symtab_va = 0, strtab_va = 0, strsz = 0, ghash_va = 0;
+        for (size_t i = 0; i < dyn_count && dyn[i].d_tag != DT_NULL; i++) {
+            switch (dyn[i].d_tag) {
+            case DT_SYMTAB:   symtab_va = dyn[i].d_un.d_ptr; break;
+            case DT_STRTAB:   strtab_va = dyn[i].d_un.d_ptr; break;
+            case DT_STRSZ:    strsz     = dyn[i].d_un.d_val; break;
+            case DT_GNU_HASH: ghash_va  = dyn[i].d_un.d_ptr; break;
+            }
+        }
+        free(dyn_buf);
+
+        if (!symtab_va || !strtab_va || !strsz) {
+            free(phdrs); fclose(ef); continue;
+        }
+
+        /* Compute dynsym count from GNU hash table or heuristic */
+        uint32_t nsyms = 0;
+        if (ghash_va) {
+            /* Convert ghash VA to file offset */
+            uint64_t ghash_foff = 0;
+            for (int i = 0; i < ehdr.e_phnum; i++) {
+                const Elf64_Phdr *ph = (const Elf64_Phdr *)(phdrs + i * ehdr.e_phentsize);
+                if (ph->p_type != PT_LOAD) continue;
+                if (ghash_va >= ph->p_vaddr &&
+                    ghash_va < ph->p_vaddr + ph->p_filesz) {
+                    ghash_foff = ghash_va - ph->p_vaddr + ph->p_offset;
+                    break;
+                }
+            }
+            /* Read just the header: nbuckets, symoffset, bloom_size, bloom_shift */
+            uint32_t ght[4];
+            fseek(ef, entries[e].data_offset + ghash_foff, SEEK_SET);
+            if (fread(ght, 1, sizeof(ght), ef) == sizeof(ght)) {
+                uint32_t nbuckets = ght[0], symoffset = ght[1], bloom_size = ght[2];
+                /* Read bloom + buckets + chain to find max index */
+                size_t bk_off = ghash_foff + 16 + bloom_size * 8;
+                uint32_t *buckets = malloc(nbuckets * 4);
+                if (buckets) {
+                    fseek(ef, entries[e].data_offset + bk_off, SEEK_SET);
+                    if (fread(buckets, 4, nbuckets, ef) == nbuckets) {
+                        uint32_t mx = symoffset;
+                        for (uint32_t b = 0; b < nbuckets; b++)
+                            if (buckets[b] > mx) mx = buckets[b];
+                        if (mx >= symoffset) {
+                            /* Walk the chain from mx until we find a terminator */
+                            size_t ch_off = bk_off + nbuckets * 4;
+                            uint32_t cv;
+                            for (;;) {
+                                fseek(ef, entries[e].data_offset + ch_off + (mx - symoffset) * 4, SEEK_SET);
+                                if (fread(&cv, 4, 1, ef) != 1) break;
+                                if (cv & 1) break;
+                                mx++;
+                            }
+                        }
+                        nsyms = mx + 1;
+                    }
+                    free(buckets);
+                }
+            }
+        }
+        if (nsyms == 0 && strtab_va > symtab_va)
+            nsyms = (uint32_t)((strtab_va - symtab_va) / sizeof(Elf64_Sym));
+
+        /* Read dynstr to count string bytes for defined func symbols */
+        uint64_t str_foff = 0;
+        for (int i = 0; i < ehdr.e_phnum; i++) {
+            const Elf64_Phdr *ph = (const Elf64_Phdr *)(phdrs + i * ehdr.e_phentsize);
+            if (ph->p_type != PT_LOAD) continue;
+            if (strtab_va >= ph->p_vaddr &&
+                strtab_va < ph->p_vaddr + ph->p_filesz) {
+                str_foff = strtab_va - ph->p_vaddr + ph->p_offset;
+                break;
+            }
+        }
+        char *dynstr = malloc(strsz);
+        if (!dynstr) { free(phdrs); fclose(ef); continue; }
+        fseek(ef, entries[e].data_offset + str_foff, SEEK_SET);
+        if (fread(dynstr, 1, strsz, ef) != strsz) {
+            free(dynstr); free(phdrs); fclose(ef); continue;
+        }
+
+        /* Read dynsym */
+        uint64_t sym_foff = 0;
+        for (int i = 0; i < ehdr.e_phnum; i++) {
+            const Elf64_Phdr *ph = (const Elf64_Phdr *)(phdrs + i * ehdr.e_phentsize);
+            if (ph->p_type != PT_LOAD) continue;
+            if (symtab_va >= ph->p_vaddr &&
+                symtab_va < ph->p_vaddr + ph->p_filesz) {
+                sym_foff = symtab_va - ph->p_vaddr + ph->p_offset;
+                break;
+            }
+        }
+        Elf64_Sym *dynsym = malloc(nsyms * sizeof(Elf64_Sym));
+        if (!dynsym) { free(dynstr); free(phdrs); fclose(ef); continue; }
+        fseek(ef, entries[e].data_offset + sym_foff, SEEK_SET);
+        if (fread(dynsym, sizeof(Elf64_Sym), nsyms, ef) != nsyms) {
+            free(dynsym); free(dynstr); free(phdrs); fclose(ef); continue;
+        }
+
+        /* Count defined function/object symbols */
+        for (uint32_t s = 1; s < nsyms; s++) {
+            unsigned char stype = ELF64_ST_TYPE(dynsym[s].st_info);
+            if (stype != STT_FUNC && stype != STT_GNU_IFUNC &&
+                stype != STT_OBJECT) continue;
+            if (dynsym[s].st_value == 0 || dynsym[s].st_shndx == SHN_UNDEF)
+                continue;
+            if (dynsym[s].st_name >= strsz) continue;
+            const char *name = dynstr + dynsym[s].st_name;
+            if (!name[0]) continue;
+            total_syms++;
+            total_strsz += strlen(name) + 1;
+        }
+
+        free(dynsym);
+        free(dynstr);
+        free(phdrs);
+        fclose(ef);
+    }
+
+    if (total_syms <= 1) { free(text_info); return 0; }
+
+    /* ---- Pass 2: build the combined tables ---- */
+    Elf64_Sym *symtab = calloc(total_syms, sizeof(Elf64_Sym));
+    char *strtab = calloc(1, total_strsz);
+    if (!symtab || !strtab) { free(symtab); free(strtab); return -1; }
+
+    size_t sym_idx = 1;   /* skip slot 0 (null symbol) */
+    size_t str_off = 1;   /* skip byte 0 (null byte) */
+
+    for (int e = 0; e < nent; e++) {
+        FILE *ef = fopen(path, "rb");
+        if (!ef) continue;
+        fseek(ef, entries[e].data_offset, SEEK_SET);
+
+        Elf64_Ehdr ehdr;
+        if (fread(&ehdr, 1, sizeof(ehdr), ef) != sizeof(ehdr) ||
+            memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0) {
+            fclose(ef); continue;
+        }
+
+        size_t phsz = ehdr.e_phnum * ehdr.e_phentsize;
+        uint8_t *phdrs = malloc(phsz);
+        if (!phdrs) { fclose(ef); continue; }
+        fseek(ef, entries[e].data_offset + ehdr.e_phoff, SEEK_SET);
+        if (fread(phdrs, 1, phsz, ef) != phsz) {
+            free(phdrs); fclose(ef); continue;
+        }
+
+        /* Find PT_DYNAMIC */
+        const Elf64_Phdr *dyn_ph = NULL;
+        for (int i = 0; i < ehdr.e_phnum; i++) {
+            const Elf64_Phdr *ph = (const Elf64_Phdr *)(phdrs + i * ehdr.e_phentsize);
+            if (ph->p_type == PT_DYNAMIC) { dyn_ph = ph; break; }
+        }
+        if (!dyn_ph) { free(phdrs); fclose(ef); continue; }
+
+        /* Read PT_DYNAMIC */
+        uint64_t dyn_foff = 0;
+        for (int i = 0; i < ehdr.e_phnum; i++) {
+            const Elf64_Phdr *ph = (const Elf64_Phdr *)(phdrs + i * ehdr.e_phentsize);
+            if (ph->p_type != PT_LOAD) continue;
+            if (dyn_ph->p_vaddr >= ph->p_vaddr &&
+                dyn_ph->p_vaddr < ph->p_vaddr + ph->p_filesz) {
+                dyn_foff = dyn_ph->p_vaddr - ph->p_vaddr + ph->p_offset;
+                break;
+            }
+        }
+        size_t dyn_filesz = dyn_ph->p_filesz;
+        uint8_t *dyn_buf = malloc(dyn_filesz);
+        if (!dyn_buf) { free(phdrs); fclose(ef); continue; }
+        fseek(ef, entries[e].data_offset + dyn_foff, SEEK_SET);
+        if (fread(dyn_buf, 1, dyn_filesz, ef) != dyn_filesz) {
+            free(dyn_buf); free(phdrs); fclose(ef); continue;
+        }
+
+        const Elf64_Dyn *dyn = (const Elf64_Dyn *)dyn_buf;
+        size_t dyn_count = dyn_filesz / sizeof(Elf64_Dyn);
+        uint64_t symtab_va = 0, strtab_va = 0, strsz = 0, ghash_va = 0;
+        for (size_t i = 0; i < dyn_count && dyn[i].d_tag != DT_NULL; i++) {
+            switch (dyn[i].d_tag) {
+            case DT_SYMTAB:   symtab_va = dyn[i].d_un.d_ptr; break;
+            case DT_STRTAB:   strtab_va = dyn[i].d_un.d_ptr; break;
+            case DT_STRSZ:    strsz     = dyn[i].d_un.d_val; break;
+            case DT_GNU_HASH: ghash_va  = dyn[i].d_un.d_ptr; break;
+            }
+        }
+        free(dyn_buf);
+        if (!symtab_va || !strtab_va || !strsz) {
+            free(phdrs); fclose(ef); continue;
+        }
+
+        /* Compute dynsym count */
+        uint32_t nsyms = 0;
+        if (ghash_va) {
+            uint64_t ghash_foff = 0;
+            for (int i = 0; i < ehdr.e_phnum; i++) {
+                const Elf64_Phdr *ph = (const Elf64_Phdr *)(phdrs + i * ehdr.e_phentsize);
+                if (ph->p_type != PT_LOAD) continue;
+                if (ghash_va >= ph->p_vaddr &&
+                    ghash_va < ph->p_vaddr + ph->p_filesz) {
+                    ghash_foff = ghash_va - ph->p_vaddr + ph->p_offset;
+                    break;
+                }
+            }
+            uint32_t ght[4];
+            fseek(ef, entries[e].data_offset + ghash_foff, SEEK_SET);
+            if (fread(ght, 1, sizeof(ght), ef) == sizeof(ght)) {
+                uint32_t nbuckets = ght[0], symoffset = ght[1], bloom_size = ght[2];
+                size_t bk_off = ghash_foff + 16 + bloom_size * 8;
+                uint32_t *buckets = malloc(nbuckets * 4);
+                if (buckets) {
+                    fseek(ef, entries[e].data_offset + bk_off, SEEK_SET);
+                    if (fread(buckets, 4, nbuckets, ef) == nbuckets) {
+                        uint32_t mx = symoffset;
+                        for (uint32_t b = 0; b < nbuckets; b++)
+                            if (buckets[b] > mx) mx = buckets[b];
+                        if (mx >= symoffset) {
+                            size_t ch_off = bk_off + nbuckets * 4;
+                            uint32_t cv;
+                            for (;;) {
+                                fseek(ef, entries[e].data_offset + ch_off + (mx - symoffset) * 4, SEEK_SET);
+                                if (fread(&cv, 4, 1, ef) != 1) break;
+                                if (cv & 1) break;
+                                mx++;
+                            }
+                        }
+                        nsyms = mx + 1;
+                    }
+                    free(buckets);
+                }
+            }
+        }
+        if (nsyms == 0 && strtab_va > symtab_va)
+            nsyms = (uint32_t)((strtab_va - symtab_va) / sizeof(Elf64_Sym));
+        if (nsyms == 0) { free(phdrs); fclose(ef); continue; }
+
+        /* Read dynstr */
+        uint64_t str_foff = 0;
+        for (int i = 0; i < ehdr.e_phnum; i++) {
+            const Elf64_Phdr *ph = (const Elf64_Phdr *)(phdrs + i * ehdr.e_phentsize);
+            if (ph->p_type != PT_LOAD) continue;
+            if (strtab_va >= ph->p_vaddr &&
+                strtab_va < ph->p_vaddr + ph->p_filesz) {
+                str_foff = strtab_va - ph->p_vaddr + ph->p_offset;
+                break;
+            }
+        }
+        char *dynstr = malloc(strsz);
+        if (!dynstr) { free(phdrs); fclose(ef); continue; }
+        fseek(ef, entries[e].data_offset + str_foff, SEEK_SET);
+        if (fread(dynstr, 1, strsz, ef) != strsz) {
+            free(dynstr); free(phdrs); fclose(ef); continue;
+        }
+
+        /* Read dynsym */
+        uint64_t sym_foff = 0;
+        for (int i = 0; i < ehdr.e_phnum; i++) {
+            const Elf64_Phdr *ph = (const Elf64_Phdr *)(phdrs + i * ehdr.e_phentsize);
+            if (ph->p_type != PT_LOAD) continue;
+            if (symtab_va >= ph->p_vaddr &&
+                symtab_va < ph->p_vaddr + ph->p_filesz) {
+                sym_foff = symtab_va - ph->p_vaddr + ph->p_offset;
+                break;
+            }
+        }
+        Elf64_Sym *dynsym = malloc(nsyms * sizeof(Elf64_Sym));
+        if (!dynsym) { free(dynstr); free(phdrs); fclose(ef); continue; }
+        fseek(ef, entries[e].data_offset + sym_foff, SEEK_SET);
+        if (fread(dynsym, sizeof(Elf64_Sym), nsyms, ef) != nsyms) {
+            free(dynsym); free(dynstr); free(phdrs); fclose(ef); continue;
+        }
+
+        /* Add defined function/object symbols with rebased addresses */
+        uint64_t base = metas[e].base_addr;
+        for (uint32_t s = 1; s < nsyms; s++) {
+            unsigned char stype = ELF64_ST_TYPE(dynsym[s].st_info);
+            if (stype != STT_FUNC && stype != STT_GNU_IFUNC &&
+                stype != STT_OBJECT) continue;
+            if (dynsym[s].st_value == 0 || dynsym[s].st_shndx == SHN_UNDEF)
+                continue;
+            if (dynsym[s].st_name >= strsz) continue;
+            const char *name = dynstr + dynsym[s].st_name;
+            if (!name[0]) continue;
+
+            Elf64_Sym *out_sym = &symtab[sym_idx];
+            out_sym->st_name  = (uint32_t)str_off;
+            out_sym->st_info  = ELF64_ST_INFO(STB_GLOBAL,
+                                    stype == STT_GNU_IFUNC ? STT_FUNC : stype);
+            out_sym->st_other = 0;
+            out_sym->st_shndx = text_info[e].valid ? (4 + e) : SHN_ABS;
+            out_sym->st_value = base + dynsym[s].st_value;
+            out_sym->st_size  = dynsym[s].st_size;
+
+            size_t nlen = strlen(name);
+            memcpy(strtab + str_off, name, nlen + 1);
+            str_off += nlen + 1;
+            sym_idx++;
+        }
+
+        free(dynsym);
+        free(dynstr);
+        free(phdrs);
+        fclose(ef);
+    }
+
+    /* ---- Append to the frozen binary ---- */
+    /*
+     * The footer (64 bytes) is always the last thing in the file, and the
+     * bootstrap locates it via st.st_size - sizeof(footer).  We therefore:
+     *   1. Read the footer from the current end.
+     *   2. Seek back over it (overwrite its position).
+     *   3. Write .shstrtab, .strtab, .symtab, section headers.
+     *   4. Re-write the footer at the new end so it stays last.
+     */
+    FILE *f = fopen(path, "r+b");
+    if (!f) { free(symtab); free(strtab); return -1; }
+    fseek(f, 0, SEEK_END);
+    size_t file_end = ftell(f);
+
+    /* Read and remove the footer from the tail */
+    struct dlfrz_footer saved_ft;
+    fseek(f, file_end - sizeof(saved_ft), SEEK_SET);
+    if (fread(&saved_ft, 1, sizeof(saved_ft), f) != sizeof(saved_ft)) {
+        fclose(f); free(symtab); free(strtab); return -1;
+    }
+    /* Position write cursor where the footer was */
+    fseek(f, file_end - sizeof(saved_ft), SEEK_SET);
+    size_t write_pos = file_end - sizeof(saved_ft);
+
+    /* Section-name string table (.shstrtab) */
+    /* Indices: 0="\0", 1=".shstrtab", 11=".strtab", 19=".symtab", 27=".text" */
+    const char shstrtab[] = "\0.shstrtab\0.strtab\0.symtab\0.text";
+    size_t shstrtab_sz = sizeof(shstrtab);  /* includes trailing NUL */
+    /* Section layout: NULL(0), .shstrtab(1), .strtab(2), .symtab(3),
+     *                 .text(4), .text(5), ..., .text(3+nent)
+     * Each embedded ELF gets its own .text section so perf can compute
+     * the correct VA→file-offset mapping per object. */
+    int sh_count = 4 + nent;   /* NULL + shstrtab + strtab + symtab + nent text */
+    enum { SHNAME_SHSTRTAB = 1, SHNAME_STRTAB = 11, SHNAME_SYMTAB = 19,
+           SHNAME_TEXT = 27 };
+
+    /* Align and write .shstrtab */
+    size_t pad_to = ALIGN_UP(write_pos, 8);
+    if (pad_to > write_pos) {
+        char zeros[8] = {0};
+        fwrite(zeros, 1, pad_to - write_pos, f);
+    }
+    size_t shstrtab_off = pad_to;
+    fwrite(shstrtab, 1, shstrtab_sz, f);
+    size_t cur = shstrtab_off + shstrtab_sz;
+
+    /* Align and write .strtab */
+    pad_to = ALIGN_UP(cur, 8);
+    if (pad_to > cur) {
+        char zeros[8] = {0};
+        fwrite(zeros, 1, pad_to - cur, f);
+    }
+    size_t strtab_off_file = pad_to;
+    fwrite(strtab, 1, total_strsz, f);
+    cur = strtab_off_file + total_strsz;
+
+    /* Align and write .symtab */
+    pad_to = ALIGN_UP(cur, 8);
+    if (pad_to > cur) {
+        char zeros[8] = {0};
+        fwrite(zeros, 1, pad_to - cur, f);
+    }
+    size_t symtab_off_file = pad_to;
+    size_t symtab_sz = sym_idx * sizeof(Elf64_Sym);
+    fwrite(symtab, 1, symtab_sz, f);
+    cur = symtab_off_file + symtab_sz;
+
+    /* Align and write section headers */
+    pad_to = ALIGN_UP(cur, 8);
+    if (pad_to > cur) {
+        char zeros[8] = {0};
+        fwrite(zeros, 1, pad_to - cur, f);
+    }
+    size_t shdr_off = pad_to;
+
+    Elf64_Shdr *shdrs = calloc(sh_count, sizeof(Elf64_Shdr));
+    if (!shdrs) { fclose(f); free(symtab); free(strtab); free(text_info); return -1; }
+
+    /* [0] SHT_NULL */
+    /* already zeroed */
+
+    /* [1] .shstrtab */
+    shdrs[1].sh_name   = SHNAME_SHSTRTAB;
+    shdrs[1].sh_type   = SHT_STRTAB;
+    shdrs[1].sh_offset = shstrtab_off;
+    shdrs[1].sh_size   = shstrtab_sz;
+    shdrs[1].sh_addralign = 1;
+
+    /* [2] .strtab */
+    shdrs[2].sh_name   = SHNAME_STRTAB;
+    shdrs[2].sh_type   = SHT_STRTAB;
+    shdrs[2].sh_offset = strtab_off_file;
+    shdrs[2].sh_size   = total_strsz;
+    shdrs[2].sh_addralign = 1;
+
+    /* [3] .symtab */
+    shdrs[3].sh_name    = SHNAME_SYMTAB;
+    shdrs[3].sh_type    = SHT_SYMTAB;
+    shdrs[3].sh_offset  = symtab_off_file;
+    shdrs[3].sh_size    = symtab_sz;
+    shdrs[3].sh_link    = 2;  /* .strtab */
+    shdrs[3].sh_entsize = sizeof(Elf64_Sym);
+    shdrs[3].sh_addralign = 8;
+    /* sh_info = index of first non-local symbol (all ours are GLOBAL) */
+    shdrs[3].sh_info = 1;
+
+    /* [4 .. 4+nent-1] .text — one per embedded ELF.
+     * Each section's (sh_addr, sh_offset) establishes the mapping:
+     *   file_offset = VA - sh_addr + sh_offset
+     * which perf uses to convert symbol VAs to file offsets for lookup. */
+    for (int i = 0; i < nent; i++) {
+        Elf64_Shdr *sh = &shdrs[4 + i];
+        sh->sh_name  = SHNAME_TEXT;
+        sh->sh_type  = SHT_PROGBITS;
+        sh->sh_flags = SHF_ALLOC | SHF_EXECINSTR;
+        if (text_info[i].valid) {
+            sh->sh_addr   = text_info[i].sh_addr;
+            sh->sh_offset = text_info[i].sh_offset;
+            sh->sh_size   = text_info[i].sh_size;
+        }
+        sh->sh_addralign = 16;
+    }
+
+    fwrite(shdrs, sizeof(Elf64_Shdr), sh_count, f);
+    free(shdrs);
+
+    /* ---- Patch the outer ELF header ---- */
+    Elf64_Ehdr ehdr;
+    fseek(f, 0, SEEK_SET);
+    if (fread(&ehdr, 1, sizeof(ehdr), f) != sizeof(ehdr)) {
+        fclose(f); free(symtab); free(strtab); free(text_info); return -1;
+    }
+    ehdr.e_shoff     = shdr_off;
+    ehdr.e_shentsize = sizeof(Elf64_Shdr);
+    ehdr.e_shnum     = sh_count;
+    ehdr.e_shstrndx  = 1;  /* .shstrtab */
+    fseek(f, 0, SEEK_SET);
+    fwrite(&ehdr, 1, sizeof(ehdr), f);
+
+    /* NOTE: We intentionally do NOT extend the payload PT_LOAD segment.
+     * The symbol/section data is only read by offline tools (readelf,
+     * perf, objdump) from the file — it doesn't need to be mapped into
+     * memory at runtime. */
+
+    /* Re-append the footer so it remains the last thing in the file.
+     * The bootstrap locates it via st.st_size - sizeof(footer). */
+    fseek(f, 0, SEEK_END);
+    fwrite(&saved_ft, 1, sizeof(saved_ft), f);
+
+    fclose(f);
+    free(symtab);
+    free(strtab);
+    free(text_info);
+
+    printf("  symbols    : %zu entries (%zu bytes)\n",
+           sym_idx - 1, symtab_sz + total_strsz + shstrtab_sz);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 int pack_frozen(const struct pack_options *opts)
 {
     FILE *out = fopen(opts->output_path, "wb");
@@ -908,19 +1471,18 @@ int pack_frozen(const struct pack_options *opts)
     const char **src_paths = calloc(nent, sizeof(char *));
 
     /* build string table ------------------------------------------- */
+    /* Store directory-qualified sonames (dirname(path)/soname) so that:
+     *   - dl_basename() still matches DT_NEEDED sonames at runtime
+     *   - profilers and dl_iterate_phdr get paths that exist on disk
+     * Note: realpath() may resolve symlinks to versioned names like
+     * libQt6Core.so.6.11.0, but DT_NEEDED uses soname "libQt6Core.so.6",
+     * so we use dirname(resolved_path)/soname for libraries. */
     size_t strsz = 0;
-    const char *exe_base = strrchr(opts->exe_path, '/');
-    exe_base = exe_base ? exe_base + 1 : opts->exe_path;
-    strsz += strlen(exe_base) + 1;
-
-    const char *interp_base = NULL;
-    if (opts->deps->interp_path) {
-        interp_base = strrchr(opts->deps->interp_path, '/');
-        interp_base = interp_base ? interp_base + 1 : opts->deps->interp_path;
-        strsz += strlen(interp_base) + 1;
-    }
+    strsz += strlen(opts->exe_path) + 1;
+    if (opts->deps->interp_path)
+        strsz += strlen(opts->deps->interp_path) + 1;
     for (int i = 0; i < opts->deps->count; i++)
-        strsz += strlen(opts->deps->libs[i].name) + 1;
+        strsz += strlen(opts->deps->libs[i].path) + strlen(opts->deps->libs[i].name) + 2;
 
     char *strtab = calloc(1, strsz);
     size_t stroff = 0;
@@ -932,7 +1494,7 @@ int pack_frozen(const struct pack_options *opts)
     entries[eidx].data_offset = off;
     entries[eidx].flags       = DLFRZ_FLAG_MAIN_EXE;
     entries[eidx].name_offset = stroff;
-    strcpy(strtab + stroff, exe_base); stroff += strlen(exe_base) + 1;
+    strcpy(strtab + stroff, opts->exe_path); stroff += strlen(opts->exe_path) + 1;
     if (append_file(out, opts->exe_path, &written) < 0) goto fail2;
     entries[eidx].data_size = written;
     src_paths[eidx] = opts->exe_path;
@@ -944,7 +1506,7 @@ int pack_frozen(const struct pack_options *opts)
         entries[eidx].data_offset = off;
         entries[eidx].flags       = DLFRZ_FLAG_INTERP;
         entries[eidx].name_offset = stroff;
-        strcpy(strtab + stroff, interp_base); stroff += strlen(interp_base) + 1;
+        strcpy(strtab + stroff, opts->deps->interp_path); stroff += strlen(opts->deps->interp_path) + 1;
         if (append_file(out, opts->deps->interp_path, &written) < 0) goto fail2;
         entries[eidx].data_size = written;
         src_paths[eidx] = opts->deps->interp_path;
@@ -959,8 +1521,24 @@ int pack_frozen(const struct pack_options *opts)
         if (opts->deps->libs[i].from_dlopen)
             entries[eidx].flags |= DLFRZ_FLAG_DLOPEN;
         entries[eidx].name_offset = stroff;
-        strcpy(strtab + stroff, opts->deps->libs[i].name);
-        stroff += strlen(opts->deps->libs[i].name) + 1;
+        /* Build dirname(path)/soname — e.g. "/usr/lib/libQt6Core.so.6"
+         * The path may have been resolved via realpath() to a versioned
+         * name like libQt6Core.so.6.11.0, but we need the soname for
+         * basename matching against DT_NEEDED entries at runtime. */
+        {
+            const char *rpath = opts->deps->libs[i].path;
+            const char *sname = opts->deps->libs[i].name;
+            const char *last_slash = strrchr(rpath, '/');
+            if (last_slash) {
+                size_t dirlen = (size_t)(last_slash - rpath + 1); /* include '/' */
+                memcpy(strtab + stroff, rpath, dirlen);
+                strcpy(strtab + stroff + dirlen, sname);
+                stroff += dirlen + strlen(sname) + 1;
+            } else {
+                strcpy(strtab + stroff, sname);
+                stroff += strlen(sname) + 1;
+            }
+        }
         if (append_file(out, opts->deps->libs[i].path, &written) < 0) goto fail2;
         entries[eidx].data_size = written;
         src_paths[eidx] = opts->deps->libs[i].path;
@@ -1063,6 +1641,11 @@ int pack_frozen(const struct pack_options *opts)
         } else {
             printf("  pre-linked : no (failed, will use runtime relocation)\n");
         }
+
+        /* 10. append combined symbol table for profiler support ----- */
+        append_combined_symtab(opts->output_path,
+                                entries_copy, metas, eidx_save);
+
         free(metas);
         free(entries_copy);
     }
@@ -1070,7 +1653,7 @@ int pack_frozen(const struct pack_options *opts)
     printf("Frozen binary: %s\n", opts->output_path);
     printf("  bootstrap  : %zu bytes\n", bootstrap_sz);
     printf("  embedded   : %d files\n", eidx_save);
-    printf("  total size : %zu bytes\n", total_sz);
+    printf("  total size : %zu bytes\n", filesize(opts->output_path));
     return 0;
 
 fail2:

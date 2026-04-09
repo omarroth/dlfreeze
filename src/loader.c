@@ -39,6 +39,13 @@ static void *g_null_page;
  * Set before TLS swap (getenv is safe in bootstrap's libc). */
 static int g_debug;
 
+/* Perf-friendly mode — enabled by DLFREEZE_PERF=1 env var.
+ * Uses anonymous memory (memcpy) instead of file-backed mmap so that
+ * perf falls back to /tmp/perf-<PID>.map for symbol resolution.
+ * Without this, all loaded code is file-backed from the frozen binary
+ * which has stripped section headers, so perf finds no symbols. */
+static int g_perf_mode;
+
 /* ---- error output (no stdio — bootstrap may break after TLS swap) ----- */
 static void ldr_msg(const char *s)
 {
@@ -1217,8 +1224,15 @@ static int reserve_address_range(const struct dlfrz_lib_meta *metas,
     /* Add guard pages at the end */
     range_hi += 4 * 4096;
 
+    /* In perf mode, segments stay as anonymous memory (memcpy, not
+     * file-backed mmap), so include PROT_EXEC in the reservation —
+     * IRELATIVE resolvers need executable text before protect_object
+     * sets final per-segment permissions. */
+    int res_prot = PROT_READ | PROT_WRITE;
+    if (g_perf_mode) res_prot |= PROT_EXEC;
+
     void *mapped = mmap((void *)range_lo, range_hi - range_lo,
-                        PROT_READ | PROT_WRITE,
+                        res_prot,
                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
                         -1, 0);
     if (mapped == MAP_FAILED) return -1;
@@ -1259,7 +1273,8 @@ static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         const Elf64_Phdr *ph = (const Elf64_Phdr *)(phdr_base + i * meta->phdr_entsz);
         if (ph->p_type != PT_LOAD) continue;
 
-        if (ph->p_filesz > 0 && srcfd >= 0 && mem_foff == 0) {
+        if (ph->p_filesz > 0 && srcfd >= 0 && mem_foff == 0 && 
+            !(g_perf_mode && (meta->flags & LDR_FLAG_MAIN_EXE))) {
             uint64_t seg_page_vaddr = ph->p_vaddr & ~0xFFFULL;
             uint64_t seg_page_off   = ph->p_offset & ~0xFFFULL;
             uint64_t page_delta     = ph->p_vaddr - seg_page_vaddr;
@@ -2246,6 +2261,122 @@ static char *my_dlerror(void)
     return NULL;
 }
 
+/* ---- perf map file for profilers ------------------------------------- */
+
+/*
+ * Write /tmp/perf-<PID>.map so that profilers (perf report, flamegraph)
+ * can resolve addresses in frozen-binary code to function names.
+ *
+ * Format per line: HEX_ADDR HEX_SIZE SYMBOL_NAME\n
+ *
+ * Uses raw syscalls to avoid musl's errno handling which corrupts
+ * glibc's pointer_guard after the TLS swap.
+ */
+static void write_perf_map(void)
+{
+    long ret;
+
+    /* getpid() */
+    __asm__ volatile("syscall" : "=a"(ret) : "a"((long)SYS_getpid)
+                     : "rcx", "r11", "memory");
+    long pid = ret;
+
+    /* Build "/tmp/perf-<PID>.map" */
+    char path[64];
+    int pi = 0;
+    const char *pfx = "/tmp/perf-";
+    while (*pfx) path[pi++] = *pfx++;
+    char dbuf[20];
+    int dn = 0;
+    long t = pid;
+    do { dbuf[dn++] = '0' + (t % 10); t /= 10; } while (t);
+    while (dn > 0) path[pi++] = dbuf[--dn];
+    const char *sfx = ".map";
+    while (*sfx) path[pi++] = *sfx++;
+    path[pi] = '\0';
+
+    /* openat(AT_FDCWD, path, O_WRONLY|O_CREAT|O_TRUNC, 0644) */
+    {
+        register long r10 __asm__("r10") = 0644;
+        __asm__ volatile("syscall" : "=a"(ret)
+            : "a"((long)SYS_openat), "D"((long)AT_FDCWD),
+              "S"((long)(uintptr_t)path),
+              "d"((long)(O_WRONLY | O_CREAT | O_TRUNC)),
+              "r"(r10)
+            : "rcx", "r11", "memory");
+    }
+    if (ret < 0) return;
+    int fd = (int)ret;
+
+    char buf[16384];
+    int bpos = 0;
+
+    #define PM_FLUSH() do { \
+        if (bpos > 0) { \
+            long _r; \
+            __asm__ volatile("syscall" : "=a"(_r) \
+                : "a"((long)SYS_write), "D"((long)fd), \
+                  "S"((long)(uintptr_t)buf), "d"((long)bpos) \
+                : "rcx", "r11", "memory"); \
+            bpos = 0; \
+        } \
+    } while(0)
+
+    for (int i = 0; i < g_nobj; i++) {
+        const struct loaded_obj *obj = &g_all_objs[i];
+        if (!obj->dynsym || !obj->dynstr) continue;
+
+        for (uint32_t s = 0; s < obj->dynsym_count; s++) {
+            const Elf64_Sym *sym = &obj->dynsym[s];
+            unsigned char stype = ELF64_ST_TYPE(sym->st_info);
+            if (stype != STT_FUNC && stype != STT_GNU_IFUNC) continue;
+            if (sym->st_value == 0 || sym->st_shndx == SHN_UNDEF) continue;
+
+            const char *name = obj->dynstr + sym->st_name;
+            if (!name[0]) continue;
+
+            uint64_t addr = obj->base + sym->st_value;
+            uint64_t size = sym->st_size;
+
+            if (bpos > (int)sizeof(buf) - 512) PM_FLUSH();
+
+            /* hex addr (no 0x prefix, lowercase) */
+            char hx[17];
+            int hn = 0;
+            uint64_t v = addr;
+            do { hx[hn++] = "0123456789abcdef"[v & 0xf]; v >>= 4; } while (v);
+            while (hn > 0) buf[bpos++] = hx[--hn];
+            buf[bpos++] = ' ';
+
+            /* hex size */
+            hn = 0; v = size;
+            if (v == 0) { buf[bpos++] = '0'; }
+            else {
+                do { hx[hn++] = "0123456789abcdef"[v & 0xf]; v >>= 4; } while (v);
+                while (hn > 0) buf[bpos++] = hx[--hn];
+            }
+            buf[bpos++] = ' ';
+
+            /* symbol name */
+            while (*name && bpos < (int)sizeof(buf) - 2)
+                buf[bpos++] = *name++;
+            buf[bpos++] = '\n';
+        }
+    }
+
+    PM_FLUSH();
+    #undef PM_FLUSH
+
+    /* close(fd) */
+    __asm__ volatile("syscall" : "=a"(ret)
+                     : "a"((long)SYS_close), "D"((long)fd)
+                     : "rcx", "r11", "memory");
+
+    ldr_dbg("[loader] wrote ");
+    ldr_dbg(path);
+    ldr_dbg("\n");
+}
+
 /* ---------- dl_iterate_phdr override ---------------------------------- */
 
 static int my_dl_iterate_phdr(
@@ -2526,10 +2657,12 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
                uint32_t num_entries,
                int argc, char **argv, char **envp)
 {
-    /* Check debug flag before TLS swap (getenv uses bootstrap's libc) */
+    /* Check env flags before TLS swap (getenv uses bootstrap's libc) */
     {
         const char *dbg = getenv("DLFREEZE_DEBUG");
         g_debug = (dbg && dbg[0] != '0' && dbg[0] != '\0');
+        const char *perf = getenv("DLFREEZE_PERF");
+        g_perf_mode = (perf && perf[0] != '0' && perf[0] != '\0');
     }
 
     clear_resolution_caches();
@@ -2769,12 +2902,20 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
 
     /* 6. Set final memory protections.
      *    For pre-linked objects, segments were already mapped with their
-     *    correct ELF permissions from map_object, so no mprotect needed.
-     *    Only non-prelinked objects need post-relocation protection. */
+     *    correct ELF permissions from map_object, so no mprotect needed
+     *    — UNLESS perf mode is active for the main exe, where memcpy into
+     *    the anonymous reservation leaves pages as RW without EXEC. */
     ldr_dbg("[loader] setting protections...\n");
     if (!prelinked) {
         for (int i = 0; i < nobj; i++)
             protect_object(&objs[i], &metas[idx_map[i]]);
+    } else if (g_perf_mode) {
+        /* In perf mode for main exe: only protect the main exe (prelinked),
+         * shared libraries stay file-backed and need no extra protection. */
+        for (int i = 0; i < nobj; i++) {
+            if (objs[i].flags & LDR_FLAG_MAIN_EXE)
+                protect_object(&objs[i], &metas[idx_map[i]]);
+        }
     }
 
     /* Set dlopen support globals before init functions or main() can
@@ -2825,6 +2966,9 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
             ((init_fn_t)objs[i].init_array[j])(argc, argv, envp);
     }
     ldr_dbg("[loader] init functions done\n");
+
+    /* 7c. Write perf map for profiler symbol resolution */
+    write_perf_map();
 
     /* 8. Find the exe's entry point and transfer control */
     uintptr_t entry = 0;

@@ -74,6 +74,13 @@ static void rmtree(const char *path)
 }
 
 /* ---- extract one embedded blob to a file ------------------------- */
+static const char *bs_basename(const char *path)
+{
+    const char *base = path;
+    while (*path) { if (*path == '/') base = path + 1; path++; }
+    return base;
+}
+
 static int extract(int srcfd, const char *dst,
                    uint64_t off, uint64_t sz, int exec)
 {
@@ -335,7 +342,7 @@ int main(int argc, char **argv)
     for (uint32_t i = 0; i < ft.num_entries; i++) {
         const char *name = strtab + ent[i].name_offset;
         char dst[PATH_MAX + 256];
-        snprintf(dst, sizeof(dst), "%s/%s", g_tmpdir, name);
+        snprintf(dst, sizeof(dst), "%s/%s", g_tmpdir, bs_basename(name));
 
         int is_exec = (ent[i].flags & (DLFRZ_FLAG_MAIN_EXE | DLFRZ_FLAG_INTERP));
 
