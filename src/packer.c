@@ -904,11 +904,12 @@ static int patch_elf_for_upx(const char *path, size_t bootstrap_sz,
         /* Continue anyway — file-based path will still work */
     }
 
-    /* --- Strip section-header table --- */
-    ehdr->e_shoff     = 0;
-    ehdr->e_shentsize = 0;
-    ehdr->e_shnum     = 0;
-    ehdr->e_shstrndx  = 0;
+    /* --- Zero section-header table if not already set by symtab --- */
+    if (ehdr->e_shoff == 0) {
+        ehdr->e_shentsize = 0;
+        ehdr->e_shnum     = 0;
+        ehdr->e_shstrndx  = 0;
+    }
 
     /* --- Patch the DLFRZLDR sentinel in .data --- */
     const char sentinel[] = "DLFRZLDR";
@@ -1701,16 +1702,7 @@ int pack_frozen(const struct pack_options *opts)
     fclose(out);
     chmod(opts->output_path, 0755);
 
-    /* 8. patch ELF for UPX compatibility --------------------------- */
-    size_t total_sz = filesize(opts->output_path);
-    if (patch_elf_for_upx(opts->output_path, bootstrap_sz,
-                           payload_off, total_sz) < 0) {
-        fprintf(stderr, "dlfreeze: ELF patching failed\n");
-        free(metas);
-        return -1;
-    }
-
-    /* 9. pre-link: apply relocations at freeze time ---------------- */
+    /* 8. pre-link: apply relocations at freeze time ---------------- */
     if (metas) {
         printf("  pre-linking...\n");
         if (prelink_objects(opts->output_path, entries_copy, metas, eidx_save) == 0) {
@@ -1728,12 +1720,22 @@ int pack_frozen(const struct pack_options *opts)
             printf("  pre-linked : no (failed, will use runtime relocation)\n");
         }
 
-        /* 10. append combined symbol table for profiler support ----- */
+        /* 9. append combined symbol table for profiler support ----- */
         append_combined_symtab(opts->output_path,
                                 entries_copy, metas, eidx_save);
 
         free(metas);
         free(entries_copy);
+    }
+
+    /* 10. patch ELF for UPX compatibility --------------------------
+     * Must happen LAST so payload_filesz includes everything appended
+     * after the footer (symtab, section headers, re-appended footer). */
+    size_t total_sz = filesize(opts->output_path);
+    if (patch_elf_for_upx(opts->output_path, bootstrap_sz,
+                           payload_off, total_sz) < 0) {
+        fprintf(stderr, "dlfreeze: ELF patching failed\n");
+        return -1;
     }
 
     printf("Frozen binary: %s\n", opts->output_path);

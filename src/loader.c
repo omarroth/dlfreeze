@@ -1826,7 +1826,8 @@ static int resolve_tpoff(struct loaded_obj *objs, int nobj,
  * Returns 0 on success, -1 on failure.
  */
 static int reserve_address_range(const struct dlfrz_lib_meta *metas,
-                                  const int *idx_map, int nobj)
+                                  const int *idx_map, int nobj,
+                                  _Bool memcpy_mode)
 {
     /* Find lowest and highest addresses across all objects */
     uint64_t range_lo = UINT64_MAX, range_hi = 0;
@@ -1842,12 +1843,12 @@ static int reserve_address_range(const struct dlfrz_lib_meta *metas,
     /* Add guard pages at the end */
     range_hi += 4 * 4096;
 
-    /* In perf mode, segments stay as anonymous memory (memcpy, not
-     * file-backed mmap), so include PROT_EXEC in the reservation —
-     * IRELATIVE resolvers need executable text before protect_object
+    /* When segments are populated via memcpy (perf mode or UPX path
+     * where srcfd<0), include PROT_EXEC in the reservation so that
+     * IRELATIVE resolvers can execute text before protect_object
      * sets final per-segment permissions. */
     int res_prot = PROT_READ | PROT_WRITE;
-    if (g_perf_mode) res_prot |= PROT_EXEC;
+    if (g_perf_mode || memcpy_mode) res_prot |= PROT_EXEC;
 
     void *mapped = mmap((void *)range_lo, range_hi - range_lo,
                         res_prot,
@@ -3350,7 +3351,7 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
      *    map individual segments on top.  This reduces mmap syscalls
      *    from N*M (objects*segments) to 1 + N*M_file-backed. */
     ldr_dbg("[loader] mapping objects...\n");
-    if (reserve_address_range(metas, idx_map, nobj) < 0) {
+    if (reserve_address_range(metas, idx_map, nobj, srcfd < 0) < 0) {
         ldr_err("failed to reserve address range", NULL);
         return -1;
     }
@@ -3551,10 +3552,11 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     /* 6. Set final memory protections.
      *    For pre-linked objects, segments were already mapped with their
      *    correct ELF permissions from map_object, so no mprotect needed
-     *    — UNLESS perf mode is active for the main exe, where memcpy into
-     *    the anonymous reservation leaves pages as RW without EXEC. */
+     *    — UNLESS memcpy was used (perf mode or UPX path with srcfd<0),
+     *    where the anonymous reservation leaves pages as RWX and we need
+     *    to set proper per-segment permissions. */
     ldr_dbg("[loader] setting protections...\n");
-    if (!prelinked) {
+    if (!prelinked || srcfd < 0) {
         for (int i = 0; i < nobj; i++)
             protect_object(&objs[i], &metas[idx_map[i]]);
     } else if (g_perf_mode) {
