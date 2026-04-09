@@ -14,6 +14,38 @@
 #define DIRECT_LOAD_BASE  0x200000000ULL
 
 /* ------------------------------------------------------------------ */
+/* Data file list helpers                                              */
+/* ------------------------------------------------------------------ */
+void data_file_list_init(struct data_file_list *dl)
+{
+    dl->paths    = NULL;
+    dl->count    = 0;
+    dl->capacity = 0;
+}
+
+void data_file_list_add(struct data_file_list *dl, const char *path)
+{
+    /* Deduplicate */
+    for (int i = 0; i < dl->count; i++)
+        if (strcmp(dl->paths[i], path) == 0) return;
+
+    if (dl->count >= dl->capacity) {
+        dl->capacity = dl->capacity ? dl->capacity * 2 : 64;
+        dl->paths = realloc(dl->paths, dl->capacity * sizeof(char *));
+    }
+    dl->paths[dl->count++] = strdup(path);
+}
+
+void data_file_list_free(struct data_file_list *dl)
+{
+    for (int i = 0; i < dl->count; i++)
+        free(dl->paths[i]);
+    free(dl->paths);
+    dl->paths = NULL;
+    dl->count = dl->capacity = 0;
+}
+
+/* ------------------------------------------------------------------ */
 static int append_file(FILE *out, const char *path, size_t *written)
 {
     FILE *in = fopen(path, "rb");
@@ -670,6 +702,8 @@ static int prelink_objects(const char *output_path,
             if (m->flags & DLFRZ_FLAG_INTERP) continue;
             /* Skip dlopen'd objects — loaded lazily at runtime */
             if (m->flags & DLFRZ_FLAG_DLOPEN) continue;
+            /* Skip embedded data files — not ELFs */
+            if (m->flags & DLFRZ_FLAG_DATA) continue;
 
         uint64_t lo   = m->vaddr_lo & ~0xFFFULL;
         uint64_t hi   = ALIGN_UP(m->vaddr_hi, 4096);
@@ -721,6 +755,7 @@ static int prelink_objects(const char *output_path,
     for (int i = 0; i < nobj; i++) {
         if (metas[i].flags & DLFRZ_FLAG_INTERP) continue;
         if (metas[i].flags & DLFRZ_FLAG_DLOPEN) continue;
+        if (metas[i].flags & DLFRZ_FLAG_DATA) continue;
         if (objs[i].tls_memsz > 0) {
             uint64_t align = objs[i].tls_align;
             total_tls = ALIGN_UP(total_tls + objs[i].tls_memsz, align);
@@ -735,6 +770,7 @@ static int prelink_objects(const char *output_path,
     for (int i = 0; i < nobj; i++) {
             if (metas[i].flags & DLFRZ_FLAG_INTERP) continue;
             if (metas[i].flags & DLFRZ_FLAG_DLOPEN) continue;
+            if (metas[i].flags & DLFRZ_FLAG_DATA) continue;
         pl_apply_relr(&objs[i]);
         if (objs[i].rela_count > 0)
             pl_apply_rela(&objs[i], objs[i].rela, objs[i].rela_count,
@@ -747,6 +783,7 @@ static int prelink_objects(const char *output_path,
     for (int i = 0; i < nobj; i++) {
             if (metas[i].flags & DLFRZ_FLAG_INTERP) continue;
             if (metas[i].flags & DLFRZ_FLAG_DLOPEN) continue;
+            if (metas[i].flags & DLFRZ_FLAG_DATA) continue;
         if (objs[i].rela_count > 0)
             pl_apply_rela(&objs[i], objs[i].rela, objs[i].rela_count,
                           objs, nobj, 1);
@@ -760,6 +797,7 @@ static int prelink_objects(const char *output_path,
         const struct dlfrz_lib_meta *m = &metas[i];
             if (m->flags & DLFRZ_FLAG_INTERP) continue;
             if (m->flags & DLFRZ_FLAG_DLOPEN) continue;
+            if (m->flags & DLFRZ_FLAG_DATA) continue;
         uint64_t base = objs[i].base;
         const uint8_t *phdr_mem = (const uint8_t *)(base + m->phdr_off);
 
@@ -927,6 +965,7 @@ static int append_combined_symtab(const char *path,
     size_t total_strsz = 1;  /* byte 0 is always '\0' */
 
     for (int e = 0; e < nent; e++) {
+        if (entries[e].flags & DLFRZ_FLAG_DATA) continue; /* skip data files */
         FILE *ef = fopen(path, "rb");
         if (!ef) continue;
         fseek(ef, entries[e].data_offset, SEEK_SET);
@@ -1117,6 +1156,7 @@ static int append_combined_symtab(const char *path,
     size_t str_off = 1;   /* skip byte 0 (null byte) */
 
     for (int e = 0; e < nent; e++) {
+        if (entries[e].flags & DLFRZ_FLAG_DATA) continue; /* skip data files */
         FILE *ef = fopen(path, "rb");
         if (!ef) continue;
         fseek(ef, entries[e].data_offset, SEEK_SET);
@@ -1464,8 +1504,9 @@ int pack_frozen(const struct pack_options *opts)
     size_t bootstrap_sz = written;
     off += written;
 
-    /* total entries: main-exe + interpreter? + libs */
-    int nent = 1 + (opts->deps->interp_path ? 1 : 0) + opts->deps->count;
+    /* total entries: main-exe + interpreter? + libs + data files */
+    int ndata = opts->data_files ? opts->data_files->count : 0;
+    int nent = 1 + (opts->deps->interp_path ? 1 : 0) + opts->deps->count + ndata;
     struct dlfrz_entry *entries = calloc(nent, sizeof(*entries));
     /* Parallel array of source paths for lib_meta computation */
     const char **src_paths = calloc(nent, sizeof(char *));
@@ -1483,6 +1524,8 @@ int pack_frozen(const struct pack_options *opts)
         strsz += strlen(opts->deps->interp_path) + 1;
     for (int i = 0; i < opts->deps->count; i++)
         strsz += strlen(opts->deps->libs[i].path) + strlen(opts->deps->libs[i].name) + 2;
+    for (int i = 0; i < ndata; i++)
+        strsz += strlen(opts->data_files->paths[i]) + 1;
 
     char *strtab = calloc(1, strsz);
     size_t stroff = 0;
@@ -1545,6 +1588,21 @@ int pack_frozen(const struct pack_options *opts)
         off += written; eidx++;
     }
 
+    /* 4b. data files ----------------------------------------------- */
+    for (int i = 0; i < ndata; i++) {
+        write_pad(out, off, 8); off = ALIGN_UP(off, 8);
+        entries[eidx].data_offset = off;
+        entries[eidx].flags       = DLFRZ_FLAG_DATA;
+        entries[eidx].name_offset = stroff;
+        const char *dpath = opts->data_files->paths[i];
+        strcpy(strtab + stroff, dpath);
+        stroff += strlen(dpath) + 1;
+        if (append_file(out, dpath, &written) < 0) goto fail2;
+        entries[eidx].data_size = written;
+        src_paths[eidx] = dpath;
+        off += written; eidx++;
+    }
+
     /* 5. string table ---------------------------------------------- */
     write_pad(out, off, 8); off = ALIGN_UP(off, 8);
     size_t strtab_off = off;
@@ -1567,6 +1625,10 @@ int pack_frozen(const struct pack_options *opts)
 
         uint64_t base = DIRECT_LOAD_BASE;
         for (int i = 0; i < eidx; i++) {
+            if (entries[i].flags & DLFRZ_FLAG_DATA) {
+                metas[i].flags = DLFRZ_FLAG_DATA; /* mark so loader can skip */
+                continue;
+            }
             if (compute_lib_meta(src_paths[i], base, entries[i].flags,
                                   &metas[i]) < 0) {
                 free(metas); goto fail2;

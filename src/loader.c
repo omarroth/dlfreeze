@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/stat.h>
 #include <elf.h>
 #include <link.h>
 #include <stdint.h>
@@ -30,6 +31,7 @@
 #define LDR_FLAG_DLOPEN      0x08
 #define LDR_FLAG_PRELINKED   0x10
 #define LDR_FLAG_NEEDS_RTLD  0x20
+#define LDR_FLAG_DATA        0x40
 
 /* Zeroed page used as target for unresolved OBJECT symbols.
  * Prevents NULL dereference crashes in IFUNC resolvers. */
@@ -862,6 +864,171 @@ static int g_dlerror_valid;
 static char g_dl_strbuf[8192];
 static size_t g_dl_strbuf_used;
 
+/* ==== Embedded data-file VFS ========================================== */
+/*
+ * When -f patterns are used, non-ELF data files are packed into the frozen
+ * binary with DLFRZ_FLAG_DATA.  At runtime we intercept openat() so that
+ * any access to a path that matches an embedded file returns a memfd
+ * containing the embedded data instead of going to the real filesystem.
+ */
+
+#define VFS_HASH_SIZE 1024U  /* must be power-of-two */
+
+struct vfs_entry {
+    const char     *path;      /* absolute path string (in strtab) */
+    const uint8_t  *data;      /* pointer into mmap'd frozen binary */
+    uint64_t        size;
+};
+
+static struct vfs_entry g_vfs_table[VFS_HASH_SIZE];
+static int g_vfs_count;
+
+static uint32_t vfs_hash(const char *s)
+{
+    uint32_t h = 5381;
+    for (; *s; s++)
+        h = h * 33 + (uint8_t)*s;
+    return h;
+}
+
+static void vfs_init(const uint8_t *mem, uint64_t mem_foff,
+                     const struct dlfrz_entry *entries,
+                     const char *strtab, uint32_t num_entries)
+{
+    g_vfs_count = 0;
+    for (uint32_t i = 0; i < num_entries; i++) {
+        if (!(entries[i].flags & DLFRZ_FLAG_DATA)) continue;
+        const char *path = strtab + entries[i].name_offset;
+        uint32_t idx = vfs_hash(path) & (VFS_HASH_SIZE - 1);
+        while (g_vfs_table[idx].path)
+            idx = (idx + 1) & (VFS_HASH_SIZE - 1);
+        g_vfs_table[idx].path = path;
+        g_vfs_table[idx].data = mem + (entries[i].data_offset - mem_foff);
+        g_vfs_table[idx].size = entries[i].data_size;
+        g_vfs_count++;
+    }
+    if (g_debug && g_vfs_count > 0) {
+        ldr_dbg_hex("[loader] vfs: 0x", g_vfs_count);
+        ldr_msg(" data files registered\n");
+    }
+}
+
+static const struct vfs_entry *vfs_lookup(const char *path)
+{
+    if (g_vfs_count == 0) return NULL;
+    uint32_t idx = vfs_hash(path) & (VFS_HASH_SIZE - 1);
+    for (int probes = 0; probes < (int)VFS_HASH_SIZE; probes++) {
+        if (!g_vfs_table[idx].path) return NULL;
+        if (strcmp(g_vfs_table[idx].path, path) == 0)
+            return &g_vfs_table[idx];
+        idx = (idx + 1) & (VFS_HASH_SIZE - 1);
+    }
+    return NULL;
+}
+
+/* The VFS overrides are only populated in the special-table when
+ * g_vfs_count > 0, so they are a no-op for non-VFS binaries. */
+
+static int vfs_open(const char *path, int flags, int mode)
+{
+    /* Only intercept absolute paths for read-only opens */
+    if (path && path[0] == '/' && (flags & 3) == 0 /* O_RDONLY */) {
+        const struct vfs_entry *ve = vfs_lookup(path);
+        if (ve) {
+            int fd = (int)syscall(SYS_memfd_create, "dlfrz-vfs", 0);
+            if (fd >= 0) {
+                const uint8_t *p = ve->data;
+                uint64_t rem = ve->size;
+                while (rem > 0) {
+                    long w = syscall(SYS_write, fd, p, rem);
+                    if (w <= 0) { syscall(SYS_close, fd); fd = -1; break; }
+                    p   += w;
+                    rem -= w;
+                }
+                if (fd >= 0) {
+                    syscall(SYS_lseek, fd, (off_t)0, 0 /* SEEK_SET */);
+                    if (g_debug) {
+                        ldr_msg("vfs: serving ");
+                        ldr_msg(path);
+                        ldr_msg("\n");
+                    }
+                    return fd;
+                }
+            }
+        }
+    }
+    return (int)syscall(SYS_openat, AT_FDCWD, path, flags, mode);
+}
+
+static int vfs_openat(int dirfd, const char *path, int flags, int mode)
+{
+    if (path && path[0] == '/' && (flags & 3) == 0) {
+        const struct vfs_entry *ve = vfs_lookup(path);
+        if (ve) {
+            int fd = (int)syscall(SYS_memfd_create, "dlfrz-vfs", 0);
+            if (fd >= 0) {
+                const uint8_t *p = ve->data;
+                uint64_t rem = ve->size;
+                while (rem > 0) {
+                    long w = syscall(SYS_write, fd, p, rem);
+                    if (w <= 0) { syscall(SYS_close, fd); fd = -1; break; }
+                    p   += w;
+                    rem -= w;
+                }
+                if (fd >= 0) {
+                    syscall(SYS_lseek, fd, (off_t)0, 0 /* SEEK_SET */);
+                    if (g_debug) {
+                        ldr_msg("vfs: serving ");
+                        ldr_msg(path);
+                        ldr_msg("\n");
+                    }
+                    return fd;
+                }
+            }
+        }
+    }
+    return (int)syscall(SYS_openat, dirfd, path, flags, mode);
+}
+
+/*
+ * vfs_stat / vfs_fstatat — intercept stat calls for embedded files.
+ * Python's import system checks if files exist via stat() before opening.
+ * We fabricate a regular-file stat result for embedded VFS entries.
+ */
+static int vfs_stat(const char *path, struct stat *buf)
+{
+    if (path && path[0] == '/') {
+        const struct vfs_entry *ve = vfs_lookup(path);
+        if (ve) {
+            __builtin_memset(buf, 0, sizeof(*buf));
+            buf->st_mode  = 0100644;  /* regular file, rw-r--r-- */
+            buf->st_nlink = 1;
+            buf->st_size  = ve->size;
+            buf->st_blksize = 4096;
+            buf->st_blocks  = (ve->size + 511) / 512;
+            return 0;
+        }
+    }
+    return (int)syscall(SYS_newfstatat, AT_FDCWD, path, buf, 0);
+}
+
+static int vfs_fstatat(int dirfd, const char *path, struct stat *buf, int flag)
+{
+    if (path && path[0] == '/') {
+        const struct vfs_entry *ve = vfs_lookup(path);
+        if (ve) {
+            __builtin_memset(buf, 0, sizeof(*buf));
+            buf->st_mode  = 0100644;
+            buf->st_nlink = 1;
+            buf->st_size  = ve->size;
+            buf->st_blksize = 4096;
+            buf->st_blocks  = (ve->size + 511) / 512;
+            return 0;
+        }
+    }
+    return (int)syscall(SYS_newfstatat, dirfd, path, buf, flag);
+}
+
 /* ==== Resolution cache ================================================ */
 
 #define RESOLVE_CACHE_SIZE 8192U  /* must be power-of-two */
@@ -1055,11 +1222,31 @@ static const struct stub_sym g_overrides[] = {
     { NULL, NULL }
 };
 
+/* VFS overrides — only activated when -f embeds data files into the binary.
+ * Intercept file open/stat operations to serve embedded data files. */
+static const struct stub_sym g_vfs_overrides[] = {
+    { "open",            (void *)vfs_open           },
+    { "open64",          (void *)vfs_open           },
+    { "openat",          (void *)vfs_openat         },
+    { "openat64",        (void *)vfs_openat         },
+    { "__open64_2",      (void *)vfs_open           },
+    { "stat",            (void *)vfs_stat           },
+    { "stat64",          (void *)vfs_stat           },
+    { "fstatat",         (void *)vfs_fstatat        },
+    { "fstatat64",       (void *)vfs_fstatat        },
+    { NULL, NULL }
+};
+
 static uint64_t lookup_override(const char *name)
 {
     for (const struct stub_sym *o = g_overrides; o->name; o++)
         if (strcmp(name, o->name) == 0)
             return (uint64_t)(uintptr_t)o->addr;
+    if (g_vfs_count > 0) {
+        for (const struct stub_sym *o = g_vfs_overrides; o->name; o++)
+            if (strcmp(name, o->name) == 0)
+                return (uint64_t)(uintptr_t)o->addr;
+    }
     return 0;
 }
 
@@ -1082,6 +1269,10 @@ static void build_special_table(void)
 
     for (const struct stub_sym *o = g_overrides; o->name; o++)
         SPEC_INSERT(o->name, o->addr);
+    if (g_vfs_count > 0) {
+        for (const struct stub_sym *o = g_vfs_overrides; o->name; o++)
+            SPEC_INSERT(o->name, o->addr);
+    }
     for (const struct stub_sym *s = g_stubs; s->name; s++)
         SPEC_INSERT(s->name, s->addr);
     if (g_fake_rtld_global)
@@ -2261,17 +2452,8 @@ static char *my_dlerror(void)
     return NULL;
 }
 
-/* ---- perf map file for profilers ------------------------------------- */
-
-/*
- * Write /tmp/perf-<PID>.map so that profilers (perf report, flamegraph)
- * can resolve addresses in frozen-binary code to function names.
- *
- * Format per line: HEX_ADDR HEX_SIZE SYMBOL_NAME\n
- *
- * Uses raw syscalls to avoid musl's errno handling which corrupts
- * glibc's pointer_guard after the TLS swap.
- */
+/* ---- perf map file for profilers (UNUSED — kept for reference) -------- */
+#if 0  /* Embedded .symtab/.text sections make this unnecessary */
 static void write_perf_map(void)
 {
     long ret;
@@ -2376,6 +2558,7 @@ static void write_perf_map(void)
     ldr_dbg(path);
     ldr_dbg("\n");
 }
+#endif
 
 /* ---------- dl_iterate_phdr override ---------------------------------- */
 
@@ -2695,10 +2878,14 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     /* Allocate fake _rtld_global / _rtld_global_ro for libc */
     if (init_fake_rtld() < 0) return -1;
 
+    /* Initialize embedded data-file VFS (before any opens) */
+    vfs_init(mem, mem_foff, entries, strtab, num_entries);
+
     int nobj = 0;
     for (uint32_t i = 0; i < num_entries; i++)
         if (!(metas[i].flags & LDR_FLAG_INTERP) &&
-            !(metas[i].flags & LDR_FLAG_DLOPEN)) nobj++;
+            !(metas[i].flags & LDR_FLAG_DLOPEN) &&
+            !(metas[i].flags & LDR_FLAG_DATA)) nobj++;
 
     if (nobj == 0) { ldr_err("no objects to load", NULL); return -1; }
     if (nobj > MAX_TOTAL_OBJS) { ldr_err("too many objects", NULL); return -1; }
@@ -2708,11 +2895,12 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     int idx_map[nobj];    /* idx_map[oi] = manifest index */
     memset(objs, 0, nobj * sizeof(struct loaded_obj));
 
-    /* Build in order: exe first, then shared libs (skip DLOPEN) */
+    /* Build in order: exe first, then shared libs (skip DLOPEN, DATA) */
     int oi = 0;
     for (uint32_t i = 0; i < num_entries; i++) {
         if (metas[i].flags & LDR_FLAG_INTERP) continue;
         if (metas[i].flags & LDR_FLAG_DLOPEN) continue;
+        if (metas[i].flags & LDR_FLAG_DATA) continue;
         if (!(metas[i].flags & LDR_FLAG_MAIN_EXE)) continue;
         objs[oi].name  = strtab + entries[i].name_offset;
         objs[oi].flags = metas[i].flags;
@@ -2722,6 +2910,7 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     for (uint32_t i = 0; i < num_entries; i++) {
         if (metas[i].flags & LDR_FLAG_INTERP) continue;
         if (metas[i].flags & LDR_FLAG_DLOPEN) continue;
+        if (metas[i].flags & LDR_FLAG_DATA) continue;
         if (metas[i].flags & LDR_FLAG_MAIN_EXE) continue;
         objs[oi].name  = strtab + entries[i].name_offset;
         objs[oi].flags = metas[i].flags;
@@ -2840,6 +3029,12 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
                         int maybe = (c0 == 'd' && c1 == 'l')
                                  || (c0 == '_' && (c1 == 'r' || c1 == 'd'
                                      || (c1 == '_' && (name[2] == 't' || name[2] == 'r'))));
+                        if (!maybe && g_vfs_count > 0) {
+                            maybe = (c0 == 'o')  /* open, open64, openat, openat64 */
+                                 || (c0 == 's')  /* stat, stat64 */
+                                 || (c0 == 'f')  /* fstatat, fstatat64 */
+                                 || (c0 == '_' && c1 == '_' && name[2] == 'o'); /* __open64_2 */
+                        }
                         if (maybe) {
                             uint32_t gh = gnu_hash_calc(name);
                             uint64_t ovr = lookup_special(name, gh);
@@ -2966,9 +3161,6 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
             ((init_fn_t)objs[i].init_array[j])(argc, argv, envp);
     }
     ldr_dbg("[loader] init functions done\n");
-
-    /* 7c. Write perf map for profiler symbol resolution */
-    write_perf_map();
 
     /* 8. Find the exe's entry point and transfer control */
     uintptr_t entry = 0;

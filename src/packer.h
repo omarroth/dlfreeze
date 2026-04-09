@@ -3,12 +3,24 @@
 
 #include "dep_resolver.h"
 
+/* List of data files to embed alongside ELF objects */
+struct data_file_list {
+    char **paths;      /* absolute paths of files to embed */
+    int    count;
+    int    capacity;
+};
+
+void data_file_list_init(struct data_file_list *dl);
+void data_file_list_add(struct data_file_list *dl, const char *path);
+void data_file_list_free(struct data_file_list *dl);
+
 struct pack_options {
     const char      *exe_path;        /* original executable           */
     const char      *output_path;     /* frozen output file            */
     const char      *bootstrap_path;  /* statically-linked bootstrap   */
     struct dep_list *deps;            /* resolved dependencies         */
     int              direct_load;     /* 1 = embed loader metadata     */
+    struct data_file_list *data_files; /* non-ELF files to embed       */
 };
 
 /* Create a frozen (self-extracting) ELF binary. */

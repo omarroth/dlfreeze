@@ -12,6 +12,7 @@
 #define DLFRZ_FLAG_DLOPEN      0x08
 #define DLFRZ_FLAG_PRELINKED   0x10  /* segments contain pre-applied relocations */
 #define DLFRZ_FLAG_NEEDS_RTLD  0x20  /* imports _rtld_global/_rtld_global_ro      */
+#define DLFRZ_FLAG_DATA        0x40  /* embedded data file (not ELF)              */
 
 struct dlfrz_entry {
     uint64_t data_offset;

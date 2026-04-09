@@ -20,6 +20,8 @@
 #include <getopt.h>
 #include <limits.h>
 #include <sys/wait.h>
+#include <fnmatch.h>
+#include <sys/stat.h>
 
 #include "elf_parser.h"
 #include "dep_resolver.h"
@@ -35,13 +37,15 @@ static void usage(const char *prog)
         "  -o <path>   Output file  (default: <name>.frozen)\n"
         "  -d          Direct-load mode (in-process loader, no tmpdir)\n"
         "  -t          Trace dlopen calls by running the program\n"
+        "  -f <glob>   Embed data files matching glob (requires -t, repeatable)\n"
         "  -v          Verbose\n"
         "  -h          Help\n\n"
         "Examples:\n"
         "  %s /bin/ls\n"
         "  %s -o frozen_ls /bin/ls\n"
-        "  %s -t -o frozen_py python3 -- -c 'import json'\n",
-        prog, prog, prog, prog);
+        "  %s -t -o frozen_py python3 -- -c 'import json'\n"
+        "  %s -d -t -f '/usr/lib/python*' python3 -- -c 'import json'\n",
+        prog, prog, prog, prog, prog);
 }
 
 /* locate helper binaries next to our own executable */
@@ -84,17 +88,156 @@ static char *resolve_exe(const char *name)
 }
 
 /* ------------------------------------------------------------------ */
+/* Capture data files opened during a traced run using strace.         */
+/* Runs: strace -f -e trace=openat -o <tracefile> <exe> [args...]      */
+/* Then parses the output for successfully opened regular files and     */
+/* filters them against the glob patterns.                             */
+/* ------------------------------------------------------------------ */
+static int capture_data_files(const char *exe_path, int argc, char **argv,
+                              int optind_val, const char **patterns,
+                              int npatterns, struct data_file_list *out,
+                              const struct dep_list *deps, int verbose)
+{
+    char tracef[] = "/tmp/dlfreeze-strace.XXXXXX";
+    int tfd = mkstemp(tracef);
+    if (tfd < 0) { perror("mkstemp"); return -1; }
+    close(tfd);
+
+    printf("Tracing file access …\n");
+
+    pid_t pid = fork();
+    if (pid < 0) { perror("fork"); unlink(tracef); return -1; }
+
+    if (pid == 0) {
+        /* Build: strace -f -e trace=openat -o tracefile -- exe [args...] */
+        int tstart = optind_val + 1;
+        if (tstart < argc && strcmp(argv[tstart], "--") == 0)
+            tstart++;
+
+        int nargs = 7 + 1 + (argc - tstart) + 1;
+        char **sav = calloc(nargs, sizeof(char *));
+        int si = 0;
+        sav[si++] = "strace";
+        sav[si++] = "-f";
+        sav[si++] = "-e";
+        sav[si++] = "trace=openat";
+        sav[si++] = "-o";
+        sav[si++] = tracef;
+        sav[si++] = (char *)exe_path;
+        for (int i = tstart; i < argc; i++)
+            sav[si++] = argv[i];
+        sav[si] = NULL;
+        execvp("strace", sav);
+        perror("strace");
+        _exit(127);
+    }
+
+    int st;
+    waitpid(pid, &st, 0);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) == 127) {
+        fprintf(stderr, "dlfreeze: strace failed (is strace installed?)\n");
+        unlink(tracef);
+        return -1;
+    }
+
+    /* Parse strace output for openat() calls that returned a valid fd.
+     * Format: PID openat(AT_FDCWD, "/path/file", O_RDONLY...) = 3 */
+    FILE *tf = fopen(tracef, "r");
+    if (!tf) { unlink(tracef); return -1; }
+
+    char line[4096];
+    while (fgets(line, sizeof(line), tf)) {
+        /* Must contain "openat(" and end with a valid fd (not -1) */
+        char *p = strstr(line, "openat(");
+        if (!p) continue;
+
+        /* Find the return value: ") = N" at the end */
+        char *eq = strstr(p, ") = ");
+        if (!eq) continue;
+        int retval = atoi(eq + 4);
+        if (retval < 0) continue;  /* failed open */
+
+        /* Extract path: second argument, quoted string */
+        char *q1 = strchr(p + 7, '"');
+        if (!q1) continue;
+        q1++;
+        char *q2 = strchr(q1, '"');
+        if (!q2) continue;
+        *q2 = '\0';
+
+        /* Resolve to absolute path */
+        char rpath[PATH_MAX];
+        if (q1[0] != '/') continue;  /* skip relative paths */
+        if (!realpath(q1, rpath)) continue;  /* skip deleted/inaccessible */
+
+        /* Must be a regular file */
+        struct stat sb;
+        if (stat(rpath, &sb) != 0 || !S_ISREG(sb.st_mode)) continue;
+
+        /* Skip ELF files (these are already handled as shared libs) */
+        if (elf_check(rpath)) continue;
+
+        /* Skip the executable itself */
+        if (strcmp(rpath, exe_path) == 0) continue;
+
+        /* Skip files already in deps */
+        int skip = 0;
+        if (deps->interp_path && strcmp(rpath, deps->interp_path) == 0)
+            skip = 1;
+        for (int i = 0; !skip && i < deps->count; i++) {
+            char dpath[PATH_MAX];
+            if (realpath(deps->libs[i].path, dpath) && strcmp(rpath, dpath) == 0)
+                skip = 1;
+        }
+        if (skip) continue;
+
+        /* Check against glob patterns */
+        int matched = 0;
+        for (int i = 0; i < npatterns; i++) {
+            if (fnmatch(patterns[i], rpath, 0) == 0) {
+                matched = 1;
+                break;
+            }
+        }
+        if (!matched) continue;
+
+        /* Skip empty files */
+        if (sb.st_size == 0) continue;
+
+        data_file_list_add(out, rpath);
+    }
+
+    fclose(tf);
+    unlink(tracef);
+
+    if (verbose || out->count > 0) {
+        printf("  data files : %d matched\n", out->count);
+        if (verbose) {
+            for (int i = 0; i < out->count; i++)
+                printf("    %s\n", out->paths[i]);
+        }
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 int main(int argc, char **argv)
 {
     const char *out_path = NULL;
     int do_trace = 0, verbose = 0, direct_load = 0;
+    const char *file_patterns[64];
+    int nfile_patterns = 0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "+o:dtvh")) != -1) {
+    while ((opt = getopt(argc, argv, "+o:f:dtvh")) != -1) {
         switch (opt) {
         case 'o': out_path = optarg;  break;
         case 'd': direct_load = 1;   break;
         case 't': do_trace = 1;      break;
+        case 'f':
+            if (nfile_patterns < 64)
+                file_patterns[nfile_patterns++] = optarg;
+            break;
         case 'v': verbose  = 1;      break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 1;
@@ -103,6 +246,10 @@ int main(int argc, char **argv)
     if (optind >= argc) {
         fprintf(stderr, "dlfreeze: no executable specified\n");
         usage(argv[0]);
+        return 1;
+    }
+    if (nfile_patterns > 0 && !do_trace) {
+        fprintf(stderr, "dlfreeze: -f requires -t (tracing mode)\n");
         return 1;
     }
 
@@ -209,6 +356,15 @@ int main(int argc, char **argv)
         }
     }
 
+    /* capture data files (strace-based, after deps are resolved) */
+    struct data_file_list data_files;
+    data_file_list_init(&data_files);
+    if (do_trace && nfile_patterns > 0) {
+        capture_data_files(exe_path, argc, argv, optind,
+                           file_patterns, nfile_patterns,
+                           &data_files, &deps, verbose);
+    }
+
     /* output path */
     char outbuf[PATH_MAX];
     if (!out_path) {
@@ -219,16 +375,19 @@ int main(int argc, char **argv)
     }
 
     /* pack */
-    printf("Packing %d files into %s …\n", deps.count + 2, out_path);
+    int nfiles = deps.count + 2 + data_files.count;
+    printf("Packing %d files into %s …\n", nfiles, out_path);
     struct pack_options po = {
         .exe_path       = exe_path,
         .output_path    = out_path,
         .bootstrap_path = bootstrap,
         .deps           = &deps,
         .direct_load    = direct_load,
+        .data_files     = data_files.count > 0 ? &data_files : NULL,
     };
     int rc = pack_frozen(&po);
 
+    data_file_list_free(&data_files);
     dep_list_free(&deps);
     free(exe_path);
     free(bootstrap);
