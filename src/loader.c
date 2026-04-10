@@ -33,6 +33,9 @@
 #define LDR_FLAG_PRELINKED   0x10
 #define LDR_FLAG_NEEDS_RTLD  0x20
 #define LDR_FLAG_DATA        0x40
+#define LDR_FLAG_RUNTIME_SCAN 0x80
+
+#define LDR_PRELINK_FIXUP_JMPREL 0x80000000u
 
 /* Zeroed page used as target for unresolved OBJECT symbols.
  * Prevents NULL dereference crashes in IFUNC resolvers. */
@@ -1922,6 +1925,38 @@ static uint64_t lookup_special(const char *name, uint32_t gh)
     return 0;
 }
 
+static int maybe_runtime_override_name(const char *name)
+{
+    char c0 = name[0], c1 = name[1];
+
+    if ((c0 == 'd' && c1 == 'l') ||
+        (c0 == 's' && c1 == 'i'))
+        return 1;
+
+    if (c0 == '_') {
+        if (c1 == 'r' || c1 == 'd')
+            return 1;
+        if (c1 == '_') {
+            char c2 = name[2];
+            if (c2 == 't' || c2 == 'r')
+                return 1;
+            if (c2 == 's' && strcmp(name, "__sigaction") == 0)
+                return 1;
+        }
+    }
+
+    if (g_vfs_count <= 0)
+        return 0;
+
+    return (c0 == 'o')
+        || (c0 == 's')
+        || (c0 == 'f')
+        || (c0 == 'a')
+        || (c0 == 'r')
+        || (c0 == 'c' && c1 == 'l')
+        || (c0 == '_' && c1 == '_' && name[2] == 'o');
+}
+
 /*
  * Global symbol search — exe first, then libs in load order.
  * Returns resolved virtual address or 0.
@@ -2013,6 +2048,68 @@ static int resolve_tpoff(struct loaded_obj *objs, int nobj,
     return -1;
 }
 
+static void apply_prelinked_runtime_reloc(struct loaded_obj *obj,
+                                          struct loaded_obj *objs, int nobj,
+                                          const Elf64_Rela *rel)
+{
+    uint64_t base = obj->base;
+    uint32_t type = ELF64_R_TYPE(rel->r_info);
+
+    if (type == R_X86_64_IRELATIVE) {
+        typedef uint64_t (*ifunc_t)(void);
+        ifunc_t resolver = (ifunc_t)(base + rel->r_addend);
+        *(uint64_t *)(base + rel->r_offset) = resolver();
+        return;
+    }
+
+    if (type != R_X86_64_GLOB_DAT &&
+        type != R_X86_64_JUMP_SLOT)
+        return;
+
+    uint32_t sidx = ELF64_R_SYM(rel->r_info);
+    if (sidx == 0)
+        return;
+
+    uint64_t *slot = (uint64_t *)(base + rel->r_offset);
+
+    if (*slot != 0) {
+        const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
+        if (maybe_runtime_override_name(name)) {
+            uint32_t gh = gnu_hash_calc(name);
+            uint64_t ovr = lookup_special(name, gh);
+            if (ovr) {
+                if (g_debug) {
+                    ldr_msg("GOT patch: ");
+                    ldr_msg(name);
+                    ldr_msg(" in ");
+                    ldr_msg(obj->name);
+                    ldr_msg("\n");
+                }
+                *slot = ovr + rel->r_addend;
+            }
+        }
+        return;
+    }
+
+    {
+        const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
+        uint32_t gh = gnu_hash_calc(name);
+        uint64_t ovr = lookup_special(name, gh);
+        if (ovr) {
+            *slot = ovr + rel->r_addend;
+        } else {
+            uint64_t addr = resolve_sym(objs, nobj, name);
+            if (addr) {
+                *slot = addr + rel->r_addend;
+            } else if (ELF64_ST_BIND(obj->dynsym[sidx].st_info) != STB_WEAK
+                       && ELF64_ST_TYPE(obj->dynsym[sidx].st_info) == STT_OBJECT
+                       && g_null_page) {
+                *slot = (uint64_t)(uintptr_t)g_null_page + rel->r_addend;
+            }
+        }
+    }
+}
+
 /* ==== Map one object's PT_LOAD segments ================================ */
 
 /*
@@ -2051,6 +2148,21 @@ static int reserve_address_range(const struct dlfrz_lib_meta *metas,
                         -1, 0);
     if (mapped == MAP_FAILED) return -1;
     return 0;
+}
+
+static void zero_segment_bss_tail(uint64_t base, const Elf64_Phdr *ph)
+{
+    if (ph->p_memsz <= ph->p_filesz || ph->p_filesz == 0)
+        return;
+
+    uint64_t zero_off = ph->p_vaddr + ph->p_filesz;
+    uint64_t zero_end = ALIGN_UP(zero_off, 4096);
+    uint64_t seg_end = ph->p_vaddr + ph->p_memsz;
+
+    if (zero_end > seg_end)
+        zero_end = seg_end;
+    if (zero_end > zero_off)
+        memset((void *)(uintptr_t)(base + zero_off), 0, zero_end - zero_off);
 }
 
 static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
@@ -2115,15 +2227,9 @@ static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
             memcpy((void *)(base + ph->p_vaddr), elf_base + ph->p_offset,
                    ph->p_filesz);
         }
-
-        /* Zero .bss tail in case file-backed map populated bytes past filesz
-         * on the last data page. */
-        if (ph->p_memsz > ph->p_filesz) {
-            uint8_t *zb = (uint8_t *)(uintptr_t)(base + ph->p_vaddr + ph->p_filesz);
-            uint64_t zlen = ph->p_memsz - ph->p_filesz;
-            memset(zb, 0, zlen);
-        }
-        /* BSS (p_memsz - p_filesz) is zero from anon mmap */
+        /* Only clear the partial tail of the last file-backed page. Full
+         * .bss pages are already zero from the anonymous reservation. */
+        zero_segment_bss_tail(base, ph);
     }
 
     obj->base = base;
@@ -2746,10 +2852,7 @@ static struct loaded_obj *load_elf_from_file(const char *path)
                 pread(fd, (void *)(base + phdr_buf[i].p_vaddr),
                       phdr_buf[i].p_filesz, phdr_buf[i].p_offset);
         }
-        /* Zero BSS tail */
-        if (phdr_buf[i].p_memsz > phdr_buf[i].p_filesz)
-            memset((void *)(base + phdr_buf[i].p_vaddr + phdr_buf[i].p_filesz),
-                   0, phdr_buf[i].p_memsz - phdr_buf[i].p_filesz);
+        zero_segment_bss_tail(base, &phdr_buf[i]);
     }
 
     close(fd);
@@ -3491,6 +3594,8 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
                const struct dlfrz_entry *entries,
                const char *strtab,
                uint32_t num_entries,
+               const uint32_t *runtime_fixups,
+               uint32_t runtime_fixup_count,
                int argc, char **argv, char **envp)
 {
     /* Check env flags before TLS swap (getenv uses bootstrap's libc) */
@@ -3668,85 +3773,54 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
          * Skip leading RELATIVE entries in .rela.dyn (DT_RELACOUNT tells
          * us how many there are) — they were applied at pre-link time. */
         for (int i = 0; i < nobj; i++) {
-            uint64_t base_i = objs[i].base;
-            const Elf64_Rela *tabs[] = { objs[i].rela, objs[i].jmprel };
-            size_t counts[] = { objs[i].rela_count, objs[i].jmprel_count };
-            size_t starts[] = { objs[i].rela_relative_count, 0 };
-            for (int t = 0; t < 2; t++) {
-                for (size_t r = starts[t]; r < counts[t]; r++) {
-                    const Elf64_Rela *rel = &tabs[t][r];
-                    uint32_t type = ELF64_R_TYPE(rel->r_info);
+            const uint32_t *obj_fixups = NULL;
+            uint32_t obj_fixup_count = 0;
 
-                    if (type == R_X86_64_IRELATIVE) {
-                        typedef uint64_t (*ifunc_t)(void);
-                        ifunc_t resolver = (ifunc_t)(base_i + rel->r_addend);
-                        *(uint64_t *)(base_i + rel->r_offset) = resolver();
-                        continue;
-                    }
+            if (g_vfs_count == 0 && runtime_fixups != NULL &&
+                metas[idx_map[i]].runtime_fixup_count != 0) {
+                uint32_t off = metas[idx_map[i]].runtime_fixup_off;
+                uint32_t count = metas[idx_map[i]].runtime_fixup_count;
+                if (off <= runtime_fixup_count &&
+                    count <= runtime_fixup_count - off) {
+                    obj_fixups = runtime_fixups + off;
+                    obj_fixup_count = count;
+                }
+            }
 
-                    if (type != R_X86_64_GLOB_DAT &&
-                        type != R_X86_64_JUMP_SLOT) continue;
-                    uint32_t sidx = ELF64_R_SYM(rel->r_info);
-                    if (sidx == 0) continue;
+            if (obj_fixups != NULL) {
+                for (uint32_t f = 0; f < obj_fixup_count; f++) {
+                    uint32_t encoded = obj_fixups[f];
+                    const Elf64_Rela *tab;
+                    size_t count;
+                    uint32_t idx = encoded & ~LDR_PRELINK_FIXUP_JMPREL;
 
-                    uint64_t *slot = (uint64_t *)(base_i + rel->r_offset);
-
-                    if (*slot != 0) {
-                        /* Fast path: pre-linker already resolved this.
-                         * Only patch if it's a special symbol (override/
-                         * stub/fake_rtld) whose address is runtime-only.
-                         * Prefix filter: all specials match dl*, signal,
-                         * _rt*, _dl*, __t*, or __r* — reject _Z* (C++
-                         * mangled, 95% of underscore symbols) and
-                         * everything else. */
-                        const char *name = objs[i].dynstr + objs[i].dynsym[sidx].st_name;
-                        char c0 = name[0], c1 = name[1];
-                        int maybe = (c0 == 'd' && c1 == 'l')
-                                 || (c0 == 's' && c1 == 'i')
-                                 || (c0 == '_' && (c1 == 'r' || c1 == 'd'
-                                     || (c1 == '_' && (name[2] == 't' || name[2] == 'r'))));
-                        if (!maybe && g_vfs_count > 0) {
-                            maybe = (c0 == 'o')  /* open, open64, openat, openat64, opendir */
-                                 || (c0 == 's')  /* stat, stat64 */
-                                 || (c0 == 'f')  /* fstatat, fstatat64, faccessat */
-                                 || (c0 == 'a')  /* access */
-                                 || (c0 == 'r')  /* readdir, readdir64 */
-                                 || (c0 == 'c' && c1 == 'l') /* closedir */
-                                 || (c0 == '_' && c1 == '_' && name[2] == 'o'); /* __open64_2 */
-                        }
-                        if (maybe) {
-                            uint32_t gh = gnu_hash_calc(name);
-                            uint64_t ovr = lookup_special(name, gh);
-                            if (ovr) {
-                                if (g_debug) {
-                                    ldr_msg("GOT patch: ");
-                                    ldr_msg(name);
-                                    ldr_msg(" in ");
-                                    ldr_msg(objs[i].name);
-                                    ldr_msg("\n");
-                                }
-                                *slot = ovr + rel->r_addend;
-                            }
-                        }
+                    if (encoded & LDR_PRELINK_FIXUP_JMPREL) {
+                        tab = objs[i].jmprel;
+                        count = objs[i].jmprel_count;
                     } else {
-                        /* Slot is 0: truly unresolved at pre-link time.
-                         * Try special table, then full resolve. */
-                        const char *name = objs[i].dynstr + objs[i].dynsym[sidx].st_name;
-                        uint32_t gh = gnu_hash_calc(name);
-                        uint64_t ovr = lookup_special(name, gh);
-                        if (ovr) {
-                            *slot = ovr + rel->r_addend;
-                        } else {
-                            uint64_t addr = resolve_sym(objs, nobj, name);
-                            if (addr) {
-                                *slot = addr + rel->r_addend;
-                            } else if (ELF64_ST_BIND(objs[i].dynsym[sidx].st_info) != STB_WEAK
-                                       && ELF64_ST_TYPE(objs[i].dynsym[sidx].st_info) == STT_OBJECT
-                                       && g_null_page) {
-                                *slot = (uint64_t)(uintptr_t)g_null_page + rel->r_addend;
-                            }
-                        }
+                        tab = objs[i].rela;
+                        count = objs[i].rela_count;
                     }
+                    if (idx >= count)
+                        continue;
+
+                    apply_prelinked_runtime_reloc(&objs[i], objs, nobj,
+                                                  &tab[idx]);
+                }
+                continue;
+            }
+
+            if (g_vfs_count == 0 && !(objs[i].flags & LDR_FLAG_RUNTIME_SCAN))
+                continue;
+
+            {
+                const Elf64_Rela *tabs[] = { objs[i].rela, objs[i].jmprel };
+                size_t counts[] = { objs[i].rela_count, objs[i].jmprel_count };
+                size_t starts[] = { objs[i].rela_relative_count, 0 };
+                for (int t = 0; t < 2; t++) {
+                    for (size_t r = starts[t]; r < counts[t]; r++)
+                        apply_prelinked_runtime_reloc(&objs[i], objs, nobj,
+                                                      &tabs[t][r]);
                 }
             }
         }

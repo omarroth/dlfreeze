@@ -13,6 +13,7 @@
 #define DLFRZ_FLAG_PRELINKED   0x10  /* segments contain pre-applied relocations */
 #define DLFRZ_FLAG_NEEDS_RTLD  0x20  /* imports _rtld_global/_rtld_global_ro      */
 #define DLFRZ_FLAG_DATA        0x40  /* embedded data file (not ELF)              */
+#define DLFRZ_FLAG_RUNTIME_SCAN 0x80 /* needs runtime special/IRELATIVE scan      */
 
 struct dlfrz_entry {
     uint64_t data_offset;
@@ -28,7 +29,7 @@ struct dlfrz_footer {
     uint64_t manifest_offset;
     uint64_t strtab_offset;
     uint64_t strtab_size;
-    uint8_t  pad[24];
+    uint8_t  pad[24]; /* [0..7]=meta_off, [8..15]=fixup_off, [16..23]=fixup_count */
 };
 
 /*
@@ -63,6 +64,8 @@ struct dlfrz_lib_meta {
     uint16_t phdr_num;      /* e_phnum                                */
     uint16_t phdr_entsz;    /* e_phentsize                            */
     uint32_t flags;         /* DLFRZ_FLAG_*                           */
+    uint32_t runtime_fixup_off;   /* index into footer fixup table      */
+    uint32_t runtime_fixup_count; /* number of runtime fixups           */
     uint32_t _reserved;
 };
 

@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <stdint.h>
 #include <elf.h>
+#include <errno.h>
 
 /* Starting base address for direct-loaded objects (above bootstrap VA) */
 #define DIRECT_LOAD_BASE  0x200000000ULL
@@ -206,6 +207,131 @@ static int has_rtld_import(FILE *f, const Elf64_Ehdr *ehdr)
     return found;
 }
 
+static int runtime_reloc_name_match(const char *name)
+{
+    if ((name[0] == 'd' && name[1] == 'l') ||
+        strcmp(name, "signal") == 0 ||
+        strcmp(name, "sigaction") == 0 ||
+        strcmp(name, "__sigaction") == 0)
+        return 1;
+
+    if (name[0] != '_')
+        return 0;
+
+    if (name[1] == 'r' || name[1] == 'd')
+        return 1;
+
+    return name[1] == '_' &&
+           (name[2] == 't' || name[2] == 'r');
+}
+
+/* Determine whether a pre-linked object still needs runtime relocation work.
+ * We only need the merged loader pass when the object imports runtime-only
+ * special symbols or still contains IRELATIVE relocations. */
+static int needs_runtime_reloc_scan(FILE *f, const Elf64_Ehdr *ehdr)
+{
+    if (ehdr->e_shoff == 0 || ehdr->e_shnum == 0 || ehdr->e_shentsize == 0)
+        return 1;  /* conservative fallback */
+
+    size_t shsz = (size_t)ehdr->e_shnum * ehdr->e_shentsize;
+    uint8_t *shdrs = malloc(shsz);
+    if (!shdrs) return 1;
+
+    if (fseek(f, ehdr->e_shoff, SEEK_SET) != 0 ||
+        fread(shdrs, 1, shsz, f) != shsz) {
+        free(shdrs);
+        return 1;
+    }
+
+    Elf64_Shdr *dynsym_sh = NULL;
+    Elf64_Shdr *str_sh = NULL;
+    for (int i = 0; i < ehdr->e_shnum; i++) {
+        Elf64_Shdr *sh = (Elf64_Shdr *)(shdrs + i * ehdr->e_shentsize);
+        if (sh->sh_type != SHT_DYNSYM) continue;
+        if (sh->sh_link >= ehdr->e_shnum || sh->sh_entsize != sizeof(Elf64_Sym))
+            continue;
+        dynsym_sh = sh;
+        str_sh = (Elf64_Shdr *)(shdrs + sh->sh_link * ehdr->e_shentsize);
+        break;
+    }
+
+    if (!dynsym_sh || !str_sh) {
+        free(shdrs);
+        return 1;
+    }
+
+    char *strtab = malloc(str_sh->sh_size ? (size_t)str_sh->sh_size : 1);
+    Elf64_Sym *syms = malloc(dynsym_sh->sh_size ? (size_t)dynsym_sh->sh_size : 1);
+    if (!strtab || !syms) {
+        free(strtab);
+        free(syms);
+        free(shdrs);
+        return 1;
+    }
+
+    if (fseek(f, str_sh->sh_offset, SEEK_SET) != 0 ||
+        fread(strtab, 1, str_sh->sh_size, f) != str_sh->sh_size ||
+        fseek(f, dynsym_sh->sh_offset, SEEK_SET) != 0 ||
+        fread(syms, 1, dynsym_sh->sh_size, f) != dynsym_sh->sh_size) {
+        free(strtab);
+        free(syms);
+        free(shdrs);
+        return 1;
+    }
+
+    size_t nsyms = dynsym_sh->sh_size / sizeof(Elf64_Sym);
+    int needs_scan = 0;
+
+    for (int i = 0; i < ehdr->e_shnum && !needs_scan; i++) {
+        Elf64_Shdr *sh = (Elf64_Shdr *)(shdrs + i * ehdr->e_shentsize);
+        if (sh->sh_type != SHT_RELA || sh->sh_entsize != sizeof(Elf64_Rela))
+            continue;
+
+        size_t relasz = sh->sh_size;
+        if (relasz == 0) continue;
+
+        Elf64_Rela *rels = malloc(relasz);
+        if (!rels) {
+            needs_scan = 1;
+            break;
+        }
+
+        if (fseek(f, sh->sh_offset, SEEK_SET) != 0 ||
+            fread(rels, 1, relasz, f) != relasz) {
+            free(rels);
+            needs_scan = 1;
+            break;
+        }
+
+        size_t nrels = relasz / sizeof(Elf64_Rela);
+        for (size_t j = 0; j < nrels; j++) {
+            uint32_t type = ELF64_R_TYPE(rels[j].r_info);
+            if (type == R_X86_64_IRELATIVE) {
+                needs_scan = 1;
+                break;
+            }
+            if (type != R_X86_64_GLOB_DAT && type != R_X86_64_JUMP_SLOT)
+                continue;
+
+            uint32_t sidx = ELF64_R_SYM(rels[j].r_info);
+            if (sidx >= nsyms) continue;
+            if (syms[sidx].st_shndx != SHN_UNDEF) continue;
+            if (syms[sidx].st_name >= str_sh->sh_size) continue;
+            if (runtime_reloc_name_match(strtab + syms[sidx].st_name)) {
+                needs_scan = 1;
+                break;
+            }
+        }
+
+        free(rels);
+    }
+
+    free(strtab);
+    free(syms);
+    free(shdrs);
+    return needs_scan;
+}
+
 /*
  * Extract `main` address from _start for stripped PIE binaries.
  * Scans the entry point code for `lea disp32(%rip), %rdi` (48 8d 3d XX XX XX XX)
@@ -276,11 +402,15 @@ static int compute_lib_meta(const char *path, uint64_t base, uint32_t flags,
     meta->phdr_num   = ehdr.e_phnum;
     meta->phdr_entsz = ehdr.e_phentsize;
     meta->flags      = flags;
+    meta->runtime_fixup_off = 0;
+    meta->runtime_fixup_count = 0;
     meta->_reserved  = 0;
 
     /* Check if this library imports _rtld_global/_rtld_global_ro */
     if (has_rtld_import(f, &ehdr))
         meta->flags |= DLFRZ_FLAG_NEEDS_RTLD;
+    if (needs_runtime_reloc_scan(f, &ehdr))
+        meta->flags |= DLFRZ_FLAG_RUNTIME_SCAN;
 
     /* Read program headers to get VA span */
     size_t phsz = ehdr.e_phnum * ehdr.e_phentsize;
@@ -685,19 +815,97 @@ static int pl_apply_rela(struct prelink_obj *obj,
     return 0;
 }
 
+/* Per-object runtime fixup table entries encode the relocation table in the
+ * top bit and the relocation index in the remaining bits. */
+#define PRELINK_FIXUP_JMPREL 0x80000000u
+
+static int prelink_obj_collect_runtime_fixups(const struct prelink_obj *obj,
+                                              uint32_t **fixups,
+                                              size_t *fixup_count,
+                                              size_t *fixup_cap,
+                                              uint32_t *out_off,
+                                              uint32_t *out_count)
+{
+    const Elf64_Rela *tabs[] = { obj->rela, obj->jmprel };
+    size_t counts[] = { obj->rela_count, obj->jmprel_count };
+
+    if (*fixup_count > UINT32_MAX)
+        return -1;
+
+    *out_off = (uint32_t)*fixup_count;
+    *out_count = 0;
+
+    for (int t = 0; t < 2; t++) {
+        for (size_t i = 0; i < counts[t]; i++) {
+            const Elf64_Rela *rel = &tabs[t][i];
+            uint32_t type = ELF64_R_TYPE(rel->r_info);
+            int needs_fixup = 0;
+
+            if (type == R_X86_64_IRELATIVE) {
+                needs_fixup = 1;
+            } else if (type == R_X86_64_GLOB_DAT ||
+                       type == R_X86_64_JUMP_SLOT) {
+                uint32_t sidx = ELF64_R_SYM(rel->r_info);
+                uint64_t slot = *(const uint64_t *)(obj->base + rel->r_offset);
+
+                if (slot == 0) {
+                    needs_fixup = 1;
+                } else if (sidx != 0 && sidx < obj->dynsym_count) {
+                    const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
+                    if (runtime_reloc_name_match(name))
+                        needs_fixup = 1;
+                }
+            }
+
+            if (!needs_fixup)
+                continue;
+
+            if (*fixup_count >= UINT32_MAX)
+                return -1;
+
+            if (*fixup_count == *fixup_cap) {
+                size_t newcap = *fixup_cap ? *fixup_cap * 2 : 256;
+                uint32_t *grown = realloc(*fixups, newcap * sizeof(**fixups));
+                if (!grown)
+                    return -1;
+                *fixups = grown;
+                *fixup_cap = newcap;
+            }
+
+            (*fixups)[*fixup_count] = (t ? PRELINK_FIXUP_JMPREL : 0)
+                                    | (uint32_t)i;
+            (*fixup_count)++;
+            (*out_count)++;
+        }
+    }
+
+    return 0;
+}
+
 static int prelink_objects(const char *output_path,
                            const struct dlfrz_entry *entries,
-                           const struct dlfrz_lib_meta *metas,
+                           struct dlfrz_lib_meta *metas,
+                           uint64_t meta_off,
                            int nobj)
 {
     pid_t pid = fork();
-    if (pid < 0) { perror("fork"); return -1; }
+    if (pid < 0) {
+        perror("fork");
+        return -1;
+    }
 
     if (pid > 0) {
         int status;
-        waitpid(pid, &status, 0);
+
+        while (waitpid(pid, &status, 0) < 0) {
+            if (errno != EINTR) {
+                perror("waitpid");
+                return -1;
+            }
+        }
         if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
             return 0;
+
         fprintf(stderr, "dlfreeze: pre-linker %s\n",
                 WIFSIGNALED(status) ? "crashed" : "failed");
         return -1;
@@ -711,6 +919,9 @@ static int prelink_objects(const char *output_path,
     pl_cache_init();
 
     struct prelink_obj *objs = calloc(nobj, sizeof(*objs));
+    uint32_t *runtime_fixups = NULL;
+    size_t runtime_fixup_count = 0;
+    size_t runtime_fixup_cap = 0;
     if (!objs) _exit(1);
 
     /* 1. Map all objects at assigned base addresses and load segments */
@@ -812,6 +1023,43 @@ static int prelink_objects(const char *output_path,
                           objs, nobj, 1);
     }
 
+    for (int i = 0; i < nobj; i++) {
+        uint32_t fixup_off = 0, fixup_count = 0;
+
+        metas[i].flags |= DLFRZ_FLAG_PRELINKED;
+        metas[i].runtime_fixup_off = 0;
+        metas[i].runtime_fixup_count = 0;
+        metas[i]._reserved = 0;
+
+        if (metas[i].flags & DLFRZ_FLAG_INTERP) {
+            metas[i].flags &= ~DLFRZ_FLAG_RUNTIME_SCAN;
+            continue;
+        }
+        if (metas[i].flags & DLFRZ_FLAG_DLOPEN) {
+            metas[i].flags &= ~DLFRZ_FLAG_RUNTIME_SCAN;
+            continue;
+        }
+        if (metas[i].flags & DLFRZ_FLAG_DATA) {
+            metas[i].flags &= ~DLFRZ_FLAG_RUNTIME_SCAN;
+            continue;
+        }
+
+        if (prelink_obj_collect_runtime_fixups(&objs[i],
+                                              &runtime_fixups,
+                                              &runtime_fixup_count,
+                                              &runtime_fixup_cap,
+                                              &fixup_off,
+                                              &fixup_count) < 0)
+            _exit(1);
+
+        metas[i].runtime_fixup_off = fixup_off;
+        metas[i].runtime_fixup_count = fixup_count;
+        if (fixup_count != 0)
+            metas[i].flags |= DLFRZ_FLAG_RUNTIME_SCAN;
+        else
+            metas[i].flags &= ~DLFRZ_FLAG_RUNTIME_SCAN;
+    }
+
     /* 5. Write patched segments back to frozen binary */
     for (int i = 0; i < nobj; i++) {
         const struct dlfrz_lib_meta *m = &metas[i];
@@ -831,7 +1079,47 @@ static int prelink_objects(const char *output_path,
         }
     }
 
+    if (meta_off != 0) {
+        fseek(outf, (long)meta_off, SEEK_SET);
+        if (fwrite(metas, sizeof(*metas), (size_t)nobj, outf) != (size_t)nobj)
+            _exit(1);
+    }
+
+    if (runtime_fixup_count > 0) {
+        struct dlfrz_footer saved_ft;
+        size_t file_end, footer_pos, pad_to;
+        uint64_t fixup_off = 0;
+        uint64_t fixup_total = (uint64_t)runtime_fixup_count;
+
+        fseek(outf, 0, SEEK_END);
+        file_end = (size_t)ftell(outf);
+        footer_pos = file_end - sizeof(saved_ft);
+
+        fseek(outf, (long)footer_pos, SEEK_SET);
+        if (fread(&saved_ft, 1, sizeof(saved_ft), outf) != sizeof(saved_ft))
+            _exit(1);
+
+        fseek(outf, (long)footer_pos, SEEK_SET);
+        pad_to = ALIGN_UP(footer_pos, 8);
+        if (pad_to > footer_pos) {
+            static const char zeros[8];
+            if (fwrite(zeros, 1, pad_to - footer_pos, outf) != pad_to - footer_pos)
+                _exit(1);
+        }
+
+        fixup_off = pad_to;
+        if (fwrite(runtime_fixups, sizeof(*runtime_fixups), runtime_fixup_count, outf)
+            != runtime_fixup_count)
+            _exit(1);
+
+        memcpy(saved_ft.pad + 8, &fixup_off, sizeof(fixup_off));
+        memcpy(saved_ft.pad + 16, &fixup_total, sizeof(fixup_total));
+        if (fwrite(&saved_ft, 1, sizeof(saved_ft), outf) != sizeof(saved_ft))
+            _exit(1);
+    }
+
     fclose(outf);
+    free(runtime_fixups);
     free(objs);
     _exit(0);
 }
@@ -1705,17 +1993,11 @@ int pack_frozen(const struct pack_options *opts)
     /* 8. pre-link: apply relocations at freeze time ---------------- */
     if (metas) {
         printf("  pre-linking...\n");
-        if (prelink_objects(opts->output_path, entries_copy, metas, eidx_save) == 0) {
+        if (prelink_objects(opts->output_path, entries_copy, metas,
+                            meta_off, eidx_save) == 0) {
             printf("  pre-linked : yes\n");
-            /* Set DLFRZ_FLAG_PRELINKED on all metas and rewrite them */
-            FILE *mf = fopen(opts->output_path, "r+b");
-            if (mf) {
-                for (int i = 0; i < eidx_save; i++)
-                    metas[i].flags |= DLFRZ_FLAG_PRELINKED;
-                fseek(mf, meta_off, SEEK_SET);
-                fwrite(metas, sizeof(*metas), eidx_save, mf);
-                fclose(mf);
-            }
+            for (int i = 0; i < eidx_save; i++)
+                metas[i].flags |= DLFRZ_FLAG_PRELINKED;
         } else {
             printf("  pre-linked : no (failed, will use runtime relocation)\n");
         }

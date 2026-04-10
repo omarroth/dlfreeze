@@ -214,7 +214,11 @@ int main(int argc, char **argv)
 
     /* 5. check for direct-load metadata in footer pad[0..7] */
     uint64_t meta_off = 0;
+    uint64_t fixup_off = 0;
+    uint64_t fixup_count = 0;
     memcpy(&meta_off, ft.pad, sizeof(meta_off));
+    memcpy(&fixup_off, ft.pad + 8, sizeof(fixup_off));
+    memcpy(&fixup_count, ft.pad + 16, sizeof(fixup_count));
     if (meta_off != 0) {
         /* Direct-load mode: try in a child first so we can fall back to
          * extraction if the in-process loader fails for this binary. */
@@ -261,10 +265,20 @@ int main(int argc, char **argv)
             ldr_srcfd = sfd;
         }
 
+        const uint32_t *runtime_fixups = NULL;
+        uint32_t runtime_fixup_count = 0;
+        if (fixup_off != 0 && fixup_count != 0 &&
+            fixup_count <= UINT32_MAX &&
+            fixup_off >= ldr_mem_foff) {
+            runtime_fixups = (const uint32_t *)(ldr_mem + (fixup_off - ldr_mem_foff));
+            runtime_fixup_count = (uint32_t)fixup_count;
+        }
+
         /* DLFREEZE_NO_FORK=1 → run loader_run() directly (for debugging) */
         if (getenv("DLFREEZE_NO_FORK")) {
             loader_run(ldr_mem, ldr_mem_foff, ldr_srcfd, metas, ent, strtab,
-                       ft.num_entries, argc, argv, environ);
+                       ft.num_entries, runtime_fixups, runtime_fixup_count,
+                       argc, argv, environ);
             fprintf(stderr, "dlfreeze-bootstrap: in-process loader failed\n");
             close(sfd);
             return 127;
@@ -284,7 +298,8 @@ int main(int argc, char **argv)
 
         if (is_prelinked) {
             loader_run(ldr_mem, ldr_mem_foff, ldr_srcfd, metas, ent, strtab,
-                       ft.num_entries, argc, argv, environ);
+                       ft.num_entries, runtime_fixups, runtime_fixup_count,
+                       argc, argv, environ);
             /* loader_run returns only on failure */
             fprintf(stderr, "dlfreeze-bootstrap: in-process loader failed\n");
             close(sfd);
@@ -301,7 +316,8 @@ int main(int argc, char **argv)
         if (lpid == 0) {
             /* loader_run() does NOT return on success */
             loader_run(ldr_mem, ldr_mem_foff, ldr_srcfd, metas, ent, strtab,
-                       ft.num_entries, argc, argv, environ);
+                       ft.num_entries, runtime_fixups, runtime_fixup_count,
+                       argc, argv, environ);
             close(sfd);
             fprintf(stderr, "dlfreeze-bootstrap: in-process loader failed\n");
             _exit(127);

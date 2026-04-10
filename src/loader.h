@@ -33,6 +33,8 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
                const struct dlfrz_entry *entries,
                const char *strtab,
                uint32_t num_entries,
+               const uint32_t *runtime_fixups,
+               uint32_t runtime_fixup_count,
                int argc, char **argv, char **envp);
 
 #endif /* DLFREEZE_LOADER_H */

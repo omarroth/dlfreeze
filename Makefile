@@ -14,7 +14,7 @@ DLFREEZE  = $(BUILD)/dlfreeze
 BOOTSTRAP = $(BUILD)/dlfreeze-bootstrap
 PRELOAD   = $(BUILD)/dlfreeze-preload.so
 
-.PHONY: all clean test
+.PHONY: all clean test bench
 
 all: $(DLFREEZE) $(BOOTSTRAP) $(PRELOAD)
 
@@ -46,6 +46,9 @@ $(PRELOAD): $(SRC)/dlopen_preload.c | $(BUILD)
 # ── test suite ─────────────────────────────────────────────────────
 test: all
 	@bash tests/run_tests.sh "$(BUILD)"
+
+bench: all
+	@bash tests/run_benchmarks.sh "$(BUILD)"
 
 clean:
 	rm -rf $(BUILD)
