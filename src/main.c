@@ -33,7 +33,7 @@ extern char **environ;
 static void usage(const char *prog)
 {
     fprintf(stderr,
-        "Usage: %s [options] <executable> [-- trace-args...]\n\n"
+        "Usage: %s [options] [--] <executable> [args...]\n\n"
         "Options:\n"
         "  -o <path>   Output file  (default: <name>.frozen)\n"
         "  -d          Direct-load mode (in-process loader, no tmpdir)\n"
@@ -44,8 +44,8 @@ static void usage(const char *prog)
         "Examples:\n"
         "  %s /bin/ls\n"
         "  %s -o frozen_ls /bin/ls\n"
-        "  %s -t -o frozen_py python3 -- -c 'import json'\n"
-        "  %s -d -t -f '/usr/lib/python*' python3 -- -c 'import json'\n",
+        "  %s -t -o frozen_py -- python3 -c 'import json'\n"
+        "  %s -d -t -f '/usr/lib/python*' -- python3 -c 'import json'\n",
         prog, prog, prog, prog, prog);
 }
 
@@ -210,9 +210,7 @@ static int capture_data_files(const char *exe_path, int argc, char **argv,
         }
 
         /* Build: strace -f -e trace=openat -o tracefile -- exe [args...] */
-        int tstart = optind_val + 1;
-        if (tstart < argc && strcmp(argv[tstart], "--") == 0)
-            tstart++;
+        int tstart = optind_val + 1;  /* args after the executable */
 
         int nargs = 7 + 1 + (argc - tstart) + 1;
         char **sav = calloc(nargs, sizeof(char *));
@@ -507,9 +505,7 @@ int main(int argc, char **argv)
                     setenv("LD_PRELOAD", preload, 1);
                     setenv("DLFREEZE_TRACE_FILE", tracef, 1);
 
-                    int tstart = optind + 1;
-                    if (tstart < argc && strcmp(argv[tstart], "--") == 0)
-                        tstart++;
+                    int tstart = optind + 1;  /* args after the executable */
                     int nargs = 1 + (argc - tstart);
                     char **tav = calloc(nargs + 1, sizeof(char *));
                     tav[0] = exe_path;

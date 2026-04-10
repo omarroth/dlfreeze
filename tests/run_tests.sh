@@ -145,7 +145,7 @@ test_python3() {
     local pypath out="$BUILD/python3.frozen"
     pypath=$(readlink -f "$(which python3)")
 
-    if ! "$DLFREEZE" -v -t -o "$out" "$pypath" -- -c 'import json; print("ok")'; then
+    if ! "$DLFREEZE" -v -t -o "$out" -- "$pypath" -c 'import json; print("ok")'; then
         fail "python3" "dlfreeze failed"; return
     fi
 
@@ -297,7 +297,7 @@ test_python3_advanced() {
     pypath=$(readlink -f "$(which python3)")
 
     # Trace with a broader import set
-    if ! "$DLFREEZE" -t -o "$out" "$pypath" -- -c \
+    if ! "$DLFREEZE" -t -o "$out" -- "$pypath" -c \
          'import os,sys,json,hashlib,socket,ssl,sqlite3; print("traced")' 2>/dev/null; then
         fail "python3-adv" "dlfreeze failed"; return
     fi
@@ -523,7 +523,7 @@ test_python3_direct() {
     pypath=$(readlink -f "$(which python3)")
 
     # Freeze with -d (direct) and -t (trace dlopen) to capture C extensions
-    if ! "$DLFREEZE" -d -t -o "$out" "$pypath" -- -c \
+    if ! "$DLFREEZE" -d -t -o "$out" -- "$pypath" -c \
          'import hashlib,sqlite3; print("traced")' 2>/dev/null; then
         fail "python3-direct" "dlfreeze failed"; return
     fi

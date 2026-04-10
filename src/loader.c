@@ -113,6 +113,36 @@ static inline void restore_ptr_guard(void)
         *(uintptr_t *)g_ptr_guard_addr = g_saved_ptr_guard;
 }
 
+/* Fatal signals that the loader temporarily owns while running init code. */
+static const int g_crash_signals[] = {
+    SIGSEGV, SIGABRT, SIGBUS, SIGFPE, SIGILL
+};
+
+#define CRASH_SIGNAL_COUNT \
+    ((int)(sizeof(g_crash_signals) / sizeof(g_crash_signals[0])))
+
+typedef void (*signal_handler_t)(int);
+
+enum deferred_crash_handler_kind {
+    DEFERRED_CRASH_NONE = 0,
+    DEFERRED_CRASH_SIGACTION,
+    DEFERRED_CRASH_SIGNAL,
+};
+
+struct deferred_crash_handler {
+    int kind;
+    struct sigaction act;
+    signal_handler_t handler;
+};
+
+static int g_crash_handlers_locked;
+static unsigned int g_crash_guard_depth;
+static struct sigaction g_saved_crash_handlers[CRASH_SIGNAL_COUNT];
+static struct deferred_crash_handler
+    g_deferred_crash_handlers[CRASH_SIGNAL_COUNT];
+
+static void crash_handler(int sig, siginfo_t *info, void *ucontext);
+
 static void crash_handler(int sig, siginfo_t *info, void *ucontext)
 {
     (void)ucontext;
@@ -179,6 +209,154 @@ static void crash_handler(int sig, siginfo_t *info, void *ucontext)
         }
     }
     _exit(127);
+}
+
+static void install_crash_handlers(void)
+{
+    struct sigaction sa = {0};
+    sa.sa_sigaction = crash_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    for (int i = 0; i < CRASH_SIGNAL_COUNT; i++)
+        sigaction(g_crash_signals[i], &sa, NULL);
+}
+
+static int crash_signal_slot(int signum)
+{
+    for (int i = 0; i < CRASH_SIGNAL_COUNT; i++)
+        if (g_crash_signals[i] == signum)
+            return i;
+    return -1;
+}
+
+static int is_loader_crash_action(const struct sigaction *act)
+{
+    return (act->sa_flags & SA_SIGINFO) &&
+           act->sa_sigaction == crash_handler;
+}
+
+static void capture_crash_handlers(struct sigaction *dst)
+{
+    for (int i = 0; i < CRASH_SIGNAL_COUNT; i++)
+        sigaction(g_crash_signals[i], NULL, &dst[i]);
+}
+
+static void fill_visible_crash_oldact(int slot, struct sigaction *oldact)
+{
+    if (!oldact) return;
+
+    if (g_deferred_crash_handlers[slot].kind == DEFERRED_CRASH_SIGACTION) {
+        *oldact = g_deferred_crash_handlers[slot].act;
+        return;
+    }
+
+    if (g_deferred_crash_handlers[slot].kind == DEFERRED_CRASH_SIGNAL) {
+        memset(oldact, 0, sizeof(*oldact));
+        oldact->sa_handler = g_deferred_crash_handlers[slot].handler;
+        sigemptyset(&oldact->sa_mask);
+        return;
+    }
+
+    *oldact = g_saved_crash_handlers[slot];
+}
+
+static void restore_crash_handlers_if_still_loader(const struct sigaction *saved)
+{
+    for (int i = 0; i < CRASH_SIGNAL_COUNT; i++) {
+        struct sigaction cur;
+
+        if (sigaction(g_crash_signals[i], NULL, &cur) < 0)
+            continue;
+        if (is_loader_crash_action(&cur))
+            sigaction(g_crash_signals[i], &saved[i], NULL);
+    }
+}
+
+static void begin_crash_handler_guard_from_saved(const struct sigaction *saved)
+{
+    if (g_crash_guard_depth++ > 0)
+        return;
+
+    memcpy(g_saved_crash_handlers, saved, sizeof(g_saved_crash_handlers));
+    memset(g_deferred_crash_handlers, 0, sizeof(g_deferred_crash_handlers));
+    g_crash_handlers_locked = 1;
+    install_crash_handlers();
+}
+
+static void begin_crash_handler_guard(void)
+{
+    struct sigaction saved[CRASH_SIGNAL_COUNT];
+
+    capture_crash_handlers(saved);
+    begin_crash_handler_guard_from_saved(saved);
+}
+
+static void end_crash_handler_guard(void)
+{
+    if (g_crash_guard_depth == 0)
+        return;
+    if (--g_crash_guard_depth != 0)
+        return;
+
+    g_crash_handlers_locked = 0;
+
+    for (int i = 0; i < CRASH_SIGNAL_COUNT; i++) {
+        switch (g_deferred_crash_handlers[i].kind) {
+        case DEFERRED_CRASH_SIGACTION:
+            sigaction(g_crash_signals[i], &g_deferred_crash_handlers[i].act,
+                      NULL);
+            break;
+        case DEFERRED_CRASH_SIGNAL:
+            signal(g_crash_signals[i], g_deferred_crash_handlers[i].handler);
+            break;
+        default:
+            sigaction(g_crash_signals[i], &g_saved_crash_handlers[i], NULL);
+            break;
+        }
+    }
+
+    memset(g_deferred_crash_handlers, 0, sizeof(g_deferred_crash_handlers));
+}
+
+/*
+ * Wrapper for sigaction() — libraries in our GOT will call this instead
+ * of the real sigaction.  While the loader's crash guard is active, defer
+ * fatal-signal handler changes until control returns to the frozen program.
+ */
+
+static int vfs_sigaction(int signum, const struct sigaction *act,
+                         struct sigaction *oldact)
+{
+    int slot = crash_signal_slot(signum);
+
+    if (g_crash_handlers_locked && slot >= 0) {
+        fill_visible_crash_oldact(slot, oldact);
+        if (act) {
+            g_deferred_crash_handlers[slot].kind = DEFERRED_CRASH_SIGACTION;
+            g_deferred_crash_handlers[slot].act = *act;
+            g_deferred_crash_handlers[slot].handler = NULL;
+        }
+        return 0;
+    }
+    return sigaction(signum, act, oldact);
+}
+
+static signal_handler_t vfs_signal(int signum, signal_handler_t handler)
+{
+    int slot = crash_signal_slot(signum);
+
+    if (g_crash_handlers_locked && slot >= 0) {
+        struct sigaction oldact;
+
+        fill_visible_crash_oldact(slot, &oldact);
+        g_deferred_crash_handlers[slot].kind = DEFERRED_CRASH_SIGNAL;
+        g_deferred_crash_handlers[slot].handler = handler;
+        memset(&g_deferred_crash_handlers[slot].act, 0,
+               sizeof(g_deferred_crash_handlers[slot].act));
+        return oldact.sa_handler;
+    }
+
+    return signal(signum, handler);
 }
 
 /* ---- fake _rtld_global / _rtld_global_ro for libc -------------------- */
@@ -615,7 +793,7 @@ static uint64_t lookup_fake_object(const char *name)
 
 /* ---- Unified special-symbol hash table --------------------------------
  * Declared here, populated later after g_overrides is defined. */
-#define SPECIAL_TAB_SIZE 64  /* must be power of 2, > total special syms */
+#define SPECIAL_TAB_SIZE 128  /* must be power of 2, > total special syms */
 static struct { uint32_t hash; const char *name; uint64_t addr; uint8_t used; }
     g_special_tab[SPECIAL_TAB_SIZE];
 static int g_special_tab_ready;
@@ -884,6 +1062,14 @@ struct vfs_entry {
 static struct vfs_entry g_vfs_table[VFS_HASH_SIZE];
 static int g_vfs_count;
 
+/*
+ * VFS_SYSCALL — wrapper for syscall() in VFS functions.
+ * musl's __syscall_ret writes errno at FS:0x34 on failure, corrupting
+ * glibc's pointer_guard at FS:0x30.  This macro restores it after
+ * every syscall so that atexit handlers can still PTR_DEMANGLE.
+ */
+#define VFS_SYSCALL(...) ({ long _r = syscall(__VA_ARGS__); restore_ptr_guard(); _r; })
+
 /* Saved real libc fopen/fdopen for vfs_fopen fallthrough */
 typedef void *(*fopen_fn)(const char *, const char *);
 typedef void *(*fdopen_fn)(int, const char *);
@@ -1094,7 +1280,7 @@ static void *vfs_opendir(const char *path)
     int fd = -1;
 
     if (!captured) {
-        fd = (int)syscall(SYS_openat, AT_FDCWD, path,
+        fd = (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, path,
                           O_RDONLY | O_DIRECTORY | O_CLOEXEC);
         if (fd < 0 && !has_vfs)
             return NULL;
@@ -1128,7 +1314,7 @@ static void *vfs_opendir(const char *path)
         return (void *)h;
     }
     /* No free handles */
-    if (fd >= 0) syscall(SYS_close, fd);
+    if (fd >= 0) VFS_SYSCALL(SYS_close, fd);
     return NULL;
 }
 
@@ -1151,7 +1337,7 @@ static struct dirent *vfs_readdir(void *dirp)
         if (h->fd_compat >= 0) {
             for (;;) {
                 if (h->gd_pos >= h->gd_len) {
-                    long ret = syscall(SYS_getdents64, h->fd_compat,
+                    long ret = VFS_SYSCALL(SYS_getdents64, h->fd_compat,
                                        h->gd_buf, sizeof(h->gd_buf));
                     if (ret <= 0) break;  /* done with real dir */
                     h->gd_len = (int)ret;
@@ -1196,7 +1382,7 @@ static struct dirent *vfs_readdir(void *dirp)
                         && rest[3] == 'r' && rest[4] == '\0') continue;
                     /* Skip if real FS already has this file */
                     if (h->fd_compat >= 0) {
-                        int r = (int)syscall(SYS_faccessat, AT_FDCWD, fp, 0 /*F_OK*/, 0);
+                        int r = (int)VFS_SYSCALL(SYS_faccessat, AT_FDCWD, fp, 0 /*F_OK*/, 0);
                         if (r == 0) continue;
                     }
                     h->result.d_ino = (ino_t)(si + 1);
@@ -1225,7 +1411,7 @@ static struct dirent *vfs_readdir(void *dirp)
                     if (strchr(rest, '/')) continue; /* not direct child */
                     /* Skip if real FS already has this dir */
                     if (h->fd_compat >= 0) {
-                        int r = (int)syscall(SYS_faccessat, AT_FDCWD, dp, 0, 0);
+                        int r = (int)VFS_SYSCALL(SYS_faccessat, AT_FDCWD, dp, 0, 0);
                         if (r == 0) continue;
                     }
                     h->result.d_ino = (ino_t)(VFS_HASH_SIZE + si + 1);
@@ -1247,7 +1433,7 @@ static struct dirent *vfs_readdir(void *dirp)
     /* ---- Non-VFS: pure real directory (phase was never -1) ---- */
     for (;;) {
         if (h->gd_pos >= h->gd_len) {
-            long ret = syscall(SYS_getdents64, h->fd_compat,
+            long ret = VFS_SYSCALL(SYS_getdents64, h->fd_compat,
                                h->gd_buf, sizeof(h->gd_buf));
             if (ret <= 0) return NULL;
             h->gd_len = (int)ret;
@@ -1274,7 +1460,7 @@ static int vfs_closedir(void *dirp)
     struct vfs_dir_handle *h = (struct vfs_dir_handle *)dirp;
     if (!h || h->magic != VFS_FAKE_DIR_MAGIC) return -1;
     if (h->fd_compat >= 0)
-        syscall(SYS_close, h->fd_compat);
+        VFS_SYSCALL(SYS_close, h->fd_compat);
     h->magic = 0;
     return 0;
 }
@@ -1282,17 +1468,17 @@ static int vfs_closedir(void *dirp)
 /* Helper: create a memfd serving embedded VFS data for a file entry */
 static int vfs_serve_memfd(const struct vfs_entry *ve, const char *path)
 {
-    int fd = (int)syscall(SYS_memfd_create, "dlfrz-vfs", 0);
+    int fd = (int)VFS_SYSCALL(SYS_memfd_create, "dlfrz-vfs", 0);
     if (fd < 0) return -1;
     const uint8_t *p = ve->data;
     uint64_t rem = ve->size;
     while (rem > 0) {
-        long w = syscall(SYS_write, fd, p, rem);
-        if (w <= 0) { syscall(SYS_close, fd); return -1; }
+        long w = VFS_SYSCALL(SYS_write, fd, p, rem);
+        if (w <= 0) { VFS_SYSCALL(SYS_close, fd); return -1; }
         p   += w;
         rem -= w;
     }
-    syscall(SYS_lseek, fd, (off_t)0, 0 /* SEEK_SET */);
+    VFS_SYSCALL(SYS_lseek, fd, (off_t)0, 0 /* SEEK_SET */);
     if (g_debug) {
         ldr_msg("vfs: serving ");
         ldr_msg(path);
@@ -1311,7 +1497,7 @@ static int vfs_open(const char *path, int flags, int mode)
             if (fd >= 0) return fd;
         }
     }
-    return (int)syscall(SYS_openat, AT_FDCWD, path, flags, mode);
+    return (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, path, flags, mode);
 }
 
 static int vfs_openat(int dirfd, const char *path, int flags, int mode)
@@ -1334,17 +1520,17 @@ static int vfs_openat(int dirfd, const char *path, int flags, int mode)
                     ldr_msg(path);
                     ldr_msg("\n");
                 }
-                return (int)syscall(SYS_openat, AT_FDCWD, "/",
+                return (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, "/",
                                     O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
             }
-            int real_fd = (int)syscall(SYS_openat, dirfd, path, flags, mode);
+            int real_fd = (int)VFS_SYSCALL(SYS_openat, dirfd, path, flags, mode);
             if (real_fd >= 0) return real_fd;
             /* Real dir doesn't exist but VFS knows it */
-            return (int)syscall(SYS_openat, AT_FDCWD, "/",
+            return (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, "/",
                                 O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
         }
     }
-    return (int)syscall(SYS_openat, dirfd, path, flags, mode);
+    return (int)VFS_SYSCALL(SYS_openat, dirfd, path, flags, mode);
 }
 
 /* vfs_fopen — intercept fopen/fopen64 so that libc's internal openat
@@ -1358,11 +1544,17 @@ static void *vfs_fopen(const char *path, const char *mode)
             int fd = vfs_serve_memfd(ve, path);
             if (fd >= 0 && g_real_fdopen)
                 return g_real_fdopen(fd, mode);
-            if (fd >= 0) syscall(SYS_close, fd);
+            if (fd >= 0) VFS_SYSCALL(SYS_close, fd);
         }
     }
-    if (g_real_fopen)
+    if (g_real_fopen) {
+        if (g_debug && path) {
+            ldr_msg("vfs_fopen fallthrough: ");
+            ldr_msg(path);
+            ldr_msg("\n");
+        }
         return g_real_fopen(path, mode);
+    }
     return (void *)0;
 }
 
@@ -1387,7 +1579,7 @@ static int vfs_stat(const char *path, struct stat *buf)
         }
     }
     /* Directories & everything else: real FS first, VFS fallback */
-    int ret = (int)syscall(SYS_newfstatat, AT_FDCWD, path, buf, 0);
+    int ret = (int)VFS_SYSCALL(SYS_newfstatat, AT_FDCWD, path, buf, 0);
     if (ret == 0) return 0;
     if (path && path[0] == '/' && vfs_dir_exists(path)) {
         __builtin_memset(buf, 0, sizeof(*buf));
@@ -1413,7 +1605,7 @@ static int vfs_fstatat(int dirfd, const char *path, struct stat *buf, int flag)
             return 0;
         }
     }
-    int ret = (int)syscall(SYS_newfstatat, dirfd, path, buf, flag);
+    int ret = (int)VFS_SYSCALL(SYS_newfstatat, dirfd, path, buf, flag);
     if (ret == 0) return 0;
     if (path && path[0] == '/' && vfs_dir_exists(path)) {
         __builtin_memset(buf, 0, sizeof(*buf));
@@ -1431,7 +1623,7 @@ static int vfs_access(const char *path, int amode)
     if (path && path[0] == '/') {
         if (vfs_lookup(path)) return 0;
     }
-    int ret = (int)syscall(SYS_faccessat, AT_FDCWD, path, amode, 0);
+    int ret = (int)VFS_SYSCALL(SYS_faccessat, AT_FDCWD, path, amode, 0);
     if (ret == 0) return 0;
     if (path && path[0] == '/' && vfs_dir_exists(path)) return 0;
     return ret;
@@ -1442,7 +1634,7 @@ static int vfs_faccessat(int dirfd, const char *path, int amode, int flag)
     if (path && path[0] == '/') {
         if (vfs_lookup(path)) return 0;
     }
-    int ret = (int)syscall(SYS_faccessat, dirfd, path, amode, flag);
+    int ret = (int)VFS_SYSCALL(SYS_faccessat, dirfd, path, amode, flag);
     if (ret == 0) return 0;
     if (path && path[0] == '/' && vfs_dir_exists(path)) return 0;
     return ret;
@@ -1709,6 +1901,9 @@ static void build_special_table(void)
     SPEC_INSERT("__rseq_offset", &g_rseq_offset);
     SPEC_INSERT("__rseq_size",   &g_rseq_size);
     SPEC_INSERT("__rseq_flags",  &g_rseq_flags);
+    SPEC_INSERT("signal",        vfs_signal);
+    SPEC_INSERT("sigaction",     vfs_sigaction);
+    SPEC_INSERT("__sigaction",   vfs_sigaction);
     #undef SPEC_INSERT
 
     g_special_tab_ready = 1;
@@ -2622,12 +2817,27 @@ static struct loaded_obj *load_elf_from_file(const char *path)
      * libc may have corrupted it via errno writes during open/mmap. */
     restore_ptr_guard();
 
-    /* Call init functions */
+    /* Keep loader crash diagnostics active while running init code, but
+     * restore any handler the library registers before returning. */
     typedef void (*init_fn_t)(int, char **, char **);
-    if (obj->init_func)
+    if (obj->init_func) {
+        if (g_special_tab_ready)
+            begin_crash_handler_guard();
+        else
+            install_crash_handlers();
         ((init_fn_t)obj->init_func)(g_argc, g_argv, g_envp);
-    for (size_t j = 0; j < obj->init_array_sz; j++)
+        if (g_special_tab_ready)
+            end_crash_handler_guard();
+    }
+    for (size_t j = 0; j < obj->init_array_sz; j++) {
+        if (g_special_tab_ready)
+            begin_crash_handler_guard();
+        else
+            install_crash_handlers();
         ((init_fn_t)obj->init_array[j])(g_argc, g_argv, g_envp);
+        if (g_special_tab_ready)
+            end_crash_handler_guard();
+    }
 
     ldr_dbg("[loader] dlopen: ");
     ldr_dbg(dl_basename(path));
@@ -2770,12 +2980,27 @@ static struct loaded_obj *load_embedded_object(uint32_t mi)
      * writes from dependency loading may have corrupted it. */
     restore_ptr_guard();
 
-    /* Call init functions */
+    /* Keep loader crash diagnostics active while running init code, but
+     * restore any handler the library registers before returning. */
     typedef void (*init_fn_t)(int, char **, char **);
-    if (obj->init_func)
+    if (obj->init_func) {
+        if (g_special_tab_ready)
+            begin_crash_handler_guard();
+        else
+            install_crash_handlers();
         ((init_fn_t)obj->init_func)(g_argc, g_argv, g_envp);
-    for (size_t j = 0; j < obj->init_array_sz; j++)
+        if (g_special_tab_ready)
+            end_crash_handler_guard();
+    }
+    for (size_t j = 0; j < obj->init_array_sz; j++) {
+        if (g_special_tab_ready)
+            begin_crash_handler_guard();
+        else
+            install_crash_handlers();
         ((init_fn_t)obj->init_array[j])(g_argc, g_argv, g_envp);
+        if (g_special_tab_ready)
+            end_crash_handler_guard();
+    }
 
     ldr_dbg("[loader] dlopen (embedded): ");
     ldr_dbg(dl_basename(ename));
@@ -3278,6 +3503,9 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
 
     clear_resolution_caches();
 
+    struct sigaction startup_crash_handlers[CRASH_SIGNAL_COUNT];
+    capture_crash_handlers(startup_crash_handlers);
+
     /* Kick off asynchronous readahead of the frozen binary so that
      * page faults during segment mapping hit warm page cache. */
     if (srcfd >= 0) {
@@ -3287,16 +3515,7 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     }
 
     /* Install crash handlers for debugging */
-    {
-        struct sigaction sa = {0};
-        sa.sa_sigaction = crash_handler;
-        sa.sa_flags = SA_SIGINFO;
-        sigaction(SIGSEGV, &sa, NULL);
-        sigaction(SIGABRT, &sa, NULL);
-        sigaction(SIGBUS,  &sa, NULL);
-        sigaction(SIGFPE,  &sa, NULL);
-        sigaction(SIGILL,  &sa, NULL);
-    }
+    install_crash_handlers();
 
     /* 1. Count non-INTERP libraries and build object array */
     /* Allocate a zero-filled page for unresolved OBJECT symbols */
@@ -3426,6 +3645,10 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
                         g_real_fdopen = (fdopen_fn)(uintptr_t)(objs[i].base + sym->st_value);
                 }
             }
+            ldr_dbg("[loader] g_real_fopen=");
+            ldr_dbg_hex("0x", (uint64_t)(uintptr_t)g_real_fopen);
+            ldr_dbg(" g_real_fdopen=");
+            ldr_dbg_hex("0x", (uint64_t)(uintptr_t)g_real_fdopen);
         }
 
         /* Build the unified special-symbol hash table (overrides, stubs,
@@ -3472,12 +3695,14 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
                         /* Fast path: pre-linker already resolved this.
                          * Only patch if it's a special symbol (override/
                          * stub/fake_rtld) whose address is runtime-only.
-                         * Prefix filter: all specials match dl*, _rt*,
-                         * _dl*, __t*, or __r* — reject _Z* (C++ mangled,
-                         * 95% of underscore symbols) and everything else. */
+                         * Prefix filter: all specials match dl*, signal,
+                         * _rt*, _dl*, __t*, or __r* — reject _Z* (C++
+                         * mangled, 95% of underscore symbols) and
+                         * everything else. */
                         const char *name = objs[i].dynstr + objs[i].dynsym[sidx].st_name;
                         char c0 = name[0], c1 = name[1];
                         int maybe = (c0 == 'd' && c1 == 'l')
+                                 || (c0 == 's' && c1 == 'i')
                                  || (c0 == '_' && (c1 == 'r' || c1 == 'd'
                                      || (c1 == '_' && (name[2] == 't' || name[2] == 'r'))));
                         if (!maybe && g_vfs_count > 0) {
@@ -3492,7 +3717,16 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
                         if (maybe) {
                             uint32_t gh = gnu_hash_calc(name);
                             uint64_t ovr = lookup_special(name, gh);
-                            if (ovr) *slot = ovr + rel->r_addend;
+                            if (ovr) {
+                                if (g_debug) {
+                                    ldr_msg("GOT patch: ");
+                                    ldr_msg(name);
+                                    ldr_msg(" in ");
+                                    ldr_msg(objs[i].name);
+                                    ldr_msg("\n");
+                                }
+                                *slot = ovr + rel->r_addend;
+                            }
                         }
                     } else {
                         /* Slot is 0: truly unresolved at pre-link time.
@@ -3601,6 +3835,9 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
      * may call PTR_MANGLE-using functions like __cxa_atexit. */
     restore_ptr_guard();
 
+    if (prelinked)
+        begin_crash_handler_guard_from_saved(startup_crash_handlers);
+
     /* Call in reverse order: libraries without dependents first (libc, libm,
      * etc.) then libraries that depend on them (libpython, etc.).
      * The packer stores objects as: exe, direct-deps, transitive-deps...
@@ -3616,6 +3853,11 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
             ((init_fn_t)objs[i].init_array[j])(argc, argv, envp);
     }
     ldr_dbg("[loader] init functions done\n");
+
+    if (prelinked)
+        end_crash_handler_guard();
+    else
+        restore_crash_handlers_if_still_loader(startup_crash_handlers);
 
     /* 8. Find the exe's entry point and transfer control */
     uintptr_t entry = 0;
