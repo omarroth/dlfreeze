@@ -70,6 +70,58 @@ C
 }
 
 # ===================================================================
+# Test 1b: musl dynamic executable in direct-load mode
+# ===================================================================
+test_musl_hello_direct() {
+    echo "--- musl hello direct-load ---"
+    if ! command -v musl-gcc &>/dev/null; then
+        skip "musl-hello-direct" "musl-gcc not installed"
+        return
+    fi
+
+    local src="$BUILD/hello_musl.c" bin="$BUILD/hello_musl" out="$BUILD/hello_musl.frozen"
+    cat > "$src" <<'C'
+#include <stdio.h>
+int main(void) {
+    puts("hello musl");
+    return 0;
+}
+C
+
+    if ! musl-gcc "$src" -o "$bin"; then
+        fail "musl-hello-direct" "musl-gcc failed"
+        rm -f "$src" "$bin" "$out"
+        return
+    fi
+
+    if ! file "$bin" | grep -q 'interpreter .*ld-musl'; then
+        skip "musl-hello-direct" "musl-gcc did not produce a dynamic musl executable"
+        rm -f "$src" "$bin" "$out"
+        return
+    fi
+
+    local expect actual
+    expect=$("$bin" 2>&1)
+
+    if ! "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
+        fail "musl-hello-direct" "dlfreeze failed"
+        rm -f "$src" "$bin" "$out"
+        return
+    fi
+
+    actual=$("$out" 2>&1)
+    if [ "$expect" = "$actual" ]; then
+        pass "musl hello direct-load"
+    else
+        fail "musl hello direct-load" "output differs"
+        echo "  expect: $expect"
+        echo "  actual: $actual"
+    fi
+
+    rm -f "$src" "$bin" "$out"
+}
+
+# ===================================================================
 # Test 2: exit code preservation
 # ===================================================================
 test_exit_code() {
@@ -550,6 +602,7 @@ echo "build dir: $BUILD"
 echo ""
 
 test_hello
+test_musl_hello_direct
 test_exit_code
 test_ls
 test_cat

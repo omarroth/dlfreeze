@@ -14,6 +14,9 @@ DLFREEZE  = $(BUILD)/dlfreeze
 BOOTSTRAP = $(BUILD)/dlfreeze-bootstrap
 PRELOAD   = $(BUILD)/dlfreeze-preload.so
 
+# Use musl-gcc for static tools when available; fall back to system gcc.
+TOOL_CC := $(shell command -v musl-gcc 2>/dev/null || echo $(CC))
+
 .PHONY: all clean test bench
 
 all: $(DLFREEZE) $(BOOTSTRAP) $(PRELOAD)
@@ -23,10 +26,10 @@ $(BUILD):
 
 # ── main tool ───────────────────────────────────────────────────────
 $(BUILD)/%.o: $(SRC)/%.c | $(BUILD)
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(TOOL_CC) $(CFLAGS) -c -o $@ $<
 
 $(DLFREEZE): $(TOOL_OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	$(TOOL_CC) $(CFLAGS) -static -o $@ $^ $(LDFLAGS)
 
 # ── bootstrap (statically linked, includes in-process loader) ──────
 # Use musl-gcc for much smaller static binary (fewer page faults).

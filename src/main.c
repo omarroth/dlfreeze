@@ -88,6 +88,16 @@ static char *resolve_exe(const char *name)
     return NULL;
 }
 
+static int is_musl_interpreter_path(const char *path)
+{
+    const char *base;
+
+    if (!path || !path[0]) return 0;
+    base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    return strncmp(base, "ld-musl", 7) == 0;
+}
+
 // Match a path against a glob pattern.  fnmatch's '*' doesn't cross '/',
 // but users expect -f '/usr/lib/*' to match anything under /usr/lib/.
 // If the pattern ends with "/" + "*", we also do a prefix check so that
@@ -475,6 +485,12 @@ int main(int argc, char **argv)
         for (int i = 0; i < deps.count; i++)
             printf("  %-30s → %s%s\n", deps.libs[i].name, deps.libs[i].path,
                    deps.libs[i].from_dlopen ? " (dlopen)" : "");
+    }
+
+    if (direct_load && is_musl_interpreter_path(deps.interp_path)) {
+        fprintf(stderr,
+                "dlfreeze: warning: direct-load is not supported for musl-linked executables; falling back to extracted mode\n");
+        direct_load = 0;
     }
 
     /* optional tracing: dlopen + data-file capture in one run when possible */

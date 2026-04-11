@@ -1944,7 +1944,7 @@ int pack_frozen(const struct pack_options *opts)
             }
             if (compute_lib_meta(src_paths[i], base, entries[i].flags,
                                   &metas[i]) < 0) {
-                free(metas); goto fail2;
+                goto fail2;
             }
             uint64_t span = metas[i].vaddr_hi - (metas[i].vaddr_lo & ~0xFFFULL);
             base += ALIGN_UP(span, 0x200000); /* 2 MB gap between objects */
@@ -1954,7 +1954,7 @@ int pack_frozen(const struct pack_options *opts)
         meta_off = off;
         size_t metasz = eidx * sizeof(struct dlfrz_lib_meta);
         if (fwrite(metas, 1, metasz, out) != metasz) {
-            free(metas); goto fail2;
+            goto fail2;
         }
         off += metasz;
 

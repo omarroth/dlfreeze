@@ -51,6 +51,30 @@ static int g_debug;
  * Without this, all loaded code is file-backed from the frozen binary
  * which has stripped section headers, so perf finds no symbols. */
 static int g_perf_mode;
+static int g_is_musl_runtime;
+
+static const char *path_basename(const char *path)
+{
+    const char *base = strrchr(path, '/');
+    return base ? base + 1 : path;
+}
+
+static int frozen_uses_musl(const struct dlfrz_lib_meta *metas,
+                            const struct dlfrz_entry *entries,
+                            const char *strtab,
+                            uint32_t num_entries)
+{
+    for (uint32_t i = 0; i < num_entries; i++) {
+        const char *name;
+
+        if (!(metas[i].flags & LDR_FLAG_INTERP))
+            continue;
+        name = strtab + entries[i].name_offset;
+        if (strncmp(path_basename(name), "ld-musl", 7) == 0)
+            return 1;
+    }
+    return 0;
+}
 
 /* ---- error output (no stdio — bootstrap may break after TLS swap) ----- */
 static void ldr_msg(const char *s)
@@ -806,6 +830,7 @@ static void build_special_table(void);
 static uint64_t lookup_special(const char *name, uint32_t gh);
 
 /* ---- TLS / arch constants --------------------------------------------- */
+#define ARCH_GET_FS   0x1003
 #define ARCH_SET_FS   0x1002
 #define TCB_ALLOC     4096     /* generous TCB allocation */
 
@@ -813,6 +838,7 @@ static uint64_t lookup_special(const char *name, uint32_t gh);
 #define TCB_OFF_SELF         0    /* void *tcb              */
 #define TCB_OFF_DTV          8    /* dtv_t *dtv             */
 #define TCB_OFF_SELF2       16    /* void *self             */
+#define TCB_OFF_SELF3       24    /* musl thread self       */
 #define TCB_OFF_STACK_GUARD 40    /* uintptr_t stack_guard  (0x28) */
 #define TCB_OFF_PTR_GUARD   48    /* uintptr_t pointer_guard (0x30) */
 #define TCB_OFF_TID        720    /* pid_t tid (0x2D0) — thread ID */
@@ -3354,6 +3380,43 @@ static uintptr_t get_auxval(char **envp, unsigned long type)
     return 0;
 }
 
+static Elf64_auxv_t *get_auxv_ptr(char **envp)
+{
+    char **p = envp;
+    while (*p) p++;
+    p++;
+    return (Elf64_auxv_t *)p;
+}
+
+static size_t get_auxv_count(char **envp)
+{
+    Elf64_auxv_t *a = get_auxv_ptr(envp);
+    size_t count = 1;
+
+    while (a[count - 1].a_type != AT_NULL)
+        count++;
+    return count;
+}
+
+static void set_auxv_entry(Elf64_auxv_t *auxv, size_t *count,
+                           unsigned long type, uintptr_t value)
+{
+    for (size_t i = 0; i < *count; i++) {
+        if (auxv[i].a_type == type) {
+            auxv[i].a_un.a_val = value;
+            return;
+        }
+        if (auxv[i].a_type == AT_NULL)
+            break;
+    }
+
+    auxv[*count - 1].a_type = type;
+    auxv[*count - 1].a_un.a_val = value;
+    auxv[*count].a_type = AT_NULL;
+    auxv[*count].a_un.a_val = 0;
+    (*count)++;
+}
+
 /*
  * Set up static TLS for all loaded objects.
  * Returns the thread pointer (TP) on success, 0 on failure.
@@ -3365,6 +3428,8 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
                             int *idx_map, int num_entries __attribute__((unused)),
                             uintptr_t at_random)
 {
+    uintptr_t old_tp = 0;
+
     /* Discover PT_TLS for each object and compute total static TLS size.
      * x86-64 uses Variant II: TLS blocks at negative TP offsets.
      * Layout: [TLS block N ... TLS block 1] [TCB]
@@ -3414,9 +3479,23 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
 
     uintptr_t tp = (uintptr_t)block + tls_aligned;
 
+    if (g_is_musl_runtime)
+        syscall(SYS_arch_prctl, ARCH_GET_FS, &old_tp);
+
     /* Initialize TCB header */
     *(uintptr_t *)(tp + TCB_OFF_SELF)  = tp;
     *(uintptr_t *)(tp + TCB_OFF_SELF2) = tp;
+    if (g_is_musl_runtime)
+        *(uintptr_t *)(tp + TCB_OFF_SELF3) = tp;
+
+    if (g_is_musl_runtime) {
+        uintptr_t *musl_dtv = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (old_tp)
+            memcpy((void *)(tp + 0x20), (void *)(old_tp + 0x20), 0x20);
+        *(uintptr_t *)(tp + TCB_OFF_DTV) =
+            (musl_dtv == MAP_FAILED) ? 0 : (uintptr_t)musl_dtv;
+    }
 
     /* Set thread ID so pthread_mutex_lock ERRORCHECK doesn't
      * falsely detect deadlock (owner==0 vs tid==0). */
@@ -3437,29 +3516,31 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
      *   dtv = raw_dtv + 1 (in dtv_t units)
      *   dtv[modid] = {val, to_free} for TLS module modid (1-indexed)
      */
-    size_t dtv_slots = 2 + (size_t)nobj;
-    size_t raw_dtv_bytes = (1 + dtv_slots) * 2 * sizeof(uintptr_t);
-    uintptr_t *raw_dtv = (uintptr_t *)mmap(NULL, ALIGN_UP(raw_dtv_bytes, 4096),
-        PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (raw_dtv != MAP_FAILED) {
-        /* raw_dtv[0] = generation counter (accessed as dtv[-1]) */
-        raw_dtv[0] = 1;   /* generation */
-        raw_dtv[1] = 0;
-        /* dtv = raw_dtv + one dtv_t entry (2 uintptr_t's) */
-        uintptr_t *dtv = raw_dtv + 2;
-        /* dtv[modid] for each TLS module: .val = tp + tpoff, .to_free = NULL
-         * glibc uses 1-indexed modules, dtv[1] = module 1, etc. */
-        for (int oi = 0; oi < nobj; oi++) {
-            if (objs[oi].tls.memsz == 0) continue;
-            size_t slot = (size_t)(oi + 1);
-            if (slot < dtv_slots) {
-                dtv[slot * 2]     = tp + (uintptr_t)objs[oi].tls.tpoff;
-                dtv[slot * 2 + 1] = 0;  /* to_free = NULL */
+    if (!g_is_musl_runtime) {
+        size_t dtv_slots = 2 + (size_t)nobj;
+        size_t raw_dtv_bytes = (1 + dtv_slots) * 2 * sizeof(uintptr_t);
+        uintptr_t *raw_dtv = (uintptr_t *)mmap(NULL, ALIGN_UP(raw_dtv_bytes, 4096),
+            PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (raw_dtv != MAP_FAILED) {
+            /* raw_dtv[0] = generation counter (accessed as dtv[-1]) */
+            raw_dtv[0] = 1;   /* generation */
+            raw_dtv[1] = 0;
+            /* dtv = raw_dtv + one dtv_t entry (2 uintptr_t's) */
+            uintptr_t *dtv = raw_dtv + 2;
+            /* dtv[modid] for each TLS module: .val = tp + tpoff, .to_free = NULL
+             * glibc uses 1-indexed modules, dtv[1] = module 1, etc. */
+            for (int oi = 0; oi < nobj; oi++) {
+                if (objs[oi].tls.memsz == 0) continue;
+                size_t slot = (size_t)(oi + 1);
+                if (slot < dtv_slots) {
+                    dtv[slot * 2]     = tp + (uintptr_t)objs[oi].tls.tpoff;
+                    dtv[slot * 2 + 1] = 0;  /* to_free = NULL */
+                }
             }
+            *(uintptr_t *)(tp + TCB_OFF_DTV) = (uintptr_t)dtv;
+        } else {
+            *(uintptr_t *)(tp + TCB_OFF_DTV) = 0;
         }
-        *(uintptr_t *)(tp + TCB_OFF_DTV) = (uintptr_t)dtv;
-    } else {
-        *(uintptr_t *)(tp + TCB_OFF_DTV) = 0;
     }
 
     /* Stack canary from AT_RANDOM */
@@ -3520,30 +3601,35 @@ static void copy_tdata(struct loaded_obj *objs, int nobj, uintptr_t tp)
 __attribute__((noreturn))
 static void transfer_to_entry(uintptr_t entry, int argc, char **argv,
                                char **envp, uintptr_t phdr, int phnum,
-                               uintptr_t at_entry, uintptr_t at_random)
+                               uintptr_t at_base, uintptr_t at_entry,
+                               uintptr_t at_random)
 {
     /* Count envp */
     int envc = 0;
     while (envp[envc]) envc++;
 
-    /* Build auxiliary vector entries */
-    Elf64_auxv_t auxv[] = {
-        { AT_PHDR,    { phdr } },
-        { AT_PHNUM,   { phnum } },
-        { AT_PHENT,   { sizeof(Elf64_Phdr) } },
-        { AT_PAGESZ,  { 4096 } },
-        { AT_BASE,    { 0 } },          /* no interpreter */
-        { AT_ENTRY,   { at_entry } },
-        { AT_RANDOM,  { at_random } },
-        { AT_SECURE,  { 0 } },
-        { AT_NULL,    { 0 } },
-    };
-    int auxvc = sizeof(auxv) / sizeof(auxv[0]); /* includes AT_NULL */
+    /* Preserve the kernel-provided auxv and override only the entries
+     * that must describe the direct-loaded image.  musl startup uses
+     * more of auxv than the glibc direct-main shortcut does. */
+    size_t orig_auxvc = get_auxv_count(envp);
+    Elf64_auxv_t *orig_auxv = get_auxv_ptr(envp);
+    Elf64_auxv_t auxv[orig_auxvc + 8];
+    size_t auxvc = orig_auxvc;
+
+    memcpy(auxv, orig_auxv, orig_auxvc * sizeof(*auxv));
+    set_auxv_entry(auxv, &auxvc, AT_PHDR, phdr);
+    set_auxv_entry(auxv, &auxvc, AT_PHNUM, (uintptr_t)phnum);
+    set_auxv_entry(auxv, &auxvc, AT_PHENT, sizeof(Elf64_Phdr));
+    set_auxv_entry(auxv, &auxvc, AT_PAGESZ, 4096);
+    set_auxv_entry(auxv, &auxvc, AT_BASE, at_base);
+    set_auxv_entry(auxv, &auxvc, AT_ENTRY, at_entry);
+    set_auxv_entry(auxv, &auxvc, AT_RANDOM, at_random);
+    set_auxv_entry(auxv, &auxvc, AT_SECURE, 0);
 
     /* Total words on stack:
      *   1 (argc) + argc+1 (argv+NULL) + envc+1 (envp+NULL) + auxvc*2 (auxv pairs)
      */
-    int nwords = 1 + (argc + 1) + (envc + 1) + auxvc * 2;
+    int nwords = 1 + (argc + 1) + (envc + 1) + (int)auxvc * 2;
 
     /* Allocate a proper stack (8 MB) */
     size_t stack_size = 8 * 1024 * 1024;
@@ -3572,7 +3658,7 @@ static void transfer_to_entry(uintptr_t entry, int argc, char **argv,
     sp[p++] = 0;  /* argv NULL */
     for (int i = 0; i < envc; i++) sp[p++] = (uintptr_t)envp[i];
     sp[p++] = 0;  /* envp NULL */
-    for (int i = 0; i < auxvc; i++) {
+    for (size_t i = 0; i < auxvc; i++) {
         sp[p++] = auxv[i].a_type;
         sp[p++] = auxv[i].a_un.a_val;
     }
@@ -3607,6 +3693,9 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     }
 
     clear_resolution_caches();
+
+    int is_musl_runtime = frozen_uses_musl(metas, entries, strtab, num_entries);
+    g_is_musl_runtime = is_musl_runtime;
 
     struct sigaction startup_crash_handlers[CRASH_SIGNAL_COUNT];
     capture_crash_handlers(startup_crash_handlers);
@@ -3936,6 +4025,7 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     /* 8. Find the exe's entry point and transfer control */
     uintptr_t entry = 0;
     uintptr_t exe_phdr = 0;
+    uintptr_t at_base = 0;
     int exe_phnum = 0;
     for (int i = 0; i < nobj; i++) {
         if (!(objs[i].flags & LDR_FLAG_MAIN_EXE)) continue;
@@ -3948,6 +4038,17 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     if (!entry) {
         ldr_err("no entry point found", NULL);
         _exit(127);
+    }
+
+    if (is_musl_runtime) {
+        for (int i = 0; i < nobj; i++) {
+            if (objs[i].flags & LDR_FLAG_MAIN_EXE)
+                continue;
+            if (strcmp(path_basename(objs[i].name), "libc.so") == 0) {
+                at_base = objs[i].base;
+                break;
+            }
+        }
     }
 
     /* 8. Try to call main() directly, bypassing __libc_start_main.
@@ -3970,7 +4071,7 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     if (!main_addr)
         main_addr = resolve_sym(objs, nobj, "main");
 
-    if (main_addr) {
+    if (main_addr && !is_musl_runtime) {
         /* Warm up the mapped libc's allocator with a small malloc/free
          * cycle.  This forces __ptmalloc_init's first sbrk() call to
          * happen before we enter user code, establishing main_arena's
@@ -4000,6 +4101,6 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     ldr_dbg("[loader] transferring to _start...\n");
     restore_ptr_guard();
     transfer_to_entry(entry, argc, argv, envp,
-                      exe_phdr, exe_phnum, entry, at_random);
+                      exe_phdr, exe_phnum, at_base, entry, at_random);
     /* NOTREACHED */
 }

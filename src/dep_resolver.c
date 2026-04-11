@@ -33,6 +33,46 @@ static int is_virtual_lib(const char *name)
             strncmp(name, "ld-musl", 7) == 0);
 }
 
+static int is_musl_interpreter(const char *path)
+{
+    const char *base;
+
+    if (!path || !path[0]) return 0;
+    base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    return strncmp(base, "ld-musl", 7) == 0;
+}
+
+static char *resolve_from_musl_interp_dir(const char *name,
+                                          const char *interp_path)
+{
+    char *interp_real;
+    char *interp_copy;
+    char *interp_dir;
+    char path[PATH_MAX];
+    struct stat st;
+
+    if (!is_musl_interpreter(interp_path)) return NULL;
+
+    interp_real = realpath(interp_path, NULL);
+    if (!interp_real) return NULL;
+
+    interp_copy = strdup(interp_real);
+    free(interp_real);
+    if (!interp_copy) return NULL;
+
+    interp_dir = dirname(interp_copy);
+    snprintf(path, sizeof(path), "%s/%s", interp_dir, name);
+    free(interp_copy);
+
+    if (stat(path, &st) != 0) return NULL;
+
+    {
+        char *rp = realpath(path, NULL);
+        return rp ? rp : strdup(path);
+    }
+}
+
 /* Common glibc runtime libs loaded via dlopen (NSS, resolv …) */
 static const char *glibc_runtime_libs[] = {
     "libnss_files.so.2",
@@ -179,7 +219,7 @@ static char *search_dirs(const char *name, const char *dirs, const char *origin)
 
 static char *find_library(const char *name,
                           const char *rpath, const char *runpath,
-                          const char *origin)
+                          const char *origin, const char *interp_path)
 {
     char *p;
     struct stat st;
@@ -208,6 +248,10 @@ static char *find_library(const char *name,
         p = search_dirs(name, runpath, origin);
         if (p) return p;
     }
+
+    /* musl keeps its real runtime DSOs next to the interpreter */
+    p = resolve_from_musl_interp_dir(name, interp_path);
+    if (p) return p;
 
     /* 4. ldconfig cache */
     p = resolve_from_ldconfig(name);
@@ -273,7 +317,8 @@ static void resolve_needed(struct elf_info *info, const char *origin,
         const char *name = info->needed[i];
         if (is_virtual_lib(name)) continue;
 
-        char *path = find_library(name, info->rpath, info->runpath, origin);
+        char *path = find_library(name, info->rpath, info->runpath, origin,
+                                  deps->interp_path);
         if (!path) {
             fprintf(stderr, "dlfreeze: warning: library not found: %s\n", name);
             continue;
@@ -346,7 +391,8 @@ int dep_resolve(const char *exe_path, struct dep_list *deps)
         bfs_init(&q2);
 
         for (int i = 0; glibc_runtime_libs[i]; i++) {
-            char *p = find_library(glibc_runtime_libs[i], NULL, NULL, origin);
+            char *p = find_library(glibc_runtime_libs[i], NULL, NULL, origin,
+                                   deps->interp_path);
             if (p) {
                 int added = dep_list_add(deps, glibc_runtime_libs[i], p, 0);
                 if (added > 0) bfs_push(&q2, p);
