@@ -53,6 +53,9 @@ static int g_debug;
 static int g_perf_mode;
 static int g_is_musl_runtime;
 
+#define MUSL_INIT_FINI_LIST_PTR_OFF      0xa9f48
+#define MUSL_INIT_FINI_LIST_SENTINEL_OFF 0xa9840
+
 static const char *path_basename(const char *path)
 {
     const char *base = strrchr(path, '/');
@@ -891,6 +894,24 @@ struct loaded_obj {
     /* TLS */
     struct obj_tls    tls;
 };
+
+static void seed_musl_startup_globals(struct loaded_obj *objs, int nobj)
+{
+    uintptr_t libc_base = 0;
+
+    for (int i = 0; i < nobj; i++) {
+        if (objs[i].name && strcmp(path_basename(objs[i].name), "libc.so") == 0) {
+            libc_base = objs[i].base;
+            break;
+        }
+    }
+
+    if (!libc_base)
+        return;
+
+    *(uintptr_t *)(libc_base + MUSL_INIT_FINI_LIST_PTR_OFF) =
+        libc_base + MUSL_INIT_FINI_LIST_SENTINEL_OFF;
+}
 
 /* ---- dlopen support globals ------------------------------------------ */
 
@@ -4015,12 +4036,27 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         for (size_t j = 0; j < objs[i].init_array_sz; j++)
             ((init_fn_t)objs[i].init_array[j])(argc, argv, envp);
     }
+
+    for (int i = 0; i < nobj; i++) {
+        if (!(objs[i].flags & LDR_FLAG_MAIN_EXE)) continue;
+        ldr_dbg("[loader] init: ");
+        ldr_dbg(objs[i].name);
+        ldr_dbg("\n");
+        if (objs[i].init_func)
+            ((init_fn_t)objs[i].init_func)(argc, argv, envp);
+        for (size_t j = 0; j < objs[i].init_array_sz; j++)
+            ((init_fn_t)objs[i].init_array[j])(argc, argv, envp);
+    }
+
     ldr_dbg("[loader] init functions done\n");
 
     if (prelinked)
         end_crash_handler_guard();
     else
         restore_crash_handlers_if_still_loader(startup_crash_handlers);
+
+    if (is_musl_runtime)
+        seed_musl_startup_globals(objs, nobj);
 
     /* 8. Find the exe's entry point and transfer control */
     uintptr_t entry = 0;
@@ -4099,6 +4135,8 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
 
     /* Fallback: transfer control via _start → __libc_start_main. */
     ldr_dbg("[loader] transferring to _start...\n");
+    if (g_debug && is_musl_runtime)
+        install_crash_handlers();
     restore_ptr_guard();
     transfer_to_entry(entry, argc, argv, envp,
                       exe_phdr, exe_phnum, at_base, entry, at_random);

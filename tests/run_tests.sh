@@ -122,6 +122,66 @@ C
 }
 
 # ===================================================================
+# Test 1c: musl direct-load preserves main executable constructors
+# ===================================================================
+test_musl_ctor_direct() {
+    echo "--- musl ctor direct-load ---"
+    if ! command -v musl-gcc &>/dev/null; then
+        skip "musl-ctor-direct" "musl-gcc not installed"
+        return
+    fi
+
+    local src="$BUILD/ctor_musl.c" bin="$BUILD/ctor_musl" out="$BUILD/ctor_musl.frozen"
+    cat > "$src" <<'C'
+#include <stdio.h>
+
+static int ctor_ran;
+
+__attribute__((constructor)) static void init(void) {
+    ctor_ran = 7;
+    puts("ctor");
+}
+
+int main(void) {
+    printf("main:%d\n", ctor_ran);
+    return ctor_ran != 7;
+}
+C
+
+    if ! musl-gcc "$src" -o "$bin"; then
+        fail "musl-ctor-direct" "musl-gcc failed"
+        rm -f "$src" "$bin" "$out"
+        return
+    fi
+
+    if ! file "$bin" | grep -q 'interpreter .*ld-musl'; then
+        skip "musl-ctor-direct" "musl-gcc did not produce a dynamic musl executable"
+        rm -f "$src" "$bin" "$out"
+        return
+    fi
+
+    local expect actual rc_e=0 rc_a=0
+    expect=$("$bin" 2>&1) || rc_e=$?
+
+    if ! "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
+        fail "musl-ctor-direct" "dlfreeze failed"
+        rm -f "$src" "$bin" "$out"
+        return
+    fi
+
+    actual=$("$out" 2>&1) || rc_a=$?
+    if [ "$expect" = "$actual" ] && [ "$rc_e" = "$rc_a" ]; then
+        pass "musl ctor direct-load"
+    else
+        fail "musl ctor direct-load" "output or exit code differs (exit $rc_e vs $rc_a)"
+        echo "  expect: $expect"
+        echo "  actual: $actual"
+    fi
+
+    rm -f "$src" "$bin" "$out"
+}
+
+# ===================================================================
 # Test 2: exit code preservation
 # ===================================================================
 test_exit_code() {
@@ -603,6 +663,7 @@ echo ""
 
 test_hello
 test_musl_hello_direct
+test_musl_ctor_direct
 test_exit_code
 test_ls
 test_cat
