@@ -81,6 +81,13 @@ static const char *bs_basename(const char *path)
     return base;
 }
 
+static int bs_is_musl_interp_path(const char *path)
+{
+    const char *base = bs_basename(path);
+
+    return strncmp(base, "ld-musl", 7) == 0;
+}
+
 static int extract(int srcfd, const char *dst,
                    uint64_t off, uint64_t sz, int exec)
 {
@@ -389,10 +396,16 @@ int main(int argc, char **argv)
         rmtree(g_tmpdir); return 127;
     }
 
-    /* 8. build argv for the real program
-     *    format: <interp> --library-path <tmpdir> <exe> [user-args …] */
+    /* 8. build argv for the real program.
+     *    glibc keeps working well when we exec the bundled interpreter
+     *    directly, but musl toolchain drivers such as clang inspect
+     *    /proc/self/exe to re-exec themselves as helper modes (-cc1,
+     *    etc.). Launching musl through ld-musl makes /proc/self/exe
+     *    point at the interpreter instead of the executable, which
+     *    breaks that self-reexec flow. */
     int nac; char **nav;
-    if (interp_path[0]) {
+    int use_interp_launcher = interp_path[0] && !bs_is_musl_interp_path(interp_path);
+    if (use_interp_launcher) {
         nac = argc + 3;
         nav = calloc(nac + 1, sizeof(char *));
         nav[0] = interp_path;
@@ -425,7 +438,7 @@ int main(int argc, char **argv)
 
     if (g_child == 0) {
         /* child ── become the real program */
-        if (interp_path[0])
+        if (use_interp_launcher)
             execve(interp_path, nav, environ);
         else
             execve(exe_path, nav, environ);

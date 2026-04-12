@@ -712,23 +712,9 @@ static int pl_apply_rela(struct prelink_obj *obj,
              * _rtld_global_ro GOT entry.  Loader handles these at runtime. */
             continue;
         }
-        if (pass == 1) continue;
+        if (type == R_X86_64_COPY) {
+            if (pass != 2) continue;
 
-        switch (type) {
-        case R_X86_64_RELATIVE:
-            *slot = base + r->r_addend;
-            break;
-
-        case R_X86_64_GLOB_DAT:
-        case R_X86_64_JUMP_SLOT:
-        case R_X86_64_64: {
-            const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
-            uint64_t addr = pl_resolve_sym(all, nobj, name);
-            *slot = addr + r->r_addend;
-            break;
-        }
-
-        case R_X86_64_COPY: {
             const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
             uint64_t src_size = obj->dynsym[sidx].st_size;
             for (int j = 0; j < nobj; j++) {
@@ -743,6 +729,21 @@ static int pl_apply_rela(struct prelink_obj *obj,
                     break;
                 }
             }
+            continue;
+        }
+        if (pass != 0) continue;
+
+        switch (type) {
+        case R_X86_64_RELATIVE:
+            *slot = base + r->r_addend;
+            break;
+
+        case R_X86_64_GLOB_DAT:
+        case R_X86_64_JUMP_SLOT:
+        case R_X86_64_64: {
+            const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
+            uint64_t addr = pl_resolve_sym(all, nobj, name);
+            *slot = addr + r->r_addend;
             break;
         }
 
@@ -997,7 +998,7 @@ static int prelink_objects(const char *output_path,
     }
 
     /* 4. Apply relocations */
-    /* Pass 0: all except IRELATIVE */
+    /* Pass 0: all except IRELATIVE/COPY */
     for (int i = 0; i < nobj; i++) {
             if (metas[i].flags & DLFRZ_FLAG_INTERP) continue;
             if (metas[i].flags & DLFRZ_FLAG_DLOPEN) continue;
@@ -1021,6 +1022,18 @@ static int prelink_objects(const char *output_path,
         if (objs[i].jmprel_count > 0)
             pl_apply_rela(&objs[i], objs[i].jmprel, objs[i].jmprel_count,
                           objs, nobj, 1);
+    }
+    /* Pass 2: COPY after source DSOs have already been fully relocated. */
+    for (int i = 0; i < nobj; i++) {
+            if (metas[i].flags & DLFRZ_FLAG_INTERP) continue;
+            if (metas[i].flags & DLFRZ_FLAG_DLOPEN) continue;
+            if (metas[i].flags & DLFRZ_FLAG_DATA) continue;
+        if (objs[i].rela_count > 0)
+            pl_apply_rela(&objs[i], objs[i].rela, objs[i].rela_count,
+                          objs, nobj, 2);
+        if (objs[i].jmprel_count > 0)
+            pl_apply_rela(&objs[i], objs[i].jmprel, objs[i].jmprel_count,
+                          objs, nobj, 2);
     }
 
     for (int i = 0; i < nobj; i++) {

@@ -168,10 +168,28 @@ static void scan_dir_shallow(const char *dirpath,
 
 /* ------------------------------------------------------------------ */
 /* Capture data files opened during a traced run using strace.         */
-/* Runs: strace -f -e trace=openat -o <tracefile> <exe> [args...]      */
+/* Runs: strace -f -e trace=open,openat,openat2 -o <tracefile>         */
+/*       <exe> [args...]                                               */
 /* Then parses the output for successfully opened regular files and     */
 /* filters them against the glob patterns.                             */
 /* ------------------------------------------------------------------ */
+static char *find_traced_open_call(char *line)
+{
+    static const char *const names[] = {
+        "openat2(",
+        "openat(",
+        "open(",
+    };
+
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        char *p = strstr(line, names[i]);
+
+        if (p)
+            return p;
+    }
+    return NULL;
+}
+
 static int capture_data_files(const char *exe_path, int argc, char **argv,
                               int optind_val, const char **patterns,
                               int npatterns, struct data_file_list *out,
@@ -209,7 +227,7 @@ static int capture_data_files(const char *exe_path, int argc, char **argv,
             setenv("DLFREEZE_TRACE_FILE", dlopen_tracef, 1);
         }
 
-        /* Build: strace -f -e trace=openat -o tracefile -- exe [args...] */
+        /* Build: strace -f -e trace=open,openat,openat2 -o tracefile -- exe [args...] */
         int tstart = optind_val + 1;  /* args after the executable */
 
         int nargs = 7 + 1 + (argc - tstart) + 1;
@@ -218,7 +236,7 @@ static int capture_data_files(const char *exe_path, int argc, char **argv,
         sav[si++] = "strace";
         sav[si++] = "-f";
         sav[si++] = "-e";
-        sav[si++] = "trace=openat";
+        sav[si++] = "trace=open,openat,openat2";
         sav[si++] = "-o";
         sav[si++] = tracef;
         sav[si++] = (char *)exe_path;
@@ -263,8 +281,11 @@ static int capture_data_files(const char *exe_path, int argc, char **argv,
         unlink(dlopen_tracef);
     }
 
-    /* Parse strace output for openat() calls that returned a valid fd.
-     * Format: PID openat(AT_FDCWD, "/path/file", O_RDONLY...) = 3
+    /* Parse strace output for open/openat/openat2 calls that returned a
+     * valid fd. Formats:
+     *   PID open("/path/file", O_RDONLY...) = 3
+     *   PID openat(AT_FDCWD, "/path/file", O_RDONLY...) = 3
+     *   PID openat2(AT_FDCWD, "/path/file", {...}) = 3
      *
      * Two kinds of captures:
      * 1. Regular files matching -f patterns → add to data files.
@@ -280,8 +301,8 @@ static int capture_data_files(const char *exe_path, int argc, char **argv,
 
     char line[4096];
     while (fgets(line, sizeof(line), tf)) {
-        /* Must contain "openat(" and end with a valid fd (not -1) */
-        char *p = strstr(line, "openat(");
+        /* Must contain an open-like syscall and end with a valid fd (not -1) */
+        char *p = find_traced_open_call(line);
         if (!p) continue;
 
         /* Find the return value: ") = N" at the end */
@@ -290,8 +311,8 @@ static int capture_data_files(const char *exe_path, int argc, char **argv,
         int retval = atoi(eq + 4);
         if (retval < 0) continue;  /* failed open */
 
-        /* Extract path: second argument, quoted string */
-        char *q1 = strchr(p + 7, '"');
+        /* Extract path: first quoted string in open/openat/openat2 */
+        char *q1 = strchr(p, '"');
         if (!q1) continue;
         q1++;
         char *q2 = strchr(q1, '"');

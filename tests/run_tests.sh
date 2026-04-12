@@ -11,6 +11,34 @@ pass() { echo "${GRN}PASS${RST}: $1"; ((PASS++)) || true; }
 fail() { echo "${RED}FAIL${RST}: $1 — $2"; ((FAIL++)) || true; }
 skip() { echo "${YLW}SKIP${RST}: $1 — $2"; ((SKIP++)) || true; }
 
+docker_usable() {
+    command -v docker &>/dev/null && docker info >/dev/null 2>&1
+}
+
+docker_alpine_run() {
+    local repo_root build_abs
+
+    repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+    build_abs=$(readlink -f "$BUILD")
+    docker run --rm \
+        -v "$repo_root":/work \
+        -v "$build_abs":/dlfreeze-build \
+        -w /work \
+        alpine:3.20 sh -lc "$1"
+}
+
+    docker_alpine_edge_run() {
+        local repo_root build_abs
+
+        repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+        build_abs=$(readlink -f "$BUILD")
+        docker run --rm \
+        -v "$repo_root":/work \
+        -v "$build_abs":/dlfreeze-build \
+        -w /work \
+        alpine:edge sh -lc "$1"
+    }
+
 # ===================================================================
 # Helper: freeze, run, compare
 # ===================================================================
@@ -179,6 +207,353 @@ C
     fi
 
     rm -f "$src" "$bin" "$out"
+}
+
+# ===================================================================
+# Test 1d: musl direct-load fixes COPY-relocated stderr/stdout aliases
+# ===================================================================
+test_musl_copy_reloc_direct() {
+    echo "--- musl copy-reloc direct-load ---"
+    if ! command -v musl-gcc &>/dev/null; then
+        skip "musl-copy-reloc-direct" "musl-gcc not installed"
+        return
+    fi
+
+    local src="$BUILD/copy_reloc_musl.c" bin="$BUILD/copy_reloc_musl" out="$BUILD/copy_reloc_musl.frozen"
+    cat > "$src" <<'C'
+#include <stdio.h>
+
+int main(void) {
+    setvbuf(stderr, NULL, _IONBF, 0);
+    fputs("copy-reloc-ok\n", stderr);
+    return 0;
+}
+C
+
+    if ! musl-gcc "$src" -o "$bin"; then
+        fail "musl-copy-reloc-direct" "musl-gcc failed"
+        rm -f "$src" "$bin" "$out"
+        return
+    fi
+
+    if ! file "$bin" | grep -q 'interpreter .*ld-musl'; then
+        skip "musl-copy-reloc-direct" "musl-gcc did not produce a dynamic musl executable"
+        rm -f "$src" "$bin" "$out"
+        return
+    fi
+
+    if ! readelf -W -r "$bin" | grep -q 'R_X86_64_COPY.*stderr'; then
+        skip "musl-copy-reloc-direct" "musl-gcc did not emit stderr COPY relocation"
+        rm -f "$src" "$bin" "$out"
+        return
+    fi
+
+    local expect actual rc_e=0 rc_a=0
+    expect=$("$bin" 2>&1) || rc_e=$?
+
+    if ! "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
+        fail "musl-copy-reloc-direct" "dlfreeze failed"
+        rm -f "$src" "$bin" "$out"
+        return
+    fi
+
+    actual=$("$out" 2>&1) || rc_a=$?
+    if [ "$expect" = "$actual" ] && [ "$rc_e" = "$rc_a" ]; then
+        pass "musl copy-reloc direct-load"
+    else
+        fail "musl copy-reloc direct-load" "output or exit code differs (exit $rc_e vs $rc_a)"
+        echo "  expect: $expect"
+        echo "  actual: $actual"
+    fi
+
+    rm -f "$src" "$bin" "$out"
+}
+
+# ===================================================================
+# Test 1e: musl direct-load seeds thread locale for multibyte APIs
+# ===================================================================
+test_musl_multibyte_direct() {
+    echo "--- musl multibyte direct-load ---"
+    if ! command -v musl-gcc &>/dev/null; then
+        skip "musl-multibyte-direct" "musl-gcc not installed"
+        return
+    fi
+
+    local src="$BUILD/multibyte_musl.c" bin="$BUILD/multibyte_musl" out="$BUILD/multibyte_musl.frozen"
+    cat > "$src" <<'C'
+#include <stdio.h>
+#include <wchar.h>
+
+int main(void) {
+    wchar_t out[8] = {0};
+    const char *src = "abc";
+    size_t n = mbsrtowcs(out, &src, 8, NULL);
+    printf("%zu %u %u %u\n", n,
+           (unsigned)out[0], (unsigned)out[1], (unsigned)out[2]);
+    return !(n == 3 && src == NULL && out[0] == L'a' && out[1] == L'b' && out[2] == L'c');
+}
+C
+
+    if ! musl-gcc "$src" -o "$bin"; then
+        fail "musl-multibyte-direct" "musl-gcc failed"
+        rm -f "$src" "$bin" "$out"
+        return
+    fi
+
+    if ! file "$bin" | grep -q 'interpreter .*ld-musl'; then
+        skip "musl-multibyte-direct" "musl-gcc did not produce a dynamic musl executable"
+        rm -f "$src" "$bin" "$out"
+        return
+    fi
+
+    local expect actual rc_e=0 rc_a=0
+    expect=$("$bin" 2>&1) || rc_e=$?
+
+    if ! "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
+        fail "musl-multibyte-direct" "dlfreeze failed"
+        rm -f "$src" "$bin" "$out"
+        return
+    fi
+
+    actual=$("$out" 2>&1) || rc_a=$?
+    if [ "$expect" = "$actual" ] && [ "$rc_e" = "$rc_a" ]; then
+        pass "musl multibyte direct-load"
+    else
+        fail "musl multibyte direct-load" "output or exit code differs (exit $rc_e vs $rc_a)"
+        echo "  expect: $expect"
+        echo "  actual: $actual"
+    fi
+
+    rm -f "$src" "$bin" "$out"
+}
+
+# ===================================================================
+# Test 1f: musl direct-load populates DTV for shared-library TLS modules
+# ===================================================================
+test_musl_shared_tls_direct() {
+    echo "--- musl shared-tls direct-load ---"
+    if ! command -v musl-gcc &>/dev/null; then
+        skip "musl-shared-tls-direct" "musl-gcc not installed"
+        return
+    fi
+
+    local src_lib="$BUILD/tlsdep_musl.c" src_main="$BUILD/tlsmain_musl.c"
+    local lib="$BUILD/libtlsdep_musl.so" bin="$BUILD/tlsmain_musl" out="$BUILD/tlsmain_musl.frozen"
+    cat > "$src_lib" <<'C'
+__thread int tls_value = 41;
+
+int get_tls_value(void) {
+    return ++tls_value;
+}
+C
+    cat > "$src_main" <<'C'
+#include <stdio.h>
+
+int get_tls_value(void);
+
+int main(void) {
+    printf("%d\n", get_tls_value());
+    return 0;
+}
+C
+
+    if ! musl-gcc -shared -fPIC -Wl,-soname,libtlsdep_musl.so -o "$lib" "$src_lib"; then
+        fail "musl-shared-tls-direct" "musl-gcc failed building shared library"
+        rm -f "$src_lib" "$src_main" "$lib" "$bin" "$out"
+        return
+    fi
+
+    if ! readelf -W -l "$lib" | grep -q 'TLS'; then
+        skip "musl-shared-tls-direct" "musl-gcc did not emit PT_TLS for the shared library"
+        rm -f "$src_lib" "$src_main" "$lib" "$bin" "$out"
+        return
+    fi
+
+    if ! musl-gcc -Wl,-rpath,'$ORIGIN' -L"$BUILD" -o "$bin" "$src_main" -ltlsdep_musl; then
+        fail "musl-shared-tls-direct" "musl-gcc failed building main executable"
+        rm -f "$src_lib" "$src_main" "$lib" "$bin" "$out"
+        return
+    fi
+
+    if ! file "$bin" | grep -q 'interpreter .*ld-musl'; then
+        skip "musl-shared-tls-direct" "musl-gcc did not produce a dynamic musl executable"
+        rm -f "$src_lib" "$src_main" "$lib" "$bin" "$out"
+        return
+    fi
+
+    local expect actual rc_e=0 rc_a=0
+    expect=$("$bin" 2>&1) || rc_e=$?
+
+    if ! "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
+        fail "musl-shared-tls-direct" "dlfreeze failed"
+        rm -f "$src_lib" "$src_main" "$lib" "$bin" "$out"
+        return
+    fi
+
+    actual=$("$out" 2>&1) || rc_a=$?
+    if [ "$expect" = "$actual" ] && [ "$rc_e" = "$rc_a" ]; then
+        pass "musl shared-tls direct-load"
+    else
+        fail "musl shared-tls direct-load" "output or exit code differs (exit $rc_e vs $rc_a)"
+        echo "  expect: $expect"
+        echo "  actual: $actual"
+    fi
+
+    rm -f "$src_lib" "$src_main" "$lib" "$bin" "$out"
+}
+
+# ===================================================================
+# Test 1g: Alpine musl direct-load supports Python threading
+# ===================================================================
+test_alpine_python_thread_direct() {
+    echo "--- alpine python thread direct-load ---"
+    if ! docker_usable; then
+        skip "alpine-python-thread-direct" "docker unavailable"
+        return
+    fi
+
+    local script actual rc=0
+    script='set -e; apk add --no-cache python3 >/dev/null; /dlfreeze-build/dlfreeze -o /tmp/python312-thread.frozen -d -- python3 -c '\''import threading; out=[]; t=threading.Thread(target=lambda: out.append(7)); t.start(); t.join(); print(out[0])'\'' >/dev/null 2>&1; timeout 30 /tmp/python312-thread.frozen -c '\''import threading; out=[]; t=threading.Thread(target=lambda: out.append(7)); t.start(); t.join(); print(out[0])'\'''
+
+    actual=$(docker_alpine_run "$script" 2>&1) || rc=$?
+    if [ "$rc" = 0 ] && [ "$actual" = "7" ]; then
+        pass "alpine python thread direct-load"
+    else
+        fail "alpine python thread direct-load" "output or exit code differs (exit $rc)"
+        echo "  actual: $actual"
+    fi
+}
+
+# ===================================================================
+# Test 1h: Alpine musl direct-load supports Python sqlite fallback imports
+# ===================================================================
+test_alpine_python_sqlite_direct() {
+    echo "--- alpine python sqlite direct-load ---"
+    if ! docker_usable; then
+        skip "alpine-python-sqlite-direct" "docker unavailable"
+        return
+    fi
+
+    local script actual rc=0
+    script='set -e; apk add --no-cache python3 >/dev/null; /dlfreeze-build/dlfreeze -o /tmp/python312-sqlite.frozen -d -- python3 -c '\''import sqlite3; conn=sqlite3.connect(":memory:"); print(conn.execute("select 42").fetchone()[0])'\'' >/dev/null 2>&1; timeout 30 /tmp/python312-sqlite.frozen -c '\''import sqlite3; conn=sqlite3.connect(":memory:"); print(conn.execute("select 42").fetchone()[0])'\'' 2>/tmp/python312-sqlite.err'
+
+    actual=$(docker_alpine_run "$script" 2>&1) || rc=$?
+    if [ "$rc" = 0 ] && [ "$actual" = "42" ]; then
+        pass "alpine python sqlite direct-load"
+    else
+        fail "alpine python sqlite direct-load" "output or exit code differs (exit $rc)"
+        echo "  actual: $actual"
+    fi
+}
+
+# ===================================================================
+# Test 1i: Alpine edge musl direct-load supports Python cryptography imports
+# ===================================================================
+test_alpine_python_cryptography_direct() {
+    echo "--- alpine python cryptography direct-load ---"
+    if ! docker_usable; then
+        skip "alpine-python-cryptography-direct" "docker unavailable"
+        return
+    fi
+
+    local script actual rc=0
+    script='set -e; apk add --no-cache python3 py3-cryptography >/dev/null; printf "from cryptography.fernet import Fernet\nmsg = b\"hello\"\ncipher = Fernet(Fernet.generate_key())\nprint(cipher.decrypt(cipher.encrypt(msg)).decode())\n" > /tmp/crypt.py; /dlfreeze-build/dlfreeze -d -o /tmp/python314-crypt.frozen -- python3 /tmp/crypt.py >/dev/null 2>&1; timeout 60 /tmp/python314-crypt.frozen /tmp/crypt.py 2>/tmp/python314-crypt.err'
+
+    actual=$(docker_alpine_edge_run "$script" 2>&1) || rc=$?
+    if [ "$rc" = 0 ] && [ "$actual" = "hello" ]; then
+        pass "alpine python cryptography direct-load"
+    else
+        fail "alpine python cryptography direct-load" "output or exit code differs (exit $rc)"
+        echo "  actual: $actual"
+    fi
+}
+
+# ===================================================================
+# Test 1j: Alpine edge traced/data direct-load supports Python cryptography
+# ===================================================================
+test_alpine_python_cryptography_captured() {
+    echo "--- alpine python cryptography traced direct-load ---"
+    if ! docker_usable; then
+        skip "alpine-python-cryptography-captured" "docker unavailable"
+        return
+    fi
+
+    local script actual rc=0
+    script='set -e; apk add --no-cache python3 py3-cryptography strace >/dev/null; printf "from cryptography.fernet import Fernet\nmsg = b\"hello\"\ncipher = Fernet(Fernet.generate_key())\nprint(cipher.decrypt(cipher.encrypt(msg)).decode())\n" > /tmp/crypt.py; /dlfreeze-build/dlfreeze -d -t -f "/usr/*" -o /tmp/python314-crypt-vfs.frozen -- python3 /tmp/crypt.py >/dev/null 2>&1; timeout 60 /tmp/python314-crypt-vfs.frozen /tmp/crypt.py'
+
+    actual=$(docker_alpine_edge_run "$script" 2>&1) || rc=$?
+    if [ "$rc" = 0 ] && [ "$actual" = "hello" ]; then
+        pass "alpine python cryptography traced direct-load"
+    else
+        fail "alpine python cryptography traced direct-load" "output or exit code differs (exit $rc)"
+        echo "  actual: $actual"
+    fi
+}
+
+# ===================================================================
+# Test 1k: Alpine musl extracted mode preserves clang self-reexec helpers
+# ===================================================================
+test_alpine_clang_compile() {
+    echo "--- alpine clang compile ---"
+    if ! docker_usable; then
+        skip "alpine-clang-compile" "docker unavailable"
+        return
+    fi
+
+    local script actual rc=0
+    script='set -e; apk add --no-cache clang17 build-base >/dev/null; printf "int main(void){return 0;}\n" > /tmp/hello.c; /dlfreeze-build/dlfreeze -o /tmp/clang17.frozen -- $(command -v clang-17) >/dev/null 2>&1; timeout 45 /tmp/clang17.frozen /tmp/hello.c -o /tmp/hello; /tmp/hello; echo ok'
+
+    actual=$(docker_alpine_run "$script" 2>&1) || rc=$?
+    if [ "$rc" = 0 ] && [ "$actual" = "ok" ]; then
+        pass "alpine clang compile"
+    else
+        fail "alpine clang compile" "output or exit code differs (exit $rc)"
+        echo "  actual: $actual"
+    fi
+}
+
+# ===================================================================
+# Test 1l: Alpine edge musl direct-load supports clang21 compilation
+# ===================================================================
+test_alpine_clang_direct_compile() {
+    echo "--- alpine clang direct compile ---"
+    if ! docker_usable; then
+        skip "alpine-clang-direct-compile" "docker unavailable"
+        return
+    fi
+
+    local script actual rc=0
+    script='set -e; apk add --no-cache clang21 build-base >/dev/null; printf "#include <stdio.h>\nint main(void){puts(\"ok\");return 0;}\n" > /tmp/hello.c; /dlfreeze-build/dlfreeze -d -o /tmp/clang21d.frozen -- $(command -v clang-21) >/dev/null 2>&1; timeout 45 /tmp/clang21d.frozen /tmp/hello.c -o /tmp/hello; /tmp/hello'
+
+    actual=$(docker_alpine_edge_run "$script" 2>&1) || rc=$?
+    if [ "$rc" = 0 ] && [ "$actual" = "ok" ]; then
+        pass "alpine clang direct compile"
+    else
+        fail "alpine clang direct compile" "output or exit code differs (exit $rc)"
+        echo "  actual: $actual"
+    fi
+}
+
+# ===================================================================
+# Test 1m: Alpine edge captures linker archives via -f tracing
+# ===================================================================
+test_alpine_clang_captured_static_libs() {
+    echo "--- alpine clang captured static libs ---"
+    if ! docker_usable; then
+        skip "alpine-clang-captured-static-libs" "docker unavailable"
+        return
+    fi
+
+    local script actual rc=0
+    script='set -e; apk add --no-cache clang21 build-base strace >/dev/null; printf "#include <stdio.h>\nint main(void){puts(\"ok\");return 0;}\n" > /tmp/hello.c; /dlfreeze-build/dlfreeze -d -t -f "/usr/*" -o /tmp/clang21vfs.frozen -- $(command -v clang-21) /tmp/hello.c -o /tmp/hello.freeze >/dev/null 2>&1; rm -f /tmp/hello.freeze; mv /usr/lib/libssp_nonshared.a /tmp/libssp_nonshared.a.hide; trap "mv /tmp/libssp_nonshared.a.hide /usr/lib/libssp_nonshared.a" EXIT; timeout 45 /tmp/clang21vfs.frozen -resource-dir /usr/lib/llvm21/lib/clang/21 /tmp/hello.c -o /tmp/hello; /tmp/hello'
+
+    actual=$(docker_alpine_edge_run "$script" 2>&1) || rc=$?
+    if [ "$rc" = 0 ] && [ "$actual" = "ok" ]; then
+        pass "alpine clang captured static libs"
+    else
+        fail "alpine clang captured static libs" "output or exit code differs (exit $rc)"
+        echo "  actual: $actual"
+    fi
 }
 
 # ===================================================================
@@ -664,6 +1039,16 @@ echo ""
 test_hello
 test_musl_hello_direct
 test_musl_ctor_direct
+test_musl_copy_reloc_direct
+test_musl_multibyte_direct
+test_musl_shared_tls_direct
+test_alpine_python_thread_direct
+test_alpine_python_sqlite_direct
+test_alpine_python_cryptography_direct
+test_alpine_python_cryptography_captured
+test_alpine_clang_compile
+test_alpine_clang_direct_compile
+test_alpine_clang_captured_static_libs
 test_exit_code
 test_ls
 test_cat
