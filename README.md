@@ -30,9 +30,9 @@ Freeze Python with traced `dlopen()` dependencies and data files:
 2. **dlopen tracing** (`-t`) — Runs the program under an `LD_PRELOAD` shim that intercepts `dlopen()` and records the resolved paths.
 3. **Packing** — Concatenates the statically-linked bootstrap stub, every collected object (page-aligned), a string table, a manifest, and a 64-byte footer (`DLFREEZ` magic) into a single ELF.
 4. **Runtime — extraction mode (default)** — The bootstrap reads `/proc/self/exe`, extracts files to a tmpdir, and execs the program through the bundled `ld.so`.
-5. **Runtime — direct-load mode** (`-d`) — The bootstrap invokes an in-process ELF loader that maps segments from the payload, resolves relocations, sets up TLS, and jumps to `_start` — no tmpdir, no `ld.so`.
+5. **Runtime — direct-load mode** (`-d`) — The bootstrap invokes an in-process ELF loader that maps segments from the payload, resolves relocations, sets up TLS, and jumps to `_start`.
 
-Frozen binaries are compatible with UPX: the payload lives in a `PT_LOAD` segment so compressors preserve it, and a `DLFRZLDR` sentinel in `.data` lets the bootstrap find the payload in virtual memory if the footer is no longer at EOF.
+Frozen binaries are compatible with UPX and should mostly work with other packing tools: the payload lives in a `PT_LOAD` segment so compressors preserve it, and a `DLFRZLDR` sentinel in `.data` lets the bootstrap find the payload in virtual memory if the footer is no longer at EOF.
 
 ## Usage
 
