@@ -1526,6 +1526,93 @@ static int install_musl_dlopen_tls(struct loaded_obj *obj)
     return 0;
 }
 
+/* install_glibc_dlopen_tls — allocate a TLS block for a dlopen'd module
+ * and install it in the calling thread's DTV.  glibc convention:
+ *   tcb->dtv = &raw_dtv[1]   (in dtv_t units, each 2×uintptr_t)
+ *   dtv[modid*2]   = pointer to TLS block
+ *   dtv[modid*2+1] = to_free marker
+ * Only called for glibc runtime; musl uses install_musl_dlopen_tls. */
+static int install_glibc_dlopen_tls(struct loaded_obj *obj)
+{
+    if (g_is_musl_runtime || obj->tls.memsz == 0 || obj->tls.modid == 0)
+        return 0;
+
+    uintptr_t tp = arch_get_tp();
+    uintptr_t *dtv = *(uintptr_t **)(tp + 8 /* TCB_OFF_DTV */);
+
+    /* Compute required raw DTV capacity.  The raw array is:
+     *   raw_dtv[0]=generation, raw_dtv[1]=unused, raw_dtv[2..] = dtv[0..]
+     * dtv (stored in tcb) points to raw_dtv+2.
+     * Slot numbering: dtv[modid*2] = val, dtv[modid*2+1] = free_marker.
+     * We need (modid+1) dtv_t entries, each 2 words → (modid+1)*2 words. */
+    size_t need_words = (obj->tls.modid + 1) * 2;
+
+    if (!dtv) {
+        /* No DTV at all yet — allocate fresh */
+        size_t raw_bytes = (need_words + 2) * sizeof(uintptr_t);
+        raw_bytes = ALIGN_UP(raw_bytes, 4096);
+        uintptr_t *raw = mmap(NULL, raw_bytes, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (raw == MAP_FAILED) return -1;
+        raw[0] = 1;  /* generation */
+        raw[1] = 0;
+        dtv = raw + 2;
+        *(uintptr_t **)(tp + 8) = dtv;
+    } else {
+        /* Check if current DTV is large enough.  The generation counter
+         * lives at dtv[-2] (raw_dtv[0]).  We scan existing slots to
+         * determine the old capacity. */
+        size_t old_cap = 0;
+        /* Walk backwards from dtv pointer: raw_dtv = dtv - 2 */
+        uintptr_t *raw_dtv = dtv - 2;
+        /* Estimate old capacity from the allocation: look for the largest
+         * populated modid.  Fall back to g_nobj as a safe upper bound. */
+        for (int i = 0; i < g_nobj; i++) {
+            if (g_all_objs[i].tls.memsz == 0) continue;
+            size_t s = (g_all_objs[i].tls.modid + 1) * 2;
+            if (s > old_cap) old_cap = s;
+        }
+
+        if (need_words > old_cap) {
+            /* Grow: allocate new, copy old, install */
+            size_t raw_bytes = (need_words + 2) * sizeof(uintptr_t);
+            raw_bytes = ALIGN_UP(raw_bytes, 4096);
+            uintptr_t *new_raw = mmap(NULL, raw_bytes, PROT_READ | PROT_WRITE,
+                                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (new_raw == MAP_FAILED) return -1;
+            /* Copy old raw array: generation + unused + old_cap words */
+            memcpy(new_raw, raw_dtv, (old_cap + 2) * sizeof(uintptr_t));
+            dtv = new_raw + 2;
+            *(uintptr_t **)(tp + 8) = dtv;
+        }
+    }
+
+    /* Allocate the TLS block for this module */
+    size_t align = obj->tls.align ? (size_t)obj->tls.align : sizeof(uintptr_t);
+    size_t map_len = ALIGN_UP(obj->tls.memsz + align, 4096);
+    void *map = mmap(NULL, map_len, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (map == MAP_FAILED) return -1;
+
+    uintptr_t tls_base = ALIGN_UP((uintptr_t)map, align);
+    memcpy((void *)tls_base, (const void *)(obj->base + obj->tls.vaddr),
+           obj->tls.filesz);
+    if (obj->tls.memsz > obj->tls.filesz)
+        memset((void *)(tls_base + obj->tls.filesz), 0,
+               obj->tls.memsz - obj->tls.filesz);
+
+    dtv[obj->tls.modid * 2]     = tls_base;
+    dtv[obj->tls.modid * 2 + 1] = 0;
+
+    if (g_debug) {
+        ldr_msg("[loader] glibc dlopen tls: ");
+        ldr_msg(obj->name ? obj->name : "?");
+        ldr_dbg_hex(" mod=0x", obj->tls.modid);
+        ldr_dbg_hex(" block=0x", tls_base);
+    }
+    return 0;
+}
+
 /* _dl_allocate_tls_init — copy .tdata for every TLS module into a
  * new thread's TLS block.  Called by glibc's pthread_create. */
 static int g_tls_alloc_count;
@@ -1546,6 +1633,10 @@ static void *stub_dl_allocate_tls_init(void *mem)
     }
     for (int i = 0; i < g_nobj; i++) {
         if (g_all_objs[i].tls.memsz == 0) continue;
+        /* dlopen'd modules (tpoff==0) get TLS via separate DTV blocks,
+         * not the static TLS area.  Skip them here — their .tdata is
+         * copied during DTV block allocation in stub_dl_allocate_tls. */
+        if (g_all_objs[i].tls.tpoff == 0) continue;
         uint8_t *dst = (uint8_t *)(tp + g_all_objs[i].tls.tpoff);
         const uint8_t *src = (const uint8_t *)(
             g_all_objs[i].base + g_all_objs[i].tls.vaddr);
@@ -1599,10 +1690,28 @@ static void *stub_dl_allocate_tls(void *mem)
         for (int i = 0; i < g_nobj; i++) {
             if (g_all_objs[i].tls.memsz == 0) continue;
             size_t slot = g_all_objs[i].tls.modid;
-            if (slot < dtv_slots) {
+            if (slot >= dtv_slots) continue;
+            if (g_all_objs[i].tls.tpoff != 0) {
+                /* Static TLS — block is in the pre-allocated area */
                 dtv[slot * 2]     = tp + (uintptr_t)g_all_objs[i].tls.tpoff;
-                dtv[slot * 2 + 1] = 0;
+            } else {
+                /* dlopen'd module — allocate separate TLS block */
+                size_t al = g_all_objs[i].tls.align;
+                if (!al) al = sizeof(uintptr_t);
+                size_t ml = ALIGN_UP(g_all_objs[i].tls.memsz + al, 4096);
+                void *blk = mmap(NULL, ml, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                if (blk == MAP_FAILED) continue;
+                uintptr_t ba = ALIGN_UP((uintptr_t)blk, al);
+                memcpy((void *)ba,
+                       (const void *)(g_all_objs[i].base + g_all_objs[i].tls.vaddr),
+                       g_all_objs[i].tls.filesz);
+                if (g_all_objs[i].tls.memsz > g_all_objs[i].tls.filesz)
+                    memset((void *)(ba + g_all_objs[i].tls.filesz), 0,
+                           g_all_objs[i].tls.memsz - g_all_objs[i].tls.filesz);
+                dtv[slot * 2] = ba;
             }
+            dtv[slot * 2 + 1] = 0;
         }
         *(uintptr_t *)(tp + 8 /* TCB_OFF_DTV */) = (uintptr_t)dtv;
     }
@@ -1736,6 +1845,7 @@ static uint32_t vfs_hash(const char *s)
 }
 
 static void vfs_init_dirs(void);
+static void vfs_init_pyc_aliases(void);
 
 static void vfs_init(const uint8_t *mem, uint64_t mem_foff,
                      const struct dlfrz_entry *entries,
@@ -1757,8 +1867,10 @@ static void vfs_init(const uint8_t *mem, uint64_t mem_foff,
         ldr_dbg_hex("[loader] vfs: 0x", g_vfs_count);
         ldr_msg(" data files registered\n");
     }
-    if (g_vfs_count > 0)
+    if (g_vfs_count > 0) {
         vfs_init_dirs();
+        vfs_init_pyc_aliases();
+    }
 }
 
 static const struct vfs_entry *vfs_lookup(const char *path)
@@ -1888,6 +2000,84 @@ static void vfs_init_dirs(void)
     if (g_debug && g_vfs_dir_count > 0) {
         ldr_dbg_hex("[loader] vfs: 0x", g_vfs_dir_count);
         ldr_msg(" directories derived\n");
+    }
+}
+
+/*
+ * vfs_init_pyc_aliases — create synthetic <name>.pyc entries for every
+ * __pycache__/<name>.cpython-XY.pyc file where the corresponding
+ * <name>.py is missing from VFS.
+ *
+ * Python's SourceFileLoader needs <name>.py to exist on disk to find a
+ * module.  When only the .pyc from __pycache__/ was captured (Python
+ * loaded it without opening the .py source), SourceFileLoader fails.
+ * SourcelessFileLoader looks for <name>.pyc (without version tag) in
+ * the parent directory.  By creating these aliases we enable it to
+ * find and load the bytecode.
+ */
+static void vfs_init_pyc_aliases(void)
+{
+    static char pyc_strbuf[65536];
+    int strpos = 0;
+    int alias_count = 0;
+
+    for (int i = 0; i < (int)VFS_HASH_SIZE; i++) {
+        if (!g_vfs_table[i].path) continue;
+        const char *path = g_vfs_table[i].path;
+
+        /* Match __pycache__/<name>.cpython-<digits>.pyc */
+        const char *pc = strstr(path, "/__pycache__/");
+        if (!pc) continue;
+
+        const char *fname = pc + 13; /* past "/__pycache__/" */
+        const char *cp = strstr(fname, ".cpython-");
+        if (!cp) continue;
+        const char *ext = cp + 9; /* past ".cpython-" */
+        while (*ext >= '0' && *ext <= '9') ext++;
+        if (ext[0] != '.' || ext[1] != 'p' || ext[2] != 'y' ||
+            ext[3] != 'c' || ext[4] != '\0')
+            continue;
+
+        int parent_len = (int)(pc - path);
+        int name_len   = (int)(cp - fname);
+
+        /* Build <parent>/<name>.py and <parent>/<name>.pyc in a check buf */
+        char buf[512];
+        int base = parent_len + 1 + name_len;
+        if (base + 5 > (int)sizeof(buf)) continue; /* .pyc\0 */
+        memcpy(buf, path, parent_len);
+        buf[parent_len] = '/';
+        memcpy(buf + parent_len + 1, fname, name_len);
+
+        /* Skip if .py already exists — SourceFileLoader handles it */
+        memcpy(buf + base, ".py", 4);
+        if (vfs_lookup(buf)) continue;
+
+        /* Skip if .pyc already exists */
+        memcpy(buf + base, ".pyc", 5);
+        if (vfs_lookup(buf)) continue;
+
+        /* Store the new path string */
+        int need = base + 4 + 1; /* .pyc\0 */
+        if (strpos + need > (int)sizeof(pyc_strbuf)) break;
+        char *dest = pyc_strbuf + strpos;
+        memcpy(dest, buf, need);
+        strpos += need;
+
+        /* Insert into the hash table */
+        uint32_t idx = vfs_hash(dest) & (VFS_HASH_SIZE - 1);
+        while (g_vfs_table[idx].path)
+            idx = (idx + 1) & (VFS_HASH_SIZE - 1);
+        g_vfs_table[idx].path = dest;
+        g_vfs_table[idx].data = g_vfs_table[i].data;
+        g_vfs_table[idx].size = g_vfs_table[i].size;
+        g_vfs_count++;
+        alias_count++;
+    }
+
+    if (g_debug && alias_count > 0) {
+        ldr_dbg_hex("[loader] vfs: 0x", alias_count);
+        ldr_msg(" pyc aliases created\n");
     }
 }
 
@@ -2418,12 +2608,22 @@ static int vfs_serve_memfd(const struct vfs_entry *ve, const char *path)
     return fd;
 }
 
+/* .dir markers are 0-byte sentinel entries used for directory structure.
+ * They must NOT be served as regular files. */
+static int vfs_is_dir_marker(const char *path)
+{
+    int len = 0;
+    for (const char *p = path; *p; p++) len++;
+    return len >= 5 && path[len-5] == '/' && path[len-4] == '.'
+        && path[len-3] == 'd' && path[len-2] == 'i' && path[len-1] == 'r';
+}
+
 static int vfs_open(const char *path, int flags, int mode)
 {
     /* Only intercept absolute paths for read-only opens */
     if (path && path[0] == '/' && (flags & 3) == 0 /* O_RDONLY */) {
         const struct vfs_entry *ve = vfs_lookup(path);
-        if (ve && ve->size > 0) {
+        if (ve && !vfs_is_dir_marker(path)) {
             int fd = vfs_serve_memfd(ve, path);
             if (fd >= 0) return fd;
         }
@@ -2436,7 +2636,7 @@ static int vfs_openat(int dirfd, const char *path, int flags, int mode)
     if (path && path[0] == '/') {
         if ((flags & 3) == 0 /* O_RDONLY */) {
             const struct vfs_entry *ve = vfs_lookup(path);
-            if (ve && ve->size > 0) {
+            if (ve && !vfs_is_dir_marker(path)) {
                 int fd = vfs_serve_memfd(ve, path);
                 if (fd >= 0) return fd;
             }
@@ -2471,7 +2671,7 @@ static void *vfs_fopen(const char *path, const char *mode)
 {
     if (path && path[0] == '/' && mode && mode[0] == 'r') {
         const struct vfs_entry *ve = vfs_lookup(path);
-        if (ve && ve->size > 0) {
+        if (ve && !vfs_is_dir_marker(path)) {
             int fd = vfs_serve_memfd(ve, path);
             if (fd >= 0 && g_real_fdopen)
                 return g_real_fdopen(fd, mode);
@@ -2990,6 +3190,31 @@ static void apply_prelinked_runtime_reloc(struct loaded_obj *obj,
         return;
     }
 
+    if (type == ARCH_RELOC_COPY) {
+        uint32_t sidx = ELF64_R_SYM(rel->r_info);
+        if (sidx == 0) return;
+        const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
+        uint64_t src_size = obj->dynsym[sidx].st_size;
+        if (g_debug) {
+            ldr_msg("COPY reloc: ");
+            ldr_msg(name);
+            ldr_msg("\n");
+        }
+        for (int j = 0; j < nobj; j++) {
+            if (&objs[j] == obj) continue;
+            for (uint32_t k = 0; k < objs[j].dynsym_count; k++) {
+                if (objs[j].dynsym[k].st_shndx == 0) continue;
+                const char *sn = objs[j].dynstr + objs[j].dynsym[k].st_name;
+                if (strcmp(sn, name) != 0) continue;
+                uint64_t src = objs[j].base + objs[j].dynsym[k].st_value;
+                uint64_t sz = src_size ? src_size : objs[j].dynsym[k].st_size;
+                memcpy((void *)(base + rel->r_offset), (void *)src, sz);
+                return;
+            }
+        }
+        return;
+    }
+
     if (type != ARCH_RELOC_GLOB_DAT &&
         type != ARCH_RELOC_JUMP_SLOT)
         return;
@@ -3042,40 +3267,51 @@ static void apply_prelinked_runtime_reloc(struct loaded_obj *obj,
 /* ==== Map one object's PT_LOAD segments ================================ */
 
 /*
- * Reserve the entire virtual address range for all objects in a single
- * mmap call.  Individual objects are then mapped on top with MAP_FIXED.
- * Returns 0 on success, -1 on failure.
+ * Reserve virtual address ranges for all objects.  When all objects share
+ * a high base address (PIE/DSOs only), a single contiguous reservation
+ * suffices.  When a non-PIE executable is present (base_addr=0, mapped at
+ * its original link address), the range is split into two reservations so
+ * the bootstrap binary in between is not disturbed.
  */
 static int reserve_address_range(const struct dlfrz_lib_meta *metas,
                                   const int *idx_map, int nobj,
                                   _Bool memcpy_mode)
 {
-    /* Find lowest and highest addresses across all objects */
-    uint64_t range_lo = UINT64_MAX, range_hi = 0;
+    /* Partition objects into native-address (base_addr=0, non-PIE exe)
+     * and relocated (base_addr>0, DSOs + PIE executables). */
+    uint64_t nat_lo = UINT64_MAX, nat_hi = 0;
+    uint64_t rel_lo = UINT64_MAX, rel_hi = 0;
     for (int i = 0; i < nobj; i++) {
         int mi = idx_map[i];
         uint64_t lo = metas[mi].base_addr + (metas[mi].vaddr_lo & ~0xFFFULL);
         uint64_t hi = metas[mi].base_addr + ALIGN_UP(metas[mi].vaddr_hi, 4096);
-        if (lo < range_lo) range_lo = lo;
-        if (hi > range_hi) range_hi = hi;
+        if (metas[mi].base_addr == 0) {
+            if (lo < nat_lo) nat_lo = lo;
+            if (hi > nat_hi) nat_hi = hi;
+        } else {
+            if (lo < rel_lo) rel_lo = lo;
+            if (hi > rel_hi) rel_hi = hi;
+        }
     }
-    if (range_lo >= range_hi) return -1;
 
-    /* Add guard pages at the end */
-    range_hi += 4 * 4096;
-
-    /* When segments are populated via memcpy (perf mode or UPX path
-     * where srcfd<0), include PROT_EXEC in the reservation so that
-     * IRELATIVE resolvers can execute text before protect_object
-     * sets final per-segment permissions. */
     int res_prot = PROT_READ | PROT_WRITE;
     if (g_perf_mode || memcpy_mode) res_prot |= PROT_EXEC;
 
-    void *mapped = mmap((void *)range_lo, range_hi - range_lo,
-                        res_prot,
-                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
-                        -1, 0);
-    if (mapped == MAP_FAILED) return -1;
+    if (nat_lo < nat_hi) {
+        nat_hi += 4 * 4096;
+        void *m = mmap((void *)nat_lo, nat_hi - nat_lo, res_prot,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+                       -1, 0);
+        if (m == MAP_FAILED) return -1;
+    }
+    if (rel_lo < rel_hi) {
+        rel_hi += 4 * 4096;
+        void *m = mmap((void *)rel_lo, rel_hi - rel_lo, res_prot,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+                       -1, 0);
+        if (m == MAP_FAILED) return -1;
+    }
+    if (nat_lo >= nat_hi && rel_lo >= rel_hi) return -1;
     return 0;
 }
 
@@ -3688,7 +3924,29 @@ static void init_libc_process_state(struct loaded_obj *objs, int nobj,
     uint64_t addr;
 
     addr = resolve_sym(objs, nobj, "__environ");
-    if (addr) *(char ***)(uintptr_t)addr = envp;
+    if (addr) {
+        if (g_debug) {
+            ldr_hex("__environ resolved to ", addr);
+        }
+        *(char ***)(uintptr_t)addr = envp;
+    }
+    /* Also set __environ in each DSO's own data (for COPY reloc scenarios
+     * where libc may have internal references to its own copy). */
+    for (int i = 0; i < nobj; i++) {
+        if (objs[i].flags & LDR_FLAG_MAIN_EXE) continue;
+        const Elf64_Sym *sym = objs[i].gnu_hash
+            ? lookup_gnu_hash(&objs[i], "__environ", gnu_hash_calc("__environ"))
+            : lookup_linear(&objs[i], "__environ");
+        if (sym && sym->st_shndx != 0 && sym->st_size > 0) {
+            uint64_t dso_addr = objs[i].base + sym->st_value;
+            if (dso_addr != addr) {
+                if (g_debug) {
+                    ldr_hex("__environ DSO copy at ", dso_addr);
+                }
+                *(char ***)(uintptr_t)dso_addr = envp;
+            }
+        }
+    }
     addr = resolve_sym(objs, nobj, "environ");
     if (addr) *(char ***)(uintptr_t)addr = envp;
 
@@ -4097,6 +4355,11 @@ static struct loaded_obj *load_elf_from_file(const char *path)
         g_nobj = idx;
         return NULL;
     }
+    if (install_glibc_dlopen_tls(obj) < 0) {
+        dl_set_error(path, ": glibc TLS setup failed");
+        g_nobj = idx;
+        return NULL;
+    }
 
     /* Set final memory protections */
     protect_object(obj, meta);
@@ -4269,6 +4532,11 @@ static struct loaded_obj *load_embedded_object(uint32_t mi)
 
     if (install_musl_dlopen_tls(obj) < 0) {
         dl_set_error(ename, ": musl TLS setup failed");
+        g_nobj = idx;
+        return NULL;
+    }
+    if (install_glibc_dlopen_tls(obj) < 0) {
+        dl_set_error(ename, ": glibc TLS setup failed");
         g_nobj = idx;
         return NULL;
     }

@@ -417,13 +417,22 @@ static uint64_t find_main_from_entry(FILE *f, const Elf64_Ehdr *ehdr,
     size_t nr = fread(code, 1, sizeof(code), f);
     if (nr < 16) return 0;
 
-    /* Scan for: 48 8d 3d XX XX XX XX  (lea disp32(%rip), %rdi) */
+    /* Scan for: 48 8d 3d XX XX XX XX  (lea disp32(%rip), %rdi)  — PIE
+     *     or:   48 c7 c7 XX XX XX XX  (mov $imm32, %rdi)        — non-PIE */
     for (size_t i = 0; i + 7 <= nr; i++) {
         if (code[i] == 0x48 && code[i+1] == 0x8d && code[i+2] == 0x3d) {
             int32_t disp;
             memcpy(&disp, &code[i+3], 4);
             /* RIP at time of lea = entry_va + i + 7 */
             uint64_t main_va = entry_va + i + 7 + (int64_t)disp;
+            fprintf(stderr, "dlfreeze: extracted main=0x%lx from _start\n",
+                    (unsigned long)main_va);
+            return main_va;
+        }
+        if (code[i] == 0x48 && code[i+1] == 0xc7 && code[i+2] == 0xc7) {
+            uint32_t imm;
+            memcpy(&imm, &code[i+3], 4);
+            uint64_t main_va = (uint64_t)imm;
             fprintf(stderr, "dlfreeze: extracted main=0x%lx from _start\n",
                     (unsigned long)main_va);
             return main_va;
@@ -772,22 +781,8 @@ static int pl_apply_rela(struct prelink_obj *obj,
             continue;
         }
         if (type == ARCH_RELOC_COPY) {
-            if (pass != 2) continue;
-
-            const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
-            uint64_t src_size = obj->dynsym[sidx].st_size;
-            for (int j = 0; j < nobj; j++) {
-                if (&all[j] == obj) continue;
-                const Elf64_Sym *s = all[j].gnu_hash
-                    ? pl_lookup_gnu(&all[j], name, pl_gnu_hash(name))
-                    : pl_lookup_linear(&all[j], name);
-                if (s && s->st_shndx != 0) {
-                    uint64_t sz = src_size ? src_size : s->st_size;
-                    memcpy((void *)(base + r->r_offset),
-                           (void *)(all[j].base + s->st_value), sz);
-                    break;
-                }
-            }
+            /* COPY targets live in .bss (memsz > filesz) which is not
+             * written back to the frozen file.  Defer to the loader. */
             continue;
         }
         if (pass != 0) continue;
@@ -798,7 +793,15 @@ static int pl_apply_rela(struct prelink_obj *obj,
             break;
 
         case ARCH_RELOC_GLOB_DAT:
-        case ARCH_RELOC_JUMP_SLOT:
+        case ARCH_RELOC_JUMP_SLOT: {
+            /* ELF ABI: S (no addend).  glibc ≥2.39 stores the PLT stub
+             * address in r_addend for JUMP_SLOT; applying it would point
+             * the GOT at the wrong function. */
+            const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
+            uint64_t addr = pl_resolve_sym(all, nobj, name);
+            *slot = addr;
+            break;
+        }
         case ARCH_RELOC_ABS: {
             const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
             uint64_t addr = pl_resolve_sym(all, nobj, name);
@@ -901,7 +904,8 @@ static int prelink_obj_collect_runtime_fixups(const struct prelink_obj *obj,
             uint32_t type = ELF64_R_TYPE(rel->r_info);
             int needs_fixup = 0;
 
-            if (type == ARCH_RELOC_IRELATIVE) {
+            if (type == ARCH_RELOC_IRELATIVE ||
+                type == ARCH_RELOC_COPY) {
                 needs_fixup = 1;
             } else if (type == ARCH_RELOC_GLOB_DAT ||
                        type == ARCH_RELOC_JUMP_SLOT) {
@@ -2018,32 +2022,26 @@ int pack_frozen(const struct pack_options *opts)
                                   &metas[i]) < 0) {
                 goto fail2;
             }
-            /* Advance base past the object's highest vaddr (not just
-             * the span hi-lo).  Non-PIE executables have vaddr_lo > 0
-             * (e.g. 0x400000), so using hi-lo would leave a gap that
-             * overlaps with the next object's mapping at base+lo. */
-            base += ALIGN_UP(metas[i].vaddr_hi, 0x200000);
-        }
 
-        /* Non-PIE executables (ET_EXEC) have absolute addresses baked
-         * into code and data sections that cannot be relocated.  They
-         * must run at their original link address (e.g. 0x400000),
-         * which conflicts with the bootstrap.  Fall back to plain
-         * extraction mode. */
-        int non_pie_main = 0;
-        for (int i = 0; i < eidx; i++) {
+            /* Non-PIE executables (ET_EXEC) have absolute addresses
+             * baked into code/data.  They must run at their original
+             * link address, so set base_addr=0 (loader maps at vaddr
+             * directly) and don't advance the DSO base cursor. */
             if ((entries[i].flags & DLFRZ_FLAG_MAIN_EXE) &&
                 metas[i].vaddr_lo != 0) {
-                non_pie_main = 1;
-                break;
+                metas[i].base_addr = 0;
+                /* Verify the exe doesn't overlap with either the
+                 * bootstrap (at 0x40000000) or the DSO region. */
+                if (metas[i].vaddr_hi > 0x40000000ULL) {
+                    fprintf(stderr,
+                            "dlfreeze: non-PIE executable VA range extends "
+                            "past 0x40000000; direct-load not supported\n");
+                    free(metas); metas = NULL;
+                    break;
+                }
+            } else {
+                base += ALIGN_UP(metas[i].vaddr_hi, 0x200000);
             }
-        }
-        if (non_pie_main) {
-            fprintf(stderr,
-                    "dlfreeze: main executable is not position-independent "
-                    "(ET_EXEC); direct-load unavailable, using extraction\n");
-            free(metas);
-            metas = NULL;
         }
 
         if (metas) {

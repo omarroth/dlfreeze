@@ -28,8 +28,10 @@ $(BUILD):
 $(BUILD)/%.o: $(SRC)/%.c | $(BUILD)
 	$(TOOL_CC) $(CFLAGS) -c -o $@ $<
 
+# Link at 0x40000000 so the default 0x400000 range is free for non-PIE
+# executables in the prelinker child process.
 $(DLFREEZE): $(TOOL_OBJS)
-	$(TOOL_CC) $(CFLAGS) -static -o $@ $^ $(LDFLAGS)
+	$(TOOL_CC) $(CFLAGS) -static -Wl,-Ttext-segment=0x40000000 -o $@ $^ $(LDFLAGS)
 
 # ── bootstrap (statically linked, includes in-process loader) ──────
 # Use musl-gcc for much smaller static binary (fewer page faults).
@@ -42,11 +44,14 @@ INC      = include
 $(BOOTSTRAP): $(SRC)/bootstrap.c $(SRC)/loader.c $(INC)/common.h $(INC)/loader.h | $(BUILD)
 	$(BOOTSTRAP_CC) -Wall -Wextra -O2 -D_GNU_SOURCE -Iinclude -fno-stack-protector \
 	    -ffunction-sections -fdata-sections \
-	    -static -Wl,--gc-sections -o $@ $(SRC)/bootstrap.c $(SRC)/loader.c
+	    -static -Wl,--gc-sections -Wl,-Ttext-segment=0x40000000 \
+	    -o $@ $(SRC)/bootstrap.c $(SRC)/loader.c
 
 # ── LD_PRELOAD library for tracing dlopen ──────────────────────────
+# -U_FORTIFY_SOURCE: glibc fortification (__fprintf_chk etc.) is not
+# available on musl, so disable it for cross-platform portability.
 $(PRELOAD): $(SRC)/dlopen_preload.c | $(BUILD)
-	$(CC) $(CFLAGS) -shared -fPIC -o $@ $< -ldl -lpthread
+	$(CC) $(CFLAGS) -U_FORTIFY_SOURCE -shared -fPIC -o $@ $< -ldl -lpthread
 
 # ── test suite ─────────────────────────────────────────────────────
 test: all
