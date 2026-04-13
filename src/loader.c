@@ -39,6 +39,13 @@
 
 #define LDR_PRELINK_FIXUP_JMPREL 0x80000000u
 
+/* Fallback for musl libc which lacks Elf64_Relr */
+#ifndef ELF_RELR_DEFINED
+#ifdef __LP64__
+typedef Elf64_Xword Elf64_Relr;
+#endif
+#endif
+
 /* ---- architecture abstraction ----------------------------------------- */
 /* Fallback defines for aarch64 relocation types missing from older elf.h */
 #ifndef R_AARCH64_IRELATIVE
