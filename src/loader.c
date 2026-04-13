@@ -46,6 +46,11 @@ typedef Elf64_Xword Elf64_Relr;
 #endif
 #endif
 
+/* Fallback for pre-4.17 kernel headers */
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+
 /* ---- architecture abstraction ----------------------------------------- */
 /* Fallback defines for aarch64 relocation types missing from older elf.h */
 #ifndef R_AARCH64_IRELATIVE
