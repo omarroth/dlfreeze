@@ -529,32 +529,95 @@ static signal_handler_t vfs_signal(int signum, signal_handler_t handler)
  * copies with critical fields initialised so that malloc, stdio, etc.
  * work without the real dynamic linker.
  *
- * Field offsets are glibc-version-specific (determined for glibc 2.43
- * on x86-64).  When building on a system with a different glibc,
- * verify with: gdb -batch -ex 'start' -ex 'ptype /o struct rtld_global_ro' /bin/true
+ * Field offsets are glibc-version-specific.  The struct layouts changed
+ * significantly in glibc 2.40 (cpu_features restructured, hwcap_flags
+ * and platforms arrays removed, tlsdesc fields added).
+ *
+ * We detect the correct layout at runtime by parsing the embedded
+ * ld-linux.so's .dynsym for the _rtld_global_ro and _rtld_global
+ * OBJECT symbols — their st_size uniquely identifies the struct layout.
+ * This avoids hardcoding against any particular glibc version and keeps
+ * dlfreeze portable as a static musl binary.
+ *
+ * To add a new glibc layout profile, use:
+ *   gdb -batch -ex 'start' -ex 'ptype /o struct rtld_global_ro' /bin/true
+ *   gdb -batch -ex 'start' -ex 'ptype /o struct rtld_global' /bin/true
+ *   readelf --dyn-syms -W /lib64/ld-linux-x86-64.so.2 | grep _rtld_global
  */
 
-/* _rtld_global_ro (928 bytes on glibc 2.43 x86-64) */
-#define GLRO_SIZE        4096                /* generous allocation     */
-#define GLRO_DL_PAGESIZE_OFF  24             /* offset 0x18             */
-#define GLRO_DL_MINSIGSTKSZ_OFF 32           /* _dl_minsigstacksize     */
-#define GLRO_DL_CLKTCK_OFF    64             /* offset 0x40             */
-#define GLRO_DL_FPU_CONTROL_OFF 0x58           /* _dl_fpu_control         */
-#define GLRO_DL_AUXV_OFF      104            /* _dl_auxv                */
-#define GLRO_DL_TLS_STATIC_SIZE_OFF  672     /* 0x2a0                   */
-#define GLRO_DL_TLS_STATIC_ALIGN_OFF 680     /* 0x2a8                   */
+/* Sizes for mmap allocation (generous, covers any glibc version) */
+#define GLRO_SIZE        8192
+#define GL_SIZE          8192
 
-/* _rtld_global (2120 bytes on glibc 2.43 x86-64) */
-#define GL_SIZE          4096                /* generous allocation     */
-#define GL_DL_NNS_OFF         0x700          /* _dl_nns                 */
-#define GL_DL_STACK_FLAGS_OFF 0x7b8          /* _dl_stack_flags         */
-#define GL_DL_TLS_GENERATION_OFF 0x7f0       /* _dl_tls_generation      */
-#define GL_DL_STACK_USED_OFF  0x800          /* _dl_stack_used (list_t) */
-#define GL_DL_STACK_USER_OFF  0x810          /* _dl_stack_user (list_t) */
-#define GL_DL_STACK_CACHE_OFF 0x820          /* _dl_stack_cache(list_t) */
+/* Version-independent offsets in _rtld_global_ro (stable across 2.35–2.43) */
+#define GLRO_DL_PAGESIZE_OFF    24           /* offset 0x18             */
+#define GLRO_DL_MINSIGSTKSZ_OFF 32           /* _dl_minsigstacksize     */
+#define GLRO_DL_CLKTCK_OFF      64           /* offset 0x40             */
+#define GLRO_DL_FPU_CONTROL_OFF 0x58         /* _dl_fpu_control         */
+#define GLRO_DL_AUXV_OFF        104          /* _dl_auxv                */
+
+/* Version-dependent offset profile for glibc _rtld_global{,_ro} */
+struct glibc_ver_offsets {
+    /* _rtld_global_ro */
+    int glro_tls_static_size;
+    int glro_tls_static_align;
+    int glro_debug_printf;
+    int glro_mcount;
+    int glro_open;
+    int glro_close;
+    int glro_catch_error;
+    int glro_error_free;
+    int glro_find_object;
+    /* _rtld_global */
+    int gl_nns;
+    int gl_stack_flags;
+    int gl_tls_generation;
+    int gl_stack_used;
+    int gl_stack_user;
+    int gl_stack_cache;
+};
+
+/* glibc 2.35–2.39 (x86-64): _rtld_global_ro=952B, _rtld_global=4352B */
+static const struct glibc_ver_offsets glibc_pre240 = {
+    .glro_tls_static_size  = 712,   /* 0x2C8 */
+    .glro_tls_static_align = 720,   /* 0x2D0 */
+    .glro_debug_printf     = 848,
+    .glro_mcount           = 856,
+    .glro_open             = 872,
+    .glro_close            = 880,
+    .glro_catch_error      = 888,
+    .glro_error_free       = 896,
+    .glro_find_object      = 920,
+    .gl_nns                = 2560,  /* 0xA00 */
+    .gl_stack_flags        = 4208,  /* 0x1070 */
+    .gl_tls_generation     = 4264,  /* 0x10A8 */
+    .gl_stack_used         = 4280,  /* 0x10B8 */
+    .gl_stack_user         = 4296,  /* 0x10C8 */
+    .gl_stack_cache        = 4312,  /* 0x10D8 */
+};
+
+/* glibc 2.40+ (x86-64): _rtld_global_ro=928B, _rtld_global=2120B */
+static const struct glibc_ver_offsets glibc_post240 = {
+    .glro_tls_static_size  = 672,   /* 0x2A0 */
+    .glro_tls_static_align = 680,   /* 0x2A8 */
+    .glro_debug_printf     = 816,
+    .glro_mcount           = 824,
+    .glro_open             = 840,
+    .glro_close            = 848,
+    .glro_catch_error      = 856,
+    .glro_error_free       = 864,
+    .glro_find_object      = 888,
+    .gl_nns                = 1792,  /* 0x700 */
+    .gl_stack_flags        = 1976,  /* 0x7B8 */
+    .gl_tls_generation     = 2032,  /* 0x7F0 */
+    .gl_stack_used         = 2048,  /* 0x800 */
+    .gl_stack_user         = 2064,  /* 0x810 */
+    .gl_stack_cache        = 2080,  /* 0x820 */
+};
 
 static uint8_t *g_fake_rtld_global;
 static uint8_t *g_fake_rtld_global_ro;
+static const struct glibc_ver_offsets *g_glibc_off = &glibc_post240;
 
 /* Fake link_map used by __cxa_thread_atexit_impl and other glibc internals
  * that dereference _rtld_global._dl_ns[0]._ns_loaded (offset 0).
@@ -634,15 +697,6 @@ static void glro_dl_mcount(uintptr_t from, uintptr_t to)
     (void)from; (void)to;
 }
 
-/* Offsets of function pointers in struct rtld_global_ro (glibc 2.43 x86-64) */
-#define GLRO_DL_DEBUG_PRINTF_OFF  816
-#define GLRO_DL_MCOUNT_OFF        824
-#define GLRO_DL_OPEN_OFF          840
-#define GLRO_DL_CLOSE_OFF         848
-#define GLRO_DL_CATCH_ERROR_OFF   856
-#define GLRO_DL_ERROR_FREE_OFF    864
-#define GLRO_DL_FIND_OBJECT_OFF   888
-
 /* make a list_t {next, prev} point to itself (empty circular list) */
 static void init_empty_list(uint8_t *base, size_t off)
 {
@@ -676,10 +730,6 @@ static int init_fake_rtld(void)
 #if defined(__x86_64__)
     *(int    *)(g_fake_rtld_global_ro + GLRO_DL_FPU_CONTROL_OFF) = 0x037f;
 #endif
-    /* TLS static fields needed by __libc_early_init → thread stack guard
-     * computation.  Without these, __libc_early_init divides by zero. */
-    *(size_t *)(g_fake_rtld_global_ro + GLRO_DL_TLS_STATIC_SIZE_OFF)  = 0x1080;
-    *(size_t *)(g_fake_rtld_global_ro + GLRO_DL_TLS_STATIC_ALIGN_OFF) = 0x40;
 
 #if defined(__x86_64__)
     /*
@@ -689,8 +739,8 @@ static int init_fake_rtld(void)
      * a generic SSE2 variant that prefetches 12 KiB ahead, causing
      * SIGSEGV on buffer boundaries.
      *
-     * struct cpu_features layout (glibc 2.43 x86-64):
-     *   +0x70  _dl_x86_cpu_features  (528 bytes)
+     * struct cpu_features layout (stable across glibc 2.35–2.43):
+     *   +0x70  _dl_x86_cpu_features
      *     +0   cpu_features_basic (20 bytes: kind, max_cpuid, family, model, stepping)
      *     +20  cpuid_feature_internal features[10] (32 bytes each: cpuid + usable)
      *     +340 preferred[1]
@@ -779,12 +829,12 @@ static int init_fake_rtld(void)
          * entirely.  This matches normal behaviour for most workloads
          * (non-temporal copies are only beneficial for multi-MB buffers).
          *
-         * cpu_features layout (glibc 2.43):
+         * cpu_features layout (stable offset for non_temporal_threshold):
          *   +384  non_temporal_threshold         (8 bytes)
-         *   +392  memset_non_temporal_threshold   (8 bytes)
-         *   +400  rep_movsb_threshold             (8 bytes)
-         *   +408  rep_movsb_stop_threshold        (8 bytes)
-         *   +416  rep_stosb_threshold             (8 bytes)
+         * Following offsets shifted by +8 in glibc 2.40+ (added
+         * memset_non_temporal_threshold), but all are set to SIZE_MAX
+         * so the shift is harmless — the extra write lands on an adjacent
+         * threshold or cache-size field which tolerates SIZE_MAX.
          */
 #define CPUF_NON_TEMPORAL_THRESHOLD  (CPUF_BASE + 384)
 #define CPUF_MEMSET_NT_THRESHOLD     (CPUF_BASE + 392)
@@ -799,33 +849,202 @@ static int init_fake_rtld(void)
     }
 #endif /* __x86_64__ */
 
-    /* _rtld_global critical fields */
-    *(size_t *)(g_fake_rtld_global + GL_DL_NNS_OFF)            = 1;
-    *(int    *)(g_fake_rtld_global + GL_DL_STACK_FLAGS_OFF)     = 3; /* PROT_READ|PROT_WRITE */
-    *(size_t *)(g_fake_rtld_global + GL_DL_TLS_GENERATION_OFF) = 1;
-
     /* _dl_ns[0]._ns_loaded — pointer to the head link_map.  Used by
      * __cxa_thread_atexit_impl when _dl_find_dso_for_object returns NULL:
      * it falls back to *(_rtld_global+0) to get a link_map and increments
-     * a reference counter at link_map+0x498. */
+     * a reference counter at link_map+0x498.
+     * Offset 0 is version-independent (always start of struct). */
     *(uintptr_t *)(g_fake_rtld_global + 0) = (uintptr_t)g_fake_link_map;
 
-    /* Empty circular lists for stack tracking */
-    init_empty_list(g_fake_rtld_global, GL_DL_STACK_USED_OFF);
-    init_empty_list(g_fake_rtld_global, GL_DL_STACK_USER_OFF);
-    init_empty_list(g_fake_rtld_global, GL_DL_STACK_CACHE_OFF);
-
-    /* dl* function pointer stubs — makes dlopen/dlsym/dlclose return
-     * error/NULL instead of SIGSEGV-ing through a NULL pointer. */
-    *(void **)(g_fake_rtld_global_ro + GLRO_DL_DEBUG_PRINTF_OFF) = (void *)glro_dl_debug_printf;
-    *(void **)(g_fake_rtld_global_ro + GLRO_DL_OPEN_OFF)         = (void *)glro_dl_open;
-    *(void **)(g_fake_rtld_global_ro + GLRO_DL_CLOSE_OFF)        = (void *)glro_dl_close;
-    *(void **)(g_fake_rtld_global_ro + GLRO_DL_CATCH_ERROR_OFF)  = (void *)glro_dl_catch_error;
-    *(void **)(g_fake_rtld_global_ro + GLRO_DL_ERROR_FREE_OFF)   = (void *)glro_dl_error_free;
-    *(void **)(g_fake_rtld_global_ro + GLRO_DL_FIND_OBJECT_OFF)  = (void *)glro_dl_find_object;
-    *(void **)(g_fake_rtld_global_ro + GLRO_DL_MCOUNT_OFF)       = (void *)glro_dl_mcount;
+    /* Version-dependent fields (_rtld_global_ro TLS offsets, function
+     * pointer stubs, _rtld_global nns/stack/tls) are set later by
+     * fixup_rtld_for_glibc() once the glibc version is known. */
 
     return 0;
+}
+
+/*
+ * Set version-dependent fields in fake _rtld_global / _rtld_global_ro.
+ * Called after libraries are loaded and relocated, but BEFORE
+ * __libc_early_init which reads the TLS fields.
+ */
+static void fixup_rtld_for_glibc(const struct glibc_ver_offsets *o)
+{
+    /* _rtld_global_ro: TLS static fields needed by __libc_early_init →
+     * thread stack guard computation.  Without these, __libc_early_init
+     * divides by zero (SIGFPE). */
+    *(size_t *)(g_fake_rtld_global_ro + o->glro_tls_static_size)  = 0x1080;
+    *(size_t *)(g_fake_rtld_global_ro + o->glro_tls_static_align) = 0x40;
+
+    /* _rtld_global_ro: dl* function pointer stubs — makes dlopen/dlsym/
+     * dlclose return error/NULL instead of SIGSEGV through a NULL ptr. */
+    *(void **)(g_fake_rtld_global_ro + o->glro_debug_printf) = (void *)glro_dl_debug_printf;
+    *(void **)(g_fake_rtld_global_ro + o->glro_mcount)       = (void *)glro_dl_mcount;
+    *(void **)(g_fake_rtld_global_ro + o->glro_open)         = (void *)glro_dl_open;
+    *(void **)(g_fake_rtld_global_ro + o->glro_close)        = (void *)glro_dl_close;
+    *(void **)(g_fake_rtld_global_ro + o->glro_catch_error)  = (void *)glro_dl_catch_error;
+    *(void **)(g_fake_rtld_global_ro + o->glro_error_free)   = (void *)glro_dl_error_free;
+    *(void **)(g_fake_rtld_global_ro + o->glro_find_object)  = (void *)glro_dl_find_object;
+
+    /* _rtld_global: critical fields */
+    *(size_t *)(g_fake_rtld_global + o->gl_nns)            = 1;
+    *(int    *)(g_fake_rtld_global + o->gl_stack_flags)    = 3; /* PROT_READ|PROT_WRITE */
+    *(size_t *)(g_fake_rtld_global + o->gl_tls_generation) = 1;
+
+    /* Empty circular lists for stack tracking */
+    init_empty_list(g_fake_rtld_global, o->gl_stack_used);
+    init_empty_list(g_fake_rtld_global, o->gl_stack_user);
+    init_empty_list(g_fake_rtld_global, o->gl_stack_cache);
+}
+
+/*
+ * Detect glibc struct layout by parsing the embedded ld-linux.so (INTERP)
+ * ELF to extract st_size of _rtld_global_ro and _rtld_global symbols.
+ * The sizes uniquely identify the layout version (e.g., 952 bytes for
+ * glibc 2.35–2.39 vs 928 bytes for glibc 2.40+).
+ *
+ * This approach is fully portable: it reads the actual struct sizes from
+ * the binary that was frozen, regardless of which glibc version the build
+ * host used.
+ */
+
+/* Known layout profiles, keyed by _rtld_global_ro st_size */
+static const struct {
+    size_t glro_size;   /* expected st_size of _rtld_global_ro */
+    size_t gl_size;     /* expected st_size of _rtld_global    */
+    const struct glibc_ver_offsets *offsets;
+} glibc_layout_table[] = {
+    { 952,  4352, &glibc_pre240  },  /* glibc 2.35–2.39 x86-64 */
+    { 928,  2120, &glibc_post240 },  /* glibc 2.40–2.43 x86-64 */
+};
+
+/* Convert a virtual address to a file offset using PT_LOAD segments. */
+static uint64_t elf_vaddr_to_foff(const uint8_t *elf, const Elf64_Ehdr *ehdr,
+                                   uint64_t vaddr)
+{
+    const Elf64_Phdr *ph = (const Elf64_Phdr *)(elf + ehdr->e_phoff);
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        if (ph[i].p_type == PT_LOAD &&
+            vaddr >= ph[i].p_vaddr &&
+            vaddr < ph[i].p_vaddr + ph[i].p_filesz)
+            return ph[i].p_offset + (vaddr - ph[i].p_vaddr);
+    }
+    return (uint64_t)-1;
+}
+
+/*
+ * Detect glibc offsets from the embedded ld-linux.so's .dynsym.
+ * Returns a pointer to the matching offset profile, or NULL on failure.
+ */
+static const struct glibc_ver_offsets *
+detect_glibc_offsets_from_interp(const uint8_t *mem, uint64_t mem_foff,
+                                  const struct dlfrz_entry *entries,
+                                  const struct dlfrz_lib_meta *metas,
+                                  uint32_t num_entries)
+{
+    /* Find the INTERP entry (ld-linux.so) */
+    int idx = -1;
+    for (uint32_t i = 0; i < num_entries; i++) {
+        if (metas[i].flags & LDR_FLAG_INTERP) { idx = (int)i; break; }
+    }
+    if (idx < 0) return NULL;  /* no interp — likely musl-based */
+
+    const uint8_t *elf = mem + (entries[idx].data_offset - mem_foff);
+    size_t elf_size = entries[idx].data_size;
+    if (elf_size < sizeof(Elf64_Ehdr)) return NULL;
+
+    const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *)elf;
+    if (ehdr->e_ident[EI_MAG0] != 0x7f || ehdr->e_ident[EI_MAG1] != 'E' ||
+        ehdr->e_ident[EI_MAG2] != 'L'  || ehdr->e_ident[EI_MAG3] != 'F')
+        return NULL;
+
+    /* Find PT_DYNAMIC to locate .dynsym and .dynstr */
+    const Elf64_Phdr *phdrs = (const Elf64_Phdr *)(elf + ehdr->e_phoff);
+    uint64_t dyn_foff = 0;
+    size_t dyn_size = 0;
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        if (phdrs[i].p_type == PT_DYNAMIC) {
+            dyn_foff = phdrs[i].p_offset;
+            dyn_size = phdrs[i].p_filesz;
+            break;
+        }
+    }
+    if (!dyn_foff || dyn_foff + dyn_size > elf_size) return NULL;
+
+    /* Extract DT_SYMTAB, DT_STRTAB, DT_HASH from dynamic section */
+    const Elf64_Dyn *dyn = (const Elf64_Dyn *)(elf + dyn_foff);
+    size_t ndyn = dyn_size / sizeof(Elf64_Dyn);
+    uint64_t symtab_vaddr = 0, dynstr_vaddr = 0, hash_vaddr = 0;
+    for (size_t i = 0; i < ndyn && dyn[i].d_tag != DT_NULL; i++) {
+        switch (dyn[i].d_tag) {
+            case DT_SYMTAB: symtab_vaddr = dyn[i].d_un.d_ptr; break;
+            case DT_STRTAB: dynstr_vaddr = dyn[i].d_un.d_ptr; break;
+            case DT_HASH:   hash_vaddr   = dyn[i].d_un.d_ptr; break;
+        }
+    }
+    if (!symtab_vaddr || !dynstr_vaddr) return NULL;
+
+    /* Convert virtual addresses to file offsets */
+    uint64_t symtab_foff = elf_vaddr_to_foff(elf, ehdr, symtab_vaddr);
+    uint64_t dynstr_foff = elf_vaddr_to_foff(elf, ehdr, dynstr_vaddr);
+    if (symtab_foff == (uint64_t)-1 || dynstr_foff == (uint64_t)-1) return NULL;
+
+    /* Get symbol count from DT_HASH (nchain field) */
+    uint32_t nsyms = 0;
+    if (hash_vaddr) {
+        uint64_t hash_foff = elf_vaddr_to_foff(elf, ehdr, hash_vaddr);
+        if (hash_foff != (uint64_t)-1 && hash_foff + 8 <= elf_size) {
+            const uint32_t *hashtab = (const uint32_t *)(elf + hash_foff);
+            nsyms = hashtab[1];  /* nchain = number of symbols */
+        }
+    }
+    if (nsyms == 0) nsyms = 4096;  /* fallback upper bound */
+
+    /* Scan .dynsym for _rtld_global_ro and _rtld_global */
+    const Elf64_Sym *syms = (const Elf64_Sym *)(elf + symtab_foff);
+    const char *str = (const char *)(elf + dynstr_foff);
+    size_t glro_size = 0, gl_size = 0;
+    int found = 0;
+    (void)gl_size;  /* used for debugging/future layout discrimination */
+
+    for (uint32_t i = 0; i < nsyms && found < 2; i++) {
+        if (ELF64_ST_TYPE(syms[i].st_info) != STT_OBJECT) continue;
+        if (syms[i].st_size == 0) continue;
+        uint32_t noff = syms[i].st_name;
+        const char *name = str + noff;
+        /* Compare names — _rtld_global_ro first (longer) to avoid false match */
+        if (name[0] == '_' && name[1] == 'r') {
+            int j = 0;
+            const char *expect_ro = "_rtld_global_ro";
+            const char *expect_gl = "_rtld_global";
+            while (expect_ro[j] && name[j] == expect_ro[j]) j++;
+            if (expect_ro[j] == '\0' && (name[j] == '\0' || name[j] == '@')) {
+                glro_size = syms[i].st_size;
+                found++;
+            } else {
+                j = 0;
+                while (expect_gl[j] && name[j] == expect_gl[j]) j++;
+                if (expect_gl[j] == '\0' && (name[j] == '\0' || name[j] == '@')) {
+                    gl_size = syms[i].st_size;
+                    found++;
+                }
+            }
+        }
+    }
+
+    if (!glro_size) return NULL;  /* symbol not found */
+
+    /* Match against known layouts */
+    for (size_t i = 0; i < sizeof(glibc_layout_table)/sizeof(glibc_layout_table[0]); i++) {
+        if (glibc_layout_table[i].glro_size == glro_size) {
+            ldr_dbg("[loader] detected _rtld_global_ro size from ld-linux.so, matched layout\n");
+            return glibc_layout_table[i].offsets;
+        }
+    }
+
+    /* Unknown struct size — log and return NULL for fallback */
+    ldr_dbg("[loader] unknown _rtld_global_ro size, falling back\n");
+    return NULL;
 }
 
 /* ---- ld.so function stubs -------------------------------------------- */
@@ -3400,14 +3619,45 @@ static void init_libc_process_state(struct loaded_obj *objs, int nobj,
      *
      * Requires fake _rtld_global_ro to have:
      *   +0x18  _dl_pagesize = 4096
-     *   +0x2a0 _dl_tls_static_size (non-zero, e.g. 0x1080)
-     *   +0x2a8 _dl_tls_static_align (non-zero, e.g. 0x40)
+     *   _dl_tls_static_size (non-zero, version-dependent offset)
+     *   _dl_tls_static_align (non-zero, version-dependent offset)
      *
      * tcache TLS is already initialized from .tdata to &__tcache_dummy.
      * On first free(), glibc detects tcache == __tcache_dummy and calls
      * tcache_init() which allocates a real tcache via malloc. This is the
      * normal glibc initialization path — no manual tcache setup needed.
      */
+
+    /* Detect glibc version and set version-dependent offsets in the fake
+     * _rtld_global/_rtld_global_ro structs.  Must happen BEFORE
+     * __libc_early_init which reads _dl_tls_static_align (divides by it).
+     *
+     * Primary detection happens earlier via detect_glibc_offsets_from_interp()
+     * which parses ld-linux.so's symbol table.  This fallback handles the
+     * case where the INTERP entry was missing or unparseable. */
+    if (g_glibc_off == &glibc_post240) {
+        /* Check if fixup was already applied by the primary detection */
+        int already_fixed = *(size_t *)(g_fake_rtld_global_ro +
+                             g_glibc_off->glro_tls_static_align) != 0;
+        if (!already_fixed) {
+            const struct glibc_ver_offsets *glibc_off = &glibc_post240;
+            addr = resolve_sym(objs, nobj, "gnu_get_libc_version");
+            if (addr) {
+                const char *ver = ((const char *(*)(void))(uintptr_t)addr)();
+                if (ver && ver[0] == '2' && ver[1] == '.') {
+                    int minor = 0;
+                    for (int i = 2; ver[i] >= '0' && ver[i] <= '9'; i++)
+                        minor = minor * 10 + (ver[i] - '0');
+                    glibc_off = (minor >= 40) ? &glibc_post240 : &glibc_pre240;
+                    ldr_dbg(minor >= 40
+                        ? "[loader] fallback: glibc >=2.40 offsets\n"
+                        : "[loader] fallback: glibc <2.40 offsets\n");
+                }
+            }
+            fixup_rtld_for_glibc(glibc_off);
+            g_glibc_off = glibc_off;
+        }
+    }
 
     /* Pre-initialize __curbrk in the mapped libc so that sbrk() has
      * the correct kernel brk value from the start.  Must be done
@@ -4241,7 +4491,7 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
     {
         size_t tls_static =
             ALIGN_UP(total_tls + 0x1800, 64);
-        *(size_t *)(g_fake_rtld_global_ro + GLRO_DL_TLS_STATIC_SIZE_OFF)
+        *(size_t *)(g_fake_rtld_global_ro + g_glibc_off->glro_tls_static_size)
             = tls_static;
     }
 
@@ -4537,6 +4787,23 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
 
     /* Allocate fake _rtld_global / _rtld_global_ro for libc */
     if (init_fake_rtld() < 0) return -1;
+
+    /* Detect glibc struct layout from the embedded ld-linux.so and set
+     * all version-dependent fields.  Must happen before any libc code
+     * that reads _rtld_global{,_ro} (especially __libc_early_init). */
+    {
+        const struct glibc_ver_offsets *off =
+            detect_glibc_offsets_from_interp(mem, mem_foff, entries, metas,
+                                              num_entries);
+        if (off) {
+            g_glibc_off = off;
+            fixup_rtld_for_glibc(off);
+        }
+        /* If detection failed (e.g. musl binary, no INTERP), the
+         * version-dependent fields remain unset.  For musl this is fine
+         * (they're not referenced).  For glibc, init_libc_process_state()
+         * will retry with gnu_get_libc_version() as a fallback. */
+    }
 
     /* Initialize embedded data-file VFS (before any opens) */
     vfs_init(mem, mem_foff, entries, strtab, num_entries);
