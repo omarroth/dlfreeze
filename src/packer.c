@@ -2018,19 +2018,45 @@ int pack_frozen(const struct pack_options *opts)
                                   &metas[i]) < 0) {
                 goto fail2;
             }
-            uint64_t span = metas[i].vaddr_hi - (metas[i].vaddr_lo & ~0xFFFULL);
-            base += ALIGN_UP(span, 0x200000); /* 2 MB gap between objects */
+            /* Advance base past the object's highest vaddr (not just
+             * the span hi-lo).  Non-PIE executables have vaddr_lo > 0
+             * (e.g. 0x400000), so using hi-lo would leave a gap that
+             * overlaps with the next object's mapping at base+lo. */
+            base += ALIGN_UP(metas[i].vaddr_hi, 0x200000);
         }
 
-        write_pad(out, off, 8); off = ALIGN_UP(off, 8);
-        meta_off = off;
-        size_t metasz = eidx * sizeof(struct dlfrz_lib_meta);
-        if (fwrite(metas, 1, metasz, out) != metasz) {
-            goto fail2;
+        /* Non-PIE executables (ET_EXEC) have absolute addresses baked
+         * into code and data sections that cannot be relocated.  They
+         * must run at their original link address (e.g. 0x400000),
+         * which conflicts with the bootstrap.  Fall back to plain
+         * extraction mode. */
+        int non_pie_main = 0;
+        for (int i = 0; i < eidx; i++) {
+            if ((entries[i].flags & DLFRZ_FLAG_MAIN_EXE) &&
+                metas[i].vaddr_lo != 0) {
+                non_pie_main = 1;
+                break;
+            }
         }
-        off += metasz;
+        if (non_pie_main) {
+            fprintf(stderr,
+                    "dlfreeze: main executable is not position-independent "
+                    "(ET_EXEC); direct-load unavailable, using extraction\n");
+            free(metas);
+            metas = NULL;
+        }
 
-        printf("  mode       : direct-load (in-process loader)\n");
+        if (metas) {
+            write_pad(out, off, 8); off = ALIGN_UP(off, 8);
+            meta_off = off;
+            size_t metasz = eidx * sizeof(struct dlfrz_lib_meta);
+            if (fwrite(metas, 1, metasz, out) != metasz) {
+                goto fail2;
+            }
+            off += metasz;
+
+            printf("  mode       : direct-load (in-process loader)\n");
+        }
     }
 
     /* 7. footer ---------------------------------------------------- */
