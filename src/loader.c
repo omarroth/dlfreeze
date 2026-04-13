@@ -2756,14 +2756,8 @@ static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
                        PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
                        -1, 0);
-        if (m == MAP_FAILED) {
-            /* Already mapped (shouldn't happen on this path) — try MAP_FIXED */
-            m = mmap((void *)(base + lo), span,
-                     PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
-                     -1, 0);
-            if (m == MAP_FAILED) return -1;
-        }
+        if (m == MAP_FAILED)
+            return -1;  /* address collision — do not use MAP_FIXED */
     }
 
     /* Copy/map each PT_LOAD segment from the payload. */
@@ -3818,9 +3812,12 @@ static struct loaded_obj *load_embedded_object(uint32_t mi)
                     }
                 }
                 if (found) continue;
-                /* Try to find in frozen image */
+                /* Try to find in frozen image (skip INTERP — the dynamic
+                 * linker is never needed in direct-load mode and its
+                 * pre-assigned address may overlap other objects). */
                 int dep_found = 0;
                 for (uint32_t fi = 0; fi < g_frozen_num_entries; fi++) {
+                    if (g_frozen_metas[fi].flags & LDR_FLAG_INTERP) continue;
                     const char *fn = g_frozen_strtab + g_frozen_entries[fi].name_offset;
                     if (strcmp(dl_basename(fn), needed) == 0) {
                         load_embedded_object(fi);
