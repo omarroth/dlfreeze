@@ -452,7 +452,7 @@ static int compute_lib_meta(const char *path, uint64_t base, uint32_t flags,
     meta->base_addr  = base;
     meta->entry      = ehdr.e_entry;
     meta->main_sym   = 0;
-    meta->phdr_off   = (uint32_t)ehdr.e_phoff;
+    meta->phdr_off   = (uint32_t)ehdr.e_phoff;  /* updated to vaddr below */
     meta->phdr_num   = ehdr.e_phnum;
     meta->phdr_entsz = ehdr.e_phentsize;
     meta->flags      = flags;
@@ -496,6 +496,11 @@ static int compute_lib_meta(const char *path, uint64_t base, uint32_t flags,
     if (lo > hi) { lo = hi = 0; }
     meta->vaddr_lo = lo;
     meta->vaddr_hi = hi;
+
+    /* Convert phdr_off from file offset to virtual address.  The phdr
+     * table lives in the first PT_LOAD segment whose p_offset is always 0
+     * for standard ELFs, so: phdr_vaddr = e_phoff + first_load_vaddr. */
+    meta->phdr_off = (uint32_t)(ehdr.e_phoff + lo);
     return 0;
 }
 
@@ -1005,7 +1010,7 @@ static int prelink_objects(const char *output_path,
         size_t phsz = m->phdr_num * m->phdr_entsz;
         uint8_t *phdr_buf = malloc(phsz);
         if (!phdr_buf) _exit(1);
-        fseek(outf, entries[i].data_offset + m->phdr_off, SEEK_SET);
+        fseek(outf, entries[i].data_offset + m->phdr_off - m->vaddr_lo, SEEK_SET);
         if (fread(phdr_buf, 1, phsz, outf) != phsz) _exit(1);
 
         /* Load each PT_LOAD segment */

@@ -3117,7 +3117,8 @@ static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
 
     /* Copy/map each PT_LOAD segment from the payload. */
     const uint8_t *elf_base = mem + (ent->data_offset - mem_foff);
-    const uint8_t *phdr_base = elf_base + meta->phdr_off;
+    /* phdr_off is a vaddr; convert to file offset for embedded data access */
+    const uint8_t *phdr_base = elf_base + (meta->phdr_off - meta->vaddr_lo);
     for (int i = 0; i < meta->phdr_num; i++) {
         const Elf64_Phdr *ph = (const Elf64_Phdr *)(phdr_base + i * meta->phdr_entsz);
         if (ph->p_type != PT_LOAD) continue;
@@ -4038,7 +4039,7 @@ static struct loaded_obj *load_elf_from_file(const char *path)
     obj->base  = base;
     obj->name  = dl_store_name(path);
     obj->flags = LDR_FLAG_SHLIB;
-    obj->phdr  = (const Elf64_Phdr *)(base + ehdr.e_phoff);
+    obj->phdr  = (const Elf64_Phdr *)(base + ehdr.e_phoff + lo);
     obj->phdr_num  = ehdr.e_phnum;
     obj->map_start = base + lo;
     obj->map_end   = base + hi;
@@ -4057,7 +4058,7 @@ static struct loaded_obj *load_elf_from_file(const char *path)
     meta->base_addr  = base;
     meta->vaddr_lo   = lo;
     meta->vaddr_hi   = hi;
-    meta->phdr_off   = ehdr.e_phoff;
+    meta->phdr_off   = ehdr.e_phoff + lo;  /* store as vaddr */
     meta->phdr_num   = ehdr.e_phnum;
     meta->phdr_entsz = ehdr.e_phentsize;
     meta->flags      = LDR_FLAG_SHLIB;
@@ -4610,7 +4611,8 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
         /* Find the matching manifest index */
         int mi = idx_map[oi];
         const uint8_t *elf = mem + (entries[mi].data_offset - mem_foff);
-        const Elf64_Phdr *phdrs = (const Elf64_Phdr *)(elf + metas[mi].phdr_off);
+        /* phdr_off is a vaddr; convert to file offset */
+        const Elf64_Phdr *phdrs = (const Elf64_Phdr *)(elf + metas[mi].phdr_off - metas[mi].vaddr_lo);
 
         for (int j = 0; j < metas[mi].phdr_num; j++) {
             if (phdrs[j].p_type != PT_TLS) continue;
