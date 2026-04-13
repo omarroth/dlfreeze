@@ -39,6 +39,88 @@
 
 #define LDR_PRELINK_FIXUP_JMPREL 0x80000000u
 
+/* ---- architecture abstraction ----------------------------------------- */
+/* Fallback defines for aarch64 relocation types missing from older elf.h */
+#ifndef R_AARCH64_IRELATIVE
+#define R_AARCH64_IRELATIVE  1032
+#endif
+#ifndef R_AARCH64_COPY
+#define R_AARCH64_COPY       1024
+#endif
+#ifndef R_AARCH64_TLS_TPREL
+#define R_AARCH64_TLS_TPREL  1030
+#endif
+#ifndef R_AARCH64_TLS_DTPMOD
+#define R_AARCH64_TLS_DTPMOD 1028
+#endif
+#ifndef R_AARCH64_TLS_DTPREL
+#define R_AARCH64_TLS_DTPREL 1029
+#endif
+
+#if defined(__x86_64__)
+  #define ARCH_RELOC_RELATIVE   R_X86_64_RELATIVE
+  #define ARCH_RELOC_GLOB_DAT   R_X86_64_GLOB_DAT
+  #define ARCH_RELOC_JUMP_SLOT  R_X86_64_JUMP_SLOT
+  #define ARCH_RELOC_ABS        R_X86_64_64
+  #define ARCH_RELOC_TPOFF      R_X86_64_TPOFF64
+  #define ARCH_RELOC_DTPMOD     R_X86_64_DTPMOD64
+  #define ARCH_RELOC_DTPOFF     R_X86_64_DTPOFF64
+  #define ARCH_RELOC_IRELATIVE  R_X86_64_IRELATIVE
+  #define ARCH_RELOC_COPY       R_X86_64_COPY
+
+  static inline uintptr_t arch_get_tp(void) {
+      uintptr_t tp;
+      __asm__ volatile("mov %%fs:0, %0" : "=r"(tp));
+      return tp;
+  }
+  static inline void arch_set_tp(uintptr_t tp) {
+      syscall(SYS_arch_prctl, 0x1002 /*ARCH_SET_FS*/, tp);
+  }
+  static inline uintptr_t arch_get_tp_syscall(void) {
+      uintptr_t tp = 0;
+      syscall(SYS_arch_prctl, 0x1003 /*ARCH_GET_FS*/, &tp);
+      return tp;
+  }
+  /* Read a value at an offset from the thread pointer (FS segment) */
+  static inline uintptr_t arch_read_tp_offset(unsigned off) {
+      uintptr_t val;
+      switch (off) {
+      case 0x00: __asm__ volatile("mov %%fs:0x00, %0" : "=r"(val)); break;
+      case 0x10: __asm__ volatile("mov %%fs:0x10, %0" : "=r"(val)); break;
+      case 0x28: __asm__ volatile("mov %%fs:0x28, %0" : "=r"(val)); break;
+      default:   val = *(uintptr_t *)(arch_get_tp() + off); break;
+      }
+      return val;
+  }
+#elif defined(__aarch64__)
+  #define ARCH_RELOC_RELATIVE   R_AARCH64_RELATIVE
+  #define ARCH_RELOC_GLOB_DAT   R_AARCH64_GLOB_DAT
+  #define ARCH_RELOC_JUMP_SLOT  R_AARCH64_JUMP_SLOT
+  #define ARCH_RELOC_ABS        R_AARCH64_ABS64
+  #define ARCH_RELOC_TPOFF      R_AARCH64_TLS_TPREL
+  #define ARCH_RELOC_DTPMOD     R_AARCH64_TLS_DTPMOD
+  #define ARCH_RELOC_DTPOFF     R_AARCH64_TLS_DTPREL
+  #define ARCH_RELOC_IRELATIVE  R_AARCH64_IRELATIVE
+  #define ARCH_RELOC_COPY       R_AARCH64_COPY
+
+  static inline uintptr_t arch_get_tp(void) {
+      uintptr_t tp;
+      __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+      return tp;
+  }
+  static inline void arch_set_tp(uintptr_t tp) {
+      __asm__ volatile("msr tpidr_el0, %0" :: "r"(tp));
+  }
+  static inline uintptr_t arch_get_tp_syscall(void) {
+      return arch_get_tp();
+  }
+  static inline uintptr_t arch_read_tp_offset(unsigned off) {
+      return *(uintptr_t *)(arch_get_tp() + off);
+  }
+#else
+  #error "Unsupported architecture"
+#endif
+
 /* Zeroed page used as target for unresolved OBJECT symbols.
  * Prevents NULL dereference crashes in IFUNC resolvers. */
 static void *g_null_page;
@@ -212,6 +294,7 @@ static void crash_handler(int sig, siginfo_t *info, void *ucontext)
     ldr_msg(" at addr=");
     ldr_hex("", (uint64_t)(uintptr_t)info->si_addr);
     ucontext_t *uc = (ucontext_t *)ucontext;
+#if defined(__x86_64__)
     ldr_hex("[loader] RIP=0x", (uint64_t)uc->uc_mcontext.gregs[REG_RIP]);
     /* Print RSP and the return address (caller) from the stack */
     uint64_t rsp = (uint64_t)uc->uc_mcontext.gregs[REG_RSP];
@@ -229,11 +312,26 @@ static void crash_handler(int sig, siginfo_t *info, void *ucontext)
     ldr_hex("[loader] RBP=0x", (uint64_t)uc->uc_mcontext.gregs[REG_RBP]);
     ldr_hex("[loader] RAX=0x", (uint64_t)uc->uc_mcontext.gregs[REG_RAX]);
     ldr_hex("[loader] RDI=0x", (uint64_t)uc->uc_mcontext.gregs[REG_RDI]);
-    /* Show FS:0x10 (thread self pointer) for TLS diagnosis */
+#elif defined(__aarch64__)
+    ldr_hex("[loader] PC=0x", (uint64_t)uc->uc_mcontext.pc);
+    uint64_t rsp = (uint64_t)uc->uc_mcontext.sp;
+    ldr_hex("[loader] SP=0x", rsp);
+    if (rsp > 0x1000) {
+        uint64_t fp = (uint64_t)uc->uc_mcontext.regs[29];
+        ldr_msg("[loader] backtrace:\n");
+        for (int f = 0; f < 15 && fp > 0x1000; f++) {
+            ldr_hex("[loader]  frame ret=", *(uint64_t *)(fp + 8));
+            fp = *(uint64_t *)(fp);
+        }
+    }
+    ldr_hex("[loader] FP=0x",  (uint64_t)uc->uc_mcontext.regs[29]);
+    ldr_hex("[loader] LR=0x",  (uint64_t)uc->uc_mcontext.regs[30]);
+    ldr_hex("[loader] X0=0x",  (uint64_t)uc->uc_mcontext.regs[0]);
+#endif
+    /* Show thread pointer for TLS diagnosis */
     {
-        uintptr_t fs_base = 0;
-        syscall(SYS_arch_prctl, 0x1003 /*ARCH_GET_FS*/, &fs_base);
-        ldr_hex("[loader] FS_BASE=0x", fs_base);
+        uintptr_t fs_base = arch_get_tp_syscall();
+        ldr_hex("[loader] TP=0x", fs_base);
         ldr_hex("[loader] gettid=", (uint64_t)syscall(SYS_gettid));
         /* Dump first 72 bytes of TCB (9 qwords: tcb,dtv,self,...,stack_guard,ptr_guard) */
         if (fs_base > 0x1000) {
@@ -568,12 +666,15 @@ static int init_fake_rtld(void)
     *(int    *)(g_fake_rtld_global_ro + GLRO_DL_CLKTCK_OFF)   = 100;
     /* FPU control word — default x87 CW (0x037f).  Must match the
      * actual CW or _init_first will call __setfpucw. */
+#if defined(__x86_64__)
     *(int    *)(g_fake_rtld_global_ro + GLRO_DL_FPU_CONTROL_OFF) = 0x037f;
+#endif
     /* TLS static fields needed by __libc_early_init → thread stack guard
      * computation.  Without these, __libc_early_init divides by zero. */
     *(size_t *)(g_fake_rtld_global_ro + GLRO_DL_TLS_STATIC_SIZE_OFF)  = 0x1080;
     *(size_t *)(g_fake_rtld_global_ro + GLRO_DL_TLS_STATIC_ALIGN_OFF) = 0x40;
 
+#if defined(__x86_64__)
     /*
      * Populate _dl_x86_cpu_features from CPUID so that IFUNC resolvers
      * (memcpy, memset, strcmp, etc.) pick CPU-appropriate implementations.
@@ -689,6 +790,7 @@ static int init_fake_rtld(void)
         *(size_t *)(g_fake_rtld_global_ro + CPUF_REP_MOVSB_STOP)         = (size_t)-1;
         *(size_t *)(g_fake_rtld_global_ro + CPUF_REP_STOSB_THRESHOLD)    = (size_t)-1;
     }
+#endif /* __x86_64__ */
 
     /* _rtld_global critical fields */
     *(size_t *)(g_fake_rtld_global + GL_DL_NNS_OFF)            = 1;
@@ -785,8 +887,7 @@ static int stub_dl_rtld_di_serinfo(void) { return -1; }
 struct tls_index { unsigned long ti_module; unsigned long ti_offset; };
 static void *stub_tls_get_addr(struct tls_index *ti)
 {
-    uintptr_t tp;
-    __asm__ volatile("mov %%fs:0, %0" : "=r"(tp));
+    uintptr_t tp = arch_get_tp();
     uintptr_t *dtv = *(uintptr_t **)(tp + 8 /* TCB_OFF_DTV */);
     if (dtv) {
         if (g_is_musl_runtime) {
@@ -869,10 +970,9 @@ static void build_special_table(void);
 static uint64_t lookup_special(const char *name, uint32_t gh);
 
 /* ---- TLS / arch constants --------------------------------------------- */
-#define ARCH_GET_FS   0x1003
-#define ARCH_SET_FS   0x1002
 #define TCB_ALLOC     4096     /* generous TCB allocation */
 
+#if defined(__x86_64__)
 /* tcbhead_t offsets on x86-64 glibc */
 #define TCB_OFF_SELF         0    /* void *tcb              */
 #define TCB_OFF_DTV          8    /* dtv_t *dtv             */
@@ -881,6 +981,21 @@ static uint64_t lookup_special(const char *name, uint32_t gh);
 #define TCB_OFF_STACK_GUARD 40    /* uintptr_t stack_guard  (0x28) */
 #define TCB_OFF_PTR_GUARD   48    /* uintptr_t pointer_guard (0x30) */
 #define TCB_OFF_TID        720    /* pid_t tid (0x2D0) — thread ID */
+#elif defined(__aarch64__)
+/* tcbhead_t offsets on aarch64 glibc (TP points to start of TCB) */
+#define TCB_OFF_DTV          0    /* dtv_t *dtv             */
+#define TCB_OFF_SELF         8    /* void *private (unused) */
+#define TCB_OFF_SELF2        8
+#define TCB_OFF_SELF3       16    /* musl thread self       */
+/* On aarch64 glibc the stack guard and pointer guard live in struct
+ * pthread, which sits at a negative offset from the thread pointer.
+ * These offsets are from the TP (positive, into the TCB header area).
+ * glibc aarch64 stores the stack canary at TP - 0x10 equivalently,
+ * but for our TCB we place them at fixed offsets within TCB_ALLOC. */
+#define TCB_OFF_STACK_GUARD 16    /* uintptr_t stack_guard  */
+#define TCB_OFF_PTR_GUARD   24    /* uintptr_t pointer_guard */
+#define TCB_OFF_TID        720    /* pid_t tid              */
+#endif
 #define MUSL_TCB_PRESERVE_OFF 0x20
 #define MUSL_TCB_PRESERVE_LEN 0xb0
 
@@ -1008,7 +1123,7 @@ static int install_musl_dlopen_tls(struct loaded_obj *obj)
     if (!g_is_musl_runtime || obj->tls.memsz == 0 || obj->tls.modid == 0)
         return 0;
 
-    __asm__ volatile("mov %%fs:0, %0" : "=r"(tp));
+    tp = arch_get_tp();
     old_dtv = *(uintptr_t **)(tp + TCB_OFF_DTV);
     if (old_dtv)
         old_slots = old_dtv[0];
@@ -1071,8 +1186,7 @@ static void *stub_dl_allocate_tls_init(void *mem)
     ldr_dbg_hex("[loader]   tid=", (uint64_t)syscall(SYS_gettid));
     /* Log caller thread's fs:0x10 for diagnostics */
     if (g_debug) {
-        uintptr_t fs_self;
-        __asm__ volatile("mov %%fs:0x10, %0" : "=r"(fs_self));
+        uintptr_t fs_self = arch_read_tp_offset(0x10);
         ldr_dbg_hex("[loader]   caller fs:0x10=", fs_self);
         ldr_dbg_hex("[loader]   tp+0x10 before=", *(uintptr_t *)(tp + 16));
     }
@@ -1483,7 +1597,7 @@ static int vfs_init_overlay_root(void)
     if (vfs_append_decimal(g_vfs_overlay_root, sizeof(g_vfs_overlay_root),
                            &pos, (unsigned long)syscall(SYS_getpid)) < 0)
         return -1;
-    if (VFS_SYSCALL(SYS_mkdir, g_vfs_overlay_root, 0700) < 0 &&
+    if (VFS_SYSCALL(SYS_mkdirat, AT_FDCWD, g_vfs_overlay_root, 0700) < 0 &&
         errno != EEXIST)
         return -1;
     return 0;
@@ -1509,7 +1623,7 @@ static int vfs_mkdir_parents(char *path)
         if (*p != '/')
             continue;
         *p = '\0';
-        if (VFS_SYSCALL(SYS_mkdir, path, 0700) < 0 && errno != EEXIST) {
+        if (VFS_SYSCALL(SYS_mkdirat, AT_FDCWD, path, 0700) < 0 && errno != EEXIST) {
             *p = '/';
             return -1;
         }
@@ -2515,15 +2629,15 @@ static void apply_prelinked_runtime_reloc(struct loaded_obj *obj,
     uint64_t base = obj->base;
     uint32_t type = ELF64_R_TYPE(rel->r_info);
 
-    if (type == R_X86_64_IRELATIVE) {
+    if (type == ARCH_RELOC_IRELATIVE) {
         typedef uint64_t (*ifunc_t)(void);
         ifunc_t resolver = (ifunc_t)(base + rel->r_addend);
         *(uint64_t *)(base + rel->r_offset) = resolver();
         return;
     }
 
-    if (type != R_X86_64_GLOB_DAT &&
-        type != R_X86_64_JUMP_SLOT)
+    if (type != ARCH_RELOC_GLOB_DAT &&
+        type != ARCH_RELOC_JUMP_SLOT)
         return;
 
     uint32_t sidx = ELF64_R_SYM(rel->r_info);
@@ -2795,14 +2909,14 @@ static int apply_relocs_rela(struct loaded_obj *obj,
         uint32_t type  = ELF64_R_TYPE(r->r_info);
         uint32_t sidx  = ELF64_R_SYM(r->r_info);
 
-        if (type == R_X86_64_IRELATIVE) {
+        if (type == ARCH_RELOC_IRELATIVE) {
             if (pass == 0) continue;  /* defer to second pass */
             typedef uint64_t (*ifunc_t)(void);
             ifunc_t resolver = (ifunc_t)(base + r->r_addend);
             *slot = resolver();
             continue;
         }
-        if (type == R_X86_64_COPY) {
+        if (type == ARCH_RELOC_COPY) {
             if (pass != 2) continue;
 
             /* Copy relocations must wait until source DSOs have already
@@ -2827,13 +2941,13 @@ copy_done:
         if (pass != 0) continue;
 
         switch (type) {
-        case R_X86_64_RELATIVE:
+        case ARCH_RELOC_RELATIVE:
             *slot = base + r->r_addend;
             break;
 
-        case R_X86_64_GLOB_DAT:
-        case R_X86_64_JUMP_SLOT:
-        case R_X86_64_64: {
+        case ARCH_RELOC_GLOB_DAT:
+        case ARCH_RELOC_JUMP_SLOT:
+        case ARCH_RELOC_ABS: {
             const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
             uint64_t addr = resolve_sym(all, nobj, name);
             if (!addr && ELF64_ST_BIND(obj->dynsym[sidx].st_info) != STB_WEAK) {
@@ -2855,7 +2969,7 @@ copy_done:
             break;
         }
 
-        case R_X86_64_TPOFF64: {
+        case ARCH_RELOC_TPOFF: {
             if (sidx != 0) {
                 const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
                 int64_t tp;
@@ -2869,7 +2983,7 @@ copy_done:
             break;
         }
 
-        case R_X86_64_DTPMOD64:
+        case ARCH_RELOC_DTPMOD:
             /* Module ID — for GD/LD TLS model.  Use the correct module ID
              * so __tls_get_addr indexes the right DTV slot. */
             if (sidx != 0) {
@@ -2891,7 +3005,7 @@ copy_done:
             }
             break;
 
-        case R_X86_64_DTPOFF64:
+        case ARCH_RELOC_DTPOFF:
             if (sidx != 0) {
                 /* If the symbol is undefined locally (imported), look it
                  * up in the defining library to get the correct TLS offset. */
@@ -2965,7 +3079,7 @@ static void preseed_rtld_got(struct loaded_obj *obj)
         for (size_t i = 0; i < counts[t]; i++) {
             const Elf64_Rela *r = &tabs[t][i];
             uint32_t type = ELF64_R_TYPE(r->r_info);
-            if (type != R_X86_64_GLOB_DAT && type != R_X86_64_JUMP_SLOT)
+            if (type != ARCH_RELOC_GLOB_DAT && type != ARCH_RELOC_JUMP_SLOT)
                 continue;
             uint32_t sidx = ELF64_R_SYM(r->r_info);
             const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
@@ -3190,7 +3304,7 @@ static void init_alpine_musl_process_state(struct loaded_obj *objs, int nobj,
     libc->page_size = pagesz;
     libc->secure = secure;
 
-    __asm__ volatile("mov %%fs:0, %0" : "=r"(tp));
+    tp = arch_get_tp();
     if (tp) {
         *(uintptr_t *)(tp + MUSL_PTHREAD_PREV_OFF) = tp;
         *(uintptr_t *)(tp + MUSL_PTHREAD_NEXT_OFF) = tp;
@@ -4140,7 +4254,7 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
     uintptr_t tp = (uintptr_t)block + tls_aligned;
 
     if (g_is_musl_runtime)
-        syscall(SYS_arch_prctl, ARCH_GET_FS, &old_tp);
+        old_tp = arch_get_tp_syscall();
 
     /* Initialize TCB header */
     *(uintptr_t *)(tp + TCB_OFF_SELF)  = tp;
@@ -4249,8 +4363,7 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
      * the static libc (musl or glibc) continue to work after we change FS.
      * Both musl and glibc store the canary at FS:0x28. */
     {
-        uintptr_t old_canary;
-        __asm__ volatile("mov %%fs:0x28, %0" : "=r"(old_canary));
+        uintptr_t old_canary = arch_read_tp_offset(0x28);
         *(uintptr_t *)(tp + TCB_OFF_STACK_GUARD) = old_canary;
     }
 
@@ -4258,11 +4371,8 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
      * relocations are applied so that RELATIVE/RELR-relocated
      * pointers in the TLS template have their final values. */
 
-    /* Set FS register */
-    if (syscall(SYS_arch_prctl, ARCH_SET_FS, tp) != 0) {
-        ldr_err("arch_prctl ARCH_SET_FS failed", NULL);
-        return 0;
-    }
+    /* Set thread pointer register */
+    arch_set_tp(tp);
 
     /* Save pointer_guard value and address for crash diagnostics.
      * musl does not keep a glibc-style pointer guard in the TCB header. */
@@ -4358,6 +4468,7 @@ static void transfer_to_entry(uintptr_t entry, int argc, char **argv,
         sp[p++] = auxv[i].a_un.a_val;
     }
 
+#if defined(__x86_64__)
     __asm__ volatile(
         "mov %0, %%rsp\n\t"
         "xor %%edx, %%edx\n\t"    /* rdx = 0 (rtld_fini = NULL) */
@@ -4365,6 +4476,15 @@ static void transfer_to_entry(uintptr_t entry, int argc, char **argv,
         "jmp *%1\n\t"
         : : "r"(sp), "r"(entry) : "memory"
     );
+#elif defined(__aarch64__)
+    __asm__ volatile(
+        "mov sp, %0\n\t"
+        "mov x0, #0\n\t"          /* rtld_fini = NULL */
+        "mov x29, #0\n\t"         /* clear frame pointer */
+        "br %1\n\t"
+        : : "r"(sp), "r"(entry) : "memory"
+    );
+#endif
     __builtin_unreachable();
 }
 

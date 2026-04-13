@@ -11,6 +11,48 @@
 #include <elf.h>
 #include <errno.h>
 
+/* Fallback defines for aarch64 relocation types missing from older elf.h */
+#ifndef R_AARCH64_IRELATIVE
+#define R_AARCH64_IRELATIVE  1032
+#endif
+#ifndef R_AARCH64_COPY
+#define R_AARCH64_COPY       1024
+#endif
+#ifndef R_AARCH64_TLS_TPREL
+#define R_AARCH64_TLS_TPREL  1030
+#endif
+#ifndef R_AARCH64_TLS_DTPMOD
+#define R_AARCH64_TLS_DTPMOD 1028
+#endif
+#ifndef R_AARCH64_TLS_DTPREL
+#define R_AARCH64_TLS_DTPREL 1029
+#endif
+
+/* ---- architecture-specific relocation types --------------------------- */
+#if defined(__x86_64__)
+  #define ARCH_RELOC_RELATIVE   R_X86_64_RELATIVE
+  #define ARCH_RELOC_GLOB_DAT   R_X86_64_GLOB_DAT
+  #define ARCH_RELOC_JUMP_SLOT  R_X86_64_JUMP_SLOT
+  #define ARCH_RELOC_ABS        R_X86_64_64
+  #define ARCH_RELOC_TPOFF      R_X86_64_TPOFF64
+  #define ARCH_RELOC_DTPMOD     R_X86_64_DTPMOD64
+  #define ARCH_RELOC_DTPOFF     R_X86_64_DTPOFF64
+  #define ARCH_RELOC_IRELATIVE  R_X86_64_IRELATIVE
+  #define ARCH_RELOC_COPY       R_X86_64_COPY
+#elif defined(__aarch64__)
+  #define ARCH_RELOC_RELATIVE   R_AARCH64_RELATIVE
+  #define ARCH_RELOC_GLOB_DAT   R_AARCH64_GLOB_DAT
+  #define ARCH_RELOC_JUMP_SLOT  R_AARCH64_JUMP_SLOT
+  #define ARCH_RELOC_ABS        R_AARCH64_ABS64
+  #define ARCH_RELOC_TPOFF      R_AARCH64_TLS_TPREL
+  #define ARCH_RELOC_DTPMOD     R_AARCH64_TLS_DTPMOD
+  #define ARCH_RELOC_DTPOFF     R_AARCH64_TLS_DTPREL
+  #define ARCH_RELOC_IRELATIVE  R_AARCH64_IRELATIVE
+  #define ARCH_RELOC_COPY       R_AARCH64_COPY
+#else
+  #error "Unsupported architecture"
+#endif
+
 /* Starting base address for direct-loaded objects (above bootstrap VA) */
 #define DIRECT_LOAD_BASE  0x200000000ULL
 
@@ -306,11 +348,11 @@ static int needs_runtime_reloc_scan(FILE *f, const Elf64_Ehdr *ehdr)
         size_t nrels = relasz / sizeof(Elf64_Rela);
         for (size_t j = 0; j < nrels; j++) {
             uint32_t type = ELF64_R_TYPE(rels[j].r_info);
-            if (type == R_X86_64_IRELATIVE) {
+            if (type == ARCH_RELOC_IRELATIVE) {
                 needs_scan = 1;
                 break;
             }
-            if (type != R_X86_64_GLOB_DAT && type != R_X86_64_JUMP_SLOT)
+            if (type != ARCH_RELOC_GLOB_DAT && type != ARCH_RELOC_JUMP_SLOT)
                 continue;
 
             uint32_t sidx = ELF64_R_SYM(rels[j].r_info);
@@ -707,12 +749,12 @@ static int pl_apply_rela(struct prelink_obj *obj,
         uint32_t type  = ELF64_R_TYPE(r->r_info);
         uint32_t sidx  = ELF64_R_SYM(r->r_info);
 
-        if (type == R_X86_64_IRELATIVE) {
+        if (type == ARCH_RELOC_IRELATIVE) {
             /* Skip IRELATIVE at pre-link time — resolver needs a seeded
              * _rtld_global_ro GOT entry.  Loader handles these at runtime. */
             continue;
         }
-        if (type == R_X86_64_COPY) {
+        if (type == ARCH_RELOC_COPY) {
             if (pass != 2) continue;
 
             const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
@@ -734,20 +776,20 @@ static int pl_apply_rela(struct prelink_obj *obj,
         if (pass != 0) continue;
 
         switch (type) {
-        case R_X86_64_RELATIVE:
+        case ARCH_RELOC_RELATIVE:
             *slot = base + r->r_addend;
             break;
 
-        case R_X86_64_GLOB_DAT:
-        case R_X86_64_JUMP_SLOT:
-        case R_X86_64_64: {
+        case ARCH_RELOC_GLOB_DAT:
+        case ARCH_RELOC_JUMP_SLOT:
+        case ARCH_RELOC_ABS: {
             const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
             uint64_t addr = pl_resolve_sym(all, nobj, name);
             *slot = addr + r->r_addend;
             break;
         }
 
-        case R_X86_64_TPOFF64: {
+        case ARCH_RELOC_TPOFF: {
             if (sidx != 0) {
                 const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
                 for (int j = 0; j < nobj; j++) {
@@ -767,7 +809,7 @@ static int pl_apply_rela(struct prelink_obj *obj,
             break;
         }
 
-        case R_X86_64_DTPMOD64: {
+        case ARCH_RELOC_DTPMOD: {
             if (sidx != 0) {
                 const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
                 size_t mid = obj->tls_modid ? obj->tls_modid : 1;
@@ -787,7 +829,7 @@ static int pl_apply_rela(struct prelink_obj *obj,
             break;
         }
 
-        case R_X86_64_DTPOFF64: {
+        case ARCH_RELOC_DTPOFF: {
             if (sidx != 0) {
                 uint64_t off = obj->dynsym[sidx].st_value;
                 if (obj->dynsym[sidx].st_shndx == 0) {
@@ -842,10 +884,10 @@ static int prelink_obj_collect_runtime_fixups(const struct prelink_obj *obj,
             uint32_t type = ELF64_R_TYPE(rel->r_info);
             int needs_fixup = 0;
 
-            if (type == R_X86_64_IRELATIVE) {
+            if (type == ARCH_RELOC_IRELATIVE) {
                 needs_fixup = 1;
-            } else if (type == R_X86_64_GLOB_DAT ||
-                       type == R_X86_64_JUMP_SLOT) {
+            } else if (type == ARCH_RELOC_GLOB_DAT ||
+                       type == ARCH_RELOC_JUMP_SLOT) {
                 uint32_t sidx = ELF64_R_SYM(rel->r_info);
                 uint64_t slot = *(const uint64_t *)(obj->base + rel->r_offset);
 
