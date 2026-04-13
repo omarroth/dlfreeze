@@ -29,7 +29,7 @@ echo "Cross-run: $(uname -m) | $(distro_name)"
 echo "========================================================"
 echo ""
 
-FROZEN_DIR=/work/frozen-all
+FROZEN_DIR="${FROZEN_DIR:-/work/frozen-all}"
 
 if [ ! -d "$FROZEN_DIR" ]; then
     echo "ERROR: $FROZEN_DIR not found"

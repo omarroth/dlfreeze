@@ -561,10 +561,11 @@ static signal_handler_t vfs_signal(int signum, signal_handler_t handler)
 #define GLRO_DL_FPU_CONTROL_OFF 0x58         /* _dl_fpu_control         */
 #define GLRO_DL_AUXV_OFF        104          /* _dl_auxv                */
 
-/* Version-dependent offset profile for glibc _rtld_global{,_ro} */
+/* Version-dependent offset profile for glibc _rtld_global{,_ro}.
+ * Fields set to -1 are absent in that glibc version and skipped. */
 struct glibc_ver_offsets {
-    /* _rtld_global_ro */
-    int glro_tls_static_size;
+    /* _rtld_global_ro (glro) */
+    int glro_tls_static_size;   /* -1 if TLS fields are in _rtld_global */
     int glro_tls_static_align;
     int glro_debug_printf;
     int glro_mcount;
@@ -573,17 +574,98 @@ struct glibc_ver_offsets {
     int glro_catch_error;
     int glro_error_free;
     int glro_find_object;
-    /* _rtld_global */
+    /* _rtld_global (gl) */
+    int gl_tls_static_size;     /* -1 if TLS fields are in _rtld_global_ro */
+    int gl_tls_static_align;
     int gl_nns;
     int gl_stack_flags;
     int gl_tls_generation;
     int gl_stack_used;
     int gl_stack_user;
     int gl_stack_cache;
+    int gl_rtld_lock_recursive;   /* -1 if removed (glibc ≥ 2.34) */
+    int gl_rtld_unlock_recursive;
 };
 
-/* glibc 2.35–2.39 (x86-64): _rtld_global_ro=952B, _rtld_global=4352B */
-static const struct glibc_ver_offsets glibc_pre240 = {
+/* glibc 2.17–2.28 (x86-64): _rtld_global_ro=440B, _rtld_global=3960B
+ * TLS fields are in _rtld_global, not _rtld_global_ro.
+ * No _dl_catch_error/_dl_error_free/_dl_find_object.
+ * No _dl_stack_used/_dl_stack_user/_dl_stack_cache. */
+static const struct glibc_ver_offsets glibc_2_17 = {
+    .glro_tls_static_size  = -1,    /* TLS fields in _rtld_global */
+    .glro_tls_static_align = -1,
+    .glro_debug_printf     = 360,
+    .glro_mcount           = 368,
+    .glro_open             = 392,
+    .glro_close            = 400,
+    .glro_catch_error      = -1,
+    .glro_error_free       = -1,
+    .glro_find_object      = -1,
+    .gl_tls_static_size    = 3896,
+    .gl_tls_static_align   = 3912,
+    .gl_nns                = 2304,
+    .gl_stack_flags        = 3864,
+    .gl_tls_generation     = 3928,
+    .gl_stack_used         = -1,
+    .gl_stack_user         = -1,
+    .gl_stack_cache        = -1,
+    .gl_rtld_lock_recursive   = 3840,  /* 0xf00 */
+    .gl_rtld_unlock_recursive = 3848,  /* 0xf08 */
+};
+
+/* glibc 2.29–2.33 (x86-64): _rtld_global_ro=536B, _rtld_global=3992B
+ * Same structural pattern as 2.17: TLS fields in _rtld_global,
+ * no catch_error/error_free/find_object, no stack lists. */
+static const struct glibc_ver_offsets glibc_2_29 = {
+    .glro_tls_static_size  = -1,
+    .glro_tls_static_align = -1,
+    .glro_debug_printf     = 464,
+    .glro_mcount           = 472,
+    .glro_open             = 488,
+    .glro_close            = 496,
+    .glro_catch_error      = -1,
+    .glro_error_free       = -1,
+    .glro_find_object      = -1,
+    .gl_tls_static_size    = 3928,
+    .gl_tls_static_align   = 3944,
+    .gl_nns                = 2304,
+    .gl_stack_flags        = 3896,
+    .gl_tls_generation     = 3960,
+    .gl_stack_used         = -1,
+    .gl_stack_user         = -1,
+    .gl_stack_cache        = -1,
+    .gl_rtld_lock_recursive   = 3848,  /* 0xf08 */
+    .gl_rtld_unlock_recursive = 3856,  /* 0xf10 */
+};
+
+/* glibc 2.34–2.36 (x86-64): _rtld_global_ro=928B, _rtld_global=4304B
+ * TLS fields moved to _rtld_global_ro.  Has catch_error/error_free/
+ * find_object.  Has stack lists.  Same glro layout as 2.40+ but
+ * different (larger) _rtld_global. */
+static const struct glibc_ver_offsets glibc_2_34 = {
+    .glro_tls_static_size  = 680,
+    .glro_tls_static_align = 688,
+    .glro_debug_printf     = 816,
+    .glro_mcount           = 824,
+    .glro_open             = 840,
+    .glro_close            = 848,
+    .glro_catch_error      = 856,
+    .glro_error_free       = 864,
+    .glro_find_object      = 888,
+    .gl_tls_static_size    = -1,
+    .gl_tls_static_align   = -1,
+    .gl_nns                = 2560,
+    .gl_stack_flags        = 4160,
+    .gl_tls_generation     = 4216,
+    .gl_stack_used         = 4232,
+    .gl_stack_user         = 4248,
+    .gl_stack_cache        = 4264,
+    .gl_rtld_lock_recursive   = -1,
+    .gl_rtld_unlock_recursive = -1,
+};
+
+/* glibc 2.37–2.39 (x86-64): _rtld_global_ro=952B, _rtld_global=4352B */
+static const struct glibc_ver_offsets glibc_2_37 = {
     .glro_tls_static_size  = 712,   /* 0x2C8 */
     .glro_tls_static_align = 720,   /* 0x2D0 */
     .glro_debug_printf     = 848,
@@ -593,16 +675,20 @@ static const struct glibc_ver_offsets glibc_pre240 = {
     .glro_catch_error      = 888,
     .glro_error_free       = 896,
     .glro_find_object      = 920,
+    .gl_tls_static_size    = -1,
+    .gl_tls_static_align   = -1,
     .gl_nns                = 2560,  /* 0xA00 */
     .gl_stack_flags        = 4208,  /* 0x1070 */
     .gl_tls_generation     = 4264,  /* 0x10A8 */
     .gl_stack_used         = 4280,  /* 0x10B8 */
     .gl_stack_user         = 4296,  /* 0x10C8 */
     .gl_stack_cache        = 4312,  /* 0x10D8 */
+    .gl_rtld_lock_recursive   = -1,
+    .gl_rtld_unlock_recursive = -1,
 };
 
 /* glibc 2.40+ (x86-64): _rtld_global_ro=928B, _rtld_global=2120B */
-static const struct glibc_ver_offsets glibc_post240 = {
+static const struct glibc_ver_offsets glibc_2_40 = {
     .glro_tls_static_size  = 672,   /* 0x2A0 */
     .glro_tls_static_align = 680,   /* 0x2A8 */
     .glro_debug_printf     = 816,
@@ -612,17 +698,21 @@ static const struct glibc_ver_offsets glibc_post240 = {
     .glro_catch_error      = 856,
     .glro_error_free       = 864,
     .glro_find_object      = 888,
+    .gl_tls_static_size    = -1,
+    .gl_tls_static_align   = -1,
     .gl_nns                = 1792,  /* 0x700 */
     .gl_stack_flags        = 1976,  /* 0x7B8 */
     .gl_tls_generation     = 2032,  /* 0x7F0 */
     .gl_stack_used         = 2048,  /* 0x800 */
     .gl_stack_user         = 2064,  /* 0x810 */
     .gl_stack_cache        = 2080,  /* 0x820 */
+    .gl_rtld_lock_recursive   = -1,
+    .gl_rtld_unlock_recursive = -1,
 };
 
 static uint8_t *g_fake_rtld_global;
 static uint8_t *g_fake_rtld_global_ro;
-static const struct glibc_ver_offsets *g_glibc_off = &glibc_post240;
+static const struct glibc_ver_offsets *g_glibc_off = &glibc_2_40;
 
 /* Fake link_map used by __cxa_thread_atexit_impl and other glibc internals
  * that dereference _rtld_global._dl_ns[0]._ns_loaded (offset 0).
@@ -700,6 +790,15 @@ static int glro_dl_find_object(void *pc, void *result);
 static void glro_dl_mcount(uintptr_t from, uintptr_t to)
 {
     (void)from; (void)to;
+}
+
+/* _dl_rtld_lock_recursive / _dl_rtld_unlock_recursive — no-op lock stubs.
+ * In glibc < 2.34, _rtld_global contains function pointers for recursive
+ * locking of _dl_load_lock used by _dl_addr, dlopen, etc.  In a frozen
+ * single-threaded binary, locking is unnecessary. */
+static void glro_dl_lock_noop(void *lock)
+{
+    (void)lock;
 }
 
 /* make a list_t {next, prev} point to itself (empty circular list) */
@@ -877,9 +976,16 @@ static void fixup_rtld_for_glibc(const struct glibc_ver_offsets *o)
 {
     /* _rtld_global_ro: TLS static fields needed by __libc_early_init →
      * thread stack guard computation.  Without these, __libc_early_init
-     * divides by zero (SIGFPE). */
-    *(size_t *)(g_fake_rtld_global_ro + o->glro_tls_static_size)  = 0x1080;
-    *(size_t *)(g_fake_rtld_global_ro + o->glro_tls_static_align) = 0x40;
+     * divides by zero (SIGFPE).
+     * In glibc < 2.34, these fields are in _rtld_global instead. */
+    if (o->glro_tls_static_size >= 0) {
+        *(size_t *)(g_fake_rtld_global_ro + o->glro_tls_static_size)  = 0x1080;
+        *(size_t *)(g_fake_rtld_global_ro + o->glro_tls_static_align) = 0x40;
+    }
+    if (o->gl_tls_static_size >= 0) {
+        *(size_t *)(g_fake_rtld_global + o->gl_tls_static_size)  = 0x1080;
+        *(size_t *)(g_fake_rtld_global + o->gl_tls_static_align) = 0x40;
+    }
 
     /* _rtld_global_ro: dl* function pointer stubs — makes dlopen/dlsym/
      * dlclose return error/NULL instead of SIGSEGV through a NULL ptr. */
@@ -887,19 +993,31 @@ static void fixup_rtld_for_glibc(const struct glibc_ver_offsets *o)
     *(void **)(g_fake_rtld_global_ro + o->glro_mcount)       = (void *)glro_dl_mcount;
     *(void **)(g_fake_rtld_global_ro + o->glro_open)         = (void *)glro_dl_open;
     *(void **)(g_fake_rtld_global_ro + o->glro_close)        = (void *)glro_dl_close;
-    *(void **)(g_fake_rtld_global_ro + o->glro_catch_error)  = (void *)glro_dl_catch_error;
-    *(void **)(g_fake_rtld_global_ro + o->glro_error_free)   = (void *)glro_dl_error_free;
-    *(void **)(g_fake_rtld_global_ro + o->glro_find_object)  = (void *)glro_dl_find_object;
+    if (o->glro_catch_error >= 0)
+        *(void **)(g_fake_rtld_global_ro + o->glro_catch_error)  = (void *)glro_dl_catch_error;
+    if (o->glro_error_free >= 0)
+        *(void **)(g_fake_rtld_global_ro + o->glro_error_free)   = (void *)glro_dl_error_free;
+    if (o->glro_find_object >= 0)
+        *(void **)(g_fake_rtld_global_ro + o->glro_find_object)  = (void *)glro_dl_find_object;
 
     /* _rtld_global: critical fields */
     *(size_t *)(g_fake_rtld_global + o->gl_nns)            = 1;
     *(int    *)(g_fake_rtld_global + o->gl_stack_flags)    = 3; /* PROT_READ|PROT_WRITE */
     *(size_t *)(g_fake_rtld_global + o->gl_tls_generation) = 1;
 
-    /* Empty circular lists for stack tracking */
-    init_empty_list(g_fake_rtld_global, o->gl_stack_used);
-    init_empty_list(g_fake_rtld_global, o->gl_stack_user);
-    init_empty_list(g_fake_rtld_global, o->gl_stack_cache);
+    /* Empty circular lists for stack tracking (glibc ≥ 2.34) */
+    if (o->gl_stack_used >= 0)
+        init_empty_list(g_fake_rtld_global, o->gl_stack_used);
+    if (o->gl_stack_user >= 0)
+        init_empty_list(g_fake_rtld_global, o->gl_stack_user);
+    if (o->gl_stack_cache >= 0)
+        init_empty_list(g_fake_rtld_global, o->gl_stack_cache);
+
+    /* No-op lock stubs for _dl_load_lock (glibc < 2.34) */
+    if (o->gl_rtld_lock_recursive >= 0)
+        *(void **)(g_fake_rtld_global + o->gl_rtld_lock_recursive)   = (void *)glro_dl_lock_noop;
+    if (o->gl_rtld_unlock_recursive >= 0)
+        *(void **)(g_fake_rtld_global + o->gl_rtld_unlock_recursive) = (void *)glro_dl_lock_noop;
 }
 
 /*
@@ -913,14 +1031,19 @@ static void fixup_rtld_for_glibc(const struct glibc_ver_offsets *o)
  * host used.
  */
 
-/* Known layout profiles, keyed by _rtld_global_ro st_size */
+/* Known layout profiles, keyed by _rtld_global_ro AND _rtld_global st_size.
+ * Both sizes are needed to disambiguate versions that share a glro_size
+ * (e.g. glibc 2.34 and 2.40+ both have glro=928 but different gl sizes). */
 static const struct {
     size_t glro_size;   /* expected st_size of _rtld_global_ro */
     size_t gl_size;     /* expected st_size of _rtld_global    */
     const struct glibc_ver_offsets *offsets;
 } glibc_layout_table[] = {
-    { 952,  4352, &glibc_pre240  },  /* glibc 2.35–2.39 x86-64 */
-    { 928,  2120, &glibc_post240 },  /* glibc 2.40–2.43 x86-64 */
+    { 440,  3960, &glibc_2_17 },    /* glibc 2.17–2.28 x86-64 */
+    { 536,  3992, &glibc_2_29 },    /* glibc 2.29–2.33 x86-64 */
+    { 928,  4304, &glibc_2_34 },    /* glibc 2.34–2.36 x86-64 */
+    { 952,  4352, &glibc_2_37 },    /* glibc 2.37–2.39 x86-64 */
+    { 928,  2120, &glibc_2_40 },    /* glibc 2.40+     x86-64 */
 };
 
 /* Convert a virtual address to a file offset using PT_LOAD segments. */
@@ -1010,7 +1133,6 @@ detect_glibc_offsets_from_interp(const uint8_t *mem, uint64_t mem_foff,
     const char *str = (const char *)(elf + dynstr_foff);
     size_t glro_size = 0, gl_size = 0;
     int found = 0;
-    (void)gl_size;  /* used for debugging/future layout discrimination */
 
     for (uint32_t i = 0; i < nsyms && found < 2; i++) {
         if (ELF64_ST_TYPE(syms[i].st_info) != STT_OBJECT) continue;
@@ -1039,9 +1161,10 @@ detect_glibc_offsets_from_interp(const uint8_t *mem, uint64_t mem_foff,
 
     if (!glro_size) return NULL;  /* symbol not found */
 
-    /* Match against known layouts */
+    /* Match against known layouts (both sizes needed for disambiguation) */
     for (size_t i = 0; i < sizeof(glibc_layout_table)/sizeof(glibc_layout_table[0]); i++) {
-        if (glibc_layout_table[i].glro_size == glro_size) {
+        if (glibc_layout_table[i].glro_size == glro_size &&
+            glibc_layout_table[i].gl_size == gl_size) {
             ldr_dbg("[loader] detected _rtld_global_ro size from ld-linux.so, matched layout\n");
             return glibc_layout_table[i].offsets;
         }
@@ -2890,7 +3013,8 @@ static void apply_prelinked_runtime_reloc(struct loaded_obj *obj,
                     ldr_msg(obj->name);
                     ldr_msg("\n");
                 }
-                *slot = ovr + rel->r_addend;
+                /* GLOB_DAT/JUMP_SLOT: S (no addend per ELF ABI) */
+                *slot = ovr;
             }
         }
         return;
@@ -2901,15 +3025,15 @@ static void apply_prelinked_runtime_reloc(struct loaded_obj *obj,
         uint32_t gh = gnu_hash_calc(name);
         uint64_t ovr = lookup_special(name, gh);
         if (ovr) {
-            *slot = ovr + rel->r_addend;
+            *slot = ovr;
         } else {
             uint64_t addr = resolve_sym(objs, nobj, name);
             if (addr) {
-                *slot = addr + rel->r_addend;
+                *slot = addr;
             } else if (ELF64_ST_BIND(obj->dynsym[sidx].st_info) != STB_WEAK
                        && ELF64_ST_TYPE(obj->dynsym[sidx].st_info) == STT_OBJECT
                        && g_null_page) {
-                *slot = (uint64_t)(uintptr_t)g_null_page + rel->r_addend;
+                *slot = (uint64_t)(uintptr_t)g_null_page;
             }
         }
     }
@@ -3190,7 +3314,14 @@ copy_done:
                     ldr_dbg("\n");
                 }
             }
-            *slot = addr + r->r_addend;
+            /* GLOB_DAT and JUMP_SLOT: result = S (no addend per ELF ABI).
+             * ABS (R_X86_64_64): result = S + A.
+             * glibc ≥ 2.39 emits non-zero addends on JUMP_SLOT (lazy PLT
+             * stub addresses); adding them corrupts the resolved pointer. */
+            if (type == ARCH_RELOC_ABS)
+                *slot = addr + r->r_addend;
+            else
+                *slot = addr;
             break;
         }
 
@@ -3640,12 +3771,12 @@ static void init_libc_process_state(struct loaded_obj *objs, int nobj,
      * Primary detection happens earlier via detect_glibc_offsets_from_interp()
      * which parses ld-linux.so's symbol table.  This fallback handles the
      * case where the INTERP entry was missing or unparseable. */
-    if (g_glibc_off == &glibc_post240) {
+    if (g_glibc_off == &glibc_2_40) {
         /* Check if fixup was already applied by the primary detection */
         int already_fixed = *(size_t *)(g_fake_rtld_global_ro +
                              g_glibc_off->glro_tls_static_align) != 0;
         if (!already_fixed) {
-            const struct glibc_ver_offsets *glibc_off = &glibc_post240;
+            const struct glibc_ver_offsets *glibc_off = &glibc_2_40;
             addr = resolve_sym(objs, nobj, "gnu_get_libc_version");
             if (addr) {
                 const char *ver = ((const char *(*)(void))(uintptr_t)addr)();
@@ -3653,10 +3784,17 @@ static void init_libc_process_state(struct loaded_obj *objs, int nobj,
                     int minor = 0;
                     for (int i = 2; ver[i] >= '0' && ver[i] <= '9'; i++)
                         minor = minor * 10 + (ver[i] - '0');
-                    glibc_off = (minor >= 40) ? &glibc_post240 : &glibc_pre240;
-                    ldr_dbg(minor >= 40
-                        ? "[loader] fallback: glibc >=2.40 offsets\n"
-                        : "[loader] fallback: glibc <2.40 offsets\n");
+                    if (minor >= 40)
+                        glibc_off = &glibc_2_40;
+                    else if (minor >= 37)
+                        glibc_off = &glibc_2_37;
+                    else if (minor >= 34)
+                        glibc_off = &glibc_2_34;
+                    else if (minor >= 29)
+                        glibc_off = &glibc_2_29;
+                    else
+                        glibc_off = &glibc_2_17;
+                    ldr_dbg("[loader] fallback: glibc version-based offset selection\n");
                 }
             }
             fixup_rtld_for_glibc(glibc_off);
@@ -4496,8 +4634,14 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
     {
         size_t tls_static =
             ALIGN_UP(total_tls + 0x1800, 64);
-        *(size_t *)(g_fake_rtld_global_ro + g_glibc_off->glro_tls_static_size)
-            = tls_static;
+        /* In glibc ≥ 2.34, the TLS static size field is in _rtld_global_ro.
+         * In glibc < 2.34, it's in _rtld_global (sentinel: glro_tls… = -1). */
+        if (g_glibc_off->glro_tls_static_size >= 0)
+            *(size_t *)(g_fake_rtld_global_ro + g_glibc_off->glro_tls_static_size)
+                = tls_static;
+        else if (g_glibc_off->gl_tls_static_size >= 0)
+            *(size_t *)(g_fake_rtld_global + g_glibc_off->gl_tls_static_size)
+                = tls_static;
     }
 
     /* Allocate TLS block + TCB */

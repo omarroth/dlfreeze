@@ -36,8 +36,35 @@ elif [ -f /etc/debian_version ]; then
     fi
     apt-get install -y -qq gcc musl-tools make bash file binutils 2>&1 | tail -1
     apt-get install -y -qq python3 2>/dev/null || true
-    apt-get install -y -qq upx-ucl 2>/dev/null \
-        || apt-get install -y -qq upx 2>/dev/null || true
+    # Prefer UPX ≥ 4.x — the system package may be too old (e.g. 3.95 on
+    # 20.04 doesn't support our binaries).  Try to fetch a recent release.
+    if ! apt-get install -y -qq upx-ucl 2>/dev/null; then
+        apt-get install -y -qq upx 2>/dev/null || true
+    fi
+    # Verify the installed UPX can actually compress; if not, fetch a
+    # modern static binary from GitHub.
+    if command -v upx >/dev/null 2>&1; then
+        upx_ver=$(upx --version 2>/dev/null | head -1 | grep -oP '\d+\.\d+' | head -1)
+        case "$upx_ver" in
+            3.*|"")
+                echo "System UPX ($upx_ver) too old, fetching UPX 4.2.4…"
+                apt-get install -y -qq wget xz-utils 2>&1 | tail -1
+                # UPX release uses amd64/arm64 naming, not x86_64/aarch64
+                case "$(uname -m)" in
+                    x86_64)  upx_arch=amd64 ;;
+                    aarch64) upx_arch=arm64 ;;
+                    *)       upx_arch=$(uname -m) ;;
+                esac
+                wget -q "https://github.com/upx/upx/releases/download/v4.2.4/upx-4.2.4-${upx_arch}_linux.tar.xz" -O /tmp/upx.tar.xz 2>/dev/null \
+                    && tar -xJf /tmp/upx.tar.xz -C /tmp \
+                    && cp /tmp/upx-4.2.4-${upx_arch}_linux/upx /usr/local/bin/upx \
+                    && chmod +x /usr/local/bin/upx \
+                    && ln -sf /usr/local/bin/upx /usr/bin/upx \
+                    && echo "Installed UPX $(/usr/local/bin/upx --version 2>/dev/null | head -1)" \
+                    || echo "WARNING: failed to fetch newer UPX"
+                ;;
+        esac
+    fi
 fi
 
 echo ""
@@ -68,7 +95,7 @@ fi
 echo ""
 
 # ── Freeze cross-test programs ─────────────────────────────────────
-OUTDIR=/work/build/cross-test
+OUTDIR="${OUTDIR:-/work/build/cross-test}"
 mkdir -p "$OUTDIR"
 
 # 1. Hello world — deterministic output for cross-environment comparison
@@ -87,7 +114,7 @@ int main(int argc, char **argv) {
 EOF
 gcc -o /tmp/cross_hello /tmp/cross_hello.c -lm
 /tmp/cross_hello foo bar > "$OUTDIR/hello.expected"
-/work/build/dlfreeze -v -o "$OUTDIR/hello.frozen" /tmp/cross_hello
+/work/build/dlfreeze -v -d -o "$OUTDIR/hello.frozen" /tmp/cross_hello
 chmod +x "$OUTDIR/hello.frozen"
 
 # 2. Exit code preservation
@@ -98,7 +125,7 @@ int main(int argc, char **argv) {
 }
 EOF
 gcc -o /tmp/cross_exit /tmp/cross_exit.c
-/work/build/dlfreeze -v -o "$OUTDIR/exitcode.frozen" /tmp/cross_exit
+/work/build/dlfreeze -v -d -o "$OUTDIR/exitcode.frozen" /tmp/cross_exit
 chmod +x "$OUTDIR/exitcode.frozen"
 
 # 3. UPX-compressed variants (best effort)
