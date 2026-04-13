@@ -1,0 +1,90 @@
+name: Cross-Platform Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: cross-platform-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Build dlfreeze, run test suite, freeze cross-test programs ────
+  build-and-test:
+    name: build (${{ matrix.env }}, ${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # x86_64
+          - { env: ubuntu-18.04, image: "ubuntu:18.04", arch: amd64 }
+          - { env: ubuntu-20.04, image: "ubuntu:20.04", arch: amd64 }
+          - { env: ubuntu-24.04, image: "ubuntu:24.04", arch: amd64 }
+          - { env: alpine-3.20,  image: "alpine:3.20",  arch: amd64 }
+          # aarch64 (via QEMU)
+          - { env: ubuntu-18.04, image: "ubuntu:18.04", arch: arm64 }
+          - { env: ubuntu-20.04, image: "ubuntu:20.04", arch: arm64 }
+          - { env: ubuntu-24.04, image: "ubuntu:24.04", arch: arm64 }
+          - { env: alpine-3.20,  image: "alpine:3.20",  arch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        if: matrix.arch == 'arm64'
+
+      - name: Build, test, and freeze
+        run: |
+          docker run --rm --platform linux/${{ matrix.arch }} \
+            -v "$PWD":/work -w /work \
+            ${{ matrix.image }} \
+            sh /work/tests/cross-build.sh
+
+      - name: Upload frozen artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: frozen-${{ matrix.env }}-${{ matrix.arch }}
+          path: build/cross-test/
+
+  # ── Run frozen binaries from every build env on every target env ──
+  cross-run:
+    name: run (${{ matrix.env }}, ${{ matrix.arch }})
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # x86_64
+          - { env: ubuntu-18.04, image: "ubuntu:18.04", arch: amd64 }
+          - { env: ubuntu-20.04, image: "ubuntu:20.04", arch: amd64 }
+          - { env: ubuntu-24.04, image: "ubuntu:24.04", arch: amd64 }
+          - { env: alpine-3.20,  image: "alpine:3.20",  arch: amd64 }
+          # aarch64
+          - { env: ubuntu-18.04, image: "ubuntu:18.04", arch: arm64 }
+          - { env: ubuntu-20.04, image: "ubuntu:20.04", arch: arm64 }
+          - { env: ubuntu-24.04, image: "ubuntu:24.04", arch: arm64 }
+          - { env: alpine-3.20,  image: "alpine:3.20",  arch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        if: matrix.arch == 'arm64'
+
+      - name: Download frozen artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: frozen-*-${{ matrix.arch }}
+          path: frozen-all/
+
+      - name: Cross-run frozen binaries
+        run: |
+          docker run --rm --platform linux/${{ matrix.arch }} \
+            -v "$PWD":/work -w /work \
+            ${{ matrix.image }} \
+            sh /work/tests/cross-run.sh
