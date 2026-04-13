@@ -1,5 +1,5 @@
 CC       ?= gcc
-CFLAGS   = -Wall -Wextra -O2 -g -D_GNU_SOURCE
+CFLAGS   = -Wall -Wextra -O2 -g -D_GNU_SOURCE -Iinclude
 LDFLAGS  =
 
 BUILD    = build
@@ -37,8 +37,10 @@ $(DLFREEZE): $(TOOL_OBJS)
 # -fno-stack-protector: the loader changes FS register (TLS) which
 # invalidates the stack canary, so SSP must be disabled.
 BOOTSTRAP_CC := $(shell command -v musl-gcc 2>/dev/null || echo $(CC))
-$(BOOTSTRAP): $(SRC)/bootstrap.c $(SRC)/loader.c $(SRC)/common.h $(SRC)/loader.h | $(BUILD)
-	$(BOOTSTRAP_CC) -Wall -Wextra -O2 -D_GNU_SOURCE -fno-stack-protector \
+INC      = include
+
+$(BOOTSTRAP): $(SRC)/bootstrap.c $(SRC)/loader.c $(INC)/common.h $(INC)/loader.h | $(BUILD)
+	$(BOOTSTRAP_CC) -Wall -Wextra -O2 -D_GNU_SOURCE -Iinclude -fno-stack-protector \
 	    -ffunction-sections -fdata-sections \
 	    -static -Wl,--gc-sections -o $@ $(SRC)/bootstrap.c $(SRC)/loader.c
 
@@ -57,7 +59,7 @@ clean:
 	rm -rf $(BUILD)
 
 # ── header deps (manual, good enough) ─────────────────────────────
-$(BUILD)/main.o:         $(SRC)/main.c $(SRC)/elf_parser.h $(SRC)/dep_resolver.h $(SRC)/packer.h
-$(BUILD)/elf_parser.o:   $(SRC)/elf_parser.c $(SRC)/elf_parser.h
-$(BUILD)/dep_resolver.o: $(SRC)/dep_resolver.c $(SRC)/dep_resolver.h $(SRC)/elf_parser.h
-$(BUILD)/packer.o:       $(SRC)/packer.c $(SRC)/packer.h $(SRC)/common.h $(SRC)/dep_resolver.h
+$(BUILD)/main.o:         $(SRC)/main.c $(INC)/elf_parser.h $(INC)/dep_resolver.h $(INC)/packer.h
+$(BUILD)/elf_parser.o:   $(SRC)/elf_parser.c $(INC)/elf_parser.h
+$(BUILD)/dep_resolver.o: $(SRC)/dep_resolver.c $(INC)/dep_resolver.h $(INC)/elf_parser.h
+$(BUILD)/packer.o:       $(SRC)/packer.c $(INC)/packer.h $(INC)/common.h $(INC)/dep_resolver.h
