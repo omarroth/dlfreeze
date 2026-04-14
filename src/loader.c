@@ -1817,10 +1817,23 @@ struct vfs_entry {
     const char     *path;      /* absolute path string (in strtab) */
     const uint8_t  *data;      /* pointer into mmap'd frozen binary */
     uint64_t        size;
+    uint32_t        flags;
 };
 
 static struct vfs_entry g_vfs_table[VFS_HASH_SIZE];
 static int g_vfs_count;
+
+static int vfs_is_virtual_entry(const struct vfs_entry *ve)
+{
+    return ve && (ve->flags & DLFRZ_FLAG_DATA_VIRTUAL) != 0;
+}
+
+static int vfs_is_dir_marker_path(const char *path)
+{
+    size_t len = strlen(path);
+
+    return len >= 5 && strcmp(path + len - 5, "/.dir") == 0;
+}
 
 /*
  * VFS_SYSCALL — wrapper for syscall() in VFS functions.
@@ -1861,6 +1874,7 @@ static void vfs_init(const uint8_t *mem, uint64_t mem_foff,
         g_vfs_table[idx].path = path;
         g_vfs_table[idx].data = mem + (entries[i].data_offset - mem_foff);
         g_vfs_table[idx].size = entries[i].data_size;
+        g_vfs_table[idx].flags = entries[i].flags;
         g_vfs_count++;
     }
     if (g_debug && g_vfs_count > 0) {
@@ -2049,9 +2063,11 @@ static void vfs_init_pyc_aliases(void)
         buf[parent_len] = '/';
         memcpy(buf + parent_len + 1, fname, name_len);
 
-        /* Skip if .py already exists — SourceFileLoader handles it */
+                /* Skip if .py already exists as a real embedded file.
+                 * Virtual placeholders should not suppress the sourceless alias. */
         memcpy(buf + base, ".py", 4);
-        if (vfs_lookup(buf)) continue;
+        { const struct vfs_entry *py_ve = vfs_lookup(buf);
+                    if (py_ve && !vfs_is_virtual_entry(py_ve)) continue; }
 
         /* Skip if .pyc already exists */
         memcpy(buf + base, ".pyc", 5);
@@ -2608,22 +2624,12 @@ static int vfs_serve_memfd(const struct vfs_entry *ve, const char *path)
     return fd;
 }
 
-/* .dir markers are 0-byte sentinel entries used for directory structure.
- * They must NOT be served as regular files. */
-static int vfs_is_dir_marker(const char *path)
-{
-    int len = 0;
-    for (const char *p = path; *p; p++) len++;
-    return len >= 5 && path[len-5] == '/' && path[len-4] == '.'
-        && path[len-3] == 'd' && path[len-2] == 'i' && path[len-1] == 'r';
-}
-
 static int vfs_open(const char *path, int flags, int mode)
 {
     /* Only intercept absolute paths for read-only opens */
     if (path && path[0] == '/' && (flags & 3) == 0 /* O_RDONLY */) {
         const struct vfs_entry *ve = vfs_lookup(path);
-        if (ve && !vfs_is_dir_marker(path)) {
+        if (ve && !vfs_is_virtual_entry(ve)) {
             int fd = vfs_serve_memfd(ve, path);
             if (fd >= 0) return fd;
         }
@@ -2636,7 +2642,7 @@ static int vfs_openat(int dirfd, const char *path, int flags, int mode)
     if (path && path[0] == '/') {
         if ((flags & 3) == 0 /* O_RDONLY */) {
             const struct vfs_entry *ve = vfs_lookup(path);
-            if (ve && !vfs_is_dir_marker(path)) {
+            if (ve && !vfs_is_virtual_entry(ve)) {
                 int fd = vfs_serve_memfd(ve, path);
                 if (fd >= 0) return fd;
             }
@@ -2671,7 +2677,7 @@ static void *vfs_fopen(const char *path, const char *mode)
 {
     if (path && path[0] == '/' && mode && mode[0] == 'r') {
         const struct vfs_entry *ve = vfs_lookup(path);
-        if (ve && !vfs_is_dir_marker(path)) {
+        if (ve && !vfs_is_virtual_entry(ve)) {
             int fd = vfs_serve_memfd(ve, path);
             if (fd >= 0 && g_real_fdopen)
                 return g_real_fdopen(fd, mode);
@@ -2697,9 +2703,11 @@ static void *vfs_fopen(const char *path, const char *mode)
 static int vfs_stat(const char *path, struct stat *buf)
 {
     if (path && path[0] == '/') {
-        /* Files: VFS takes priority (serve embedded data) */
+        /* Report real files and non-directory virtual placeholders so
+         * importlib/plugin scanners can discover embedded ELF names.
+         * Directory markers stay synthetic-only. */
         const struct vfs_entry *ve = vfs_lookup(path);
-        if (ve) {
+        if (ve && !(vfs_is_virtual_entry(ve) && vfs_is_dir_marker_path(path))) {
             __builtin_memset(buf, 0, sizeof(*buf));
             buf->st_mode  = 0100644;  /* regular file, rw-r--r-- */
             buf->st_nlink = 1;
@@ -2726,7 +2734,7 @@ static int vfs_fstatat(int dirfd, const char *path, struct stat *buf, int flag)
 {
     if (path && path[0] == '/') {
         const struct vfs_entry *ve = vfs_lookup(path);
-        if (ve) {
+        if (ve && !(vfs_is_virtual_entry(ve) && vfs_is_dir_marker_path(path))) {
             __builtin_memset(buf, 0, sizeof(*buf));
             buf->st_mode  = 0100644;
             buf->st_nlink = 1;
@@ -2752,7 +2760,9 @@ static int vfs_fstatat(int dirfd, const char *path, struct stat *buf, int flag)
 static int vfs_access(const char *path, int amode)
 {
     if (path && path[0] == '/') {
-        if (vfs_lookup(path)) return 0;
+        const struct vfs_entry *ve = vfs_lookup(path);
+        if (ve && !(vfs_is_virtual_entry(ve) && vfs_is_dir_marker_path(path)))
+            return 0;
     }
     int ret = (int)VFS_SYSCALL(SYS_faccessat, AT_FDCWD, path, amode, 0);
     if (ret == 0) return 0;
@@ -2763,7 +2773,9 @@ static int vfs_access(const char *path, int amode)
 static int vfs_faccessat(int dirfd, const char *path, int amode, int flag)
 {
     if (path && path[0] == '/') {
-        if (vfs_lookup(path)) return 0;
+        const struct vfs_entry *ve = vfs_lookup(path);
+        if (ve && !(vfs_is_virtual_entry(ve) && vfs_is_dir_marker_path(path)))
+            return 0;
     }
     int ret = (int)VFS_SYSCALL(SYS_faccessat, dirfd, path, amode, flag);
     if (ret == 0) return 0;

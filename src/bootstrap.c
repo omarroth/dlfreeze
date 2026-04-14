@@ -364,6 +364,8 @@ int main(int argc, char **argv)
 
     for (uint32_t i = 0; i < ft.num_entries; i++) {
         const char *name = strtab + ent[i].name_offset;
+        if ((ent[i].flags & DLFRZ_FLAG_DATA_VIRTUAL) != 0)
+            continue;
         char dst[PATH_MAX + 256];
         snprintf(dst, sizeof(dst), "%s/%s", g_tmpdir, bs_basename(name));
 

@@ -1978,6 +1978,8 @@ int pack_frozen(const struct pack_options *opts)
         write_pad(out, off, 8); off = ALIGN_UP(off, 8);
         entries[eidx].data_offset = off;
         entries[eidx].flags       = DLFRZ_FLAG_DATA;
+        if (opts->data_files->is_virtual && opts->data_files->is_virtual[i])
+            entries[eidx].flags |= DLFRZ_FLAG_DATA_VIRTUAL;
         entries[eidx].name_offset = stroff;
         const char *dpath = opts->data_files->paths[i];
         strcpy(strtab + stroff, dpath);

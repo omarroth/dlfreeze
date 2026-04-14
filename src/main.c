@@ -141,11 +141,11 @@ static void scan_dir_shallow(const char *dirpath,
 
         if (!S_ISREG(sb.st_mode)) continue;
 
-        /* Check if this file should be skipped (ELF, dep, empty, exe).
+        /* Check if this file should be skipped (ELF, dep, exe).
          * Skipped files are still added as virtual entries (zero-byte,
-         * listed by VFS readdir but not served on open). */
+         * listed by VFS readdir but not served from embedded data).
+         * Real empty files are preserved so the VFS can serve them. */
         int skip = 0;
-        if (sb.st_size == 0) skip = 1;
         if (!skip && elf_check(rpath)) skip = 1;
         if (!skip && strcmp(rpath, exe_path) == 0) skip = 1;
         if (!skip && deps->interp_path &&
