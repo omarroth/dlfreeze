@@ -3437,6 +3437,7 @@ static void apply_prelinked_runtime_reloc(struct loaded_obj *obj,
 {
     uint64_t base = obj->base;
     uint32_t type = ELF64_R_TYPE(rel->r_info);
+    uint32_t sidx = ELF64_R_SYM(rel->r_info);
 
 #if defined(__aarch64__)
     if (type == ARCH_RELOC_TLSDESC) {
@@ -3477,11 +3478,101 @@ static void apply_prelinked_runtime_reloc(struct loaded_obj *obj,
         return;
     }
 
+    if (type == ARCH_RELOC_TPOFF) {
+        uint64_t *slot = (uint64_t *)(base + rel->r_offset);
+        int64_t value = 0;
+
+        if (g_debug) {
+            ldr_msg("[loader] runtime TLS TPOFF: ");
+            ldr_msg(obj->name);
+            ldr_dbg_hex(" off=0x", rel->r_offset);
+        }
+
+        if (sidx != 0) {
+            const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
+            int64_t tp;
+
+            if (resolve_tpoff(objs, nobj, name, &tp) == 0)
+                value = tp + rel->r_addend;
+        } else {
+            value = obj->tls.tpoff + rel->r_addend;
+        }
+
+        *(int64_t *)slot = value;
+        if (g_debug) {
+            ldr_dbg_hex("  addend=0x", (uint64_t)rel->r_addend);
+            ldr_dbg_hex("  value=0x", (uint64_t)value);
+        }
+        return;
+    }
+
+    if (type == ARCH_RELOC_DTPMOD) {
+        uint64_t *slot = (uint64_t *)(base + rel->r_offset);
+
+        if (g_debug) {
+            ldr_msg("[loader] runtime TLS DTPMOD: ");
+            ldr_msg(obj->name);
+            ldr_dbg_hex(" off=0x", rel->r_offset);
+        }
+
+        if (sidx != 0) {
+            const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
+            size_t mid = obj->tls.modid ? obj->tls.modid : 1;
+
+            for (int j = 0; j < nobj; j++) {
+                const Elf64_Sym *ds = objs[j].gnu_hash
+                    ? lookup_gnu_hash(&objs[j], name, gnu_hash_calc(name))
+                    : lookup_linear(&objs[j], name);
+
+                if (ds && ds->st_shndx != 0) {
+                    mid = objs[j].tls.modid ? objs[j].tls.modid : (size_t)(j + 1);
+                    break;
+                }
+            }
+            *slot = mid;
+        } else {
+            *slot = obj->tls.modid ? obj->tls.modid : 1;
+        }
+        return;
+    }
+
+    if (type == ARCH_RELOC_DTPOFF) {
+        uint64_t *slot = (uint64_t *)(base + rel->r_offset);
+
+        if (g_debug) {
+            ldr_msg("[loader] runtime TLS DTPOFF: ");
+            ldr_msg(obj->name);
+            ldr_dbg_hex(" off=0x", rel->r_offset);
+        }
+
+        if (sidx != 0) {
+            uint64_t off = obj->dynsym[sidx].st_value;
+
+            if (obj->dynsym[sidx].st_shndx == 0) {
+                const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
+
+                for (int j = 0; j < nobj; j++) {
+                    const Elf64_Sym *ds = objs[j].gnu_hash
+                        ? lookup_gnu_hash(&objs[j], name, gnu_hash_calc(name))
+                        : lookup_linear(&objs[j], name);
+
+                    if (ds && ds->st_shndx != 0) {
+                        off = ds->st_value;
+                        break;
+                    }
+                }
+            }
+            *slot = off + rel->r_addend;
+        } else {
+            *slot = rel->r_addend;
+        }
+        return;
+    }
+
     if (type != ARCH_RELOC_GLOB_DAT &&
         type != ARCH_RELOC_JUMP_SLOT)
         return;
 
-    uint32_t sidx = ELF64_R_SYM(rel->r_info);
     if (sidx == 0)
         return;
 

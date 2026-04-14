@@ -15,29 +15,55 @@ docker_usable() {
     command -v docker &>/dev/null && docker info >/dev/null 2>&1
 }
 
+docker_host_platform() {
+    case "$(uname -m)" in
+        x86_64) echo linux/amd64 ;;
+        aarch64|arm64) echo linux/arm64 ;;
+        *) return 1 ;;
+    esac
+}
+
 docker_alpine_run() {
-    local repo_root build_abs
+    local repo_root build_abs platform
 
     repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
     build_abs=$(readlink -f "$BUILD")
-    docker run --rm \
-        -v "$repo_root":/work \
-        -v "$build_abs":/dlfreeze-build \
-        -w /work \
-        alpine:3.20 sh -lc "$1"
+    platform=$(docker_host_platform) || platform=
+    if [ -n "$platform" ]; then
+        docker run --rm --platform "$platform" \
+            -v "$repo_root":/work \
+            -v "$build_abs":/dlfreeze-build \
+            -w /work \
+            alpine:3.20 sh -lc "$1"
+    else
+        docker run --rm \
+            -v "$repo_root":/work \
+            -v "$build_abs":/dlfreeze-build \
+            -w /work \
+            alpine:3.20 sh -lc "$1"
+    fi
 }
 
-    docker_alpine_edge_run() {
-        local repo_root build_abs
+docker_alpine_edge_run() {
+    local repo_root build_abs platform
 
-        repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-        build_abs=$(readlink -f "$BUILD")
+    repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+    build_abs=$(readlink -f "$BUILD")
+    platform=$(docker_host_platform) || platform=
+    if [ -n "$platform" ]; then
+        docker run --rm --platform "$platform" \
+            -v "$repo_root":/work \
+            -v "$build_abs":/dlfreeze-build \
+            -w /work \
+            alpine:edge sh -lc "$1"
+    else
         docker run --rm \
-        -v "$repo_root":/work \
-        -v "$build_abs":/dlfreeze-build \
-        -w /work \
-        alpine:edge sh -lc "$1"
-    }
+            -v "$repo_root":/work \
+            -v "$build_abs":/dlfreeze-build \
+            -w /work \
+            alpine:edge sh -lc "$1"
+    fi
+}
 
 # ===================================================================
 # Helper: freeze, run, compare

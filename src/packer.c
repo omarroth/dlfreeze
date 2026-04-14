@@ -821,67 +821,13 @@ static int pl_apply_rela(struct prelink_obj *obj,
             break;
         }
 
-        case ARCH_RELOC_TPOFF: {
-            if (sidx != 0) {
-                const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
-                for (int j = 0; j < nobj; j++) {
-                    const Elf64_Sym *s = all[j].gnu_hash
-                        ? pl_lookup_gnu(&all[j], name, pl_gnu_hash(name))
-                        : pl_lookup_linear(&all[j], name);
-                    if (s && s->st_shndx != 0) {
-                        *(int64_t *)slot = all[j].tls_tpoff + (int64_t)s->st_value + r->r_addend;
-                        goto tpoff_done;
-                    }
-                }
-                *(int64_t *)slot = obj->tls_tpoff + r->r_addend;
-            } else {
-                *(int64_t *)slot = obj->tls_tpoff + r->r_addend;
-            }
-            tpoff_done:
+        case ARCH_RELOC_TPOFF:
+        case ARCH_RELOC_DTPMOD:
+        case ARCH_RELOC_DTPOFF:
+            /* TLS relocations depend on the final runtime TLS layout.
+             * Keep the on-disk value untouched and let the loader resolve
+             * them after it has built the live TLS image. */
             break;
-        }
-
-        case ARCH_RELOC_DTPMOD: {
-            if (sidx != 0) {
-                const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
-                size_t mid = obj->tls_modid ? obj->tls_modid : 1;
-                for (int j = 0; j < nobj; j++) {
-                    const Elf64_Sym *s = all[j].gnu_hash
-                        ? pl_lookup_gnu(&all[j], name, pl_gnu_hash(name))
-                        : pl_lookup_linear(&all[j], name);
-                    if (s && s->st_shndx != 0) {
-                        mid = all[j].tls_modid ? all[j].tls_modid : (size_t)(j + 1);
-                        break;
-                    }
-                }
-                *slot = mid;
-            } else {
-                *slot = obj->tls_modid ? obj->tls_modid : 1;
-            }
-            break;
-        }
-
-        case ARCH_RELOC_DTPOFF: {
-            if (sidx != 0) {
-                uint64_t off = obj->dynsym[sidx].st_value;
-                if (obj->dynsym[sidx].st_shndx == 0) {
-                    const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
-                    for (int j = 0; j < nobj; j++) {
-                        const Elf64_Sym *s = all[j].gnu_hash
-                            ? pl_lookup_gnu(&all[j], name, pl_gnu_hash(name))
-                            : pl_lookup_linear(&all[j], name);
-                        if (s && s->st_shndx != 0) {
-                            off = s->st_value;
-                            break;
-                        }
-                    }
-                }
-                *slot = off + r->r_addend;
-            } else {
-                *slot = r->r_addend;
-            }
-            break;
-        }
 
 #if defined(__aarch64__)
         case ARCH_RELOC_TLSDESC:
@@ -926,7 +872,10 @@ static int prelink_obj_collect_runtime_fixups(const struct prelink_obj *obj,
             int needs_fixup = 0;
 
             if (type == ARCH_RELOC_IRELATIVE ||
-                type == ARCH_RELOC_COPY) {
+                type == ARCH_RELOC_COPY ||
+                type == ARCH_RELOC_TPOFF ||
+                type == ARCH_RELOC_DTPMOD ||
+                type == ARCH_RELOC_DTPOFF) {
                 needs_fixup = 1;
 #if defined(__aarch64__)
             } else if (type == ARCH_RELOC_TLSDESC) {
