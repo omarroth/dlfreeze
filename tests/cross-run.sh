@@ -15,6 +15,24 @@ pass() { echo "${GRN}PASS${RST}: $1"; PASS=$((PASS + 1)); }
 fail() { echo "${RED}FAIL${RST}: $1 — $2"; FAIL=$((FAIL + 1)); }
 skip() { echo "${YLW}SKIP${RST}: $1 — $2"; SKIP=$((SKIP + 1)); }
 
+RUN_TIMEOUT="${RUN_TIMEOUT:-15}"
+
+run_capture() {
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$RUN_TIMEOUT" "$@"
+    else
+        "$@"
+    fi
+}
+
+run_quiet() {
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$RUN_TIMEOUT" "$@"
+    else
+        "$@"
+    fi
+}
+
 distro_name() {
     if [ -f /etc/os-release ]; then
         . /etc/os-release
@@ -48,7 +66,7 @@ for src_dir in "$FROZEN_DIR"/frozen-*; do
     if [ -f "$frozen" ] && [ -f "$expected" ]; then
         chmod +x "$frozen" 2>/dev/null || true
         rc=0
-        actual=$("$frozen" foo bar 2>&1) || rc=$?
+        actual=$(run_capture "$frozen" foo bar 2>&1) || rc=$?
         exp=$(cat "$expected")
         if [ "$actual" = "$exp" ] && [ "$rc" -eq 0 ]; then
             pass "$src_env/hello.frozen"
@@ -66,7 +84,7 @@ for src_dir in "$FROZEN_DIR"/frozen-*; do
     if [ -f "$frozen_upx" ]; then
         chmod +x "$frozen_upx" 2>/dev/null || true
         rc=0
-        actual=$("$frozen_upx" foo bar 2>&1) || rc=$?
+        actual=$(run_capture "$frozen_upx" foo bar 2>&1) || rc=$?
         exp=$(cat "$expected")
         if [ "$actual" = "$exp" ] && [ "$rc" -eq 0 ]; then
             pass "$src_env/hello.upx.frozen"
@@ -86,13 +104,13 @@ for src_dir in "$FROZEN_DIR"/frozen-*; do
 
         # Test exit code 0
         rc=0
-        "$frozen_ec" 0 >/dev/null 2>&1 || rc=$?
+        run_quiet "$frozen_ec" 0 >/dev/null 2>&1 || rc=$?
         if [ "$rc" -ne 0 ]; then
             fail "$src_env/exitcode(0)" "expected rc=0, got rc=$rc"
         else
             # Test exit code 42
             rc=0
-            "$frozen_ec" 42 >/dev/null 2>&1 || rc=$?
+            run_quiet "$frozen_ec" 42 >/dev/null 2>&1 || rc=$?
             if [ "$rc" -eq 42 ]; then
                 pass "$src_env/exitcode.frozen"
             else
@@ -109,12 +127,12 @@ for src_dir in "$FROZEN_DIR"/frozen-*; do
         chmod +x "$frozen_ec_upx" 2>/dev/null || true
 
         rc=0
-        "$frozen_ec_upx" 0 >/dev/null 2>&1 || rc=$?
+        run_quiet "$frozen_ec_upx" 0 >/dev/null 2>&1 || rc=$?
         if [ "$rc" -ne 0 ]; then
             fail "$src_env/exitcode.upx(0)" "expected rc=0, got rc=$rc"
         else
             rc=0
-            "$frozen_ec_upx" 42 >/dev/null 2>&1 || rc=$?
+            run_quiet "$frozen_ec_upx" 42 >/dev/null 2>&1 || rc=$?
             if [ "$rc" -eq 42 ]; then
                 pass "$src_env/exitcode.upx.frozen"
             else

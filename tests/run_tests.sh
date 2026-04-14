@@ -429,7 +429,70 @@ C
 }
 
 # ===================================================================
-# Test 1g: Alpine musl direct-load supports Python threading
+# Test 1g: glibc direct-load exposes a valid __libc_stack_end
+# ===================================================================
+test_glibc_stack_end_direct() {
+    echo "--- glibc stack-end direct-load ---"
+
+    local src="$BUILD/libc_stack_end.c" bin="$BUILD/libc_stack_end" out="$BUILD/libc_stack_end.frozen"
+    cat > "$src" <<'C'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdio.h>
+
+int main(int argc, char **argv) {
+    (void)argc;
+
+    void **slot = (void **)dlsym(RTLD_DEFAULT, "__libc_stack_end");
+    void *expected = (void *)(argv - 1);
+
+    if (!slot || *slot != expected) {
+        fprintf(stderr,
+                "__libc_stack_end mismatch slot=%p value=%p expected=%p\n",
+                (void *)slot, slot ? *slot : NULL, expected);
+        return 1;
+    }
+
+    puts("stack-end-ok");
+    return 0;
+}
+C
+
+    if ! gcc -o "$bin" "$src" -ldl; then
+        fail "glibc-stack-end-direct" "gcc failed"
+        rm -f "$src" "$bin" "$out"
+        return
+    fi
+
+    if ! file "$bin" | grep -q 'interpreter .*ld-linux'; then
+        skip "glibc-stack-end-direct" "gcc did not produce a dynamic glibc executable"
+        rm -f "$src" "$bin" "$out"
+        return
+    fi
+
+    local expect actual rc_e=0 rc_a=0
+    expect=$("$bin" 2>&1) || rc_e=$?
+
+    if ! "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
+        fail "glibc-stack-end-direct" "dlfreeze failed"
+        rm -f "$src" "$bin" "$out"
+        return
+    fi
+
+    actual=$("$out" 2>&1) || rc_a=$?
+    if [ "$expect" = "$actual" ] && [ "$rc_e" = "$rc_a" ]; then
+        pass "glibc stack-end direct-load"
+    else
+        fail "glibc stack-end direct-load" "output or exit code differs (exit $rc_e vs $rc_a)"
+        echo "  expect: $expect"
+        echo "  actual: $actual"
+    fi
+
+    rm -f "$src" "$bin" "$out"
+}
+
+# ===================================================================
+# Test 1h: Alpine musl direct-load supports Python threading
 # ===================================================================
 test_alpine_python_thread_direct() {
     echo "--- alpine python thread direct-load ---"
@@ -1068,6 +1131,7 @@ test_musl_ctor_direct
 test_musl_copy_reloc_direct
 test_musl_multibyte_direct
 test_musl_shared_tls_direct
+test_glibc_stack_end_direct
 test_alpine_python_thread_direct
 test_alpine_python_sqlite_direct
 test_alpine_python_cryptography_direct

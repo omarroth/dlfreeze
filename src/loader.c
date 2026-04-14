@@ -145,6 +145,7 @@ static void *g_null_page;
 /* Debug verbosity — enabled by DLFREEZE_DEBUG=1 env var.
  * Set before TLS swap (getenv is safe in bootstrap's libc). */
 static int g_debug;
+static int g_glibc_early_init_done;
 
 /* Perf-friendly mode — enabled by DLFREEZE_PERF=1 env var.
  * Uses anonymous memory (memcpy) instead of file-backed mmap so that
@@ -661,6 +662,7 @@ struct glibc_ver_offsets {
     int gl_stack_cache;
     int gl_rtld_lock_recursive;   /* -1 if removed (glibc ≥ 2.34) */
     int gl_rtld_unlock_recursive;
+    int gl_make_stack_executable; /* -1 if absent or unused */
 };
 
 /* glibc 2.17–2.28 (x86-64): _rtld_global_ro=440B, _rtld_global=3960B
@@ -687,6 +689,7 @@ static const struct glibc_ver_offsets glibc_2_17 = {
     .gl_stack_cache        = -1,
     .gl_rtld_lock_recursive   = 3840,  /* 0xf00 */
     .gl_rtld_unlock_recursive = 3848,  /* 0xf08 */
+    .gl_make_stack_executable = -1,
 };
 
 /* glibc 2.29–2.33 (x86-64): _rtld_global_ro=536B, _rtld_global=3992B
@@ -712,6 +715,64 @@ static const struct glibc_ver_offsets glibc_2_29 = {
     .gl_stack_cache        = -1,
     .gl_rtld_lock_recursive   = 3848,  /* 0xf08 */
     .gl_rtld_unlock_recursive = 3856,  /* 0xf10 */
+    .gl_make_stack_executable = -1,
+};
+
+/* glibc 2.27 (AArch64): _rtld_global_ro=520B, _rtld_global=4088B
+ * Older AArch64 glibc still routes _dl_addr through recursive lock
+ * callbacks stored in _rtld_global, but their offsets differ from the
+ * x86-64 layout.  The callbacks are tiny lock/unlock helpers in ld.so.
+ * We stub them out because the frozen loader is single-threaded here.
+ * _dl_make_stack_executable is also routed via _rtld_global. */
+static const struct glibc_ver_offsets glibc_aarch64_2_27 = {
+    .glro_tls_static_size  = -1,
+    .glro_tls_static_align = -1,
+    .glro_debug_printf     = -1,
+    .glro_mcount           = -1,
+    .glro_open             = -1,
+    .glro_close            = -1,
+    .glro_catch_error      = -1,
+    .glro_error_free       = -1,
+    .glro_find_object      = -1,
+    .gl_tls_static_size    = -1,
+    .gl_tls_static_align   = -1,
+    .gl_nns                = -1,
+    .gl_stack_flags        = 0xa08,
+    .gl_tls_generation     = -1,
+    .gl_stack_used         = -1,
+    .gl_stack_user         = -1,
+    .gl_stack_cache        = -1,
+    .gl_rtld_lock_recursive   = 0xf80,
+    .gl_rtld_unlock_recursive = 0xf88,
+    .gl_make_stack_executable = 0xf90,
+};
+
+/* glibc 2.31 (AArch64): _rtld_global_ro=624B, _rtld_global=4152B
+ * Ubuntu 20.04 arm64 still uses the old _start path and expects the
+ * recursive rtld lock callbacks plus _dl_make_stack_executable to be
+ * present in _rtld_global.  The layout differs again from both x86-64
+ * and glibc 2.27 AArch64, so detect it explicitly by ld.so symbol size. */
+static const struct glibc_ver_offsets glibc_aarch64_2_31 = {
+    .glro_tls_static_size  = -1,
+    .glro_tls_static_align = -1,
+    .glro_debug_printf     = -1,
+    .glro_mcount           = -1,
+    .glro_open             = -1,
+    .glro_close            = -1,
+    .glro_catch_error      = -1,
+    .glro_error_free       = -1,
+    .glro_find_object      = -1,
+    .gl_tls_static_size    = -1,
+    .gl_tls_static_align   = -1,
+    .gl_nns                = -1,
+    .gl_stack_flags        = -1,
+    .gl_tls_generation     = -1,
+    .gl_stack_used         = -1,
+    .gl_stack_user         = -1,
+    .gl_stack_cache        = -1,
+    .gl_rtld_lock_recursive   = 0xfc0,
+    .gl_rtld_unlock_recursive = 0xfc8,
+    .gl_make_stack_executable = 0xfd0,
 };
 
 /* glibc 2.34–2.36 (x86-64): _rtld_global_ro=928B, _rtld_global=4304B
@@ -738,6 +799,7 @@ static const struct glibc_ver_offsets glibc_2_34 = {
     .gl_stack_cache        = 4264,
     .gl_rtld_lock_recursive   = -1,
     .gl_rtld_unlock_recursive = -1,
+    .gl_make_stack_executable = -1,
 };
 
 /* glibc 2.37–2.39 (x86-64): _rtld_global_ro=952B, _rtld_global=4352B */
@@ -761,6 +823,7 @@ static const struct glibc_ver_offsets glibc_2_37 = {
     .gl_stack_cache        = 4312,  /* 0x10D8 */
     .gl_rtld_lock_recursive   = -1,
     .gl_rtld_unlock_recursive = -1,
+    .gl_make_stack_executable = -1,
 };
 
 /* glibc 2.40+ (x86-64): _rtld_global_ro=928B, _rtld_global=2120B */
@@ -784,11 +847,17 @@ static const struct glibc_ver_offsets glibc_2_40 = {
     .gl_stack_cache        = 2080,  /* 0x820 */
     .gl_rtld_lock_recursive   = -1,
     .gl_rtld_unlock_recursive = -1,
+    .gl_make_stack_executable = -1,
 };
 
 static uint8_t *g_fake_rtld_global;
 static uint8_t *g_fake_rtld_global_ro;
 static const struct glibc_ver_offsets *g_glibc_off = &glibc_2_40;
+
+/* glibc consumers such as Ruby's main-thread stack setup may read
+ * __libc_stack_end from ld-linux. Direct-load mode does not map the real
+ * interpreter, so provide loader-owned storage for that symbol. */
+static void *g_fake_libc_stack_end;
 
 /* Fake link_map used by __cxa_thread_atexit_impl and other glibc internals
  * that dereference _rtld_global._dl_ns[0]._ns_loaded (offset 0).
@@ -875,6 +944,12 @@ static void glro_dl_mcount(uintptr_t from, uintptr_t to)
 static void glro_dl_lock_noop(void *lock)
 {
     (void)lock;
+}
+
+static int glro_dl_make_stack_executable(const void *stack_endp)
+{
+    (void)stack_endp;
+    return 0;
 }
 
 /* make a list_t {next, prev} point to itself (empty circular list) */
@@ -1065,10 +1140,14 @@ static void fixup_rtld_for_glibc(const struct glibc_ver_offsets *o)
 
     /* _rtld_global_ro: dl* function pointer stubs — makes dlopen/dlsym/
      * dlclose return error/NULL instead of SIGSEGV through a NULL ptr. */
-    *(void **)(g_fake_rtld_global_ro + o->glro_debug_printf) = (void *)glro_dl_debug_printf;
-    *(void **)(g_fake_rtld_global_ro + o->glro_mcount)       = (void *)glro_dl_mcount;
-    *(void **)(g_fake_rtld_global_ro + o->glro_open)         = (void *)glro_dl_open;
-    *(void **)(g_fake_rtld_global_ro + o->glro_close)        = (void *)glro_dl_close;
+    if (o->glro_debug_printf >= 0)
+        *(void **)(g_fake_rtld_global_ro + o->glro_debug_printf) = (void *)glro_dl_debug_printf;
+    if (o->glro_mcount >= 0)
+        *(void **)(g_fake_rtld_global_ro + o->glro_mcount)       = (void *)glro_dl_mcount;
+    if (o->glro_open >= 0)
+        *(void **)(g_fake_rtld_global_ro + o->glro_open)         = (void *)glro_dl_open;
+    if (o->glro_close >= 0)
+        *(void **)(g_fake_rtld_global_ro + o->glro_close)        = (void *)glro_dl_close;
     if (o->glro_catch_error >= 0)
         *(void **)(g_fake_rtld_global_ro + o->glro_catch_error)  = (void *)glro_dl_catch_error;
     if (o->glro_error_free >= 0)
@@ -1077,9 +1156,12 @@ static void fixup_rtld_for_glibc(const struct glibc_ver_offsets *o)
         *(void **)(g_fake_rtld_global_ro + o->glro_find_object)  = (void *)glro_dl_find_object;
 
     /* _rtld_global: critical fields */
-    *(size_t *)(g_fake_rtld_global + o->gl_nns)            = 1;
-    *(int    *)(g_fake_rtld_global + o->gl_stack_flags)    = 3; /* PROT_READ|PROT_WRITE */
-    *(size_t *)(g_fake_rtld_global + o->gl_tls_generation) = 1;
+    if (o->gl_nns >= 0)
+        *(size_t *)(g_fake_rtld_global + o->gl_nns)            = 1;
+    if (o->gl_stack_flags >= 0)
+        *(int    *)(g_fake_rtld_global + o->gl_stack_flags)    = 3; /* PROT_READ|PROT_WRITE */
+    if (o->gl_tls_generation >= 0)
+        *(size_t *)(g_fake_rtld_global + o->gl_tls_generation) = 1;
 
     /* Empty circular lists for stack tracking (glibc ≥ 2.34) */
     if (o->gl_stack_used >= 0)
@@ -1094,6 +1176,8 @@ static void fixup_rtld_for_glibc(const struct glibc_ver_offsets *o)
         *(void **)(g_fake_rtld_global + o->gl_rtld_lock_recursive)   = (void *)glro_dl_lock_noop;
     if (o->gl_rtld_unlock_recursive >= 0)
         *(void **)(g_fake_rtld_global + o->gl_rtld_unlock_recursive) = (void *)glro_dl_lock_noop;
+    if (o->gl_make_stack_executable >= 0)
+        *(void **)(g_fake_rtld_global + o->gl_make_stack_executable) = (void *)glro_dl_make_stack_executable;
 }
 
 /*
@@ -1116,7 +1200,9 @@ static const struct {
     const struct glibc_ver_offsets *offsets;
 } glibc_layout_table[] = {
     { 440,  3960, &glibc_2_17 },    /* glibc 2.17–2.28 x86-64 */
+    { 520,  4088, &glibc_aarch64_2_27 }, /* glibc 2.27     AArch64 */
     { 536,  3992, &glibc_2_29 },    /* glibc 2.29–2.33 x86-64 */
+    { 624,  4152, &glibc_aarch64_2_31 }, /* glibc 2.31     AArch64 */
     { 928,  4304, &glibc_2_34 },    /* glibc 2.34–2.36 x86-64 */
     { 952,  4352, &glibc_2_37 },    /* glibc 2.37–2.39 x86-64 */
     { 928,  2120, &glibc_2_40 },    /* glibc 2.40+     x86-64 */
@@ -1475,6 +1561,8 @@ static uint64_t lookup_fake_object(const char *name)
         return (uint64_t)(uintptr_t)g_fake_rtld_global;
     if (strcmp(name, "_rtld_global_ro") == 0)
         return (uint64_t)(uintptr_t)g_fake_rtld_global_ro;
+    if (strcmp(name, "__libc_stack_end") == 0)
+        return (uint64_t)(uintptr_t)&g_fake_libc_stack_end;
     return 0;
 }
 
@@ -3177,6 +3265,7 @@ static void build_special_table(void)
         SPEC_INSERT("_rtld_global", g_fake_rtld_global);
     if (g_fake_rtld_global_ro)
         SPEC_INSERT("_rtld_global_ro", g_fake_rtld_global_ro);
+    SPEC_INSERT("__libc_stack_end", &g_fake_libc_stack_end);
     SPEC_INSERT("__rseq_offset", &g_rseq_offset);
     SPEC_INSERT("__rseq_size",   &g_rseq_size);
     SPEC_INSERT("__rseq_flags",  &g_rseq_flags);
@@ -4494,6 +4583,7 @@ static void init_libc_process_state(struct loaded_obj *objs, int nobj,
     if (addr) {
         ldr_dbg("[loader] calling __libc_early_init...\n");
         ((void(*)(int))(uintptr_t)addr)(1);
+        g_glibc_early_init_done = 1;
         ldr_dbg("[loader] __libc_early_init done\n");
     }
 }
@@ -5452,7 +5542,15 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
      *   dtv[modid] = {val, to_free} for TLS module modid (1-indexed)
      */
     if (!g_is_musl_runtime) {
-        size_t dtv_slots = 2 + (size_t)nobj;
+        size_t max_modid = 0;
+        for (int oi = 0; oi < nobj; oi++) {
+            if (objs[oi].tls.memsz == 0 || objs[oi].tls.modid == 0)
+                continue;
+            if (objs[oi].tls.modid > max_modid)
+                max_modid = objs[oi].tls.modid;
+        }
+
+        size_t dtv_slots = 2 + max_modid;
         size_t raw_dtv_bytes = (1 + dtv_slots) * 2 * sizeof(uintptr_t);
         uintptr_t *raw_dtv = (uintptr_t *)mmap(NULL, ALIGN_UP(raw_dtv_bytes, 4096),
             PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -5466,7 +5564,7 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
              * glibc uses 1-indexed modules, dtv[1] = module 1, etc. */
             for (int oi = 0; oi < nobj; oi++) {
                 if (objs[oi].tls.memsz == 0) continue;
-                size_t slot = (size_t)(oi + 1);
+                size_t slot = objs[oi].tls.modid;
                 if (slot < dtv_slots) {
                     dtv[slot * 2]     = tp + (uintptr_t)objs[oi].tls.tpoff;
                     dtv[slot * 2 + 1] = 0;  /* to_free = NULL */
@@ -6047,10 +6145,13 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
 
     /* 8. Try to call main() directly, bypassing __libc_start_main.
      *    __libc_start_main accesses _rtld_global which requires ld.so.
-     *    For simple programs, calling main() directly works because:
+     *    For musl and newer glibc builds with __libc_early_init, calling
+     *    main() directly works because:
      *    - stdio FILE structs are statically initialized in libc's .data
      *    - __libc_single_threaded is 1 (from .data, no locking needed)
-     *    - __environ gets set by us below */
+     *    - __environ gets set by us below
+     *    Older glibc builds still need __libc_start_main-era setup, so
+     *    they must fall back through _start. */
     ldr_dbg("[loader] resolving main...\n");
     typedef int (*main_fn_t)(int, char **, char **);
     uint64_t main_addr = 0;
@@ -6065,11 +6166,13 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     if (!main_addr)
         main_addr = resolve_sym(objs, nobj, "main");
 
-    if (main_addr) {
+    if (main_addr && (is_musl_runtime || g_glibc_early_init_done)) {
         /* Warm up glibc's allocator so main_arena's top chunk lands in the
          * process brk before we enter user code. musl does not need this
-         * ptmalloc-specific bootstrap path. */
-        if (!is_musl_runtime) {
+         * ptmalloc-specific bootstrap path.  Older glibc builds without
+         * __libc_early_init are not ready for a bootstrap malloc here and
+         * can fault before we even enter main(). */
+        if (!is_musl_runtime && g_glibc_early_init_done) {
             uint64_t libc_malloc_addr = resolve_sym(objs, nobj, "malloc");
             uint64_t libc_free_addr = resolve_sym(objs, nobj, "free");
             if (libc_malloc_addr && libc_free_addr) {
@@ -6077,6 +6180,8 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
                 if (p)
                     ((void (*)(void *))(uintptr_t)libc_free_addr)(p);
             }
+        } else if (!is_musl_runtime && g_debug) {
+            ldr_dbg("[loader] skipping allocator warmup (no __libc_early_init)\n");
         }
         ldr_dbg("[loader] calling main() directly...\n");
         if (g_debug)
@@ -6092,6 +6197,9 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
             ((int (*)(void *))(uintptr_t)fflush_addr)(NULL);
         _exit(rc);
     }
+
+    if (main_addr && !is_musl_runtime && g_debug && !g_glibc_early_init_done)
+        ldr_dbg("[loader] using _start path (glibc needs __libc_start_main init)\n");
 
     /* Fallback: transfer control via _start → __libc_start_main. */
     ldr_dbg("[loader] transferring to _start...\n");
