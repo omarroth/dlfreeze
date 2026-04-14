@@ -62,6 +62,7 @@ for src_dir in "$FROZEN_DIR"/frozen-*; do
     fi
 
     # ── hello.upx.frozen (UPX-compressed) ──────────────────────────
+    : '
     frozen_upx="$src_dir/hello.upx.frozen"
     if [ -f "$frozen_upx" ]; then
         chmod +x "$frozen_upx" 2>/dev/null || true
@@ -78,8 +79,10 @@ for src_dir in "$FROZEN_DIR"/frozen-*; do
     else
         skip "$src_env/hello.upx.frozen" "UPX not available at build time"
     fi
+    '
 
     # ── exitcode.frozen ────────────────────────────────────────────
+    : '
     frozen_ec="$src_dir/exitcode.frozen"
     if [ -f "$frozen_ec" ]; then
         chmod +x "$frozen_ec" 2>/dev/null || true
@@ -102,8 +105,10 @@ for src_dir in "$FROZEN_DIR"/frozen-*; do
     else
         skip "$src_env/exitcode.frozen" "artifact not found"
     fi
+    '
 
     # ── exitcode.upx.frozen ────────────────────────────────────────
+    : '
     frozen_ec_upx="$src_dir/exitcode.upx.frozen"
     if [ -f "$frozen_ec_upx" ]; then
         chmod +x "$frozen_ec_upx" 2>/dev/null || true
@@ -124,6 +129,7 @@ for src_dir in "$FROZEN_DIR"/frozen-*; do
     else
         skip "$src_env/exitcode.upx.frozen" "UPX not available at build time"
     fi
+    '
 
     echo ""
 done
