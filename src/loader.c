@@ -23,6 +23,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <limits.h>
+#include <pthread.h>
 
 #include "common.h"
 #include "loader.h"
@@ -68,6 +69,9 @@ typedef Elf64_Xword Elf64_Relr;
 #ifndef R_AARCH64_TLS_DTPREL
 #define R_AARCH64_TLS_DTPREL 1029
 #endif
+#ifndef R_AARCH64_TLSDESC
+#define R_AARCH64_TLSDESC   1031
+#endif
 
 #if defined(__x86_64__)
   #define ARCH_RELOC_RELATIVE   R_X86_64_RELATIVE
@@ -112,6 +116,7 @@ typedef Elf64_Xword Elf64_Relr;
   #define ARCH_RELOC_TPOFF      R_AARCH64_TLS_TPREL
   #define ARCH_RELOC_DTPMOD     R_AARCH64_TLS_DTPMOD
   #define ARCH_RELOC_DTPOFF     R_AARCH64_TLS_DTPREL
+    #define ARCH_RELOC_TLSDESC    R_AARCH64_TLSDESC
   #define ARCH_RELOC_IRELATIVE  R_AARCH64_IRELATIVE
   #define ARCH_RELOC_COPY       R_AARCH64_COPY
 
@@ -148,6 +153,78 @@ static int g_debug;
  * which has stripped section headers, so perf finds no symbols. */
 static int g_perf_mode;
 static int g_is_musl_runtime;
+static uintptr_t g_musl_tp_self_delta;
+
+#if defined(__aarch64__)
+struct aarch64_tlsdesc_arg {
+    uint64_t modid;
+    uint64_t offset;
+    int64_t  dtv_offset;
+    uint64_t entry_shift;
+};
+
+#define AARCH64_TLSDESC_ARGS_PER_PAGE 127
+
+extern uintptr_t dlfreeze_aarch64_tlsdesc_static(void *);
+extern uintptr_t dlfreeze_aarch64_tlsdesc_dynamic(void *);
+
+struct aarch64_tlsdesc_page {
+    struct aarch64_tlsdesc_page *next;
+    size_t used;
+    struct aarch64_tlsdesc_arg args[AARCH64_TLSDESC_ARGS_PER_PAGE];
+};
+
+static struct aarch64_tlsdesc_page *g_aarch64_tlsdesc_pages;
+
+__asm__(
+    ".text\n"
+    ".align 2\n"
+    ".global dlfreeze_aarch64_tlsdesc_static\n"
+    ".hidden dlfreeze_aarch64_tlsdesc_static\n"
+    ".type dlfreeze_aarch64_tlsdesc_static, %function\n"
+    "dlfreeze_aarch64_tlsdesc_static:\n"
+    "\tldr x0, [x0, #8]\n"
+    "\tret\n"
+    ".size dlfreeze_aarch64_tlsdesc_static, .-dlfreeze_aarch64_tlsdesc_static\n"
+    ".global dlfreeze_aarch64_tlsdesc_dynamic\n"
+    ".hidden dlfreeze_aarch64_tlsdesc_dynamic\n"
+    ".type dlfreeze_aarch64_tlsdesc_dynamic, %function\n"
+    "dlfreeze_aarch64_tlsdesc_dynamic:\n"
+    "\tstp x1, x2, [sp, #-16]!\n"
+    "\tstp x3, x4, [sp, #-16]!\n"
+    "\tmrs x1, tpidr_el0\n"
+    "\tldr x0, [x0, #8]\n"
+    "\tldp x2, x3, [x0]\n"
+    "\tldr x4, [x0, #16]\n"
+    "\tldr x0, [x0, #24]\n"
+    "\tadd x4, x1, x4\n"
+    "\tldr x4, [x4]\n"
+    "\tlsl x2, x2, x0\n"
+    "\tldr x0, [x4, x2]\n"
+    "\tadd x0, x0, x3\n"
+    "\tsub x0, x0, x1\n"
+    "\tldp x3, x4, [sp], #16\n"
+    "\tldp x1, x2, [sp], #16\n"
+    "\tret\n"
+    ".size dlfreeze_aarch64_tlsdesc_dynamic, .-dlfreeze_aarch64_tlsdesc_dynamic\n");
+
+static struct aarch64_tlsdesc_arg *alloc_aarch64_tlsdesc_arg(void)
+{
+    struct aarch64_tlsdesc_page *page = g_aarch64_tlsdesc_pages;
+
+    if (!page || page->used == AARCH64_TLSDESC_ARGS_PER_PAGE) {
+        page = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (page == MAP_FAILED)
+            return NULL;
+        memset(page, 0, 4096);
+        page->next = g_aarch64_tlsdesc_pages;
+        g_aarch64_tlsdesc_pages = page;
+    }
+
+    return &page->args[page->used++];
+}
+#endif
 
 #define MUSL_INIT_FINI_LIST_PTR_OFF      0xa9f48
 #define MUSL_INIT_FINI_LIST_SENTINEL_OFF 0xa9840
@@ -252,8 +329,7 @@ static const int g_crash_signals[] = {
     SIGSEGV, SIGABRT, SIGBUS, SIGFPE, SIGILL
 };
 
-#define CRASH_SIGNAL_COUNT \
-    ((int)(sizeof(g_crash_signals) / sizeof(g_crash_signals[0])))
+#define CRASH_SIGNAL_COUNT ((int)(sizeof(g_crash_signals) / sizeof(g_crash_signals[0])))
 
 typedef void (*signal_handler_t)(int);
 
@@ -1236,13 +1312,103 @@ static void  stub_dl_deallocate_tls(void *mem) { (void)mem; }
 /* _dl_rtld_di_serinfo — no-op */
 static int stub_dl_rtld_di_serinfo(void) { return -1; }
 
+/* ---- TLS / arch constants --------------------------------------------- */
+#define TCB_ALLOC     4096     /* generous TCB allocation */
+
+#if defined(__x86_64__)
+/* tcbhead_t offsets on x86-64 glibc */
+#define TCB_OFF_SELF         0    /* void *tcb              */
+#define TCB_OFF_DTV          8    /* dtv_t *dtv             */
+#define TCB_OFF_SELF2       16    /* void *self             */
+#define TCB_OFF_SELF3       24    /* musl thread self       */
+#define TCB_OFF_STACK_GUARD 40    /* uintptr_t stack_guard  (0x28) */
+#define TCB_OFF_PTR_GUARD   48    /* uintptr_t pointer_guard (0x30) */
+#define TCB_OFF_TID        720    /* pid_t tid (0x2D0) — thread ID */
+#elif defined(__aarch64__)
+/* tcbhead_t offsets on aarch64 glibc (TP points to start of TCB) */
+#define TCB_OFF_DTV          0    /* dtv_t *dtv             */
+#define TCB_OFF_SELF         8    /* void *private (unused) */
+#define TCB_OFF_SELF2        8
+#define TCB_OFF_SELF3       16    /* musl thread self       */
+/* On aarch64 glibc the stack guard and pointer guard live in struct
+ * pthread, which sits at a negative offset from the thread pointer.
+ * These offsets are from the TP (positive, into the TCB header area).
+ * glibc aarch64 stores the stack canary at TP - 0x10 equivalently,
+ * but for our TCB we place them at fixed offsets within TCB_ALLOC. */
+#define TCB_OFF_STACK_GUARD 16    /* uintptr_t stack_guard  */
+#define TCB_OFF_PTR_GUARD   24    /* uintptr_t pointer_guard */
+#define TCB_OFF_TID        720    /* pid_t tid              */
+#endif
+#define MUSL_TCB_PRESERVE_OFF 0x20
+#define MUSL_TCB_PRESERVE_LEN 0xb0
+
+#if defined(__x86_64__)
+#define MUSL_TLS_GAP_ABOVE_TP              0
+#define MUSL_THREAD_DTV_OFF                0x08
+#define MUSL_THREAD_PREV_OFF               0x10
+#define MUSL_THREAD_NEXT_OFF               0x18
+#define MUSL_THREAD_SYSINFO_OFF            0x20
+#define MUSL_THREAD_TID_OFF                0x30
+#define MUSL_THREAD_ERRNO_OFF              0x34
+#define MUSL_THREAD_DETACH_STATE_OFF       0x38
+#define MUSL_THREAD_ROBUST_HEAD_OFF        0x88
+#define MUSL_THREAD_LOCALE_OFF             0xa8
+#elif defined(__aarch64__)
+#define MUSL_TLS_GAP_ABOVE_TP              16
+#define MUSL_THREAD_DTV_OFF                0xc0
+#define MUSL_THREAD_PREV_OFF               0x08
+#define MUSL_THREAD_NEXT_OFF               0x10
+#define MUSL_THREAD_SYSINFO_OFF            0x18
+#define MUSL_THREAD_TID_OFF                0x20
+#define MUSL_THREAD_ERRNO_OFF              0x24
+#define MUSL_THREAD_DETACH_STATE_OFF       0x28
+#define MUSL_THREAD_ROBUST_HEAD_OFF        0x78
+#define MUSL_THREAD_LOCALE_OFF             0x98
+#endif
+
+static inline int musl_tls_above_tp(void)
+{
+#if defined(__aarch64__)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+static inline uintptr_t musl_thread_self_ptr(uintptr_t tp)
+{
+    return tp - g_musl_tp_self_delta;
+}
+
+static inline uintptr_t *musl_thread_dtv_slot(uintptr_t tp)
+{
+    return (uintptr_t *)(musl_thread_self_ptr(tp) + MUSL_THREAD_DTV_OFF);
+}
+
+#if defined(__aarch64__)
+static void current_aarch64_tlsdesc_layout(int64_t *dtv_offset,
+                                           uint64_t *entry_shift)
+{
+    if (g_is_musl_runtime) {
+        *dtv_offset = -8;
+        *entry_shift = 3;
+        return;
+    }
+
+    *dtv_offset = TCB_OFF_DTV;
+    *entry_shift = 4;
+}
+#endif
+
 /* __tls_get_addr — GD/LD TLS model accessor.
  * Looks up the DTV entry for the module and adds the offset. */
 struct tls_index { unsigned long ti_module; unsigned long ti_offset; };
 static void *stub_tls_get_addr(struct tls_index *ti)
 {
     uintptr_t tp = arch_get_tp();
-    uintptr_t *dtv = *(uintptr_t **)(tp + 8 /* TCB_OFF_DTV */);
+    uintptr_t *dtv = g_is_musl_runtime
+        ? *(uintptr_t **)musl_thread_dtv_slot(tp)
+        : *(uintptr_t **)(tp + TCB_OFF_DTV);
     if (dtv) {
         if (g_is_musl_runtime) {
             uintptr_t tls_block = dtv[ti->ti_module];
@@ -1323,39 +1489,9 @@ static int g_special_tab_ready;
 static void build_special_table(void);
 static uint64_t lookup_special(const char *name, uint32_t gh);
 
-/* ---- TLS / arch constants --------------------------------------------- */
-#define TCB_ALLOC     4096     /* generous TCB allocation */
-
-#if defined(__x86_64__)
-/* tcbhead_t offsets on x86-64 glibc */
-#define TCB_OFF_SELF         0    /* void *tcb              */
-#define TCB_OFF_DTV          8    /* dtv_t *dtv             */
-#define TCB_OFF_SELF2       16    /* void *self             */
-#define TCB_OFF_SELF3       24    /* musl thread self       */
-#define TCB_OFF_STACK_GUARD 40    /* uintptr_t stack_guard  (0x28) */
-#define TCB_OFF_PTR_GUARD   48    /* uintptr_t pointer_guard (0x30) */
-#define TCB_OFF_TID        720    /* pid_t tid (0x2D0) — thread ID */
-#elif defined(__aarch64__)
-/* tcbhead_t offsets on aarch64 glibc (TP points to start of TCB) */
-#define TCB_OFF_DTV          0    /* dtv_t *dtv             */
-#define TCB_OFF_SELF         8    /* void *private (unused) */
-#define TCB_OFF_SELF2        8
-#define TCB_OFF_SELF3       16    /* musl thread self       */
-/* On aarch64 glibc the stack guard and pointer guard live in struct
- * pthread, which sits at a negative offset from the thread pointer.
- * These offsets are from the TP (positive, into the TCB header area).
- * glibc aarch64 stores the stack canary at TP - 0x10 equivalently,
- * but for our TCB we place them at fixed offsets within TCB_ALLOC. */
-#define TCB_OFF_STACK_GUARD 16    /* uintptr_t stack_guard  */
-#define TCB_OFF_PTR_GUARD   24    /* uintptr_t pointer_guard */
-#define TCB_OFF_TID        720    /* pid_t tid              */
-#endif
-#define MUSL_TCB_PRESERVE_OFF 0x20
-#define MUSL_TCB_PRESERVE_LEN 0xb0
-
 /* ---- per-object runtime state ----------------------------------------- */
 struct obj_tls {
-    int64_t  tpoff;       /* negative offset from TP to TLS block  */
+    int64_t  tpoff;       /* signed offset from TP to TLS block    */
     uint64_t filesz;      /* .tdata initialization size             */
     uint64_t memsz;       /* total TLS block (tdata + tbss)         */
     uint64_t vaddr;       /* p_vaddr of PT_TLS (in loaded image)    */
@@ -1478,7 +1614,7 @@ static int install_musl_dlopen_tls(struct loaded_obj *obj)
         return 0;
 
     tp = arch_get_tp();
-    old_dtv = *(uintptr_t **)(tp + TCB_OFF_DTV);
+    old_dtv = *(uintptr_t **)musl_thread_dtv_slot(tp);
     if (old_dtv)
         old_slots = old_dtv[0];
 
@@ -1495,7 +1631,7 @@ static int install_musl_dlopen_tls(struct loaded_obj *obj)
             memcpy(dtv, old_dtv, (old_slots + 1) * sizeof(uintptr_t));
         }
         dtv[0] = new_slots;
-        *(uintptr_t **)(tp + TCB_OFF_DTV) = dtv;
+        *(uintptr_t **)musl_thread_dtv_slot(tp) = dtv;
     }
 
     if (dtv[obj->tls.modid])
@@ -1538,7 +1674,7 @@ static int install_glibc_dlopen_tls(struct loaded_obj *obj)
         return 0;
 
     uintptr_t tp = arch_get_tp();
-    uintptr_t *dtv = *(uintptr_t **)(tp + 8 /* TCB_OFF_DTV */);
+    uintptr_t *dtv = *(uintptr_t **)(tp + TCB_OFF_DTV);
 
     /* Compute required raw DTV capacity.  The raw array is:
      *   raw_dtv[0]=generation, raw_dtv[1]=unused, raw_dtv[2..] = dtv[0..]
@@ -1557,7 +1693,7 @@ static int install_glibc_dlopen_tls(struct loaded_obj *obj)
         raw[0] = 1;  /* generation */
         raw[1] = 0;
         dtv = raw + 2;
-        *(uintptr_t **)(tp + 8) = dtv;
+        *(uintptr_t **)(tp + TCB_OFF_DTV) = dtv;
     } else {
         /* Check if current DTV is large enough.  The generation counter
          * lives at dtv[-2] (raw_dtv[0]).  We scan existing slots to
@@ -1583,7 +1719,7 @@ static int install_glibc_dlopen_tls(struct loaded_obj *obj)
             /* Copy old raw array: generation + unused + old_cap words */
             memcpy(new_raw, raw_dtv, (old_cap + 2) * sizeof(uintptr_t));
             dtv = new_raw + 2;
-            *(uintptr_t **)(tp + 8) = dtv;
+            *(uintptr_t **)(tp + TCB_OFF_DTV) = dtv;
         }
     }
 
@@ -1713,7 +1849,7 @@ static void *stub_dl_allocate_tls(void *mem)
             }
             dtv[slot * 2 + 1] = 0;
         }
-        *(uintptr_t *)(tp + 8 /* TCB_OFF_DTV */) = (uintptr_t)dtv;
+        *(uintptr_t *)(tp + TCB_OFF_DTV) = (uintptr_t)dtv;
     }
 
     /* Initialize TCB self-pointers so that %fs:0 and %fs:0x10 are valid
@@ -1732,7 +1868,7 @@ static void *stub_dl_allocate_tls(void *mem)
     g_last_tls_tp = tp;
     if (g_debug) {
         ldr_dbg_hex("[loader] alloc_tls done tp+0x00=", *(uintptr_t *)(tp + 0));
-        ldr_dbg_hex("[loader] alloc_tls done tp+0x08=", *(uintptr_t *)(tp + 8));
+        ldr_dbg_hex("[loader] alloc_tls done dtv=", *(uintptr_t *)(tp + TCB_OFF_DTV));
         ldr_dbg_hex("[loader] alloc_tls done tp+0x10=", *(uintptr_t *)(tp + 16));
         ldr_dbg_hex("[loader] alloc_tls done tp+0x18=", *(uintptr_t *)(tp + 24));
         /* Dump libc TPOFF64 GOT entries to verify relocation correctness */
@@ -3188,12 +3324,126 @@ static int resolve_tpoff(struct loaded_obj *objs, int nobj,
     return -1;
 }
 
+#if defined(__aarch64__)
+static int resolve_tlsdesc_target(struct loaded_obj *obj,
+                                  struct loaded_obj *all, int nobj,
+                                  uint32_t sidx, uint64_t addend,
+                                  size_t *modid_out,
+                                  uint64_t *offset_out,
+                                  int64_t *tprel_out,
+                                  int *have_tprel_out)
+{
+    const struct loaded_obj *owner = obj;
+    const Elf64_Sym *sym = NULL;
+    const char *name = NULL;
+
+    if (sidx != 0 && sidx < obj->dynsym_count)
+        sym = &obj->dynsym[sidx];
+
+    if (sym && sym->st_shndx == SHN_UNDEF) {
+        name = obj->dynstr + sym->st_name;
+        uint32_t gh = gnu_hash_calc(name);
+
+        for (int i = 0; i < nobj; i++) {
+            const Elf64_Sym *cand = all[i].gnu_hash
+                ? lookup_gnu_hash(&all[i], name, gh)
+                : lookup_linear(&all[i], name);
+
+            if (!cand || cand->st_shndx == SHN_UNDEF)
+                continue;
+            owner = &all[i];
+            sym = cand;
+            break;
+        }
+    }
+
+    if (!sym || sym->st_shndx == SHN_UNDEF) {
+        if (sym && ELF64_ST_BIND(sym->st_info) == STB_WEAK) {
+            *modid_out = 0;
+            *offset_out = 0;
+            *tprel_out = 0;
+            *have_tprel_out = 1;
+            return 0;
+        }
+        return -1;
+    }
+
+    if (owner->tls.memsz == 0 || owner->tls.modid == 0)
+        return -1;
+
+    *modid_out = owner->tls.modid;
+    *offset_out = sym->st_value + addend;
+    if (owner->tls.tpoff != 0) {
+        *tprel_out = owner->tls.tpoff + (int64_t)*offset_out;
+        *have_tprel_out = 1;
+    } else {
+        *tprel_out = 0;
+        *have_tprel_out = 0;
+    }
+
+    return 0;
+}
+
+static int apply_aarch64_tlsdesc_reloc(struct loaded_obj *obj,
+                                       struct loaded_obj *all, int nobj,
+                                       const Elf64_Rela *rel)
+{
+    size_t modid;
+    uint64_t offset;
+    int64_t tprel;
+    int have_tprel;
+    uint64_t *slot = (uint64_t *)(obj->base + rel->r_offset);
+
+    if (resolve_tlsdesc_target(obj, all, nobj,
+                               ELF64_R_SYM(rel->r_info),
+                               rel->r_addend,
+                               &modid, &offset,
+                               &tprel, &have_tprel) < 0) {
+        ldr_err("unresolved TLSDESC symbol", obj->name);
+        return -1;
+    }
+
+    if (have_tprel) {
+        slot[0] = (uint64_t)(uintptr_t)dlfreeze_aarch64_tlsdesc_static;
+        slot[1] = (uint64_t)tprel;
+        return 0;
+    }
+
+    {
+        int64_t dtv_offset;
+        uint64_t entry_shift;
+        struct aarch64_tlsdesc_arg *arg = alloc_aarch64_tlsdesc_arg();
+
+        if (!arg)
+            return -1;
+
+        current_aarch64_tlsdesc_layout(&dtv_offset, &entry_shift);
+        arg->modid = modid;
+        arg->offset = offset;
+        arg->dtv_offset = dtv_offset;
+        arg->entry_shift = entry_shift;
+
+        slot[0] = (uint64_t)(uintptr_t)dlfreeze_aarch64_tlsdesc_dynamic;
+        slot[1] = (uint64_t)(uintptr_t)arg;
+    }
+
+    return 0;
+}
+#endif
+
 static void apply_prelinked_runtime_reloc(struct loaded_obj *obj,
                                           struct loaded_obj *objs, int nobj,
                                           const Elf64_Rela *rel)
 {
     uint64_t base = obj->base;
     uint32_t type = ELF64_R_TYPE(rel->r_info);
+
+#if defined(__aarch64__)
+    if (type == ARCH_RELOC_TLSDESC) {
+        apply_aarch64_tlsdesc_reloc(obj, objs, nobj, rel);
+        return;
+    }
+#endif
 
     if (type == ARCH_RELOC_IRELATIVE) {
         typedef uint64_t (*ifunc_t)(void);
@@ -3271,6 +3521,58 @@ static void apply_prelinked_runtime_reloc(struct loaded_obj *obj,
                        && ELF64_ST_TYPE(obj->dynsym[sidx].st_info) == STT_OBJECT
                        && g_null_page) {
                 *slot = (uint64_t)(uintptr_t)g_null_page;
+            }
+        }
+    }
+}
+
+/* Fallback pass for pre-linked objects: ensure runtime override symbols
+ * like dlopen/dlsym/__tls_get_addr are patched even if the packer's
+ * runtime-fixup table omitted a relocation. Keep this narrowly focused
+ * on override names so the hot prelinked path still avoids a full
+ * generic relocation re-scan. */
+static void apply_prelinked_override_fallbacks(struct loaded_obj *obj)
+{
+    const Elf64_Rela *tabs[] = { obj->rela, obj->jmprel };
+    size_t counts[] = { obj->rela_count, obj->jmprel_count };
+
+    for (int t = 0; t < 2; t++) {
+        for (size_t i = 0; i < counts[t]; i++) {
+            const Elf64_Rela *rel = &tabs[t][i];
+            uint32_t type = ELF64_R_TYPE(rel->r_info);
+            uint32_t sidx;
+            const char *name;
+            uint32_t gh;
+            uint64_t ovr;
+            uint64_t *slot;
+
+            if (type != ARCH_RELOC_GLOB_DAT &&
+                type != ARCH_RELOC_JUMP_SLOT)
+                continue;
+
+            sidx = ELF64_R_SYM(rel->r_info);
+            if (sidx == 0 || sidx >= obj->dynsym_count)
+                continue;
+
+            name = obj->dynstr + obj->dynsym[sidx].st_name;
+            if (!maybe_runtime_override_name(name))
+                continue;
+
+            gh = gnu_hash_calc(name);
+            ovr = lookup_special(name, gh);
+            if (!ovr)
+                continue;
+
+            slot = (uint64_t *)(obj->base + rel->r_offset);
+            if (*slot != ovr) {
+                if (g_debug) {
+                    ldr_msg("GOT fallback patch: ");
+                    ldr_msg(name);
+                    ldr_msg(" in ");
+                    ldr_msg(obj->name);
+                    ldr_msg("\n");
+                }
+                *slot = ovr;
             }
         }
     }
@@ -3472,8 +3774,12 @@ static void parse_dynamic(struct loaded_obj *obj,
         if (mx >= so)
             while (!(ch[mx - so] & 1)) mx++;
         obj->dynsym_count = mx + 1;
-    } else if (strsz > 0 && strtab > symtab) {
-        obj->dynsym_count = (uint32_t)((strtab - symtab) / sizeof(Elf64_Sym));
+    }
+    if (strsz > 0 && strtab > symtab) {
+        uint32_t span_count = (uint32_t)((strtab - symtab) / sizeof(Elf64_Sym));
+
+        if (span_count > obj->dynsym_count)
+            obj->dynsym_count = span_count;
     }
 
     if (rela)       obj->rela       = (const Elf64_Rela *)(base + rela);
@@ -3631,6 +3937,13 @@ copy_done:
             } else
                 *slot = r->r_addend;
             break;
+
+#if defined(__aarch64__)
+        case ARCH_RELOC_TLSDESC:
+            if (apply_aarch64_tlsdesc_reloc(obj, all, nobj, r) < 0)
+                return -1;
+            break;
+#endif
 
         default:
             /* Ignore unknown types for prototype */
@@ -3882,7 +4195,9 @@ static void init_alpine_musl_process_state(struct loaded_obj *objs, int nobj,
 
             if (objs[i].tls.memsz == 0 || objs[i].tls.modid != modid)
                 continue;
-            offset = (size_t)(-(objs[i].tls.tpoff));
+            offset = musl_tls_above_tp()
+                ? (size_t)objs[i].tls.tpoff
+                : (size_t)(-(objs[i].tls.tpoff));
 
             mod->image = (void *)(uintptr_t)(objs[i].base + objs[i].tls.vaddr);
             mod->len = objs[i].tls.filesz;
@@ -3911,15 +4226,17 @@ static void init_alpine_musl_process_state(struct loaded_obj *objs, int nobj,
 
     tp = arch_get_tp();
     if (tp) {
-        *(uintptr_t *)(tp + MUSL_PTHREAD_PREV_OFF) = tp;
-        *(uintptr_t *)(tp + MUSL_PTHREAD_NEXT_OFF) = tp;
-        *(uintptr_t *)(tp + MUSL_PTHREAD_SYSINFO_OFF) = sysinfo;
-        *(int *)(tp + MUSL_PTHREAD_TID_OFF) = (int)syscall(SYS_gettid);
-        *(int *)(tp + MUSL_PTHREAD_ERRNO_OFF) = 0;
-        *(int *)(tp + MUSL_PTHREAD_DETACH_STATE_OFF) = 2;
-        *(uintptr_t *)(tp + MUSL_PTHREAD_ROBUST_HEAD_OFF) =
-            tp + MUSL_PTHREAD_ROBUST_HEAD_OFF;
-        *(uintptr_t *)(tp + MUSL_PTHREAD_LOCALE_OFF) =
+        uintptr_t self = musl_thread_self_ptr(tp);
+
+        *(uintptr_t *)(self + MUSL_THREAD_PREV_OFF) = self;
+        *(uintptr_t *)(self + MUSL_THREAD_NEXT_OFF) = self;
+        *(uintptr_t *)(self + MUSL_THREAD_SYSINFO_OFF) = sysinfo;
+        *(int *)(self + MUSL_THREAD_TID_OFF) = (int)syscall(SYS_gettid);
+        *(int *)(self + MUSL_THREAD_ERRNO_OFF) = 0;
+        *(int *)(self + MUSL_THREAD_DETACH_STATE_OFF) = 2;
+        *(uintptr_t *)(self + MUSL_THREAD_ROBUST_HEAD_OFF) =
+            self + MUSL_THREAD_ROBUST_HEAD_OFF;
+        *(uintptr_t *)(self + MUSL_THREAD_LOCALE_OFF) =
             (uintptr_t)((uint8_t *)libc + MUSL_LIBC_GLOBAL_LOCALE_OFF);
     }
 
@@ -4880,13 +5197,17 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
                             uintptr_t at_random)
 {
     uintptr_t old_tp = 0;
+    uintptr_t old_self = 0;
+    uint64_t max_tls_align = 1;
 
     /* Discover PT_TLS for each object and compute total static TLS size.
      * x86-64 uses Variant II: TLS blocks at negative TP offsets.
      * Layout: [TLS block N ... TLS block 1] [TCB]
      *                                        ^ TP (= FS register)
      */
-    uint64_t total_tls = 0;
+    uint64_t total_tls = (g_is_musl_runtime && musl_tls_above_tp())
+        ? MUSL_TLS_GAP_ABOVE_TP
+        : 0;
     for (int oi = 0; oi < nobj; oi++) {
         /* Find the matching manifest index */
         int mi = idx_map[oi];
@@ -4897,8 +5218,16 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
         for (int j = 0; j < metas[mi].phdr_num; j++) {
             if (phdrs[j].p_type != PT_TLS) continue;
             uint64_t align = phdrs[j].p_align ? phdrs[j].p_align : 1;
-            total_tls = ALIGN_UP(total_tls + phdrs[j].p_memsz, align);
-            objs[oi].tls.tpoff  = -(int64_t)total_tls;
+            if (align > max_tls_align)
+                max_tls_align = align;
+            if (g_is_musl_runtime && musl_tls_above_tp()) {
+                total_tls = ALIGN_UP(total_tls, align);
+                objs[oi].tls.tpoff = (int64_t)total_tls;
+                total_tls += phdrs[j].p_memsz;
+            } else {
+                total_tls = ALIGN_UP(total_tls + phdrs[j].p_memsz, align);
+                objs[oi].tls.tpoff  = -(int64_t)total_tls;
+            }
             objs[oi].tls.filesz = phdrs[j].p_filesz;
             objs[oi].tls.memsz  = phdrs[j].p_memsz;
             objs[oi].tls.vaddr  = phdrs[j].p_vaddr;
@@ -4926,28 +5255,48 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
                 = tls_static;
     }
 
-    /* Allocate TLS block + TCB */
-    size_t tls_aligned = ALIGN_UP(total_tls, 64);
-    size_t alloc = tls_aligned + TCB_ALLOC;
-    void *block = mmap(NULL, alloc, PROT_READ | PROT_WRITE,
-                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (block == MAP_FAILED) {
-        ldr_err("TLS mmap failed", NULL);
-        return 0;
+    if (g_is_musl_runtime) {
+        old_tp = arch_get_tp_syscall();
+        old_self = (uintptr_t)pthread_self();
+        if (old_tp >= old_self)
+            g_musl_tp_self_delta = old_tp - old_self;
     }
 
-    uintptr_t tp = (uintptr_t)block + tls_aligned;
+    /* Allocate TLS block + TCB */
+    size_t alloc;
+    uintptr_t tp;
+    void *block;
 
-    if (g_is_musl_runtime)
-        old_tp = arch_get_tp_syscall();
+    if (g_is_musl_runtime && musl_tls_above_tp()) {
+        alloc = g_musl_tp_self_delta + total_tls + max_tls_align;
+        block = mmap(NULL, alloc, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (block == MAP_FAILED) {
+            ldr_err("TLS mmap failed", NULL);
+            return 0;
+        }
+        tp = ALIGN_UP((uintptr_t)block + g_musl_tp_self_delta, max_tls_align);
+    } else {
+        size_t tls_aligned = ALIGN_UP(total_tls, 64);
 
-    /* Initialize TCB header */
-    *(uintptr_t *)(tp + TCB_OFF_SELF)  = tp;
-    *(uintptr_t *)(tp + TCB_OFF_SELF2) = tp;
-    if (g_is_musl_runtime)
-        *(uintptr_t *)(tp + TCB_OFF_SELF3) = tp;
+        alloc = tls_aligned + TCB_ALLOC;
+        block = mmap(NULL, alloc, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (block == MAP_FAILED) {
+            ldr_err("TLS mmap failed", NULL);
+            return 0;
+        }
+        tp = (uintptr_t)block + tls_aligned;
+    }
+
+    if (!g_is_musl_runtime) {
+        /* Initialize glibc TCB header */
+        *(uintptr_t *)(tp + TCB_OFF_SELF)  = tp;
+        *(uintptr_t *)(tp + TCB_OFF_SELF2) = tp;
+    }
 
     if (g_is_musl_runtime) {
+        uintptr_t self = musl_thread_self_ptr(tp);
         size_t dtv_slots = 1;
         for (int oi = 0; oi < nobj; oi++) {
             if (objs[oi].tls.memsz == 0)
@@ -4960,13 +5309,24 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
         uintptr_t *musl_dtv = mmap(NULL, musl_dtv_bytes,
                                    PROT_READ | PROT_WRITE,
                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (old_tp)
+        if (g_musl_tp_self_delta != 0 && old_self)
+            memcpy((void *)self, (void *)old_self, g_musl_tp_self_delta);
+        else if (old_tp)
             /* Preserve the bootstrap musl main thread state beyond the
              * ABI header. This carries over initialized locale/pthread
              * fields that direct-loaded musl code may read via %fs. */
             memcpy((void *)(tp + MUSL_TCB_PRESERVE_OFF),
                    (void *)(old_tp + MUSL_TCB_PRESERVE_OFF),
                    MUSL_TCB_PRESERVE_LEN);
+
+        *(uintptr_t *)(self + 0) = self;
+        *(uintptr_t *)(self + MUSL_THREAD_PREV_OFF) = self;
+        *(uintptr_t *)(self + MUSL_THREAD_NEXT_OFF) = self;
+        *(uintptr_t *)(self + MUSL_THREAD_ROBUST_HEAD_OFF) =
+            self + MUSL_THREAD_ROBUST_HEAD_OFF;
+        *(int *)(self + MUSL_THREAD_TID_OFF) = (int)syscall(SYS_gettid);
+        *(int *)(self + MUSL_THREAD_ERRNO_OFF) = 0;
+
         if (musl_dtv != MAP_FAILED) {
             musl_dtv[0] = dtv_slots - 1;
             for (int oi = 0; oi < nobj; oi++) {
@@ -4974,9 +5334,9 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
                     continue;
                 musl_dtv[objs[oi].tls.modid] = tp + (uintptr_t)objs[oi].tls.tpoff;
             }
-            *(uintptr_t *)(tp + TCB_OFF_DTV) = (uintptr_t)musl_dtv;
+            *(uintptr_t *)musl_thread_dtv_slot(tp) = (uintptr_t)musl_dtv;
         } else {
-            *(uintptr_t *)(tp + TCB_OFF_DTV) = 0;
+            *(uintptr_t *)musl_thread_dtv_slot(tp) = 0;
         }
     }
 
@@ -5027,29 +5387,27 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
         }
     }
 
-    /* Stack canary from AT_RANDOM */
-    if (at_random) {
-        uintptr_t canary;
-        memcpy(&canary, (void *)at_random, sizeof(canary));
-        canary &= ~(uintptr_t)0xFF;   /* glibc zeroes low byte */
-        *(uintptr_t *)(tp + TCB_OFF_STACK_GUARD) = canary;
-
-        if (!g_is_musl_runtime) {
-            /* Pointer guard is glibc-specific; on musl FS:0x30 is tid/errno. */
+    if (!g_is_musl_runtime) {
+        /* Stack canary from AT_RANDOM */
+        if (at_random) {
+            uintptr_t canary;
             uintptr_t ptr_guard;
+
+            memcpy(&canary, (void *)at_random, sizeof(canary));
+            canary &= ~(uintptr_t)0xFF;   /* glibc zeroes low byte */
+            *(uintptr_t *)(tp + TCB_OFF_STACK_GUARD) = canary;
 
             memcpy(&ptr_guard, (void *)(at_random + sizeof(uintptr_t)),
                    sizeof(ptr_guard));
             *(uintptr_t *)(tp + TCB_OFF_PTR_GUARD) = ptr_guard;
         }
-    }
 
-    /* Preserve the bootstrap libc's stack canary so that SSP checks in
-     * the static libc (musl or glibc) continue to work after we change FS.
-     * Both musl and glibc store the canary at FS:0x28. */
-    {
-        uintptr_t old_canary = arch_read_tp_offset(0x28);
-        *(uintptr_t *)(tp + TCB_OFF_STACK_GUARD) = old_canary;
+        /* Preserve the bootstrap libc's stack canary so that SSP checks in
+         * the static libc continue to work after we change FS. */
+        {
+            uintptr_t old_canary = arch_read_tp_offset(0x28);
+            *(uintptr_t *)(tp + TCB_OFF_STACK_GUARD) = old_canary;
+        }
     }
 
     /* NOTE: .tdata is NOT copied here — it must be copied AFTER
@@ -5417,6 +5775,8 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
                     apply_prelinked_runtime_reloc(&objs[i], objs, nobj,
                                                   &tab[idx]);
                 }
+
+                apply_prelinked_override_fallbacks(&objs[i]);
                 continue;
             }
 
@@ -5433,6 +5793,8 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
                                                       &tabs[t][r]);
                 }
             }
+
+            apply_prelinked_override_fallbacks(&objs[i]);
         }
     } else {
         ldr_dbg("[loader] applying relocations...\n");

@@ -11,6 +11,10 @@
 #include <elf.h>
 #include <errno.h>
 
+#ifndef DLFRZ_FLAG_DATA_VIRTUAL
+#define DLFRZ_FLAG_DATA_VIRTUAL 0x100
+#endif
+
 /* Fallback for musl libc which lacks Elf64_Relr */
 #ifndef ELF_RELR_DEFINED
 #ifdef __LP64__
@@ -39,6 +43,9 @@ typedef Elf64_Xword Elf64_Relr;
 #ifndef R_AARCH64_TLS_DTPREL
 #define R_AARCH64_TLS_DTPREL 1029
 #endif
+#ifndef R_AARCH64_TLSDESC
+#define R_AARCH64_TLSDESC 1031
+#endif
 
 /* ---- architecture-specific relocation types --------------------------- */
 #if defined(__x86_64__)
@@ -59,6 +66,7 @@ typedef Elf64_Xword Elf64_Relr;
   #define ARCH_RELOC_TPOFF      R_AARCH64_TLS_TPREL
   #define ARCH_RELOC_DTPMOD     R_AARCH64_TLS_DTPMOD
   #define ARCH_RELOC_DTPOFF     R_AARCH64_TLS_DTPREL
+    #define ARCH_RELOC_TLSDESC    R_AARCH64_TLSDESC
   #define ARCH_RELOC_IRELATIVE  R_AARCH64_IRELATIVE
   #define ARCH_RELOC_COPY       R_AARCH64_COPY
 #else
@@ -721,8 +729,12 @@ static void pl_parse_dynamic(struct prelink_obj *obj, uint64_t base,
         if (mx >= so)
             while (!(ch[mx - so] & 1)) mx++;
         obj->dynsym_count = mx + 1;
-    } else if (strsz > 0 && strtab > symtab) {
-        obj->dynsym_count = (uint32_t)((strtab - symtab) / sizeof(Elf64_Sym));
+    }
+    if (strsz > 0 && strtab > symtab) {
+        uint32_t span_count = (uint32_t)((strtab - symtab) / sizeof(Elf64_Sym));
+
+        if (span_count > obj->dynsym_count)
+            obj->dynsym_count = span_count;
     }
 
     if (v_rela)     obj->rela       = (const Elf64_Rela *)(base + v_rela);
@@ -871,6 +883,15 @@ static int pl_apply_rela(struct prelink_obj *obj,
             break;
         }
 
+#if defined(__aarch64__)
+        case ARCH_RELOC_TLSDESC:
+            /* TLSDESC descriptors embed resolver function pointers.
+             * These must be synthesized by the runtime loader, where the
+             * loader stub addresses are known, so keep the file contents
+             * untouched and record a runtime fixup instead. */
+            break;
+#endif
+
         default:
             break;
         }
@@ -907,6 +928,10 @@ static int prelink_obj_collect_runtime_fixups(const struct prelink_obj *obj,
             if (type == ARCH_RELOC_IRELATIVE ||
                 type == ARCH_RELOC_COPY) {
                 needs_fixup = 1;
+#if defined(__aarch64__)
+            } else if (type == ARCH_RELOC_TLSDESC) {
+                needs_fixup = 1;
+#endif
             } else if (type == ARCH_RELOC_GLOB_DAT ||
                        type == ARCH_RELOC_JUMP_SLOT) {
                 uint32_t sidx = ELF64_R_SYM(rel->r_info);
@@ -1893,6 +1918,7 @@ int pack_frozen(const struct pack_options *opts)
     int ndata = opts->data_files ? opts->data_files->count : 0;
     int nent = 1 + (opts->deps->interp_path ? 1 : 0) + opts->deps->count + ndata;
     struct dlfrz_entry *entries = calloc(nent, sizeof(*entries));
+    struct dlfrz_lib_meta *metas = NULL;
     /* Parallel array of source paths for lib_meta computation */
     const char **src_paths = calloc(nent, sizeof(char *));
 
@@ -2009,7 +2035,6 @@ int pack_frozen(const struct pack_options *opts)
 
     /* 6b. loader metadata (direct-load mode) ----------------------- */
     size_t meta_off = 0;
-    struct dlfrz_lib_meta *metas = NULL;
     if (opts->direct_load) {
         metas = calloc(eidx, sizeof(*metas));
         if (!metas) goto fail2;
