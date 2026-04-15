@@ -1197,6 +1197,125 @@ test_python3_direct() {
 }
 
 # ===================================================================
+# Test 12: glibc direct-load keeps rseq below static TLS for threads
+# ===================================================================
+test_glibc_tls_dtor_direct() {
+    echo "--- glibc tls-dtor direct-load ---"
+    if ! command -v g++ &>/dev/null; then
+        skip "glibc-tls-dtor-direct" "g++ not installed"
+        return
+    fi
+
+    local lib_src="$BUILD/tls_dtor_lib.cpp" main_src="$BUILD/tls_dtor_main.cpp"
+    local lib="$BUILD/libtls_dtor.so" bin="$BUILD/tls_dtor_main" out="$BUILD/tls_dtor_main.frozen"
+
+    cat > "$lib_src" <<'CPP'
+struct Marker {
+    int value;
+    Marker() : value(0) {}
+    ~Marker() {}
+};
+
+thread_local Marker marker;
+
+extern "C" int tls_dtor_touch(void) {
+    return ++marker.value;
+}
+CPP
+
+    cat > "$main_src" <<'CPP'
+#include <pthread.h>
+#include <stdio.h>
+
+extern "C" int tls_dtor_touch(void);
+
+static void *run(void *arg) {
+    (void)arg;
+    printf("%d\n", tls_dtor_touch());
+    return NULL;
+}
+
+int main(void) {
+    pthread_t thread;
+
+    if (pthread_create(&thread, NULL, run, NULL) != 0)
+        return 1;
+    if (pthread_join(thread, NULL) != 0)
+        return 2;
+    return 0;
+}
+CPP
+
+    if ! g++ -shared -fPIC -o "$lib" "$lib_src"; then
+        fail "glibc-tls-dtor-direct" "g++ failed building shared library"
+        return
+    fi
+    if ! g++ -pthread -L"$BUILD" -Wl,-rpath,'$ORIGIN' -o "$bin" "$main_src" -ltls_dtor; then
+        fail "glibc-tls-dtor-direct" "g++ failed building executable"
+        return
+    fi
+    if ! "$DLFREEZE" -d -o "$out" -- "$bin" 2>/dev/null; then
+        fail "glibc-tls-dtor-direct" "dlfreeze failed"
+        return
+    fi
+
+    local expect actual rc_e=0 rc_a=0
+    expect=$("$bin" 2>&1) || rc_e=$?
+    actual=$(timeout 30 "$out" 2>&1) || rc_a=$?
+
+    if [ "$expect" = "$actual" ] && [ "$rc_e" = "$rc_a" ]; then
+        pass "glibc tls-dtor direct-load"
+    else
+        fail "glibc tls-dtor direct-load" "output or exit code differs (exit $rc_e vs $rc_a)"
+        diff --color=auto <(echo "$expect") <(echo "$actual") | head -20 || true
+    fi
+
+    rm -f "$lib_src" "$main_src" "$lib" "$bin" "$out"
+}
+
+# ===================================================================
+# Test 13: host Ruby direct-load handles missing user gem directories
+# ===================================================================
+test_ruby_direct_host_run() {
+    echo "--- ruby direct-load host-run ---"
+    if ! command -v ruby &>/dev/null; then
+        skip "ruby-direct-host-run" "ruby not installed"
+        return
+    fi
+
+    local rubypath out home
+    local expect actual rc_e=0 rc_a=0
+    rubypath=$(readlink -f "$(which ruby)")
+    out="$BUILD/ruby-host.frozen"
+    home="$BUILD/ruby-home-missing"
+
+    rm -rf "$home"
+
+    expect=$(HOME="$home" "$rubypath" -e 'puts 1+2' 2>&1) || rc_e=$?
+    if [ "$rc_e" -ne 0 ]; then
+        fail "ruby-direct-host-run" "native ruby failed (exit $rc_e)"
+        rm -rf "$home"
+        return
+    fi
+    if ! HOME="$home" "$DLFREEZE" -d -t -f '/usr/*' -o "$out" -- "$rubypath" -e 'puts 1+2' 2>/dev/null; then
+        fail "ruby-direct-host-run" "dlfreeze failed"
+        rm -rf "$home"
+        return
+    fi
+    actual=$(HOME="$home" timeout 30 "$out" -e 'puts 1+2' 2>&1) || rc_a=$?
+
+    if [ "$expect" = "$actual" ] && [ "$rc_e" = "$rc_a" ]; then
+        pass "ruby direct host-run"
+    else
+        fail "ruby direct host-run" "output or exit code differs (exit $rc_e vs $rc_a)"
+        diff --color=auto <(echo "$expect") <(echo "$actual") | head -20 || true
+    fi
+
+    rm -rf "$home"
+    rm -f "$out"
+}
+
+# ===================================================================
 echo "======== dlfreeze test suite ========"
 echo "build dir: $BUILD"
 echo ""
@@ -1228,6 +1347,8 @@ test_direct_dlopen_embedded
 test_direct_dlopen_deps
 test_direct_dlopen_fallback
 test_python3_direct
+test_glibc_tls_dtor_direct
+test_ruby_direct_host_run
 
 echo ""
 echo "======== ${GRN}$PASS passed${RST}, ${RED}$FAIL failed${RST}, ${YLW}$SKIP skipped${RST} ========"

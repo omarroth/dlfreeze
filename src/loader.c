@@ -303,9 +303,19 @@ static void ldr_err(const char *ctx, const char *detail)
 #include <signal.h>
 /* Pointer to mapped libc's main_arena, set during init for crash diagnostics */
 static uintptr_t g_arena_addr;
-/* Saved pointer_guard value and its address, for crash diagnostics */
+/* Saved stack/pointer guard values and a main-thread address for diagnostics. */
+static uintptr_t g_saved_stack_guard;
 static uintptr_t g_saved_ptr_guard;
 static uintptr_t g_ptr_guard_addr;
+
+static inline void sync_glibc_errno_value(int err);
+static inline void set_loader_errno(int err);
+
+#if defined(__x86_64__)
+static const uintptr_t g_ptr_guard_off = 48;
+#elif defined(__aarch64__)
+static const uintptr_t g_ptr_guard_off = 24;
+#endif
 
 /*
  * restore_ptr_guard — fix corruption from bootstrap libc's errno writes.
@@ -322,8 +332,12 @@ static uintptr_t g_ptr_guard_addr;
  */
 static inline void restore_ptr_guard(void)
 {
-    if (g_ptr_guard_addr)
-        *(uintptr_t *)g_ptr_guard_addr = g_saved_ptr_guard;
+    if (g_saved_ptr_guard) {
+        uintptr_t tp = arch_get_tp();
+
+        if (tp > 0x1000)
+            *(uintptr_t *)(tp + g_ptr_guard_off) = g_saved_ptr_guard;
+    }
 }
 
 /* Fatal signals that the loader temporarily owns while running init code. */
@@ -339,14 +353,20 @@ static int guarded_sigaction(int signum, const struct sigaction *act,
                              struct sigaction *oldact)
 {
     int rc = sigaction(signum, act, oldact);
+    int saved_errno = errno;
     restore_ptr_guard();
+    if (rc < 0)
+        sync_glibc_errno_value(saved_errno);
     return rc;
 }
 
 static signal_handler_t guarded_signal(int signum, signal_handler_t handler)
 {
     signal_handler_t old = signal(signum, handler);
+    int saved_errno = errno;
     restore_ptr_guard();
+    if (old == SIG_ERR)
+        sync_glibc_errno_value(saved_errno);
     return old;
 }
 
@@ -876,8 +896,9 @@ static uint8_t g_fake_link_map[0x500] __attribute__((aligned(64)));
  * offset 0 (= the TCB itself).  On thread cleanup glibc memsets the
  * rseq area, destroying the TCB and causing SIGSEGV.
  *
- * We provide our own copies.  __rseq_offset = -160 matches glibc 2.43
- * on x86-64 (offsetof(struct pthread, rseq_area) from the thread pointer).
+ * We provide our own copies.  __rseq_offset is set at runtime once the
+ * static TLS layout is known so the 32-byte rseq area sits below every
+ * TLS block copied into the thread image.
  * __rseq_size = 32 is the minimum kernel rseq struct size.
  */
 static int64_t  g_rseq_offset = -160;
@@ -1968,6 +1989,12 @@ static void *stub_dl_allocate_tls(void *mem)
     *(uintptr_t *)(tp + TCB_OFF_SELF)  = tp;   /* tcbhead.tcb  (offset 0)  */
     *(uintptr_t *)(tp + TCB_OFF_SELF2) = tp;   /* tcbhead.self (offset 16) */
 
+    /* New glibc threads inherit the process-wide canary/pointer guard. */
+    if (g_saved_stack_guard)
+        *(uintptr_t *)(tp + TCB_OFF_STACK_GUARD) = g_saved_stack_guard;
+    if (g_saved_ptr_guard)
+        *(uintptr_t *)(tp + TCB_OFF_PTR_GUARD) = g_saved_ptr_guard;
+
     /* Copy .tdata for all TLS modules */
     void *ret = stub_dl_allocate_tls_init(mem);
 
@@ -2129,19 +2156,57 @@ static int vfs_is_dir_marker_path(const char *path)
     return len >= 5 && strcmp(path + len - 5, "/.dir") == 0;
 }
 
+typedef int *(*errno_location_fn)(void);
+static errno_location_fn g_real_errno_location;
+
+static inline void sync_glibc_errno_value(int err)
+{
+    if (err > 0 && g_real_errno_location)
+        *g_real_errno_location() = err;
+}
+
+static inline void set_loader_errno(int err)
+{
+    errno = err;
+    sync_glibc_errno_value(err);
+}
+
 /*
  * VFS_SYSCALL — wrapper for syscall() in VFS functions.
  * musl's __syscall_ret writes errno at FS:0x34 on failure, corrupting
  * glibc's pointer_guard at FS:0x30.  This macro restores it after
  * every syscall so that atexit handlers can still PTR_DEMANGLE.
  */
-#define VFS_SYSCALL(...) ({ long _r = syscall(__VA_ARGS__); restore_ptr_guard(); _r; })
+#define VFS_SYSCALL(...) ({                           \
+    long _r = syscall(__VA_ARGS__);                  \
+    int _e = errno;                                  \
+    restore_ptr_guard();                             \
+    if (_r < 0)                                      \
+        sync_glibc_errno_value(_e);                  \
+    _r;                                              \
+})
 
 /* Saved real libc fopen/fdopen for vfs_fopen fallthrough */
 typedef void *(*fopen_fn)(const char *, const char *);
 typedef void *(*fdopen_fn)(int, const char *);
+typedef void *(*opendir_fn)(const char *);
+typedef void *(*fdopendir_fn)(int);
+typedef void *(*readdir_fn)(void *);
+typedef int (*closedir_fn)(void *);
+typedef int (*dirfd_fn)(void *);
+typedef void (*rewinddir_fn)(void *);
+typedef long (*telldir_fn)(void *);
+typedef void (*seekdir_fn)(void *, long);
 static fopen_fn  g_real_fopen;
 static fdopen_fn g_real_fdopen;
+static opendir_fn g_real_opendir;
+static fdopendir_fn g_real_fdopendir;
+static readdir_fn g_real_readdir;
+static closedir_fn g_real_closedir;
+static dirfd_fn g_real_dirfd;
+static rewinddir_fn g_real_rewinddir;
+static telldir_fn g_real_telldir;
+static seekdir_fn g_real_seekdir;
 
 static uint32_t vfs_hash(const char *s)
 {
@@ -2765,6 +2830,21 @@ static const char *lookup_vfs_dirfd(int fd)
     return NULL;
 }
 
+static void forget_vfs_dirfd(int fd)
+{
+    if (fd < 0)
+        return;
+
+    for (int i = 0; i < VFS_DIRFD_MAP_MAX; i++) {
+        if (g_vfs_dirfd_maps[i].path[0] == '\0')
+            continue;
+        if (g_vfs_dirfd_maps[i].fd != fd)
+            continue;
+        g_vfs_dirfd_maps[i].fd = -1;
+        g_vfs_dirfd_maps[i].path[0] = '\0';
+    }
+}
+
 static int resolve_vfs_path_at(int dirfd, const char *path,
                                char *resolved, size_t resolved_sz)
 {
@@ -2804,6 +2884,9 @@ static void *vfs_opendir(const char *path)
     int has_vfs = (path && path[0] == '/' && vfs_dir_exists(path));
     int fd = -1;
 
+    if (!has_vfs && g_real_opendir)
+        return g_real_opendir(path);
+
     if (has_vfs)
         vfs_dbg_op("opendir", path, "enter");
 
@@ -2842,6 +2925,44 @@ static void *vfs_opendir(const char *path)
     return NULL;
 }
 
+static void *vfs_fdopendir(int fd)
+{
+    const char *mapped = lookup_vfs_dirfd(fd);
+
+    if (fd < 0) {
+        set_loader_errno(EBADF);
+        return NULL;
+    }
+    if (!mapped && g_real_fdopendir)
+        return g_real_fdopendir(fd);
+
+    for (int i = 0; i < VFS_MAX_DIR_HANDLES; i++) {
+        struct vfs_dir_handle *h;
+
+        if (g_dir_handles[i].magic == VFS_FAKE_DIR_MAGIC)
+            continue;
+        h = &g_dir_handles[i];
+        memset(h, 0, sizeof(*h));
+        h->magic = VFS_FAKE_DIR_MAGIC;
+        h->fd_compat = fd;
+        h->vfs_path = mapped;
+        h->gd_pos = 0;
+        h->gd_len = 0;
+        if (mapped) {
+            h->vfs_path_len = strlen(mapped);
+            h->scan_pos = 0;
+            h->phase = (int)VFS_SYSCALL(SYS_faccessat, AT_FDCWD, mapped,
+                                        0 /* F_OK */, 0) == 0 ? -1 : 0;
+            vfs_dbg_op("fdopendir", mapped,
+                       (h->phase == -1) ? "merged" : "virtual");
+        }
+        return (void *)h;
+    }
+
+    set_loader_errno(EMFILE);
+    return NULL;
+}
+
 /* linux_dirent64 as returned by SYS_getdents64 */
 struct ldr_linux_dirent64 {
     uint64_t       d_ino;
@@ -2854,7 +2975,14 @@ struct ldr_linux_dirent64 {
 static struct dirent *vfs_readdir(void *dirp)
 {
     struct vfs_dir_handle *h = (struct vfs_dir_handle *)dirp;
-    if (!h || h->magic != VFS_FAKE_DIR_MAGIC) return NULL;
+    if (!h)
+        return NULL;
+    if (h->magic != VFS_FAKE_DIR_MAGIC) {
+        if (g_real_readdir)
+            return (struct dirent *)g_real_readdir(dirp);
+        set_loader_errno(EBADF);
+        return NULL;
+    }
 
     /* ---- Phase -1: drain real directory via getdents64 ---- */
     if (h->phase == -1) {
@@ -2910,7 +3038,8 @@ static struct dirent *vfs_readdir(void *dirp)
                         if (r == 0) continue;
                     }
                     h->result.d_ino = (ino_t)(si + 1);
-                    h->result.d_off = (off_t)h->scan_pos;
+                    h->result.d_off = ((off_t)1 << 32) |
+                                      (uint32_t)h->scan_pos;
                     h->result.d_reclen = sizeof(struct dirent);
                     h->result.d_type = DT_REG;
                     int nlen = strlen(rest);
@@ -2939,7 +3068,8 @@ static struct dirent *vfs_readdir(void *dirp)
                         if (r == 0) continue;
                     }
                     h->result.d_ino = (ino_t)(VFS_HASH_SIZE + si + 1);
-                    h->result.d_off = (off_t)(VFS_HASH_SIZE + h->scan_pos);
+                    h->result.d_off = ((off_t)2 << 32) |
+                                      (uint32_t)h->scan_pos;
                     h->result.d_reclen = sizeof(struct dirent);
                     h->result.d_type = DT_DIR;
                     int nlen = strlen(rest);
@@ -2982,11 +3112,129 @@ static struct dirent *vfs_readdir(void *dirp)
 static int vfs_closedir(void *dirp)
 {
     struct vfs_dir_handle *h = (struct vfs_dir_handle *)dirp;
-    if (!h || h->magic != VFS_FAKE_DIR_MAGIC) return -1;
-    if (h->fd_compat >= 0)
+    if (!h)
+        return -1;
+    if (h->magic != VFS_FAKE_DIR_MAGIC) {
+        if (g_real_closedir)
+            return g_real_closedir(dirp);
+        set_loader_errno(EBADF);
+        return -1;
+    }
+    if (h->fd_compat >= 0) {
+        forget_vfs_dirfd(h->fd_compat);
         VFS_SYSCALL(SYS_close, h->fd_compat);
+    }
     h->magic = 0;
     return 0;
+}
+
+static void vfs_rewinddir(void *dirp)
+{
+    struct vfs_dir_handle *h = (struct vfs_dir_handle *)dirp;
+
+    if (!h)
+        return;
+    if (h->magic != VFS_FAKE_DIR_MAGIC) {
+        if (g_real_rewinddir) {
+            g_real_rewinddir(dirp);
+            return;
+        }
+        set_loader_errno(EBADF);
+        return;
+    }
+    if (h->fd_compat >= 0) {
+        VFS_SYSCALL(SYS_lseek, h->fd_compat, (off_t)0, SEEK_SET);
+        h->gd_pos = 0;
+        h->gd_len = 0;
+    }
+    h->scan_pos = 0;
+    if (h->vfs_path) {
+        h->phase = (int)VFS_SYSCALL(SYS_faccessat, AT_FDCWD, h->vfs_path,
+                                    0 /* F_OK */, 0) == 0 ? -1 : 0;
+    }
+}
+
+static long vfs_telldir(void *dirp)
+{
+    struct vfs_dir_handle *h = (struct vfs_dir_handle *)dirp;
+
+    if (!h)
+        return -1;
+    if (h->magic != VFS_FAKE_DIR_MAGIC) {
+        if (g_real_telldir)
+            return g_real_telldir(dirp);
+        set_loader_errno(EBADF);
+        return -1;
+    }
+    if (h->phase >= 0 && h->vfs_path)
+        return (long)h->result.d_off;
+    return (long)h->result.d_off;
+}
+
+static void vfs_seekdir(void *dirp, long loc)
+{
+    struct vfs_dir_handle *h = (struct vfs_dir_handle *)dirp;
+    uint32_t tag;
+
+    if (!h)
+        return;
+    if (h->magic != VFS_FAKE_DIR_MAGIC) {
+        if (g_real_seekdir) {
+            g_real_seekdir(dirp, loc);
+            return;
+        }
+        set_loader_errno(EBADF);
+        return;
+    }
+    if (loc == 0) {
+        vfs_rewinddir(dirp);
+        return;
+    }
+
+    tag = (uint32_t)((unsigned long)loc >> 32);
+    if (tag != 0 && h->vfs_path) {
+        h->phase = (int)tag - 1;
+        h->scan_pos = (int)((uint32_t)loc);
+        h->gd_pos = 0;
+        h->gd_len = 0;
+        return;
+    }
+
+    if (h->fd_compat >= 0) {
+        VFS_SYSCALL(SYS_lseek, h->fd_compat, (off_t)loc, SEEK_SET);
+        h->gd_pos = 0;
+        h->gd_len = 0;
+        if (h->vfs_path)
+            h->phase = -1;
+    }
+}
+
+static int vfs_dirfd(void *dirp)
+{
+    struct vfs_dir_handle *h = (struct vfs_dir_handle *)dirp;
+
+    if (!h)
+        return -1;
+    if (h->magic != VFS_FAKE_DIR_MAGIC) {
+        if (g_real_dirfd)
+            return g_real_dirfd(dirp);
+        set_loader_errno(EBADF);
+        return -1;
+    }
+    if (h->fd_compat < 0 && h->vfs_path) {
+        int fd = (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, "/",
+                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+
+        if (fd >= 0) {
+            h->fd_compat = fd;
+            remember_vfs_dirfd(fd, h->vfs_path);
+        }
+    }
+    if (h->fd_compat < 0) {
+        set_loader_errno(EBADF);
+        return -1;
+    }
+    return h->fd_compat;
 }
 
 /* Helper: create a memfd serving embedded VFS data for a file entry */
@@ -3446,8 +3694,13 @@ static const struct stub_sym g_vfs_overrides[] = {
     { "access",          (void *)vfs_access         },
     { "faccessat",       (void *)vfs_faccessat      },
     { "opendir",         (void *)vfs_opendir        },
+    { "fdopendir",       (void *)vfs_fdopendir      },
+    { "dirfd",           (void *)vfs_dirfd          },
     { "readdir",         (void *)vfs_readdir        },
     { "readdir64",       (void *)vfs_readdir        },
+    { "rewinddir",       (void *)vfs_rewinddir      },
+    { "telldir",         (void *)vfs_telldir        },
+    { "seekdir",         (void *)vfs_seekdir        },
     { "closedir",        (void *)vfs_closedir       },
     { "fopen",           (void *)vfs_fopen          },
     { "fopen64",         (void *)vfs_fopen          },
@@ -5611,6 +5864,7 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
     uintptr_t old_tp = 0;
     uintptr_t old_self = 0;
     uint64_t max_tls_align = 1;
+    int64_t min_static_tpoff = 0;
 
     /* Discover PT_TLS for each object and compute total static TLS size.
      * x86-64 uses Variant II: TLS blocks at negative TP offsets.
@@ -5639,6 +5893,8 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
             } else {
                 total_tls = ALIGN_UP(total_tls + phdrs[j].p_memsz, align);
                 objs[oi].tls.tpoff  = -(int64_t)total_tls;
+                if (objs[oi].tls.tpoff < min_static_tpoff)
+                    min_static_tpoff = objs[oi].tls.tpoff;
             }
             objs[oi].tls.filesz = phdrs[j].p_filesz;
             objs[oi].tls.memsz  = phdrs[j].p_memsz;
@@ -5676,6 +5932,12 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
         else if (g_glibc_off->gl_tls_static_align >= 0)
             *(size_t *)(g_fake_rtld_global + g_glibc_off->gl_tls_static_align)
                 = tls_align;
+    }
+
+    if (!g_is_musl_runtime && min_static_tpoff < 0) {
+        int64_t rseq_off = min_static_tpoff - (int64_t)32;
+
+        g_rseq_offset = rseq_off & ~((int64_t)31);
     }
 
     if (g_is_musl_runtime) {
@@ -5851,9 +6113,11 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
     /* Save pointer_guard value and address for crash diagnostics.
      * musl does not keep a glibc-style pointer guard in the TCB header. */
     if (!g_is_musl_runtime) {
+        g_saved_stack_guard = *(uintptr_t *)(tp + TCB_OFF_STACK_GUARD);
         g_ptr_guard_addr = tp + TCB_OFF_PTR_GUARD;
         g_saved_ptr_guard = *(uintptr_t *)(tp + TCB_OFF_PTR_GUARD);
     } else {
+        g_saved_stack_guard = 0;
         g_ptr_guard_addr = 0;
         g_saved_ptr_guard = 0;
     }
@@ -6137,13 +6401,18 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     if (prelinked) {
         ldr_dbg("[loader] pre-linked: patching overrides...\n");
 
-        /* Resolve real libc fopen/fdopen BEFORE overrides are applied,
-         * so vfs_fopen can fall through to the real implementation.
-         * Must bypass resolve_sym (which checks g_vfs_overrides and
-         * would return our own vfs_fopen). Scan symbol tables directly.
-         * musl exports fopen while glibc commonly exposes fopen64. */
+        /* Resolve real libc file/dir helpers BEFORE overrides are applied,
+         * so VFS wrappers can fall through to the real implementation for
+         * non-VFS paths and directory streams. Must bypass resolve_sym
+         * (which checks g_vfs_overrides and would return our wrappers). */
         if (g_vfs_count > 0) {
-            for (int i = 0; i < nobj && (!g_real_fopen || !g_real_fdopen); i++) {
+            for (int i = 0; i < nobj &&
+                    (!g_real_fopen || !g_real_fdopen || !g_real_opendir ||
+                     !g_real_fdopendir || !g_real_readdir ||
+                     !g_real_closedir || !g_real_dirfd ||
+                     !g_real_rewinddir || !g_real_telldir ||
+                     !g_real_errno_location ||
+                     !g_real_seekdir); i++) {
                 if (!objs[i].dynsym || !objs[i].dynstr) continue;
                 for (uint32_t s = 0; s < objs[i].dynsym_count; s++) {
                     const Elf64_Sym *sym = &objs[i].dynsym[s];
@@ -6157,12 +6426,49 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
                     else if (!g_real_fdopen && n[0] == 'f' && n[1] == 'd'
                              && strcmp(n, "fdopen") == 0)
                         g_real_fdopen = (fdopen_fn)(uintptr_t)(objs[i].base + sym->st_value);
+                    else if (!g_real_opendir && strcmp(n, "opendir") == 0)
+                        g_real_opendir = (opendir_fn)(uintptr_t)(objs[i].base + sym->st_value);
+                    else if (!g_real_fdopendir && strcmp(n, "fdopendir") == 0)
+                        g_real_fdopendir = (fdopendir_fn)(uintptr_t)(objs[i].base + sym->st_value);
+                    else if (!g_real_readdir && strcmp(n, "readdir") == 0)
+                        g_real_readdir = (readdir_fn)(uintptr_t)(objs[i].base + sym->st_value);
+                    else if (!g_real_closedir && strcmp(n, "closedir") == 0)
+                        g_real_closedir = (closedir_fn)(uintptr_t)(objs[i].base + sym->st_value);
+                    else if (!g_real_dirfd && strcmp(n, "dirfd") == 0)
+                        g_real_dirfd = (dirfd_fn)(uintptr_t)(objs[i].base + sym->st_value);
+                    else if (!g_real_rewinddir && strcmp(n, "rewinddir") == 0)
+                        g_real_rewinddir = (rewinddir_fn)(uintptr_t)(objs[i].base + sym->st_value);
+                    else if (!g_real_telldir && strcmp(n, "telldir") == 0)
+                        g_real_telldir = (telldir_fn)(uintptr_t)(objs[i].base + sym->st_value);
+                    else if (!g_real_errno_location &&
+                             strcmp(n, "__errno_location") == 0)
+                        g_real_errno_location = (errno_location_fn)(uintptr_t)(objs[i].base + sym->st_value);
+                    else if (!g_real_seekdir && strcmp(n, "seekdir") == 0)
+                        g_real_seekdir = (seekdir_fn)(uintptr_t)(objs[i].base + sym->st_value);
                 }
             }
             ldr_dbg("[loader] g_real_fopen=");
             ldr_dbg_hex("0x", (uint64_t)(uintptr_t)g_real_fopen);
             ldr_dbg(" g_real_fdopen=");
             ldr_dbg_hex("0x", (uint64_t)(uintptr_t)g_real_fdopen);
+            ldr_dbg(" g_real_opendir=");
+            ldr_dbg_hex("0x", (uint64_t)(uintptr_t)g_real_opendir);
+            ldr_dbg(" g_real_fdopendir=");
+            ldr_dbg_hex("0x", (uint64_t)(uintptr_t)g_real_fdopendir);
+            ldr_dbg(" g_real_readdir=");
+            ldr_dbg_hex("0x", (uint64_t)(uintptr_t)g_real_readdir);
+            ldr_dbg(" g_real_closedir=");
+            ldr_dbg_hex("0x", (uint64_t)(uintptr_t)g_real_closedir);
+            ldr_dbg(" g_real_dirfd=");
+            ldr_dbg_hex("0x", (uint64_t)(uintptr_t)g_real_dirfd);
+            ldr_dbg(" g_real_rewinddir=");
+            ldr_dbg_hex("0x", (uint64_t)(uintptr_t)g_real_rewinddir);
+            ldr_dbg(" g_real_telldir=");
+            ldr_dbg_hex("0x", (uint64_t)(uintptr_t)g_real_telldir);
+            ldr_dbg(" g_real_errno_location=");
+            ldr_dbg_hex("0x", (uint64_t)(uintptr_t)g_real_errno_location);
+            ldr_dbg(" g_real_seekdir=");
+            ldr_dbg_hex("0x", (uint64_t)(uintptr_t)g_real_seekdir);
         }
 
         /* Build the unified special-symbol hash table (overrides, stubs,
