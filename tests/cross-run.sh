@@ -143,6 +143,72 @@ for src_dir in "$FROZEN_DIR"/frozen-*; do
         skip "$src_env/exitcode.upx.frozen" "UPX not available at build time"
     fi
 
+    # ── python3.frozen ─────────────────────────────────────────────
+    frozen_py="$src_dir/python3.frozen"
+    expected_py="$src_dir/python3.expected"
+    if [ -f "$frozen_py" ] && [ -f "$expected_py" ]; then
+        chmod +x "$frozen_py" 2>/dev/null || true
+        rc=0
+        actual=$(run_capture "$frozen_py" -c 'print(1+2)' 2>&1) || rc=$?
+        exp=$(cat "$expected_py")
+        if [ "$actual" = "$exp" ] && [ "$rc" -eq 0 ]; then
+            pass "$src_env/python3.frozen"
+        else
+            fail "$src_env/python3.frozen" "output differs or rc=$rc"
+        fi
+    else
+        skip "$src_env/python3.frozen" "artifact not found"
+    fi
+
+    # ── python3.upx.frozen ─────────────────────────────────────────
+    frozen_py_upx="$src_dir/python3.upx.frozen"
+    if [ -f "$frozen_py_upx" ] && [ -f "$expected_py" ]; then
+        chmod +x "$frozen_py_upx" 2>/dev/null || true
+        rc=0
+        actual=$(run_capture "$frozen_py_upx" -c 'print(1+2)' 2>&1) || rc=$?
+        exp=$(cat "$expected_py")
+        if [ "$actual" = "$exp" ] && [ "$rc" -eq 0 ]; then
+            pass "$src_env/python3.upx.frozen"
+        else
+            fail "$src_env/python3.upx.frozen" "output differs or rc=$rc"
+        fi
+    else
+        skip "$src_env/python3.upx.frozen" "UPX not available at build time"
+    fi
+
+    # ── ruby.frozen ────────────────────────────────────────────────
+    frozen_rb="$src_dir/ruby.frozen"
+    expected_rb="$src_dir/ruby.expected"
+    if [ -f "$frozen_rb" ] && [ -f "$expected_rb" ]; then
+        chmod +x "$frozen_rb" 2>/dev/null || true
+        rc=0
+        actual=$(run_capture "$frozen_rb" -e 'puts 1+2' 2>&1) || rc=$?
+        exp=$(cat "$expected_rb")
+        if [ "$actual" = "$exp" ] && [ "$rc" -eq 0 ]; then
+            pass "$src_env/ruby.frozen"
+        else
+            fail "$src_env/ruby.frozen" "output differs or rc=$rc"
+        fi
+    else
+        skip "$src_env/ruby.frozen" "artifact not found"
+    fi
+
+    # ── ruby.upx.frozen ────────────────────────────────────────────
+    frozen_rb_upx="$src_dir/ruby.upx.frozen"
+    if [ -f "$frozen_rb_upx" ] && [ -f "$expected_rb" ]; then
+        chmod +x "$frozen_rb_upx" 2>/dev/null || true
+        rc=0
+        actual=$(run_capture "$frozen_rb_upx" -e 'puts 1+2' 2>&1) || rc=$?
+        exp=$(cat "$expected_rb")
+        if [ "$actual" = "$exp" ] && [ "$rc" -eq 0 ]; then
+            pass "$src_env/ruby.upx.frozen"
+        else
+            fail "$src_env/ruby.upx.frozen" "output differs or rc=$rc"
+        fi
+    else
+        skip "$src_env/ruby.upx.frozen" "UPX not available at build time"
+    fi
+
     echo ""
 done
 

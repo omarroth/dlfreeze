@@ -796,6 +796,36 @@ static const struct glibc_ver_offsets glibc_aarch64_2_31 = {
     .gl_make_stack_executable = 0xfd0,
 };
 
+/* glibc 2.35–2.39 (AArch64): _rtld_global_ro=688B, _rtld_global=4504B
+ * Ubuntu 22.04 arm64 (glibc 2.35) through Ubuntu 24.04 arm64 (glibc 2.39).
+ * Lock callbacks removed (same as x86-64 2.34+).
+ * TLS static size/align fields now in _rtld_global_ro.
+ * All offsets verified empirically via probe on Ubuntu 24.04 arm64 glibc 2.39.
+ * _rtld_global_ro offsets = x86-64 glibc_2_37 offsets - 264 (no x86 CPU feats).
+ * _rtld_global offsets = x86-64 glibc_2_37 offsets + 152 (larger link_map). */
+static const struct glibc_ver_offsets glibc_aarch64_2_35 = {
+    .glro_tls_static_size  = 448,   /* 0x1C0 */
+    .glro_tls_static_align = 456,   /* 0x1C8 */
+    .glro_debug_printf     = 584,   /* 0x248 */
+    .glro_mcount           = 592,   /* 0x250 */
+    .glro_open             = 608,   /* 0x260 */
+    .glro_close            = 616,   /* 0x268 */
+    .glro_catch_error      = 624,   /* 0x270 */
+    .glro_error_free       = 632,   /* 0x278 */
+    .glro_find_object      = 656,   /* 0x290 */
+    .gl_tls_static_size    = -1,
+    .gl_tls_static_align   = -1,
+    .gl_nns                = 2712,  /* 0x0A98 */
+    .gl_stack_flags        = 4360,  /* 0x1108 */
+    .gl_tls_generation     = 4416,  /* 0x1140 */
+    .gl_stack_used         = 4432,  /* 0x1150 */
+    .gl_stack_user         = 4448,  /* 0x1160 */
+    .gl_stack_cache        = 4464,  /* 0x1170 */
+    .gl_rtld_lock_recursive   = -1,
+    .gl_rtld_unlock_recursive = -1,
+    .gl_make_stack_executable = -1,
+};
+
 /* glibc 2.34–2.36 (x86-64): _rtld_global_ro=928B, _rtld_global=4304B
  * TLS fields moved to _rtld_global_ro.  Has catch_error/error_free/
  * find_object.  Has stack lists.  Same glro layout as 2.40+ but
@@ -1236,6 +1266,7 @@ static const struct {
     { 520,  4088, &glibc_aarch64_2_27 }, /* glibc 2.27     AArch64 */
     { 536,  3992, &glibc_2_29 },    /* glibc 2.29–2.33 x86-64 */
     { 624,  4152, &glibc_aarch64_2_31 }, /* glibc 2.31     AArch64 */
+    { 688,  4504, &glibc_aarch64_2_35 }, /* glibc 2.35–2.39 AArch64 */
     { 928,  4304, &glibc_2_34 },    /* glibc 2.34–2.36 x86-64 */
     { 952,  4352, &glibc_2_37 },    /* glibc 2.37–2.39 x86-64 */
     { 928,  2120, &glibc_2_40 },    /* glibc 2.40+     x86-64 */

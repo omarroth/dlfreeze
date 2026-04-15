@@ -21,6 +21,7 @@ if [ -f /etc/alpine-release ]; then
     apk add --no-cache \
         gcc musl-dev make linux-headers bash python3 file binutils
     apk add --no-cache upx 2>/dev/null || true
+    apk add --no-cache ruby 2>/dev/null || true
     # Alpine's gcc IS musl-gcc; create symlink so tests that check
     # for the musl-gcc command still work.
     if ! command -v musl-gcc >/dev/null 2>&1; then
@@ -36,6 +37,7 @@ elif [ -f /etc/debian_version ]; then
     fi
     apt-get install -y -qq gcc musl-tools make bash file binutils 2>&1 | tail -1
     apt-get install -y -qq python3 2>/dev/null || true
+    apt-get install -y -qq ruby 2>/dev/null || true
     # Prefer UPX ≥ 4.x — the system package may be too old (e.g. 3.95 on
     # 20.04 doesn't support our binaries).  Try to fetch a recent release.
     if ! apt-get install -y -qq upx-ucl 2>/dev/null; then
@@ -139,6 +141,38 @@ if command -v upx >/dev/null 2>&1; then
     echo "UPX compression: done"
 else
     echo "UPX: not available, skipping compressed variants"
+fi
+
+# 4. Python3 — freeze a simple deterministic script (best effort)
+if command -v python3 >/dev/null 2>&1; then
+    if /work/build/dlfreeze -v -d -o "$OUTDIR/python3.frozen" -- python3 -c 'print(1+2)' 2>/dev/null; then
+        chmod +x "$OUTDIR/python3.frozen"
+        echo "3" > "$OUTDIR/python3.expected"
+        if command -v upx >/dev/null 2>&1; then
+            upx --best -o "$OUTDIR/python3.upx.frozen" "$OUTDIR/python3.frozen" 2>/dev/null && \
+                chmod +x "$OUTDIR/python3.upx.frozen" || true
+        fi
+    else
+        echo "WARNING: failed to freeze python3 (skipping)"
+    fi
+else
+    echo "python3: not available, skipping"
+fi
+
+# 5. Ruby — freeze a simple deterministic script (best effort)
+if command -v ruby >/dev/null 2>&1; then
+    if /work/build/dlfreeze -v -d -o "$OUTDIR/ruby.frozen" -- ruby -e 'puts 1+2' 2>/dev/null; then
+        chmod +x "$OUTDIR/ruby.frozen"
+        echo "3" > "$OUTDIR/ruby.expected"
+        if command -v upx >/dev/null 2>&1; then
+            upx --best -o "$OUTDIR/ruby.upx.frozen" "$OUTDIR/ruby.frozen" 2>/dev/null && \
+                chmod +x "$OUTDIR/ruby.upx.frozen" || true
+        fi
+    else
+        echo "WARNING: failed to freeze ruby (skipping)"
+    fi
+else
+    echo "ruby: not available, skipping"
 fi
 
 echo ""
