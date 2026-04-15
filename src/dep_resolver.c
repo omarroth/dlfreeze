@@ -147,8 +147,28 @@ static int dep_list_add(struct dep_list *deps,
                         const char *name, const char *path, int from_dlopen)
 {
     /* deduplicate by resolved path */
-    for (int i = 0; i < deps->count; i++)
-        if (strcmp(deps->libs[i].path, path) == 0) return 0;
+    for (int i = 0; i < deps->count; i++) {
+        if (strcmp(deps->libs[i].path, path) != 0)
+            continue;
+
+        /* If the existing entry used a fully-versioned basename from a
+         * traced realpath(), but we later discover the DT_SONAME, prefer
+         * the soname so runtime DT_NEEDED basename matching works. */
+        if (strcmp(deps->libs[i].name, name) != 0) {
+            size_t nlen = strlen(name);
+
+            if (strncmp(deps->libs[i].name, name, nlen) == 0 &&
+                deps->libs[i].name[nlen] == '.') {
+                char *nn = strdup(name);
+
+                if (nn) {
+                    free(deps->libs[i].name);
+                    deps->libs[i].name = nn;
+                }
+            }
+        }
+        return 0;
+    }
 
     if (deps->count >= deps->capacity) {
         int nc = deps->capacity ? deps->capacity * 2 : 64;
@@ -443,10 +463,20 @@ int dep_add_dlopen_libs(struct dep_list *deps, const char *trace_file)
         if (!rp) continue;
 
         const char *base = strrchr(rp, '/');
+        const char *name;
+        struct elf_info info;
+
         base = base ? base + 1 : rp;
         if (is_virtual_lib(base)) { free(rp); continue; }
 
-        int added = dep_list_add(deps, base, rp, 1);
+        name = base;
+        if (elf_parse(rp, &info) == 0) {
+            if (info.soname[0])
+                name = info.soname;
+            elf_info_free(&info);
+        }
+
+        int added = dep_list_add(deps, name, rp, 1);
         if (added > 0) bfs_push(&q, rp);
         free(rp);
     }

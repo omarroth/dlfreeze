@@ -167,11 +167,8 @@ static void scan_dir_shallow(const char *dirpath,
 }
 
 /* ------------------------------------------------------------------ */
-/* Capture data files opened during a traced run using strace.         */
-/* Runs: strace -f -e trace=open,openat,openat2 -o <tracefile>         */
-/*       <exe> [args...]                                               */
-/* Then parses the output for successfully opened regular files and     */
-/* filters them against the glob patterns.                             */
+/* Capture data files opened during a traced run. Prefer the bundled   */
+/* LD_PRELOAD tracer and fall back to strace if that helper is absent. */
 /* ------------------------------------------------------------------ */
 static char *find_traced_open_call(char *line)
 {
@@ -190,16 +187,255 @@ static char *find_traced_open_call(char *line)
     return NULL;
 }
 
+static int dir_matches_patterns(const char *rpath, const char **patterns,
+                                int npatterns)
+{
+    for (int i = 0; i < npatterns; i++) {
+        if (match_glob(patterns[i], rpath))
+            return 1;
+
+        /* Pattern may only match children of this directory. */
+        char probe[PATH_MAX];
+        int plen = snprintf(probe, sizeof(probe), "%s/x", rpath);
+        if (plen > 0 && plen < (int)sizeof(probe) &&
+            match_glob(patterns[i], probe))
+            return 1;
+    }
+
+    return 0;
+}
+
+static int path_is_known_dep(const char *rpath, const char *exe_path,
+                             const struct dep_list *deps)
+{
+    if (strcmp(rpath, exe_path) == 0)
+        return 1;
+    if (deps->interp_path && strcmp(rpath, deps->interp_path) == 0)
+        return 1;
+
+    for (int i = 0; i < deps->count; i++) {
+        char dpath[PATH_MAX];
+
+        if (realpath(deps->libs[i].path, dpath) && strcmp(rpath, dpath) == 0)
+            return 1;
+    }
+
+    return 0;
+}
+
+static void add_capture_dir(char ***cap_dirs, int *ncap_dirs, int *cap_dirs_cap,
+                            const char *rpath)
+{
+    for (int i = 0; i < *ncap_dirs; i++)
+        if (strcmp((*cap_dirs)[i], rpath) == 0)
+            return;
+
+    if (*ncap_dirs >= *cap_dirs_cap) {
+        *cap_dirs_cap = *cap_dirs_cap ? *cap_dirs_cap * 2 : 64;
+        *cap_dirs = realloc(*cap_dirs, *cap_dirs_cap * sizeof(char *));
+    }
+    (*cap_dirs)[(*ncap_dirs)++] = strdup(rpath);
+}
+
+static void process_captured_path(const char *exe_path, const char **patterns,
+                                  int npatterns, struct data_file_list *out,
+                                  struct dep_list *deps, const char *rpath,
+                                  int is_dir, char ***cap_dirs,
+                                  int *ncap_dirs, int *cap_dirs_cap)
+{
+    struct stat sb;
+
+    if (is_dir) {
+        if (stat(rpath, &sb) != 0 || !S_ISDIR(sb.st_mode))
+            return;
+        if (!dir_matches_patterns(rpath, patterns, npatterns))
+            return;
+
+        add_capture_dir(cap_dirs, ncap_dirs, cap_dirs_cap, rpath);
+        return;
+    }
+
+    if (stat(rpath, &sb) != 0 || !S_ISREG(sb.st_mode))
+        return;
+    if (elf_check(rpath))
+        return;
+    if (path_is_known_dep(rpath, exe_path, deps))
+        return;
+
+    for (int i = 0; i < npatterns; i++) {
+        if (match_glob(patterns[i], rpath)) {
+            if (sb.st_size > 0)
+                data_file_list_add(out, rpath);
+            return;
+        }
+    }
+}
+
+static void finish_captured_paths(const char *exe_path, struct data_file_list *out,
+                                  struct dep_list *deps, int verbose,
+                                  char **cap_dirs, int ncap_dirs)
+{
+    if (ncap_dirs > 0 && verbose) {
+        printf("  captured dirs: %d\n", ncap_dirs);
+        for (int i = 0; i < ncap_dirs; i++)
+            printf("    %s\n", cap_dirs[i]);
+    }
+
+    for (int i = 0; i < ncap_dirs; i++) {
+        scan_dir_shallow(cap_dirs[i], out, deps, exe_path);
+        free(cap_dirs[i]);
+    }
+    free(cap_dirs);
+
+    if (verbose || out->count > 0) {
+        printf("  data files : %d matched\n", out->count);
+        if (verbose) {
+            for (int i = 0; i < out->count; i++)
+                printf("    %s\n", out->paths[i]);
+        }
+    }
+}
+
+static int preload_trace_ready(const char *tracef)
+{
+    FILE *tf = fopen(tracef, "r");
+    char line[128];
+    int ready = 0;
+
+    if (!tf)
+        return 0;
+
+    if (fgets(line, sizeof(line), tf)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = '\0';
+        ready = strcmp(line, "#DLFREEZE_PRELOAD_TRACE_V1") == 0;
+    }
+
+    fclose(tf);
+    return ready;
+}
+
+static int parse_preload_file_trace(const char *tracef, const char *exe_path,
+                                    const char **patterns, int npatterns,
+                                    struct data_file_list *out,
+                                    struct dep_list *deps, int verbose)
+{
+    FILE *tf = fopen(tracef, "r");
+    char **cap_dirs = NULL;
+    int ncap_dirs = 0, cap_dirs_cap = 0;
+    char line[4096];
+
+    if (!tf)
+        return -1;
+
+    while (fgets(line, sizeof(line), tf)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = '\0';
+
+        if (len < 3 || line[1] != ' ')
+            continue;
+        if (line[0] != 'F' && line[0] != 'D')
+            continue;
+        if (line[2] != '/')
+            continue;
+
+        process_captured_path(exe_path, patterns, npatterns, out, deps,
+                              line + 2, line[0] == 'D',
+                              &cap_dirs, &ncap_dirs, &cap_dirs_cap);
+    }
+
+    fclose(tf);
+    finish_captured_paths(exe_path, out, deps, verbose, cap_dirs, ncap_dirs);
+    return 0;
+}
+
+static int parse_strace_file_trace(const char *tracef, const char *exe_path,
+                                   const char **patterns, int npatterns,
+                                   struct data_file_list *out,
+                                   struct dep_list *deps, int verbose,
+                                   const char *elf_tracef)
+{
+    FILE *tf = fopen(tracef, "r");
+    FILE *elf_tf = elf_tracef ? fopen(elf_tracef, "a") : NULL;
+    char **cap_dirs = NULL;
+    int ncap_dirs = 0, cap_dirs_cap = 0;
+    char line[4096];
+
+    if (!tf)
+        return -1;
+
+    while (fgets(line, sizeof(line), tf)) {
+        char *p = find_traced_open_call(line);
+        if (!p)
+            continue;
+
+        char *eq = strstr(p, ") = ");
+        if (!eq)
+            continue;
+        if (atoi(eq + 4) < 0)
+            continue;
+
+        char *q1 = strchr(p, '"');
+        if (!q1)
+            continue;
+        q1++;
+        char *q2 = strchr(q1, '"');
+        if (!q2)
+            continue;
+        *q2 = '\0';
+
+        if (q1[0] != '/')
+            continue;
+
+        {
+            char rpath[PATH_MAX];
+            int is_dir = (strstr(q2 + 1, "O_DIRECTORY") != NULL);
+
+            if (!realpath(q1, rpath))
+                continue;
+
+            if (!is_dir && elf_check(rpath)) {
+                if (elf_tf && !path_is_known_dep(rpath, exe_path, deps))
+                    fprintf(elf_tf, "%s\n", rpath);
+                continue;
+            }
+
+            process_captured_path(exe_path, patterns, npatterns, out, deps,
+                                  rpath, is_dir,
+                                  &cap_dirs, &ncap_dirs, &cap_dirs_cap);
+        }
+    }
+
+    fclose(tf);
+    if (elf_tf)
+        fclose(elf_tf);
+    finish_captured_paths(exe_path, out, deps, verbose, cap_dirs, ncap_dirs);
+    return 0;
+}
+
 static int capture_data_files(const char *exe_path, int argc, char **argv,
                               int optind_val, const char **patterns,
                               int npatterns, struct data_file_list *out,
                               struct dep_list *deps, int verbose,
                               const char *preload_path)
 {
-    char tracef[] = "/tmp/dlfreeze-strace.XXXXXX";
+    char tracef[] = "/tmp/dlfreeze-file-trace.XXXXXX";
+    char elf_tracef[] = "/tmp/dlfreeze-strace-dlopen.XXXXXX";
     int tfd = mkstemp(tracef);
     if (tfd < 0) { perror("mkstemp"); return -1; }
     close(tfd);
+
+    if (!preload_path) {
+        int efd = mkstemp(elf_tracef);
+        if (efd < 0) {
+            perror("mkstemp");
+            unlink(tracef);
+            return -1;
+        }
+        close(efd);
+    }
 
     /* Optional dlopen trace file for combined run */
     char dlopen_tracef[] = "/tmp/dlfreeze-trace.XXXXXX";
@@ -221,22 +457,33 @@ static int capture_data_files(const char *exe_path, int argc, char **argv,
     }
 
     if (pid == 0) {
-        /* Set LD_PRELOAD for combined dlopen tracing */
-        if (have_preload) {
-            setenv("LD_PRELOAD", preload_path, 1);
-            setenv("DLFREEZE_TRACE_FILE", dlopen_tracef, 1);
-        }
-
-        /* Build: strace -f -e trace=open,openat,openat2 -o tracefile -- exe [args...] */
         int tstart = optind_val + 1;  /* args after the executable */
 
+        if (have_preload) {
+            int nargs = 1 + (argc - tstart);
+            char **tav;
+
+            setenv("LD_PRELOAD", preload_path, 1);
+            setenv("DLFREEZE_TRACE_FILE", dlopen_tracef, 1);
+            setenv("DLFREEZE_FILE_TRACE_FILE", tracef, 1);
+
+            tav = calloc(nargs + 1, sizeof(char *));
+            tav[0] = (char *)exe_path;
+            for (int i = tstart; i < argc; i++)
+                tav[1 + i - tstart] = argv[i];
+            tav[nargs] = NULL;
+            execve(exe_path, tav, environ);
+            _exit(127);
+        }
+
+        /* Build: strace -f -e trace=open,openat -o tracefile -- exe [args...] */
         int nargs = 7 + 1 + (argc - tstart) + 1;
         char **sav = calloc(nargs, sizeof(char *));
         int si = 0;
         sav[si++] = "strace";
         sav[si++] = "-f";
         sav[si++] = "-e";
-        sav[si++] = "trace=open,openat,openat2";
+        sav[si++] = "trace=open,openat";
         sav[si++] = "-o";
         sav[si++] = tracef;
         sav[si++] = (char *)exe_path;
@@ -250,11 +497,23 @@ static int capture_data_files(const char *exe_path, int argc, char **argv,
 
     int st;
     waitpid(pid, &st, 0);
-    if (!WIFEXITED(st) || WEXITSTATUS(st) == 127) {
-        fprintf(stderr, "dlfreeze: strace failed (is strace installed?)\n");
+    if (!WIFEXITED(st) || (!have_preload && WEXITSTATUS(st) == 127)) {
+        if (have_preload)
+            fprintf(stderr, "dlfreeze: traced execution failed\n");
+        else
+            fprintf(stderr, "dlfreeze: strace failed (is strace installed?)\n");
         unlink(tracef);
+        if (!have_preload) unlink(elf_tracef);
         if (have_preload) unlink(dlopen_tracef);
         return -1;
+    }
+
+    if (have_preload && !preload_trace_ready(tracef)) {
+        fprintf(stderr, "dlfreeze: preload trace helper unavailable in target runtime, falling back to strace\n");
+        unlink(tracef);
+        unlink(dlopen_tracef);
+        return capture_data_files(exe_path, argc, argv, optind_val, patterns,
+                                  npatterns, out, deps, verbose, NULL);
     }
 
     /* Process dlopen trace first so deps is complete when filtering
@@ -281,147 +540,28 @@ static int capture_data_files(const char *exe_path, int argc, char **argv,
         unlink(dlopen_tracef);
     }
 
-    /* Parse strace output for open/openat/openat2 calls that returned a
-     * valid fd. Formats:
-     *   PID open("/path/file", O_RDONLY...) = 3
-     *   PID openat(AT_FDCWD, "/path/file", O_RDONLY...) = 3
-     *   PID openat2(AT_FDCWD, "/path/file", {...}) = 3
-     *
-     * Two kinds of captures:
-     * 1. Regular files matching -f patterns → add to data files.
-     * 2. O_DIRECTORY opens on dirs matching -f patterns → recursively
-     *    capture ALL regular non-ELF files in that directory tree so the
-     *    VFS can serve complete directory listings without hitting disk. */
-    FILE *tf = fopen(tracef, "r");
-    if (!tf) { unlink(tracef); return -1; }
+    {
+        int rc = have_preload
+            ? parse_preload_file_trace(tracef, exe_path, patterns, npatterns,
+                                       out, deps, verbose)
+            : parse_strace_file_trace(tracef, exe_path, patterns, npatterns,
+                                      out, deps, verbose, elf_tracef);
 
-    /* Collect directories to scan (deferred so we can close the file) */
-    char **cap_dirs = NULL;
-    int ncap_dirs = 0, cap_dirs_cap = 0;
-
-    char line[4096];
-    while (fgets(line, sizeof(line), tf)) {
-        /* Must contain an open-like syscall and end with a valid fd (not -1) */
-        char *p = find_traced_open_call(line);
-        if (!p) continue;
-
-        /* Find the return value: ") = N" at the end */
-        char *eq = strstr(p, ") = ");
-        if (!eq) continue;
-        int retval = atoi(eq + 4);
-        if (retval < 0) continue;  /* failed open */
-
-        /* Extract path: first quoted string in open/openat/openat2 */
-        char *q1 = strchr(p, '"');
-        if (!q1) continue;
-        q1++;
-        char *q2 = strchr(q1, '"');
-        if (!q2) continue;
-        *q2 = '\0';
-
-        /* Check for O_DIRECTORY flag (text after the closing quote) */
-        int is_dir = (strstr(q2 + 1, "O_DIRECTORY") != NULL);
-
-        /* Resolve to absolute path */
-        char rpath[PATH_MAX];
-        if (q1[0] != '/') continue;  /* skip relative paths */
-        if (!realpath(q1, rpath)) continue;  /* skip deleted/inaccessible */
-
-        if (is_dir) {
-            /* Directory open — check if it matches a glob pattern */
-            struct stat sb;
-            if (stat(rpath, &sb) != 0 || !S_ISDIR(sb.st_mode)) continue;
-
-            int matched = 0;
-            for (int i = 0; i < npatterns; i++) {
-                if (match_glob(patterns[i], rpath)) {
-                    matched = 1; break;
-                }
-                /* Also match if the pattern covers children of this dir,
-                   e.g. pattern '/usr/lib/X' matches '/usr/lib/python3.14' */
-                char probe[PATH_MAX];
-                int plen = snprintf(probe, sizeof(probe), "%s/x", rpath);
-                if (plen > 0 && plen < (int)sizeof(probe) &&
-                    match_glob(patterns[i], probe)) {
-                    matched = 1; break;
-                }
-            }
-            if (!matched) continue;
-
-            /* Deduplicate */
-            int dup = 0;
-            for (int i = 0; i < ncap_dirs; i++)
-                if (strcmp(cap_dirs[i], rpath) == 0) { dup = 1; break; }
-            if (dup) continue;
-
-            if (ncap_dirs >= cap_dirs_cap) {
-                cap_dirs_cap = cap_dirs_cap ? cap_dirs_cap * 2 : 64;
-                cap_dirs = realloc(cap_dirs, cap_dirs_cap * sizeof(char *));
-            }
-            cap_dirs[ncap_dirs++] = strdup(rpath);
-            continue;
-        }
-
-        /* Regular file */
-        struct stat sb;
-        if (stat(rpath, &sb) != 0 || !S_ISREG(sb.st_mode)) continue;
-
-        /* Skip ELF files (these are already handled as shared libs) */
-        if (elf_check(rpath)) continue;
-
-        /* Skip the executable itself */
-        if (strcmp(rpath, exe_path) == 0) continue;
-
-        /* Skip files already in deps */
-        int skip = 0;
-        if (deps->interp_path && strcmp(rpath, deps->interp_path) == 0)
-            skip = 1;
-        for (int i = 0; !skip && i < deps->count; i++) {
-            char dpath[PATH_MAX];
-            if (realpath(deps->libs[i].path, dpath) && strcmp(rpath, dpath) == 0)
-                skip = 1;
-        }
-        if (skip) continue;
-
-        /* Check against glob patterns */
-        int matched = 0;
-        for (int i = 0; i < npatterns; i++) {
-            if (match_glob(patterns[i], rpath)) {
-                matched = 1;
-                break;
+        if (!have_preload && rc == 0) {
+            dep_add_dlopen_libs(deps, elf_tracef);
+            if (verbose) {
+                printf("libraries after strace fallback: %d\n", deps->count);
+                for (int i = 0; i < deps->count; i++)
+                    if (deps->libs[i].from_dlopen)
+                        printf("  (dlopen) %-30s → %s\n",
+                               deps->libs[i].name, deps->libs[i].path);
             }
         }
-        if (!matched) continue;
 
-        /* Skip empty files */
-        if (sb.st_size == 0) continue;
-
-        data_file_list_add(out, rpath);
+        unlink(tracef);
+        if (!have_preload) unlink(elf_tracef);
+        return rc;
     }
-
-    fclose(tf);
-    unlink(tracef);
-
-    /* Scan captured directories — adds all non-ELF regular files */
-    if (ncap_dirs > 0 && verbose) {
-        printf("  captured dirs: %d\n", ncap_dirs);
-        for (int i = 0; i < ncap_dirs; i++)
-            printf("    %s\n", cap_dirs[i]);
-    }
-    for (int i = 0; i < ncap_dirs; i++) {
-        scan_dir_shallow(cap_dirs[i], out, deps, exe_path);
-        free(cap_dirs[i]);
-    }
-    free(cap_dirs);
-
-    if (verbose || out->count > 0) {
-        printf("  data files : %d matched\n", out->count);
-        if (verbose) {
-            for (int i = 0; i < out->count; i++)
-                printf("    %s\n", out->paths[i]);
-        }
-    }
-    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -508,11 +648,20 @@ int main(int argc, char **argv)
                     "skipping dlopen trace\n");
 
         if (nfile_patterns > 0) {
-            /* Combined: strace captures file access while LD_PRELOAD
-             * captures dlopen calls — single program execution. */
-            capture_data_files(exe_path, argc, argv, optind,
-                               file_patterns, nfile_patterns,
-                               &data_files, &deps, verbose, preload);
+            int trace_rc;
+
+            trace_rc = capture_data_files(exe_path, argc, argv, optind,
+                                          file_patterns, nfile_patterns,
+                                          &data_files, &deps, verbose, preload);
+            free(preload);
+            if (trace_rc < 0) {
+                data_file_list_free(&data_files);
+                dep_list_free(&deps);
+                free(exe_path);
+                free(bootstrap);
+                return 1;
+            }
+            preload = NULL;
         } else if (preload) {
             /* dlopen-only tracing (no -f patterns, no strace needed) */
             char tracef[] = "/tmp/dlfreeze-trace.XXXXXX";

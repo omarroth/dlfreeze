@@ -12,6 +12,7 @@
 #endif
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -853,6 +854,8 @@ static const struct glibc_ver_offsets glibc_2_40 = {
 static uint8_t *g_fake_rtld_global;
 static uint8_t *g_fake_rtld_global_ro;
 static const struct glibc_ver_offsets *g_glibc_off = &glibc_2_40;
+static size_t g_tls_static_size = 0x1080;
+static size_t g_tls_static_align = 0x40;
 
 /* glibc consumers such as Ruby's main-thread stack setup may read
  * __libc_stack_end from ld-linux. Direct-load mode does not map the real
@@ -950,6 +953,15 @@ static int glro_dl_make_stack_executable(const void *stack_endp)
 {
     (void)stack_endp;
     return 0;
+}
+
+static int glibc_direct_main_without_early_init_ok(void)
+{
+#if defined(__x86_64__)
+    return g_glibc_off == &glibc_2_17 || g_glibc_off == &glibc_2_29;
+#else
+    return 0;
+#endif
 }
 
 /* make a list_t {next, prev} point to itself (empty circular list) */
@@ -1391,6 +1403,14 @@ static void stub_dl_audit_noop(void) { /* no-op */ }
 /* _dl_allocate_tls / _dl_allocate_tls_init / _dl_deallocate_tls
  * Called by glibc's pthread_create to initialise TLS for new threads.
  * Implementations are below g_all_objs/g_nobj declarations. */
+static void stub_dl_get_tls_static_info(size_t *sizep, size_t *alignp)
+{
+    if (sizep)
+        *sizep = g_tls_static_size;
+    if (alignp)
+        *alignp = g_tls_static_align;
+}
+
 static void *stub_dl_allocate_tls(void *mem);       /* impl below */
 static void *stub_dl_allocate_tls_init(void *mem);   /* impl below */
 static void  stub_dl_deallocate_tls(void *mem) { (void)mem; }
@@ -1538,6 +1558,7 @@ static const struct stub_sym g_stubs[] = {
     { "_dl_catch_exception",     (void *)stub_dl_catch_exception    },
     { "_dl_audit_symbind_alt",   (void *)stub_dl_audit_noop         },
     { "_dl_audit_preinit",       (void *)stub_dl_audit_noop         },
+    { "_dl_get_tls_static_info", (void *)stub_dl_get_tls_static_info},
     { "_dl_allocate_tls",        (void *)stub_dl_allocate_tls       },
     { "_dl_allocate_tls_init",   (void *)stub_dl_allocate_tls_init  },
     { "_dl_deallocate_tls",      (void *)stub_dl_deallocate_tls     },
@@ -2046,6 +2067,55 @@ struct vfs_entry {
 
 static struct vfs_entry g_vfs_table[VFS_HASH_SIZE];
 static int g_vfs_count;
+static uint32_t vfs_hash(const char *s);
+
+static const struct vfs_entry *vfs_lookup_slow(const char *path)
+{
+    for (int i = 0; i < (int)VFS_HASH_SIZE; i++) {
+        if (!g_vfs_table[i].path)
+            continue;
+        if (strcmp(g_vfs_table[i].path, path) == 0)
+            return &g_vfs_table[i];
+    }
+    return NULL;
+}
+
+static const struct vfs_entry *vfs_lookup_manifest(const char *path)
+{
+    if (!g_frozen_entries || !g_frozen_strtab || !g_frozen_mem)
+        return NULL;
+
+    for (uint32_t i = 0; i < g_frozen_num_entries; i++) {
+        const struct dlfrz_entry *ent = &g_frozen_entries[i];
+        const char *name;
+        uint32_t idx;
+
+        if (!(ent->flags & DLFRZ_FLAG_DATA))
+            continue;
+
+        name = g_frozen_strtab + ent->name_offset;
+        if (strcmp(name, path) != 0)
+            continue;
+
+        idx = vfs_hash(path) & (VFS_HASH_SIZE - 1);
+        while (g_vfs_table[idx].path && strcmp(g_vfs_table[idx].path, path) != 0)
+            idx = (idx + 1) & (VFS_HASH_SIZE - 1);
+
+        if (!g_vfs_table[idx].path) {
+            g_vfs_table[idx].path = name;
+            g_vfs_table[idx].data = g_frozen_mem + (ent->data_offset - g_frozen_mem_foff);
+            g_vfs_table[idx].size = ent->data_size;
+            g_vfs_table[idx].flags = ent->flags;
+            if (g_debug) {
+                ldr_msg("vfs lookup repaired from manifest: ");
+                ldr_msg(path);
+                ldr_msg("\n");
+            }
+        }
+        return &g_vfs_table[idx];
+    }
+    return NULL;
+}
 
 static int vfs_is_virtual_entry(const struct vfs_entry *ve)
 {
@@ -2083,6 +2153,7 @@ static uint32_t vfs_hash(const char *s)
 
 static void vfs_init_dirs(void);
 static void vfs_init_pyc_aliases(void);
+static int vfs_dir_exists(const char *path);
 
 static void vfs_init(const uint8_t *mem, uint64_t mem_foff,
                      const struct dlfrz_entry *entries,
@@ -2116,12 +2187,36 @@ static const struct vfs_entry *vfs_lookup(const char *path)
     if (g_vfs_count == 0) return NULL;
     uint32_t idx = vfs_hash(path) & (VFS_HASH_SIZE - 1);
     for (int probes = 0; probes < (int)VFS_HASH_SIZE; probes++) {
-        if (!g_vfs_table[idx].path) return NULL;
+        if (!g_vfs_table[idx].path) {
+            const struct vfs_entry *slow = vfs_lookup_slow(path);
+            return slow ? slow : vfs_lookup_manifest(path);
+        }
         if (strcmp(g_vfs_table[idx].path, path) == 0)
             return &g_vfs_table[idx];
         idx = (idx + 1) & (VFS_HASH_SIZE - 1);
     }
-    return NULL;
+    {
+        const struct vfs_entry *slow = vfs_lookup_slow(path);
+        return slow ? slow : vfs_lookup_manifest(path);
+    }
+}
+
+static void vfs_dbg_op(const char *op, const char *path, const char *detail)
+{
+    if (!g_debug || !path || path[0] != '/')
+        return;
+    if (!vfs_lookup(path) && !vfs_dir_exists(path))
+        return;
+
+    ldr_msg("vfs ");
+    ldr_msg(op);
+    ldr_msg(": ");
+    ldr_msg(path);
+    if (detail) {
+        ldr_msg(" ");
+        ldr_msg(detail);
+    }
+    ldr_msg("\n");
 }
 
 /* The VFS overrides are only populated in the special-table when
@@ -2158,18 +2253,31 @@ static uint32_t vfs_hash_n(const char *s, int n)
     return h;
 }
 
+static int vfs_dir_exists_n_slow(const char *path, int len)
+{
+    for (int i = 0; i < (int)VFS_DIR_HASH_SIZE; i++) {
+        if (!g_vfs_dir_table[i])
+            continue;
+        if (strncmp(g_vfs_dir_table[i], path, len) == 0 &&
+            g_vfs_dir_table[i][len] == '\0')
+            return 1;
+    }
+    return 0;
+}
+
 /* Check if a directory path of exactly `len` bytes is already in the table */
 static int vfs_dir_exists_n(const char *path, int len)
 {
     uint32_t idx = vfs_hash_n(path, len) & (VFS_DIR_HASH_SIZE - 1);
     for (int p = 0; p < (int)VFS_DIR_HASH_SIZE; p++) {
-        if (!g_vfs_dir_table[idx]) return 0;
+        if (!g_vfs_dir_table[idx])
+            return vfs_dir_exists_n_slow(path, len);
         if (strncmp(g_vfs_dir_table[idx], path, len) == 0 &&
             g_vfs_dir_table[idx][len] == '\0')
             return 1;
         idx = (idx + 1) & (VFS_DIR_HASH_SIZE - 1);
     }
-    return 0;
+    return vfs_dir_exists_n_slow(path, len);
 }
 
 static int vfs_dir_exists(const char *path)
@@ -2184,24 +2292,6 @@ static int vfs_dir_exists(const char *path)
 
 /* Check if a VFS directory has at least one direct child file
  * (not counting .dir markers, which are just structural hints). */
-static int vfs_dir_has_children(const char *dirpath)
-{
-    int dlen = strlen(dirpath);
-    for (int i = 0; i < (int)VFS_HASH_SIZE; i++) {
-        if (!g_vfs_table[i].path) continue;
-        const char *fp = g_vfs_table[i].path;
-        if (strncmp(fp, dirpath, dlen) != 0) continue;
-        if (fp[dlen] != '/') continue;
-        const char *rest = fp + dlen + 1;
-        if (strchr(rest, '/')) continue;  /* not direct child */
-        /* Skip .dir markers */
-        if (rest[0] == '.' && rest[1] == 'd' && rest[2] == 'i'
-            && rest[3] == 'r' && rest[4] == '\0') continue;
-        return 1;  /* real direct child file */
-    }
-    return 0;
-}
-
 static void vfs_dir_insert(const char *path, int len)
 {
     if (g_vfs_dir_strpos + len + 1 > (int)sizeof(g_vfs_dir_strbuf)) return;
@@ -2612,6 +2702,7 @@ static char **vfs_prepare_child_env(char **envp)
 
 #define VFS_FAKE_DIR_MAGIC 0x564653444952ULL
 #define VFS_MAX_DIR_HANDLES 32
+#define VFS_DIRFD_MAP_MAX 64
 
 struct vfs_dir_handle {
     int            fd_compat;   /* offset-0: for dirfd() ABI compat  */
@@ -2631,16 +2722,92 @@ struct vfs_dir_handle {
 
 static struct vfs_dir_handle g_dir_handles[VFS_MAX_DIR_HANDLES];
 
+struct vfs_dirfd_map {
+    int  fd;
+    char path[PATH_MAX];
+};
+
+static struct vfs_dirfd_map g_vfs_dirfd_maps[VFS_DIRFD_MAP_MAX];
+
+static void remember_vfs_dirfd(int fd, const char *path)
+{
+    int slot = -1;
+
+    if (fd < 0 || !path || path[0] != '/')
+        return;
+
+    for (int i = 0; i < VFS_DIRFD_MAP_MAX; i++) {
+        if (g_vfs_dirfd_maps[i].path[0] == '\0') {
+            if (slot < 0)
+                slot = i;
+            continue;
+        }
+        if (g_vfs_dirfd_maps[i].fd == fd) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0)
+        slot = fd % VFS_DIRFD_MAP_MAX;
+
+    g_vfs_dirfd_maps[slot].fd = fd;
+    snprintf(g_vfs_dirfd_maps[slot].path, sizeof(g_vfs_dirfd_maps[slot].path),
+             "%s", path);
+}
+
+static const char *lookup_vfs_dirfd(int fd)
+{
+    for (int i = 0; i < VFS_DIRFD_MAP_MAX; i++) {
+        if (g_vfs_dirfd_maps[i].path[0] != '\0' &&
+            g_vfs_dirfd_maps[i].fd == fd)
+            return g_vfs_dirfd_maps[i].path;
+    }
+    return NULL;
+}
+
+static int resolve_vfs_path_at(int dirfd, const char *path,
+                               char *resolved, size_t resolved_sz)
+{
+    char proc_path[64];
+    char base[PATH_MAX];
+    ssize_t len;
+
+    if (!path || !resolved || resolved_sz == 0)
+        return 0;
+    if (path[0] == '/') {
+        snprintf(resolved, resolved_sz, "%s", path);
+        return 1;
+    }
+    if (dirfd == AT_FDCWD)
+        return 0;
+
+    snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", dirfd);
+    len = (ssize_t)VFS_SYSCALL(SYS_readlinkat, AT_FDCWD, proc_path,
+                               base, sizeof(base) - 1);
+    if (len < 0)
+        return 0;
+    base[len] = '\0';
+
+    if (base[0] == '/' && base[1] == '\0') {
+        const char *mapped = lookup_vfs_dirfd(dirfd);
+        if (mapped)
+            return snprintf(resolved, resolved_sz, "%s/%s", mapped, path) <
+                   (int)resolved_sz;
+    }
+
+    return snprintf(resolved, resolved_sz, "%s/%s", base, path) <
+           (int)resolved_sz;
+}
+
 static void *vfs_opendir(const char *path)
 {
     int has_vfs = (path && path[0] == '/' && vfs_dir_exists(path));
-    /* A captured dir has real child files in VFS (not just markers).
-     * These dirs can be served entirely from VFS without opening the
-     * real directory on disk. */
-    int captured = (has_vfs && vfs_dir_has_children(path));
     int fd = -1;
 
-    if (!captured) {
+    if (has_vfs)
+        vfs_dbg_op("opendir", path, "enter");
+
+    if (has_vfs || path) {
         fd = (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, path,
                           O_RDONLY | O_DIRECTORY | O_CLOEXEC);
         if (fd < 0 && !has_vfs)
@@ -2654,18 +2821,14 @@ static void *vfs_opendir(const char *path)
         memset(h, 0, sizeof(*h));
         h->magic = VFS_FAKE_DIR_MAGIC;
         h->fd_compat = fd;
-        if (captured) {
-            /* Pure VFS: all files/subdirs from VFS, no real dir fd */
-            h->vfs_path = path;
-            h->vfs_path_len = strlen(path);
-            h->scan_pos = 0;
-            h->phase = 0;
-        } else if (has_vfs) {
-            /* Merged or VFS-only (no real dir) */
+        if (has_vfs) {
+            /* Merge real and VFS entries when the directory exists on disk,
+             * otherwise serve it from VFS only. */
             h->vfs_path = path;
             h->vfs_path_len = strlen(path);
             h->scan_pos = 0;
             h->phase = (fd >= 0) ? -1 : 0;
+            vfs_dbg_op("opendir", path, (fd >= 0) ? "merged" : "virtual");
         } else {
             /* Pure real dir, no VFS */
             h->vfs_path = NULL;
@@ -2854,42 +3017,55 @@ static int vfs_open(const char *path, int flags, int mode)
     if (path && path[0] == '/' && (flags & 3) == 0 /* O_RDONLY */) {
         const struct vfs_entry *ve = vfs_lookup(path);
         if (ve && !vfs_is_virtual_entry(ve)) {
+            vfs_dbg_op("open", path, "file");
             int fd = vfs_serve_memfd(ve, path);
             if (fd >= 0) return fd;
         }
+        vfs_dbg_op("open", path, "syscall");
     }
     return (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, path, flags, mode);
 }
 
 static int vfs_openat(int dirfd, const char *path, int flags, int mode)
 {
-    if (path && path[0] == '/') {
+    char resolved[PATH_MAX];
+    const char *lookup_path = path;
+    int real_fd;
+
+    if (path && path[0] != '/' &&
+        resolve_vfs_path_at(dirfd, path, resolved, sizeof(resolved)))
+        lookup_path = resolved;
+
+    if (lookup_path && lookup_path[0] == '/') {
         if ((flags & 3) == 0 /* O_RDONLY */) {
-            const struct vfs_entry *ve = vfs_lookup(path);
+            const struct vfs_entry *ve = vfs_lookup(lookup_path);
             if (ve && !vfs_is_virtual_entry(ve)) {
-                int fd = vfs_serve_memfd(ve, path);
+                vfs_dbg_op("openat", lookup_path, "file");
+                int fd = vfs_serve_memfd(ve, lookup_path);
                 if (fd >= 0) return fd;
             }
         }
-        /* O_DIRECTORY: captured dirs (with VFS children) use a dummy fd
-         * to avoid the real openat.  Other VFS dirs try real FS first,
-         * then fall back to dummy if the real dir doesn't exist. */
-        if ((flags & O_DIRECTORY) && vfs_dir_exists(path)) {
-            if (vfs_dir_has_children(path)) {
-                if (g_debug) {
-                    ldr_msg("vfs: dir openat dummy ");
-                    ldr_msg(path);
-                    ldr_msg("\n");
-                }
-                return (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, "/",
-                                    O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+        /* O_DIRECTORY: prefer the real directory when it exists so dirfd,
+         * fdopendir, and other directory-fd consumers see the actual path.
+         * Only synthesize a dummy fd for VFS-only directories. */
+        if ((flags & O_DIRECTORY) && vfs_dir_exists(lookup_path)) {
+            real_fd = (int)VFS_SYSCALL(SYS_openat, dirfd, path, flags, mode);
+            if (real_fd >= 0) {
+                vfs_dbg_op("openat", lookup_path, "dir-merged");
+                remember_vfs_dirfd(real_fd, lookup_path);
+                return real_fd;
             }
-            int real_fd = (int)VFS_SYSCALL(SYS_openat, dirfd, path, flags, mode);
-            if (real_fd >= 0) return real_fd;
             /* Real dir doesn't exist but VFS knows it */
-            return (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, "/",
-                                O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+            {
+                int fd = (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, "/",
+                                         O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+                if (fd >= 0)
+                    remember_vfs_dirfd(fd, lookup_path);
+                vfs_dbg_op("openat", lookup_path, "dir-virtual");
+                return fd;
+            }
         }
+        vfs_dbg_op("openat", lookup_path, "syscall");
     }
     return (int)VFS_SYSCALL(SYS_openat, dirfd, path, flags, mode);
 }
@@ -2902,11 +3078,13 @@ static void *vfs_fopen(const char *path, const char *mode)
     if (path && path[0] == '/' && mode && mode[0] == 'r') {
         const struct vfs_entry *ve = vfs_lookup(path);
         if (ve && !vfs_is_virtual_entry(ve)) {
+            vfs_dbg_op("fopen", path, "file");
             int fd = vfs_serve_memfd(ve, path);
             if (fd >= 0 && g_real_fdopen)
                 return g_real_fdopen(fd, mode);
             if (fd >= 0) VFS_SYSCALL(SYS_close, fd);
         }
+        vfs_dbg_op("fopen", path, "syscall");
     }
     if (g_real_fopen) {
         if (g_debug && path) {
@@ -2932,6 +3110,7 @@ static int vfs_stat(const char *path, struct stat *buf)
          * Directory markers stay synthetic-only. */
         const struct vfs_entry *ve = vfs_lookup(path);
         if (ve && !(vfs_is_virtual_entry(ve) && vfs_is_dir_marker_path(path))) {
+            vfs_dbg_op("stat", path, "file");
             __builtin_memset(buf, 0, sizeof(*buf));
             buf->st_mode  = 0100644;  /* regular file, rw-r--r-- */
             buf->st_nlink = 1;
@@ -2945,6 +3124,7 @@ static int vfs_stat(const char *path, struct stat *buf)
     int ret = (int)VFS_SYSCALL(SYS_newfstatat, AT_FDCWD, path, buf, 0);
     if (ret == 0) return 0;
     if (path && path[0] == '/' && vfs_dir_exists(path)) {
+        vfs_dbg_op("stat", path, "dir");
         __builtin_memset(buf, 0, sizeof(*buf));
         buf->st_mode  = 040755;  /* directory, rwxr-xr-x */
         buf->st_nlink = 2;
@@ -2956,9 +3136,17 @@ static int vfs_stat(const char *path, struct stat *buf)
 
 static int vfs_fstatat(int dirfd, const char *path, struct stat *buf, int flag)
 {
-    if (path && path[0] == '/') {
-        const struct vfs_entry *ve = vfs_lookup(path);
-        if (ve && !(vfs_is_virtual_entry(ve) && vfs_is_dir_marker_path(path))) {
+    char resolved[PATH_MAX];
+    const char *lookup_path = path;
+
+    if (path && path[0] != '/' &&
+        resolve_vfs_path_at(dirfd, path, resolved, sizeof(resolved)))
+        lookup_path = resolved;
+
+    if (lookup_path && lookup_path[0] == '/') {
+        const struct vfs_entry *ve = vfs_lookup(lookup_path);
+        if (ve && !(vfs_is_virtual_entry(ve) && vfs_is_dir_marker_path(lookup_path))) {
+            vfs_dbg_op("fstatat", lookup_path, "file");
             __builtin_memset(buf, 0, sizeof(*buf));
             buf->st_mode  = 0100644;
             buf->st_nlink = 1;
@@ -2970,7 +3158,8 @@ static int vfs_fstatat(int dirfd, const char *path, struct stat *buf, int flag)
     }
     int ret = (int)VFS_SYSCALL(SYS_newfstatat, dirfd, path, buf, flag);
     if (ret == 0) return 0;
-    if (path && path[0] == '/' && vfs_dir_exists(path)) {
+    if (lookup_path && lookup_path[0] == '/' && vfs_dir_exists(lookup_path)) {
+        vfs_dbg_op("fstatat", lookup_path, "dir");
         __builtin_memset(buf, 0, sizeof(*buf));
         buf->st_mode  = 040755;
         buf->st_nlink = 2;
@@ -2985,26 +3174,62 @@ static int vfs_access(const char *path, int amode)
 {
     if (path && path[0] == '/') {
         const struct vfs_entry *ve = vfs_lookup(path);
-        if (ve && !(vfs_is_virtual_entry(ve) && vfs_is_dir_marker_path(path)))
+        if (ve && !(vfs_is_virtual_entry(ve) && vfs_is_dir_marker_path(path))) {
+            vfs_dbg_op("access", path, "file");
             return 0;
+        }
     }
     int ret = (int)VFS_SYSCALL(SYS_faccessat, AT_FDCWD, path, amode, 0);
     if (ret == 0) return 0;
-    if (path && path[0] == '/' && vfs_dir_exists(path)) return 0;
+    if (path && path[0] == '/' && vfs_dir_exists(path)) {
+        vfs_dbg_op("access", path, "dir");
+        return 0;
+    }
     return ret;
 }
 
 static int vfs_faccessat(int dirfd, const char *path, int amode, int flag)
 {
-    if (path && path[0] == '/') {
-        const struct vfs_entry *ve = vfs_lookup(path);
-        if (ve && !(vfs_is_virtual_entry(ve) && vfs_is_dir_marker_path(path)))
+    char resolved[PATH_MAX];
+    const char *lookup_path = path;
+
+    if (path && path[0] != '/' &&
+        resolve_vfs_path_at(dirfd, path, resolved, sizeof(resolved)))
+        lookup_path = resolved;
+
+    if (lookup_path && lookup_path[0] == '/') {
+        const struct vfs_entry *ve = vfs_lookup(lookup_path);
+        if (ve && !(vfs_is_virtual_entry(ve) && vfs_is_dir_marker_path(lookup_path))) {
+            vfs_dbg_op("faccessat", lookup_path, "file");
             return 0;
+        }
     }
     int ret = (int)VFS_SYSCALL(SYS_faccessat, dirfd, path, amode, flag);
     if (ret == 0) return 0;
-    if (path && path[0] == '/' && vfs_dir_exists(path)) return 0;
+    if (lookup_path && lookup_path[0] == '/' && vfs_dir_exists(lookup_path)) {
+        vfs_dbg_op("faccessat", lookup_path, "dir");
+        return 0;
+    }
     return ret;
+}
+
+static int vfs_xstat(int ver, const char *path, struct stat *buf)
+{
+    (void)ver;
+    return vfs_stat(path, buf);
+}
+
+static int vfs_lxstat(int ver, const char *path, struct stat *buf)
+{
+    (void)ver;
+    return vfs_fstatat(AT_FDCWD, path, buf, AT_SYMLINK_NOFOLLOW);
+}
+
+static int vfs_fxstatat(int ver, int dirfd, const char *path,
+                        struct stat *buf, int flag)
+{
+    (void)ver;
+    return vfs_fstatat(dirfd, path, buf, flag);
 }
 
 /* ==== Resolution cache ================================================ */
@@ -3210,8 +3435,14 @@ static const struct stub_sym g_vfs_overrides[] = {
     { "__open64_2",      (void *)vfs_open           },
     { "stat",            (void *)vfs_stat           },
     { "stat64",          (void *)vfs_stat           },
+    { "__xstat",         (void *)vfs_xstat          },
+    { "__xstat64",       (void *)vfs_xstat          },
+    { "__lxstat",        (void *)vfs_lxstat         },
+    { "__lxstat64",      (void *)vfs_lxstat         },
     { "fstatat",         (void *)vfs_fstatat        },
     { "fstatat64",       (void *)vfs_fstatat        },
+    { "__fxstatat",      (void *)vfs_fxstatat       },
+    { "__fxstatat64",    (void *)vfs_fxstatat       },
     { "access",          (void *)vfs_access         },
     { "faccessat",       (void *)vfs_faccessat      },
     { "opendir",         (void *)vfs_opendir        },
@@ -3292,34 +3523,25 @@ static uint64_t lookup_special(const char *name, uint32_t gh)
 
 static int maybe_runtime_override_name(const char *name)
 {
-    char c0 = name[0], c1 = name[1];
-
-    if ((c0 == 'd' && c1 == 'l') ||
-        (c0 == 's' && c1 == 'i'))
-        return 1;
-
-    if (c0 == '_') {
-        if (c1 == 'r' || c1 == 'd')
+    for (const struct stub_sym *o = g_overrides; o->name; o++)
+        if (strcmp(name, o->name) == 0)
             return 1;
-        if (c1 == '_') {
-            char c2 = name[2];
-            if (c2 == 't' || c2 == 'r')
+
+    if (g_vfs_count > 0) {
+        for (const struct stub_sym *o = g_vfs_overrides; o->name; o++)
+            if (strcmp(name, o->name) == 0)
                 return 1;
-            if (c2 == 's' && strcmp(name, "__sigaction") == 0)
-                return 1;
-        }
     }
 
-    if (g_vfs_count <= 0)
-        return 0;
-
-    return (c0 == 'o')
-        || (c0 == 's')
-        || (c0 == 'f')
-        || (c0 == 'a')
-        || (c0 == 'r')
-        || (c0 == 'c' && c1 == 'l')
-        || (c0 == '_' && c1 == '_' && name[2] == 'o');
+    return strcmp(name, "_rtld_global") == 0
+        || strcmp(name, "_rtld_global_ro") == 0
+        || strcmp(name, "__libc_stack_end") == 0
+        || strcmp(name, "__rseq_offset") == 0
+        || strcmp(name, "__rseq_size") == 0
+        || strcmp(name, "__rseq_flags") == 0
+        || strcmp(name, "signal") == 0
+        || strcmp(name, "sigaction") == 0
+        || strcmp(name, "__sigaction") == 0;
 }
 
 /*
@@ -4644,6 +4866,51 @@ static void dl_set_error(const char *a, const char *b)
 static struct loaded_obj *load_elf_from_file(const char *path);
 static struct loaded_obj *load_embedded_object(uint32_t mi);
 
+static const char *g_runtime_search_dirs[] = {
+    "/lib",
+    "/lib64",
+    "/usr/lib",
+    "/usr/lib64",
+    "/lib/x86_64-linux-gnu",
+    "/usr/lib/x86_64-linux-gnu",
+    "/lib/aarch64-linux-gnu",
+    "/usr/lib/aarch64-linux-gnu",
+    NULL
+};
+
+static struct loaded_obj *load_needed_from_filesystem(const char *needed)
+{
+    char path[PATH_MAX];
+
+    if (!needed || !needed[0])
+        return NULL;
+
+    if (needed[0] == '/') {
+        int fd = open(needed, O_RDONLY);
+
+        if (fd < 0)
+            return NULL;
+        close(fd);
+        return load_elf_from_file(needed);
+    }
+
+    for (const char **dir = g_runtime_search_dirs; *dir; dir++) {
+        int fd;
+
+        if (snprintf(path, sizeof(path), "%s/%s", *dir, needed) >=
+            (int)sizeof(path))
+            continue;
+
+        fd = open(path, O_RDONLY);
+        if (fd < 0)
+            continue;
+        close(fd);
+        return load_elf_from_file(path);
+    }
+
+    return NULL;
+}
+
 /*
  * Load DT_NEEDED dependencies of a just-loaded object.
  * Searches /usr/lib/ and /lib/ for each needed library.
@@ -4679,26 +4946,7 @@ static void dl_load_needed(struct loaded_obj *obj,
         }
         if (found) continue;
 
-        /* Build path and try standard locations */
-        static const char *search_dirs[] = {
-            "/usr/lib/", "/lib/", "/usr/lib64/", "/lib64/", NULL
-        };
-        for (const char **dir = search_dirs; *dir; dir++) {
-            char path[512];
-            char *d = path;
-            const char *p = *dir;
-            while (*p) *d++ = *p++;
-            const char *n = needed;
-            while (*n && d < path + sizeof(path) - 1) *d++ = *n++;
-            *d = '\0';
-
-            int fd = open(path, O_RDONLY);
-            if (fd >= 0) {
-                close(fd);
-                load_elf_from_file(path);
-                break;
-            }
-        }
+        load_needed_from_filesystem(needed);
     }
 }
 
@@ -5001,24 +5249,7 @@ static struct loaded_obj *load_embedded_object(uint32_t mi)
                 }
                 if (!dep_found) {
                     /* Try filesystem */
-                    static const char *dirs[] = {
-                        "/usr/lib/", "/lib/", "/usr/lib64/", "/lib64/", NULL
-                    };
-                    for (const char **d = dirs; *d; d++) {
-                        char path[512];
-                        char *pp = path;
-                        const char *s = *d;
-                        while (*s) *pp++ = *s++;
-                        s = needed;
-                        while (*s && pp < path + sizeof(path) - 1) *pp++ = *s++;
-                        *pp = '\0';
-                        int fd = open(path, O_RDONLY);
-                        if (fd >= 0) {
-                            close(fd);
-                            load_elf_from_file(path);
-                            break;
-                        }
-                    }
+                    load_needed_from_filesystem(needed);
                 }
             }
         }
@@ -5418,14 +5649,18 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
         }
     }
 
-    /* Update _rtld_global_ro._dl_tls_static_size so glibc's nptl
-     * reserves enough TLS space when creating new threads.
+    /* Update fake rtld TLS size/alignment so glibc's nptl and old
+     * libpthread private hooks reserve enough static TLS for new threads.
      * glibc formula: roundup(total_tls + surplus + sizeof(struct pthread), 64)
      * sizeof(struct pthread) ≈ 2304 (0x900) on glibc 2.43 x86-64.
      * TLS_STATIC_SURPLUS ≈ 1664.  We use 0x1800 as a safe combined margin. */
     {
-        size_t tls_static =
-            ALIGN_UP(total_tls + 0x1800, 64);
+        size_t tls_static = ALIGN_UP(total_tls + 0x1800, 64);
+        size_t tls_align = max_tls_align < 0x40 ? 0x40 : max_tls_align;
+
+        g_tls_static_size = tls_static;
+        g_tls_static_align = tls_align;
+
         /* In glibc ≥ 2.34, the TLS static size field is in _rtld_global_ro.
          * In glibc < 2.34, it's in _rtld_global (sentinel: glro_tls… = -1). */
         if (g_glibc_off->glro_tls_static_size >= 0)
@@ -5434,6 +5669,13 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
         else if (g_glibc_off->gl_tls_static_size >= 0)
             *(size_t *)(g_fake_rtld_global + g_glibc_off->gl_tls_static_size)
                 = tls_static;
+
+        if (g_glibc_off->glro_tls_static_align >= 0)
+            *(size_t *)(g_fake_rtld_global_ro + g_glibc_off->glro_tls_static_align)
+                = tls_align;
+        else if (g_glibc_off->gl_tls_static_align >= 0)
+            *(size_t *)(g_fake_rtld_global + g_glibc_off->gl_tls_static_align)
+                = tls_align;
     }
 
     if (g_is_musl_runtime) {
@@ -5783,6 +6025,16 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
          * will retry with gnu_get_libc_version() as a fallback. */
     }
 
+    /* Save frozen image context early so VFS lookup repair can fall back
+     * to the original manifest before lazy dlopen initialization happens. */
+    g_frozen_mem         = mem;
+    g_frozen_mem_foff    = mem_foff;
+    g_frozen_srcfd       = srcfd;
+    g_frozen_metas       = metas;
+    g_frozen_entries     = entries;
+    g_frozen_strtab      = strtab;
+    g_frozen_num_entries = num_entries;
+
     /* Initialize embedded data-file VFS (before any opens) */
     vfs_init(mem, mem_foff, entries, strtab, num_entries);
 
@@ -6052,16 +6304,6 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     g_argv = argv;
     g_envp = runtime_envp;
 
-    /* Save frozen image context for lazy dlopen loading of embedded
-     * DLFRZ_FLAG_DLOPEN objects. */
-    g_frozen_mem         = mem;
-    g_frozen_mem_foff    = mem_foff;
-    g_frozen_srcfd       = srcfd;
-    g_frozen_metas       = metas;
-    g_frozen_entries     = entries;
-    g_frozen_strtab      = strtab;
-    g_frozen_num_entries = num_entries;
-
     /* 7. Initialise libc process state (environ, arena, tcache) BEFORE
      *    calling any init functions — init_array entries in libraries
      *    (e.g. libpython) may call malloc, so the arena must be ready. */
@@ -6166,7 +6408,8 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     if (!main_addr)
         main_addr = resolve_sym(objs, nobj, "main");
 
-    if (main_addr && (is_musl_runtime || g_glibc_early_init_done)) {
+    if (main_addr && (is_musl_runtime || g_glibc_early_init_done ||
+                      glibc_direct_main_without_early_init_ok())) {
         /* Warm up glibc's allocator so main_arena's top chunk lands in the
          * process brk before we enter user code. musl does not need this
          * ptmalloc-specific bootstrap path.  Older glibc builds without

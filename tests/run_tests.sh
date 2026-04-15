@@ -65,6 +65,18 @@ docker_alpine_edge_run() {
     fi
 }
 
+docker_ubuntu2004_amd64_run() {
+    local repo_root build_abs
+
+    repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+    build_abs=$(readlink -f "$BUILD")
+    docker run --rm --platform linux/amd64 \
+        -v "$repo_root":/work \
+        -v "$build_abs":/dlfreeze-build \
+        -w /work \
+        ubuntu:20.04 sh -lc "$1"
+}
+
 # ===================================================================
 # Helper: freeze, run, compare
 # ===================================================================
@@ -546,7 +558,7 @@ test_alpine_python_cryptography_direct() {
     fi
 
     local script actual rc=0
-    script='set -e; apk add --no-cache python3 py3-cryptography >/dev/null; printf "from cryptography.fernet import Fernet\nmsg = b\"hello\"\ncipher = Fernet(Fernet.generate_key())\nprint(cipher.decrypt(cipher.encrypt(msg)).decode())\n" > /tmp/crypt.py; /dlfreeze-build/dlfreeze -d -o /tmp/python314-crypt.frozen -- python3 /tmp/crypt.py >/dev/null 2>&1; timeout 60 /tmp/python314-crypt.frozen /tmp/crypt.py 2>/tmp/python314-crypt.err'
+    script='set -e; apk add --no-cache python3 py3-cryptography >/dev/null 2>&1; printf "from cryptography.fernet import Fernet\nmsg = b\"hello\"\ncipher = Fernet(Fernet.generate_key())\nprint(cipher.decrypt(cipher.encrypt(msg)).decode())\n" > /tmp/crypt.py; /dlfreeze-build/dlfreeze -d -o /tmp/python314-crypt.frozen -- python3 /tmp/crypt.py >/dev/null 2>&1; timeout 60 /tmp/python314-crypt.frozen /tmp/crypt.py 2>/tmp/python314-crypt.err'
 
     actual=$(docker_alpine_edge_run "$script" 2>&1) || rc=$?
     if [ "$rc" = 0 ] && [ "$actual" = "hello" ]; then
@@ -568,7 +580,7 @@ test_alpine_python_cryptography_captured() {
     fi
 
     local script actual rc=0
-    script='set -e; apk add --no-cache python3 py3-cryptography strace >/dev/null; printf "from cryptography.fernet import Fernet\nmsg = b\"hello\"\ncipher = Fernet(Fernet.generate_key())\nprint(cipher.decrypt(cipher.encrypt(msg)).decode())\n" > /tmp/crypt.py; /dlfreeze-build/dlfreeze -d -t -f "/usr/*" -o /tmp/python314-crypt-vfs.frozen -- python3 /tmp/crypt.py >/dev/null 2>&1; timeout 60 /tmp/python314-crypt-vfs.frozen /tmp/crypt.py'
+    script='set -e; apk add --no-cache python3 py3-cryptography strace >/dev/null 2>&1; printf "from cryptography.fernet import Fernet\nmsg = b\"hello\"\ncipher = Fernet(Fernet.generate_key())\nprint(cipher.decrypt(cipher.encrypt(msg)).decode())\n" > /tmp/crypt.py; /dlfreeze-build/dlfreeze -d -t -f "/usr/*" -o /tmp/python314-crypt-vfs.frozen -- python3 /tmp/crypt.py >/dev/null 2>&1; timeout 60 /tmp/python314-crypt-vfs.frozen /tmp/crypt.py'
 
     actual=$(docker_alpine_edge_run "$script" 2>&1) || rc=$?
     if [ "$rc" = 0 ] && [ "$actual" = "hello" ]; then
@@ -580,7 +592,71 @@ test_alpine_python_cryptography_captured() {
 }
 
 # ===================================================================
-# Test 1k: Alpine musl extracted mode preserves clang self-reexec helpers
+# Test 1k: Ubuntu 20.04 glibc fallback supports Python cryptography
+# ===================================================================
+test_ubuntu2004_python_cryptography_captured() {
+    echo "--- ubuntu 20.04 python cryptography traced direct-load ---"
+    if ! docker_usable; then
+        skip "ubuntu2004-python-cryptography-captured" "docker unavailable"
+        return
+    fi
+    if [ "$(uname -m)" != "x86_64" ]; then
+        skip "ubuntu2004-python-cryptography-captured" "requires x86_64 host"
+        return
+    fi
+
+    local script actual rc=0
+    script='set -e; export DEBIAN_FRONTEND=noninteractive; apt-get update >/dev/null 2>&1; apt-get install -y python3 python3-cryptography strace >/dev/null 2>&1; printf "from cryptography.fernet import Fernet\nmsg = b\"hello\"\ncipher = Fernet(Fernet.generate_key())\nprint(cipher.decrypt(cipher.encrypt(msg)).decode())\n" > /tmp/crypt.py; /dlfreeze-build/dlfreeze -d -t -f "/usr/*" -o /tmp/python38-crypt-vfs.frozen -- python3 /tmp/crypt.py >/dev/null 2>&1; timeout 90 /tmp/python38-crypt-vfs.frozen /tmp/crypt.py'
+
+    actual=$(docker_ubuntu2004_amd64_run "$script" 2>&1) || rc=$?
+    if [ "$rc" = 0 ] && [ "$actual" = "hello" ]; then
+        pass "ubuntu 20.04 python cryptography traced direct-load"
+    else
+        fail "ubuntu 20.04 python cryptography traced direct-load" "output or exit code differs (exit $rc)"
+        echo "  actual: $actual"
+    fi
+}
+
+# ===================================================================
+# Test 1l: Ubuntu 20.04 traced/data freeze runs on the host system
+# ===================================================================
+test_ubuntu2004_python_cryptography_host_run() {
+    echo "--- ubuntu 20.04 python cryptography host-run ---"
+    if ! docker_usable; then
+        skip "ubuntu2004-python-cryptography-host-run" "docker unavailable"
+        return
+    fi
+    if [ "$(uname -m)" != "x86_64" ]; then
+        skip "ubuntu2004-python-cryptography-host-run" "requires x86_64 host"
+        return
+    fi
+
+    local tmpdir actual rc=0
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' RETURN
+
+    actual=$(docker run --rm --platform linux/amd64 \
+        -v "$(pwd)":/work \
+        -v "$tmpdir":/probe \
+        -w /work \
+        ubuntu:20.04 sh -lc 'set -e; export DEBIAN_FRONTEND=noninteractive; apt-get update >/dev/null 2>&1; apt-get install -y python3 python3-cryptography strace >/dev/null 2>&1; printf "from cryptography.fernet import Fernet\nmsg = b\"hello\"\ncipher = Fernet(Fernet.generate_key())\nprint(cipher.decrypt(cipher.encrypt(msg)).decode())\n" > /probe/crypt.py; /work/'"$BUILD"'/dlfreeze -d -t -f "/usr/*" -o /probe/python38-host.frozen -- python3 /probe/crypt.py >/probe/freeze.out 2>/probe/freeze.err' 2>&1) || rc=$?
+    if [ "$rc" != 0 ]; then
+        fail "ubuntu 20.04 python cryptography host-run" "freeze failed (exit $rc)"
+        echo "  actual: $actual"
+        return
+    fi
+
+    actual=$(timeout 90 "$tmpdir/python38-host.frozen" "$tmpdir/crypt.py" 2>&1) || rc=$?
+    if [ "$rc" = 0 ] && [ "$actual" = "hello" ]; then
+        pass "ubuntu 20.04 python cryptography host-run"
+    else
+        fail "ubuntu 20.04 python cryptography host-run" "output or exit code differs (exit $rc)"
+        echo "  actual: $actual"
+    fi
+}
+
+# ===================================================================
+# Test 1m: Alpine musl extracted mode preserves clang self-reexec helpers
 # ===================================================================
 test_alpine_clang_compile() {
     echo "--- alpine clang compile ---"
@@ -1136,6 +1212,8 @@ test_alpine_python_thread_direct
 test_alpine_python_sqlite_direct
 test_alpine_python_cryptography_direct
 test_alpine_python_cryptography_captured
+test_ubuntu2004_python_cryptography_captured
+test_ubuntu2004_python_cryptography_host_run
 test_alpine_clang_compile
 test_alpine_clang_direct_compile
 test_alpine_clang_captured_static_libs
