@@ -3238,6 +3238,9 @@ static int vfs_dirfd(void *dirp)
 }
 
 /* Helper: create a memfd serving embedded VFS data for a file entry */
+static int vfs_serve_memfd(const struct vfs_entry *ve, const char *path);
+static int frozen_dlopen_serve_memfd(const char *path);
+
 static int vfs_serve_memfd(const struct vfs_entry *ve, const char *path)
 {
     int fd = (int)VFS_SYSCALL(SYS_memfd_create, "dlfrz-vfs", 0);
@@ -3269,7 +3272,17 @@ static int vfs_open(const char *path, int flags, int mode)
             int fd = vfs_serve_memfd(ve, path);
             if (fd >= 0) return fd;
         }
-        vfs_dbg_op("open", path, "syscall");
+        int ret = (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, path, flags, mode);
+        if (ret >= 0) return ret;
+        /* Probe-open for a DLOPEN ELF (e.g. Ruby's require checking .so exists) */
+        {
+            int fd = frozen_dlopen_serve_memfd(path);
+            if (fd >= 0) {
+                vfs_dbg_op("open", path, "dlopen-elf");
+                return fd;
+            }
+        }
+        return ret;
     }
     return (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, path, flags, mode);
 }
@@ -3291,6 +3304,17 @@ static int vfs_openat(int dirfd, const char *path, int flags, int mode)
                 vfs_dbg_op("openat", lookup_path, "file");
                 int fd = vfs_serve_memfd(ve, lookup_path);
                 if (fd >= 0) return fd;
+            }
+            /* Fallback: probe-open for a DLOPEN ELF path not in VFS data */
+            {
+                int ret = (int)VFS_SYSCALL(SYS_openat, dirfd, path, flags, mode);
+                if (ret >= 0) return ret;
+                int fd = frozen_dlopen_serve_memfd(lookup_path);
+                if (fd >= 0) {
+                    vfs_dbg_op("openat", lookup_path, "dlopen-elf");
+                    return fd;
+                }
+                return ret;
             }
         }
         /* O_DIRECTORY: prefer the real directory when it exists so dirfd,
@@ -3346,6 +3370,65 @@ static void *vfs_fopen(const char *path, const char *mode)
 }
 
 /*
+ * Helpers to make VFS stat/open/access wrappers aware of DLOPEN-captured ELFs.
+ * When a frozen binary (e.g. Ubuntu 20.04 Ruby) is run on a different distro,
+ * the original file paths (e.g. /usr/lib/x86_64-linux-gnu/ruby/2.7.0/monitor.so)
+ * don't exist on the host.  Without these helpers, Ruby's openat/stat probes
+ * return ENOENT → LoadError before dlopen is ever reached.
+ */
+
+/* Return the frozen ELF index for path, or -1 if not found. */
+static int frozen_dlopen_find(const char *path)
+{
+    if (!g_frozen_metas || !g_frozen_entries || !g_frozen_strtab)
+        return -1;
+    for (uint32_t i = 0; i < g_frozen_num_entries; i++) {
+        if (!(g_frozen_metas[i].flags & LDR_FLAG_DLOPEN)) continue;
+        if (g_frozen_metas[i].flags & LDR_FLAG_INTERP)   continue;
+        const char *ename = g_frozen_strtab + g_frozen_entries[i].name_offset;
+        if (strcmp(ename, path) == 0)
+            return (int)i;
+    }
+    return -1;
+}
+
+/* Returns file size >= 0 if path is a frozen DLOPEN ELF, else -1. */
+static int64_t frozen_dlopen_elf_size(const char *path)
+{
+    int idx = frozen_dlopen_find(path);
+    if (idx < 0) return -1;
+    return (int64_t)g_frozen_entries[idx].data_size;
+}
+
+/* Open a frozen DLOPEN ELF as a memfd so probe-opens (e.g. Ruby's require)
+ * succeed even when the original path doesn't exist on the host filesystem. */
+static int frozen_dlopen_serve_memfd(const char *path)
+{
+    int idx = frozen_dlopen_find(path);
+    if (idx < 0) return -1;
+    const uint8_t *data = g_frozen_mem +
+        (g_frozen_entries[idx].data_offset - g_frozen_mem_foff);
+    uint64_t size = g_frozen_entries[idx].data_size;
+    int fd = (int)VFS_SYSCALL(SYS_memfd_create, "dlfrz-elf", 0);
+    if (fd < 0) return -1;
+    const uint8_t *p = data;
+    uint64_t rem = size;
+    while (rem > 0) {
+        long w = VFS_SYSCALL(SYS_write, fd, p, rem);
+        if (w <= 0) { VFS_SYSCALL(SYS_close, fd); return -1; }
+        p   += w;
+        rem -= (uint64_t)w;
+    }
+    VFS_SYSCALL(SYS_lseek, fd, (off_t)0, 0 /* SEEK_SET */);
+    if (g_debug) {
+        ldr_msg("vfs: serving dlopen-elf ");
+        ldr_msg(path);
+        ldr_msg("\n");
+    }
+    return fd;
+}
+
+/*
  * vfs_stat / vfs_fstatat — intercept stat calls for embedded files.
  * Python's import system checks if files exist via stat() before opening.
  * We fabricate a regular-file stat result for embedded VFS entries.
@@ -3371,13 +3454,26 @@ static int vfs_stat(const char *path, struct stat *buf)
     /* Directories & everything else: real FS first, VFS fallback */
     int ret = (int)VFS_SYSCALL(SYS_newfstatat, AT_FDCWD, path, buf, 0);
     if (ret == 0) return 0;
-    if (path && path[0] == '/' && vfs_dir_exists(path)) {
-        vfs_dbg_op("stat", path, "dir");
-        __builtin_memset(buf, 0, sizeof(*buf));
-        buf->st_mode  = 040755;  /* directory, rwxr-xr-x */
-        buf->st_nlink = 2;
-        buf->st_blksize = 4096;
-        return 0;
+    if (path && path[0] == '/') {
+        if (vfs_dir_exists(path)) {
+            vfs_dbg_op("stat", path, "dir");
+            __builtin_memset(buf, 0, sizeof(*buf));
+            buf->st_mode  = 040755;  /* directory, rwxr-xr-x */
+            buf->st_nlink = 2;
+            buf->st_blksize = 4096;
+            return 0;
+        }
+        int64_t elf_sz = frozen_dlopen_elf_size(path);
+        if (elf_sz >= 0) {
+            vfs_dbg_op("stat", path, "dlopen-elf");
+            __builtin_memset(buf, 0, sizeof(*buf));
+            buf->st_mode  = 0100644;
+            buf->st_nlink = 1;
+            buf->st_size  = (off_t)elf_sz;
+            buf->st_blksize = 4096;
+            buf->st_blocks  = (elf_sz + 511) / 512;
+            return 0;
+        }
     }
     return ret;
 }
@@ -3406,13 +3502,26 @@ static int vfs_fstatat(int dirfd, const char *path, struct stat *buf, int flag)
     }
     int ret = (int)VFS_SYSCALL(SYS_newfstatat, dirfd, path, buf, flag);
     if (ret == 0) return 0;
-    if (lookup_path && lookup_path[0] == '/' && vfs_dir_exists(lookup_path)) {
-        vfs_dbg_op("fstatat", lookup_path, "dir");
-        __builtin_memset(buf, 0, sizeof(*buf));
-        buf->st_mode  = 040755;
-        buf->st_nlink = 2;
-        buf->st_blksize = 4096;
-        return 0;
+    if (lookup_path && lookup_path[0] == '/') {
+        if (vfs_dir_exists(lookup_path)) {
+            vfs_dbg_op("fstatat", lookup_path, "dir");
+            __builtin_memset(buf, 0, sizeof(*buf));
+            buf->st_mode  = 040755;
+            buf->st_nlink = 2;
+            buf->st_blksize = 4096;
+            return 0;
+        }
+        int64_t elf_sz = frozen_dlopen_elf_size(lookup_path);
+        if (elf_sz >= 0) {
+            vfs_dbg_op("fstatat", lookup_path, "dlopen-elf");
+            __builtin_memset(buf, 0, sizeof(*buf));
+            buf->st_mode  = 0100644;
+            buf->st_nlink = 1;
+            buf->st_size  = (off_t)elf_sz;
+            buf->st_blksize = 4096;
+            buf->st_blocks  = (elf_sz + 511) / 512;
+            return 0;
+        }
     }
     return ret;
 }
@@ -3429,9 +3538,15 @@ static int vfs_access(const char *path, int amode)
     }
     int ret = (int)VFS_SYSCALL(SYS_faccessat, AT_FDCWD, path, amode, 0);
     if (ret == 0) return 0;
-    if (path && path[0] == '/' && vfs_dir_exists(path)) {
-        vfs_dbg_op("access", path, "dir");
-        return 0;
+    if (path && path[0] == '/') {
+        if (vfs_dir_exists(path)) {
+            vfs_dbg_op("access", path, "dir");
+            return 0;
+        }
+        if (frozen_dlopen_elf_size(path) >= 0) {
+            vfs_dbg_op("access", path, "dlopen-elf");
+            return 0;
+        }
     }
     return ret;
 }
@@ -3454,9 +3569,15 @@ static int vfs_faccessat(int dirfd, const char *path, int amode, int flag)
     }
     int ret = (int)VFS_SYSCALL(SYS_faccessat, dirfd, path, amode, flag);
     if (ret == 0) return 0;
-    if (lookup_path && lookup_path[0] == '/' && vfs_dir_exists(lookup_path)) {
-        vfs_dbg_op("faccessat", lookup_path, "dir");
-        return 0;
+    if (lookup_path && lookup_path[0] == '/') {
+        if (vfs_dir_exists(lookup_path)) {
+            vfs_dbg_op("faccessat", lookup_path, "dir");
+            return 0;
+        }
+        if (frozen_dlopen_elf_size(lookup_path) >= 0) {
+            vfs_dbg_op("faccessat", lookup_path, "dlopen-elf");
+            return 0;
+        }
     }
     return ret;
 }
