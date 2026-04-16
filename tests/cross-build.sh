@@ -145,7 +145,7 @@ fi
 
 # 4. Python3 — freeze a simple deterministic script (best effort)
 if command -v python3 >/dev/null 2>&1; then
-    if /work/build/dlfreeze -v -d -o "$OUTDIR/python3.frozen" -- python3 -c 'print(1+2)' 2>/dev/null; then
+    if /work/build/dlfreeze -v -d -t -f '/usr/*' -o "$OUTDIR/python3.frozen" -- python3 -c 'print(1+2)' 2>/dev/null; then
         chmod +x "$OUTDIR/python3.frozen"
         echo "3" > "$OUTDIR/python3.expected"
         if command -v upx >/dev/null 2>&1; then
@@ -161,7 +161,7 @@ fi
 
 # 5. Ruby — freeze a simple deterministic script (best effort)
 if command -v ruby >/dev/null 2>&1; then
-    if /work/build/dlfreeze -v -d -o "$OUTDIR/ruby.frozen" -- ruby -e 'puts 1+2' 2>/dev/null; then
+    if /work/build/dlfreeze -v -d -t -f '/usr/*' -o "$OUTDIR/ruby.frozen" -- ruby -e 'puts 1+2' 2>/dev/null; then
         chmod +x "$OUTDIR/ruby.frozen"
         echo "3" > "$OUTDIR/ruby.expected"
         if command -v upx >/dev/null 2>&1; then
