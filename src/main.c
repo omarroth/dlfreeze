@@ -141,12 +141,13 @@ static void scan_dir_shallow(const char *dirpath,
 
         if (!S_ISREG(sb.st_mode)) continue;
 
-        /* Check if this file should be skipped (ELF, dep, exe).
-         * Skipped files are still added as virtual entries (zero-byte,
-         * listed by VFS readdir but not served from embedded data).
-         * Real empty files are preserved so the VFS can serve them. */
+        /* Check if this file is a known dep (exe, interp, or resolved
+         * shared lib / dlopen lib).  Known-dep ELF files are served at
+         * runtime via frozen_dlopen_serve_memfd; add them as virtual
+         * placeholders so VFS directory listings include them without
+         * duplicating the payload.  ELF files that are NOT known deps
+         * and non-ELF files are embedded as real data. */
         int skip = 0;
-        if (!skip && elf_check(rpath)) skip = 1;
         if (!skip && strcmp(rpath, exe_path) == 0) skip = 1;
         if (!skip && deps->interp_path &&
             strcmp(rpath, deps->interp_path) == 0) skip = 1;
@@ -257,8 +258,14 @@ static void process_captured_path(const char *exe_path, const char **patterns,
 
     if (stat(rpath, &sb) != 0 || !S_ISREG(sb.st_mode))
         return;
-    if (elf_check(rpath))
+
+    int is_elf = elf_check(rpath);
+    if (is_elf && path_is_known_dep(rpath, exe_path, deps)) {
+        /* Already captured as a DLOPEN / shlib dep; the frozen_dlopen_serve_memfd
+         * path handles probe-opens at runtime.  No separate data entry needed. */
         return;
+    }
+
     if (path_is_known_dep(rpath, exe_path, deps))
         return;
 
@@ -266,6 +273,29 @@ static void process_captured_path(const char *exe_path, const char **patterns,
         if (match_glob(patterns[i], rpath)) {
             if (sb.st_size > 0)
                 data_file_list_add(out, rpath);
+            return;
+        }
+    }
+}
+
+/* Record a path that was probed during execution but did not exist at
+ * freeze time.  At runtime the VFS will honour these entries and return
+ * ENOENT even if the file has since appeared on the target system. */
+static void process_captured_negative_path(const char **patterns, int npatterns,
+                                           struct data_file_list *out,
+                                           const char *path)
+{
+    struct stat sb;
+
+    if (!path || path[0] != '/')
+        return;
+    /* Must genuinely not exist at freeze time */
+    if (stat(path, &sb) == 0)
+        return;
+
+    for (int i = 0; i < npatterns; i++) {
+        if (match_glob(patterns[i], path)) {
+            data_file_list_add_negative(out, path);
             return;
         }
     }
@@ -336,11 +366,15 @@ static int parse_preload_file_trace(const char *tracef, const char *exe_path,
 
         if (len < 3 || line[1] != ' ')
             continue;
-        if (line[0] != 'F' && line[0] != 'D')
+        if (line[0] != 'F' && line[0] != 'D' && line[0] != 'N')
             continue;
         if (line[2] != '/')
             continue;
 
+        if (line[0] == 'N') {
+              process_captured_negative_path(patterns, npatterns, out, line + 2);
+            continue;
+        }
         process_captured_path(exe_path, patterns, npatterns, out, deps,
                               line + 2, line[0] == 'D',
                               &cap_dirs, &ncap_dirs, &cap_dirs_cap);
@@ -374,8 +408,6 @@ static int parse_strace_file_trace(const char *tracef, const char *exe_path,
         char *eq = strstr(p, ") = ");
         if (!eq)
             continue;
-        if (atoi(eq + 4) < 0)
-            continue;
 
         char *q1 = strchr(p, '"');
         if (!q1)
@@ -389,6 +421,12 @@ static int parse_strace_file_trace(const char *tracef, const char *exe_path,
         if (q1[0] != '/')
             continue;
 
+        if (atoi(eq + 4) < 0) {
+            /* Failed open: record as negative entry if path matches patterns */
+            process_captured_negative_path(patterns, npatterns, out, q1);
+            continue;
+        }
+
         {
             char rpath[PATH_MAX];
             int is_dir = (strstr(q2 + 1, "O_DIRECTORY") != NULL);
@@ -396,10 +434,10 @@ static int parse_strace_file_trace(const char *tracef, const char *exe_path,
             if (!realpath(q1, rpath))
                 continue;
 
-            if (!is_dir && elf_check(rpath)) {
-                if (elf_tf && !path_is_known_dep(rpath, exe_path, deps))
+            if (!is_dir && elf_check(rpath) &&
+                !path_is_known_dep(rpath, exe_path, deps)) {
+                if (elf_tf)
                     fprintf(elf_tf, "%s\n", rpath);
-                continue;
             }
 
             process_captured_path(exe_path, patterns, npatterns, out, deps,

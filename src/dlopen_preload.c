@@ -164,6 +164,29 @@ static void trace_path_kind(int dirfd, const char *path, int is_dir)
     write_trace_line(g_file_trace_fd, is_dir ? "D " : "F ", resolved);
 }
 
+/* Record a failed file-open (path not found) so the packer can embed a
+ * negative VFS entry.  We deliberately do NOT call canonicalize_path here
+ * because realpath(3) fails for non-existent paths. */
+static void trace_failed_path(int dirfd, const char *path)
+{
+    char resolved[PATH_MAX];
+    int saved_errno = errno;
+
+    if (g_trace_depth || g_file_trace_fd < 0)
+        return;
+
+    if (!build_path(dirfd, path, resolved, sizeof(resolved)))
+        return;
+
+    /* Only record absolute paths; relative-without-dirfd would need cwd
+     * normalisation which is error-prone for non-existent entries. */
+    if (resolved[0] != '/')
+        return;
+
+    write_trace_line(g_file_trace_fd, "N ", resolved);
+    errno = saved_errno;
+}
+
 static void trace_fd_result(int fd, int dirfd, const char *path)
 {
     struct stat st;
@@ -241,6 +264,8 @@ int open(const char *path, int flags, ...)
     fd = open_needs_mode(flags) ? real_open(path, flags, mode)
                                 : real_open(path, flags);
     trace_fd_result(fd, AT_FDCWD, path);
+    if (fd < 0 && path[0] == '/')
+        trace_failed_path(AT_FDCWD, path);
     return fd;
 }
 
@@ -271,6 +296,8 @@ int open64(const char *path, int flags, ...)
                                     : real_open(path, flags);
 
     trace_fd_result(fd, AT_FDCWD, path);
+    if (fd < 0 && path[0] == '/')
+        trace_failed_path(AT_FDCWD, path);
     return fd;
 }
 
@@ -296,6 +323,12 @@ int openat(int dirfd, const char *path, int flags, ...)
     fd = open_needs_mode(flags) ? real_openat(dirfd, path, flags, mode)
                                 : real_openat(dirfd, path, flags);
     trace_fd_result(fd, dirfd, path);
+    if (fd < 0) {
+        char resolved[PATH_MAX];
+        if (build_path(dirfd, path, resolved, sizeof(resolved)) &&
+            resolved[0] == '/')
+            trace_failed_path(dirfd, path);
+    }
     return fd;
 }
 
@@ -326,6 +359,12 @@ int openat64(int dirfd, const char *path, int flags, ...)
                                     : real_openat(dirfd, path, flags);
 
     trace_fd_result(fd, dirfd, path);
+    if (fd < 0) {
+        char resolved[PATH_MAX];
+        if (build_path(dirfd, path, resolved, sizeof(resolved)) &&
+            resolved[0] == '/')
+            trace_failed_path(dirfd, path);
+    }
     return fd;
 }
 

@@ -14,7 +14,8 @@
 #define DLFRZ_FLAG_NEEDS_RTLD  0x20  /* imports _rtld_global/_rtld_global_ro      */
 #define DLFRZ_FLAG_DATA        0x40  /* embedded data file (not ELF)              */
 #define DLFRZ_FLAG_RUNTIME_SCAN 0x80 /* needs runtime special/IRELATIVE scan      */
-#define DLFRZ_FLAG_DATA_VIRTUAL 0x100 /* placeholder data entry, not openable      */
+#define DLFRZ_FLAG_DATA_VIRTUAL  0x100 /* placeholder data entry, not openable      */
+#define DLFRZ_FLAG_DATA_NEGATIVE 0x200 /* negative entry: not found at freeze time  */
 
 struct dlfrz_entry {
     uint64_t data_offset;

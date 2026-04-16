@@ -14,6 +14,9 @@
 #ifndef DLFRZ_FLAG_DATA_VIRTUAL
 #define DLFRZ_FLAG_DATA_VIRTUAL 0x100
 #endif
+#ifndef DLFRZ_FLAG_DATA_NEGATIVE
+#define DLFRZ_FLAG_DATA_NEGATIVE 0x200
+#endif
 
 /* Fallback for musl libc which lacks Elf64_Relr */
 #ifndef ELF_RELR_DEFINED
@@ -115,6 +118,11 @@ void data_file_list_add(struct data_file_list *dl, const char *path)
 void data_file_list_add_virtual(struct data_file_list *dl, const char *path)
 {
     data_file_list_add_ex(dl, path, 1);
+}
+
+void data_file_list_add_negative(struct data_file_list *dl, const char *path)
+{
+    data_file_list_add_ex(dl, path, 2);
 }
 
 void data_file_list_free(struct data_file_list *dl)
@@ -1953,16 +1961,22 @@ int pack_frozen(const struct pack_options *opts)
         write_pad(out, off, 8); off = ALIGN_UP(off, 8);
         entries[eidx].data_offset = off;
         entries[eidx].flags       = DLFRZ_FLAG_DATA;
-        if (opts->data_files->is_virtual && opts->data_files->is_virtual[i])
-            entries[eidx].flags |= DLFRZ_FLAG_DATA_VIRTUAL;
+        {
+            int v = opts->data_files->is_virtual ? opts->data_files->is_virtual[i] : 0;
+            if (v == 1) entries[eidx].flags |= DLFRZ_FLAG_DATA_VIRTUAL;
+            else if (v == 2) entries[eidx].flags |= DLFRZ_FLAG_DATA_NEGATIVE;
+        }
         entries[eidx].name_offset = stroff;
         const char *dpath = opts->data_files->paths[i];
         strcpy(strtab + stroff, dpath);
         stroff += strlen(dpath) + 1;
-        if (opts->data_files->is_virtual && opts->data_files->is_virtual[i]) {
-            written = 0;
-        } else {
-            if (append_file(out, dpath, &written) < 0) goto fail2;
+        {
+            int v = opts->data_files->is_virtual ? opts->data_files->is_virtual[i] : 0;
+            if (v == 1 || v == 2) {
+                written = 0;  /* virtual and negative entries carry no data */
+            } else {
+                if (append_file(out, dpath, &written) < 0) goto fail2;
+            }
         }
         entries[eidx].data_size = written;
         src_paths[eidx] = dpath;

@@ -2180,6 +2180,11 @@ static int vfs_is_virtual_entry(const struct vfs_entry *ve)
     return ve && (ve->flags & DLFRZ_FLAG_DATA_VIRTUAL) != 0;
 }
 
+static int vfs_is_negative_entry(const struct vfs_entry *ve)
+{
+    return ve && (ve->flags & DLFRZ_FLAG_DATA_NEGATIVE) != 0;
+}
+
 static int vfs_is_dir_marker_path(const char *path)
 {
     size_t len = strlen(path);
@@ -2410,6 +2415,9 @@ static void vfs_init_dirs(void)
     g_vfs_dir_strpos = 0;
     for (int i = 0; i < (int)VFS_HASH_SIZE; i++) {
         if (!g_vfs_table[i].path) continue;
+        /* Negative entries represent files that do not exist; their parent
+         * directories should not be derived as VFS-visible directories. */
+        if (g_vfs_table[i].flags & DLFRZ_FLAG_DATA_NEGATIVE) continue;
         const char *path = g_vfs_table[i].path;
         int len = strlen(path);
         /* Walk backwards, extracting each parent directory */
@@ -3063,6 +3071,8 @@ static struct dirent *vfs_readdir(void *dirp)
                     /* Skip .dir markers — invisible to applications */
                     if (rest[0] == '.' && rest[1] == 'd' && rest[2] == 'i'
                         && rest[3] == 'r' && rest[4] == '\0') continue;
+                    /* Skip negative entries — they represent non-existent files */
+                    if (g_vfs_table[si].flags & DLFRZ_FLAG_DATA_NEGATIVE) continue;
                     /* Skip if real FS already has this file */
                     if (h->fd_compat >= 0) {
                         int r = (int)VFS_SYSCALL(SYS_faccessat, AT_FDCWD, fp, 0 /*F_OK*/, 0);
@@ -3298,6 +3308,11 @@ static int vfs_open(const char *path, int flags, int mode)
     /* Only intercept absolute paths for read-only opens */
     if (path && path[0] == '/' && (flags & 3) == 0 /* O_RDONLY */) {
         const struct vfs_entry *ve = vfs_lookup(path);
+        if (ve && vfs_is_negative_entry(ve)) {
+            vfs_dbg_op("open", path, "negative");
+            set_loader_errno(ENOENT);
+            return -1;
+        }
         if (ve && !vfs_is_virtual_entry(ve)) {
             vfs_dbg_op("open", path, "file");
             int fd = vfs_serve_memfd(ve, path);
@@ -3331,6 +3346,11 @@ static int vfs_openat(int dirfd, const char *path, int flags, int mode)
     if (lookup_path && lookup_path[0] == '/') {
         if ((flags & 3) == 0 /* O_RDONLY */) {
             const struct vfs_entry *ve = vfs_lookup(lookup_path);
+            if (ve && vfs_is_negative_entry(ve)) {
+                vfs_dbg_op("openat", lookup_path, "negative");
+                set_loader_errno(ENOENT);
+                return -1;
+            }
             if (ve && !vfs_is_virtual_entry(ve)) {
                 vfs_dbg_op("openat", lookup_path, "file");
                 int fd = vfs_serve_memfd(ve, lookup_path);
@@ -3380,7 +3400,7 @@ static void *vfs_fopen(const char *path, const char *mode)
 {
     if (path && path[0] == '/' && mode && mode[0] == 'r') {
         const struct vfs_entry *ve = vfs_lookup(path);
-        if (ve && !vfs_is_virtual_entry(ve)) {
+        if (ve && !vfs_is_negative_entry(ve) && !vfs_is_virtual_entry(ve)) {
             vfs_dbg_op("fopen", path, "file");
             int fd = vfs_serve_memfd(ve, path);
             if (fd >= 0 && g_real_fdopen)
@@ -3471,8 +3491,17 @@ static int vfs_stat(const char *path, struct stat *buf)
          * importlib/plugin scanners can discover embedded ELF names.
          * Directory markers stay synthetic-only. */
         const struct vfs_entry *ve = vfs_lookup(path);
+        if (ve && vfs_is_negative_entry(ve)) {
+            vfs_dbg_op("stat", path, "negative");
+            set_loader_errno(ENOENT);
+            return -1;
+        }
         if (ve && !(vfs_is_virtual_entry(ve) && vfs_is_dir_marker_path(path))) {
             vfs_dbg_op("stat", path, "file");
+            /* Virtual entries have no embedded data (size=0); fall through
+             * so the real FS or frozen_dlopen_elf_size provides the correct size. */
+            if (vfs_is_virtual_entry(ve))
+                goto vfs_stat_fallthrough;
             __builtin_memset(buf, 0, sizeof(*buf));
             buf->st_mode  = 0100644;  /* regular file, rw-r--r-- */
             buf->st_nlink = 1;
@@ -3482,6 +3511,7 @@ static int vfs_stat(const char *path, struct stat *buf)
             return 0;
         }
     }
+vfs_stat_fallthrough:;
     /* Directories & everything else: real FS first, VFS fallback */
     int ret = (int)VFS_SYSCALL(SYS_newfstatat, AT_FDCWD, path, buf, 0);
     if (ret == 0) return 0;
@@ -3520,8 +3550,15 @@ static int vfs_fstatat(int dirfd, const char *path, struct stat *buf, int flag)
 
     if (lookup_path && lookup_path[0] == '/') {
         const struct vfs_entry *ve = vfs_lookup(lookup_path);
+        if (ve && vfs_is_negative_entry(ve)) {
+            vfs_dbg_op("fstatat", lookup_path, "negative");
+            set_loader_errno(ENOENT);
+            return -1;
+        }
         if (ve && !(vfs_is_virtual_entry(ve) && vfs_is_dir_marker_path(lookup_path))) {
             vfs_dbg_op("fstatat", lookup_path, "file");
+            if (vfs_is_virtual_entry(ve))
+                goto vfs_fstatat_fallthrough;
             __builtin_memset(buf, 0, sizeof(*buf));
             buf->st_mode  = 0100644;
             buf->st_nlink = 1;
@@ -3531,6 +3568,7 @@ static int vfs_fstatat(int dirfd, const char *path, struct stat *buf, int flag)
             return 0;
         }
     }
+vfs_fstatat_fallthrough:;
     int ret = (int)VFS_SYSCALL(SYS_newfstatat, dirfd, path, buf, flag);
     if (ret == 0) return 0;
     if (lookup_path && lookup_path[0] == '/') {
@@ -3562,6 +3600,11 @@ static int vfs_access(const char *path, int amode)
 {
     if (path && path[0] == '/') {
         const struct vfs_entry *ve = vfs_lookup(path);
+        if (ve && vfs_is_negative_entry(ve)) {
+            vfs_dbg_op("access", path, "negative");
+            set_loader_errno(ENOENT);
+            return -1;
+        }
         if (ve && !(vfs_is_virtual_entry(ve) && vfs_is_dir_marker_path(path))) {
             vfs_dbg_op("access", path, "file");
             return 0;
@@ -3593,6 +3636,11 @@ static int vfs_faccessat(int dirfd, const char *path, int amode, int flag)
 
     if (lookup_path && lookup_path[0] == '/') {
         const struct vfs_entry *ve = vfs_lookup(lookup_path);
+        if (ve && vfs_is_negative_entry(ve)) {
+            vfs_dbg_op("faccessat", lookup_path, "negative");
+            set_loader_errno(ENOENT);
+            return -1;
+        }
         if (ve && !(vfs_is_virtual_entry(ve) && vfs_is_dir_marker_path(lookup_path))) {
             vfs_dbg_op("faccessat", lookup_path, "file");
             return 0;
