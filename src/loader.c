@@ -4104,6 +4104,24 @@ static int resolve_tlsdesc_target(struct loaded_obj *obj,
     if (sidx != 0 && sidx < obj->dynsym_count)
         sym = &obj->dynsym[sidx];
 
+    /* sidx == 0 means STN_UNDEF / local-DSO reference: the TLSDESC addend is
+     * a direct offset into the object's own TLS block.  Use a synthetic
+     * zero-offset symbol so the owner remains `obj`. */
+    if (sidx == 0) {
+        if (obj->tls.memsz == 0 || obj->tls.modid == 0)
+            return -1;
+        *modid_out = obj->tls.modid;
+        *offset_out = addend;
+        if (obj->tls.tpoff != 0) {
+            *tprel_out = obj->tls.tpoff + (int64_t)addend;
+            *have_tprel_out = 1;
+        } else {
+            *tprel_out = 0;
+            *have_tprel_out = 0;
+        }
+        return 0;
+    }
+
     if (sym && sym->st_shndx == SHN_UNDEF) {
         name = obj->dynstr + sym->st_name;
         uint32_t gh = gnu_hash_calc(name);
