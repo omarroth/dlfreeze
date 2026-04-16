@@ -17,7 +17,7 @@ PRELOAD   = $(BUILD)/dlfreeze-preload.so
 # Use musl-gcc for static tools when available; fall back to system gcc.
 TOOL_CC := $(shell command -v musl-gcc 2>/dev/null || echo $(CC))
 
-.PHONY: all clean test bench
+.PHONY: all clean test bench local-verify local-cross
 
 all: $(DLFREEZE) $(BOOTSTRAP) $(PRELOAD)
 
@@ -59,6 +59,12 @@ test: all
 
 bench: all
 	@bash tests/run_benchmarks.sh "$(BUILD)"
+
+local-verify: all
+	@bash tests/local-verify.sh --build-dir "$(BUILD)"
+
+local-cross:
+	@bash tests/local-cross-matrix.sh
 
 clean:
 	rm -rf $(BUILD)
