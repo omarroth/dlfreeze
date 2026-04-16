@@ -2204,6 +2204,9 @@ static inline void sync_glibc_errno_value(int err)
 static inline void set_loader_errno(int err)
 {
     errno = err;
+    /* musl errno write touches FS:0x34; once FS points at glibc TLS this can
+     * overlap pointer_guard bytes. Restore guard before returning to user code. */
+    restore_ptr_guard();
     sync_glibc_errno_value(err);
 }
 
