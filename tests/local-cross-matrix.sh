@@ -115,7 +115,7 @@ if [[ "$DO_RUN" -eq 1 ]]; then
         name="${pair%%|*}"
         image="${pair##*|}"
         echo "[cross-matrix] run on $image against all frozen-*-${ARCH}"
-        run_in_image "$image" "FROZEN_DIR=/work/frozen-all sh /work/tests/cross-run.sh"
+        run_in_image "$image" "FROZEN_DIR=/work/frozen-all FROZEN_GLOB='/work/frozen-all/frozen-*-${ARCH}' sh /work/tests/cross-run.sh"
     done
 fi
 

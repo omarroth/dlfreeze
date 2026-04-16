@@ -98,6 +98,7 @@ echo ""
 
 # ── Freeze cross-test programs ─────────────────────────────────────
 OUTDIR="${OUTDIR:-/work/build/cross-test}"
+rm -rf "$OUTDIR"
 mkdir -p "$OUTDIR"
 
 # 1. Hello world — deterministic output for cross-environment comparison
@@ -134,6 +135,7 @@ chmod +x "$OUTDIR/exitcode.frozen"
 if command -v upx >/dev/null 2>&1; then
     for f in "$OUTDIR"/*.frozen; do
         base=$(basename "$f" .frozen)
+        rm -f "$OUTDIR/${base}.upx.frozen"
         if upx --best -o "$OUTDIR/${base}.upx.frozen" "$f" 2>/dev/null; then
             chmod +x "$OUTDIR/${base}.upx.frozen"
         fi

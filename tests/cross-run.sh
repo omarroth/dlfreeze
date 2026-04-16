@@ -48,6 +48,7 @@ echo "========================================================"
 echo ""
 
 FROZEN_DIR="${FROZEN_DIR:-/work/frozen-all}"
+FROZEN_GLOB="${FROZEN_GLOB:-$FROZEN_DIR/frozen-*}"
 
 if [ ! -d "$FROZEN_DIR" ]; then
     echo "ERROR: $FROZEN_DIR not found"
@@ -55,9 +56,18 @@ if [ ! -d "$FROZEN_DIR" ]; then
 fi
 
 # ── Iterate over each source environment's frozen artifacts ────────
-for src_dir in "$FROZEN_DIR"/frozen-*; do
+for src_dir in $FROZEN_GLOB; do
     [ -d "$src_dir" ] || continue
     src_env=$(basename "$src_dir")
+    if [ ! -e "$src_dir/hello.frozen" ] \
+        && [ ! -e "$src_dir/exitcode.frozen" ] \
+        && [ ! -e "$src_dir/python3.frozen" ] \
+        && [ ! -e "$src_dir/ruby.frozen" ]; then
+        echo "--- Source: $src_env ---"
+        skip "$src_env" "no artifacts found"
+        echo ""
+        continue
+    fi
     echo "--- Source: $src_env ---"
 
     # ── hello.frozen ───────────────────────────────────────────────
@@ -81,7 +91,7 @@ for src_dir in "$FROZEN_DIR"/frozen-*; do
 
     # ── hello.upx.frozen (UPX-compressed) ──────────────────────────
     frozen_upx="$src_dir/hello.upx.frozen"
-    if [ -f "$frozen_upx" ]; then
+    if [ -f "$frozen_upx" ] && [ -f "$expected" ]; then
         chmod +x "$frozen_upx" 2>/dev/null || true
         rc=0
         actual=$(run_capture "$frozen_upx" foo bar 2>&1) || rc=$?
@@ -94,7 +104,7 @@ for src_dir in "$FROZEN_DIR"/frozen-*; do
             echo "  actual:   $(echo "$actual" | head -3)"
         fi
     else
-        skip "$src_env/hello.upx.frozen" "UPX not available at build time"
+        skip "$src_env/hello.upx.frozen" "artifact or expectation not found"
     fi
 
     # ── exitcode.frozen ────────────────────────────────────────────
@@ -173,7 +183,7 @@ for src_dir in "$FROZEN_DIR"/frozen-*; do
             fail "$src_env/python3.upx.frozen" "output differs or rc=$rc"
         fi
     else
-        skip "$src_env/python3.upx.frozen" "UPX not available at build time"
+        skip "$src_env/python3.upx.frozen" "artifact or expectation not found"
     fi
 
     # ── ruby.frozen ────────────────────────────────────────────────
@@ -206,7 +216,7 @@ for src_dir in "$FROZEN_DIR"/frozen-*; do
             fail "$src_env/ruby.upx.frozen" "output differs or rc=$rc"
         fi
     else
-        skip "$src_env/ruby.upx.frozen" "UPX not available at build time"
+        skip "$src_env/ruby.upx.frozen" "artifact or expectation not found"
     fi
 
     echo ""

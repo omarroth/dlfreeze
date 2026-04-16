@@ -158,6 +158,133 @@ static int g_is_musl_runtime;
 static uintptr_t g_musl_tp_self_delta;
 
 #if defined(__aarch64__)
+static inline int64_t sign_extend64(uint64_t value, unsigned bits)
+{
+    uint64_t sign = 1ULL << (bits - 1);
+    return (int64_t)((value ^ sign) - sign);
+}
+
+static inline int aarch64_is_b_imm(uint32_t insn)
+{
+    return (insn & 0xfc000000u) == 0x14000000u;
+}
+
+static inline uintptr_t aarch64_decode_b_imm(uintptr_t pc, uint32_t insn)
+{
+    int64_t imm = sign_extend64((uint64_t)(insn & 0x03ffffffu), 26) << 2;
+    return pc + imm;
+}
+
+static inline int aarch64_is_adrp(uint32_t insn)
+{
+    return (insn & 0x9f000000u) == 0x90000000u;
+}
+
+static inline int aarch64_is_adr(uint32_t insn)
+{
+    return (insn & 0x9f000000u) == 0x10000000u;
+}
+
+static inline uintptr_t aarch64_decode_adrp(uintptr_t pc, uint32_t insn)
+{
+    uint64_t immhi = (insn >> 5) & 0x7ffffu;
+    uint64_t immlo = (insn >> 29) & 0x3u;
+    int64_t imm = sign_extend64((immhi << 2) | immlo, 21) << 12;
+    return (pc & ~0xfffULL) + imm;
+}
+
+static inline uintptr_t aarch64_decode_adr(uintptr_t pc, uint32_t insn)
+{
+    uint64_t immhi = (insn >> 5) & 0x7ffffu;
+    uint64_t immlo = (insn >> 29) & 0x3u;
+    int64_t imm = sign_extend64((immhi << 2) | immlo, 21);
+    return pc + imm;
+}
+
+static inline int aarch64_is_add_imm64(uint32_t insn)
+{
+    return (insn & 0xff000000u) == 0x91000000u;
+}
+
+static inline uint32_t aarch64_add_imm64(uint32_t insn)
+{
+    uint32_t imm12 = (insn >> 10) & 0xfffu;
+    uint32_t shift = (insn >> 22) & 0x3u;
+    return imm12 << (shift ? 12 : 0);
+}
+
+static inline int aarch64_is_ldr_uimm64(uint32_t insn)
+{
+    return (insn & 0xffc00000u) == 0xf9400000u;
+}
+
+static uint64_t aarch64_try_extract_main_from_block(uintptr_t map_start,
+                                                    uintptr_t map_end,
+                                                    uintptr_t block_addr,
+                                                    int depth)
+{
+    if (depth <= 0)
+        return 0;
+    if (block_addr < map_start || block_addr + 16 * sizeof(uint32_t) > map_end)
+        return 0;
+
+    const uint32_t *insns = (const uint32_t *)block_addr;
+
+    for (int i = 0; i < 16; i++) {
+        uint32_t insn = insns[i];
+        uintptr_t pc = block_addr + (uintptr_t)i * sizeof(uint32_t);
+        uint32_t rd = insn & 31u;
+
+        if (aarch64_is_b_imm(insn)) {
+            uintptr_t target = aarch64_decode_b_imm(pc, insn);
+            if (target != pc)
+                return aarch64_try_extract_main_from_block(map_start, map_end,
+                                                           target, depth - 1);
+            continue;
+        }
+
+        if (rd != 0)
+            continue;
+
+        if (aarch64_is_adr(insn))
+            return aarch64_decode_adr(pc, insn);
+
+        if (!aarch64_is_adrp(insn))
+            continue;
+
+        uintptr_t base = aarch64_decode_adrp(pc, insn);
+        if (i + 1 >= 16)
+            continue;
+
+        uint32_t next = insns[i + 1];
+        uint32_t next_rd = next & 31u;
+        uint32_t next_rn = (next >> 5) & 31u;
+
+        if (aarch64_is_add_imm64(next) && next_rd == 0 && next_rn == 0)
+            return base + aarch64_add_imm64(next);
+
+        if (aarch64_is_ldr_uimm64(next) && next_rd == 0 && next_rn == 0) {
+            uintptr_t slot = base + (((next >> 10) & 0xfffu) << 3);
+
+            if (slot < map_start || slot + sizeof(uint64_t) > map_end)
+                return 0;
+
+            return *(const uint64_t *)(uintptr_t)slot;
+        }
+    }
+
+    return 0;
+}
+
+static uint64_t aarch64_extract_main_from_entry(uintptr_t map_start,
+                                                uintptr_t map_end,
+                                                uintptr_t entry)
+{
+    return aarch64_try_extract_main_from_block(map_start, map_end, entry, 3);
+}
+#endif
+
+#if defined(__aarch64__)
 struct aarch64_tlsdesc_arg {
     uint64_t modid;
     uint64_t offset;
@@ -422,6 +549,25 @@ static void crash_handler(int sig, siginfo_t *info, void *ucontext)
     ldr_hex("[loader] RBP=0x", (uint64_t)uc->uc_mcontext.gregs[REG_RBP]);
     ldr_hex("[loader] RAX=0x", (uint64_t)uc->uc_mcontext.gregs[REG_RAX]);
     ldr_hex("[loader] RDI=0x", (uint64_t)uc->uc_mcontext.gregs[REG_RDI]);
+    ldr_hex("[loader] RSI=0x", (uint64_t)uc->uc_mcontext.gregs[REG_RSI]);
+    ldr_hex("[loader] RDX=0x", (uint64_t)uc->uc_mcontext.gregs[REG_RDX]);
+    ldr_hex("[loader] RCX=0x", (uint64_t)uc->uc_mcontext.gregs[REG_RCX]);
+    ldr_hex("[loader] R8=0x",  (uint64_t)uc->uc_mcontext.gregs[REG_R8]);
+    ldr_hex("[loader] R9=0x",  (uint64_t)uc->uc_mcontext.gregs[REG_R9]);
+    ldr_hex("[loader] R13=0x", (uint64_t)uc->uc_mcontext.gregs[REG_R13]);
+    if ((uint64_t)uc->uc_mcontext.gregs[REG_R9] > 0x1000) {
+        uint64_t r9 = (uint64_t)uc->uc_mcontext.gregs[REG_R9];
+        ldr_hex("[loader] *R9=0x", *(uint64_t *)r9);
+        ldr_hex("[loader] *(R9+8)=0x", *(uint64_t *)(r9 + 8));
+        ldr_hex("[loader] *(R9+16)=0x", *(uint64_t *)(r9 + 16));
+    }
+    if ((uint64_t)uc->uc_mcontext.gregs[REG_R13] > 0x1000) {
+        uint64_t r13 = (uint64_t)uc->uc_mcontext.gregs[REG_R13];
+        ldr_hex("[loader] *R13=0x", *(uint64_t *)r13);
+        ldr_hex("[loader] *(R13+8)=0x", *(uint64_t *)(r13 + 8));
+        ldr_hex("[loader] *(R13+16)=0x", *(uint64_t *)(r13 + 16));
+        ldr_hex("[loader] *(R13+24)=0x", *(uint64_t *)(r13 + 24));
+    }
 #elif defined(__aarch64__)
     ldr_hex("[loader] PC=0x", (uint64_t)uc->uc_mcontext.pc);
     uint64_t rsp = (uint64_t)uc->uc_mcontext.sp;
@@ -1008,11 +1154,7 @@ static int glro_dl_make_stack_executable(const void *stack_endp)
 
 static int glibc_direct_main_without_early_init_ok(void)
 {
-#if defined(__x86_64__)
-    return g_glibc_off == &glibc_2_17 || g_glibc_off == &glibc_2_29;
-#else
-    return 0;
-#endif
+    return 1;
 }
 
 /* make a list_t {next, prev} point to itself (empty circular list) */
@@ -1729,6 +1871,64 @@ static int g_nobj;
 /* Per-object metadata for dlopen'd objects (used by protect_object) */
 static struct dlfrz_lib_meta g_dl_metas[MAX_TOTAL_OBJS];
 
+static uint64_t resolve_main_address(struct loaded_obj *objs, int nobj,
+                                     const int *idx_map,
+                                     const struct dlfrz_lib_meta *metas,
+                                     uintptr_t entry)
+{
+    uint64_t main_addr = 0;
+
+#if !defined(__aarch64__)
+    (void)entry;
+#endif
+
+    for (int i = 0; i < nobj; i++) {
+        if (!(objs[i].flags & LDR_FLAG_MAIN_EXE))
+            continue;
+        int mi = idx_map[i];
+        if (metas[mi].main_sym != 0) {
+            main_addr = objs[i].base + metas[mi].main_sym;
+            break;
+        }
+    }
+
+    if (!main_addr) {
+        for (int i = 0; i < nobj; i++) {
+            if (!(objs[i].flags & LDR_FLAG_MAIN_EXE))
+                continue;
+            if (!objs[i].dynsym || !objs[i].dynstr)
+                break;
+            for (uint32_t s = 1; s < objs[i].dynsym_count; s++) {
+                const Elf64_Sym *sym = &objs[i].dynsym[s];
+                if (sym->st_shndx == SHN_UNDEF || sym->st_value == 0)
+                    continue;
+                if (strcmp(objs[i].dynstr + sym->st_name, "main") == 0) {
+                    main_addr = objs[i].base + sym->st_value;
+                    break;
+                }
+            }
+            break;
+        }
+    }
+
+#if defined(__aarch64__)
+    if (!main_addr) {
+        for (int i = 0; i < nobj; i++) {
+            if (!(objs[i].flags & LDR_FLAG_MAIN_EXE))
+                continue;
+            main_addr = aarch64_extract_main_from_entry(objs[i].map_start,
+                                                        objs[i].map_end,
+                                                        entry);
+            if (main_addr && g_debug)
+                ldr_hex("[loader] main from aarch64 _start=", main_addr);
+            break;
+        }
+    }
+#endif
+
+    return main_addr;
+}
+
 static void discover_tls_template(struct loaded_obj *obj,
                                   const Elf64_Phdr *phdrs,
                                   int phnum)
@@ -2231,6 +2431,8 @@ typedef void *(*fdopen_fn)(int, const char *);
 typedef void *(*opendir_fn)(const char *);
 typedef void *(*fdopendir_fn)(int);
 typedef void *(*readdir_fn)(void *);
+typedef void *(*malloc_fn)(size_t);
+typedef char *(*realpath_fn)(const char *, char *);
 typedef int (*closedir_fn)(void *);
 typedef int (*dirfd_fn)(void *);
 typedef void (*rewinddir_fn)(void *);
@@ -2241,6 +2443,8 @@ static fdopen_fn g_real_fdopen;
 static opendir_fn g_real_opendir;
 static fdopendir_fn g_real_fdopendir;
 static readdir_fn g_real_readdir;
+static malloc_fn g_real_malloc;
+static realpath_fn g_real_realpath;
 static closedir_fn g_real_closedir;
 static dirfd_fn g_real_dirfd;
 static rewinddir_fn g_real_rewinddir;
@@ -3317,6 +3521,12 @@ static int vfs_open(const char *path, int flags, int mode)
             return -1;
         }
         if (ve && !vfs_is_virtual_entry(ve)) {
+            int ret = (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, path, flags, mode);
+
+            if (ret >= 0) {
+                vfs_dbg_op("open", path, "real-file");
+                return ret;
+            }
             vfs_dbg_op("open", path, "file");
             int fd = vfs_serve_memfd(ve, path);
             if (fd >= 0) return fd;
@@ -3355,6 +3565,12 @@ static int vfs_openat(int dirfd, const char *path, int flags, int mode)
                 return -1;
             }
             if (ve && !vfs_is_virtual_entry(ve)) {
+                int ret = (int)VFS_SYSCALL(SYS_openat, dirfd, path, flags, mode);
+
+                if (ret >= 0) {
+                    vfs_dbg_op("openat", lookup_path, "real-file");
+                    return ret;
+                }
                 vfs_dbg_op("openat", lookup_path, "file");
                 int fd = vfs_serve_memfd(ve, lookup_path);
                 if (fd >= 0) return fd;
@@ -3403,7 +3619,22 @@ static void *vfs_fopen(const char *path, const char *mode)
 {
     if (path && path[0] == '/' && mode && mode[0] == 'r') {
         const struct vfs_entry *ve = vfs_lookup(path);
-        if (ve && !vfs_is_negative_entry(ve) && !vfs_is_virtual_entry(ve)) {
+        if (ve && vfs_is_negative_entry(ve)) {
+            vfs_dbg_op("fopen", path, "negative");
+            set_loader_errno(ENOENT);
+            return (void *)0;
+        }
+        if (g_real_fopen) {
+            void *fp = g_real_fopen(path, mode);
+            int saved_errno = errno;
+
+            restore_ptr_guard();
+            if (fp)
+                return fp;
+            if (saved_errno > 0)
+                sync_glibc_errno_value(saved_errno);
+        }
+        if (ve && !vfs_is_virtual_entry(ve)) {
             vfs_dbg_op("fopen", path, "file");
             int fd = vfs_serve_memfd(ve, path);
             if (fd >= 0 && g_real_fdopen)
@@ -3670,6 +3901,51 @@ static int vfs_xstat(int ver, const char *path, struct stat *buf)
     return vfs_stat(path, buf);
 }
 
+static char *vfs_realpath(const char *path, char *resolved)
+{
+    if (path && path[0] == '/') {
+        const struct vfs_entry *ve = vfs_lookup(path);
+
+        if (ve && vfs_is_negative_entry(ve)) {
+            set_loader_errno(ENOENT);
+            return NULL;
+        }
+
+        if (g_real_realpath) {
+            char *result = g_real_realpath(path, resolved);
+
+            if (result)
+                return result;
+        }
+
+        if ((ve && !vfs_is_negative_entry(ve)) ||
+            vfs_dir_exists(path) ||
+            frozen_dlopen_elf_size(path) >= 0) {
+            size_t len = strlen(path) + 1;
+
+            if (resolved) {
+                memcpy(resolved, path, len);
+                return resolved;
+            }
+            if (g_real_malloc) {
+                char *copy = g_real_malloc(len);
+
+                if (!copy) {
+                    set_loader_errno(ENOMEM);
+                    return NULL;
+                }
+                memcpy(copy, path, len);
+                return copy;
+            }
+        }
+    }
+
+    if (g_real_realpath)
+        return g_real_realpath(path, resolved);
+    set_loader_errno(ENOENT);
+    return NULL;
+}
+
 static int vfs_lxstat(int ver, const char *path, struct stat *buf)
 {
     (void)ver;
@@ -3863,6 +4139,31 @@ static int   my_dl_iterate_phdr(
                  int (*callback)(struct dl_phdr_info *, size_t, void *),
                  void *data);
 
+static void *bootstrap_memcpy(void *dst, const void *src, size_t len)
+{
+    return memcpy(dst, src, len);
+}
+
+static void *bootstrap_memmove(void *dst, const void *src, size_t len)
+{
+    return memmove(dst, src, len);
+}
+
+static void *bootstrap_memset(void *dst, int value, size_t len)
+{
+    return memset(dst, value, len);
+}
+
+static int bootstrap_memcmp(const void *lhs, const void *rhs, size_t len)
+{
+    return memcmp(lhs, rhs, len);
+}
+
+static int bootstrap_strcmp(const char *lhs, const char *rhs)
+{
+    return strcmp(lhs, rhs);
+}
+
 /* Override table — these symbols take priority over libc's exports
  * so that dlopen/dlsym/dlclose/dlerror go through our implementation
  * which can load .so files from the filesystem at runtime. */
@@ -3873,6 +4174,11 @@ static const struct stub_sym g_overrides[] = {
     { "dlerror",         (void *)my_dlerror         },
     { "dl_iterate_phdr", (void *)my_dl_iterate_phdr },
     { "__tls_get_addr",  (void *)stub_tls_get_addr  },
+    { "memcpy",          (void *)bootstrap_memcpy   },
+    { "memmove",         (void *)bootstrap_memmove  },
+    { "memset",          (void *)bootstrap_memset   },
+    { "memcmp",          (void *)bootstrap_memcmp   },
+    { "strcmp",          (void *)bootstrap_strcmp   },
     { NULL, NULL }
 };
 
@@ -3884,6 +4190,7 @@ static const struct stub_sym g_vfs_overrides[] = {
     { "openat",          (void *)vfs_openat         },
     { "openat64",        (void *)vfs_openat         },
     { "__open64_2",      (void *)vfs_open           },
+    { "realpath",        (void *)vfs_realpath       },
     { "stat",            (void *)vfs_stat           },
     { "stat64",          (void *)vfs_stat           },
     { "__xstat",         (void *)vfs_xstat          },
@@ -4259,6 +4566,25 @@ static void apply_prelinked_runtime_reloc(struct loaded_obj *obj,
                 memcpy((void *)(base + rel->r_offset), (void *)src, sz);
                 return;
             }
+        }
+        return;
+    }
+
+    if (type == ARCH_RELOC_ABS) {
+        if (sidx == 0)
+            return;
+
+        {
+            const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
+            uint64_t addr = resolve_sym(objs, nobj, name);
+
+            if (!addr && ELF64_ST_BIND(obj->dynsym[sidx].st_info) != STB_WEAK
+                && ELF64_ST_TYPE(obj->dynsym[sidx].st_info) == STT_OBJECT
+                && g_null_page) {
+                addr = (uint64_t)(uintptr_t)g_null_page;
+            }
+
+            *(uint64_t *)(base + rel->r_offset) = addr + rel->r_addend;
         }
         return;
     }
@@ -6630,6 +6956,7 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
             for (int i = 0; i < nobj &&
                     (!g_real_fopen || !g_real_fdopen || !g_real_opendir ||
                      !g_real_fdopendir || !g_real_readdir ||
+                     !g_real_malloc || !g_real_realpath ||
                      !g_real_closedir || !g_real_dirfd ||
                      !g_real_rewinddir || !g_real_telldir ||
                      !g_real_errno_location ||
@@ -6653,12 +6980,16 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
                         g_real_fdopendir = (fdopendir_fn)(uintptr_t)(objs[i].base + sym->st_value);
                     else if (!g_real_readdir && strcmp(n, "readdir") == 0)
                         g_real_readdir = (readdir_fn)(uintptr_t)(objs[i].base + sym->st_value);
+                    else if (!g_real_malloc && strcmp(n, "malloc") == 0)
+                        g_real_malloc = (malloc_fn)(uintptr_t)(objs[i].base + sym->st_value);
                     else if (!g_real_closedir && strcmp(n, "closedir") == 0)
                         g_real_closedir = (closedir_fn)(uintptr_t)(objs[i].base + sym->st_value);
                     else if (!g_real_dirfd && strcmp(n, "dirfd") == 0)
                         g_real_dirfd = (dirfd_fn)(uintptr_t)(objs[i].base + sym->st_value);
                     else if (!g_real_rewinddir && strcmp(n, "rewinddir") == 0)
                         g_real_rewinddir = (rewinddir_fn)(uintptr_t)(objs[i].base + sym->st_value);
+                    else if (!g_real_realpath && strcmp(n, "realpath") == 0)
+                        g_real_realpath = (realpath_fn)(uintptr_t)(objs[i].base + sym->st_value);
                     else if (!g_real_telldir && strcmp(n, "telldir") == 0)
                         g_real_telldir = (telldir_fn)(uintptr_t)(objs[i].base + sym->st_value);
                     else if (!g_real_errno_location &&
@@ -6712,7 +7043,7 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
             const uint32_t *obj_fixups = NULL;
             uint32_t obj_fixup_count = 0;
 
-            if (g_vfs_count == 0 && runtime_fixups != NULL &&
+            if (runtime_fixups != NULL &&
                 metas[idx_map[i]].runtime_fixup_count != 0) {
                 uint32_t off = metas[idx_map[i]].runtime_fixup_off;
                 uint32_t count = metas[idx_map[i]].runtime_fixup_count;
@@ -6748,7 +7079,7 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
                 continue;
             }
 
-            if (g_vfs_count == 0 && !(objs[i].flags & LDR_FLAG_RUNTIME_SCAN))
+            if (!(objs[i].flags & LDR_FLAG_RUNTIME_SCAN))
                 continue;
 
             {
@@ -6831,6 +7162,76 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     g_argv = argv;
     g_envp = runtime_envp;
 
+    /* Resolve entry/program-header info before libc startup decisions. */
+    uintptr_t entry = 0;
+    uintptr_t exe_phdr = 0;
+    uintptr_t at_base = 0;
+    int exe_phnum = 0;
+    for (int i = 0; i < nobj; i++) {
+        if (!(objs[i].flags & LDR_FLAG_MAIN_EXE))
+            continue;
+        int mi = idx_map[i];
+        entry = objs[i].base + metas[mi].entry;
+        exe_phdr = objs[i].base + metas[mi].phdr_off;
+        exe_phnum = metas[mi].phdr_num;
+        break;
+    }
+    if (!entry) {
+        ldr_err("no entry point found", NULL);
+        _exit(127);
+    }
+
+    if (is_musl_runtime) {
+        for (int i = 0; i < nobj; i++) {
+            if (objs[i].flags & LDR_FLAG_MAIN_EXE)
+                continue;
+            if (is_musl_libc_path(objs[i].name)) {
+                at_base = objs[i].base;
+                break;
+            }
+        }
+    }
+
+#if defined(__aarch64__)
+    if (!is_musl_runtime) {
+        ldr_dbg("[loader] using early _start path (aarch64 glibc)...\n");
+        if (g_debug)
+            install_crash_handlers();
+        restore_ptr_guard();
+        transfer_to_entry(entry, argc, argv, envp,
+                          exe_phdr, exe_phnum, at_base, entry, at_random);
+    }
+
+    if (!is_musl_runtime) {
+        typedef int (*main_fn_t)(int, char **, char **);
+        uint64_t early_main = resolve_main_address(objs, nobj, idx_map,
+                                                   metas, entry);
+        if (early_main) {
+            uint64_t lsm_addr = resolve_sym(objs, nobj, "__libc_start_main");
+            if (lsm_addr) {
+                typedef int (*libc_start_main_fn_t)(
+                    int (*)(int, char **, char **),
+                    int, char **,
+                    void (*)(void),
+                    void (*)(void),
+                    void (*)(void),
+                    void *);
+                ldr_dbg("[loader] using early __libc_start_main bridge...\n");
+                restore_ptr_guard();
+                int rc = ((libc_start_main_fn_t)(uintptr_t)lsm_addr)(
+                    (main_fn_t)(uintptr_t)early_main,
+                    argc,
+                    argv,
+                    NULL,
+                    NULL,
+                    NULL,
+                    (void *)&argv[-1]);
+                _exit(rc);
+            }
+        }
+    }
+#endif
+
     /* 7. Initialise libc process state (environ, arena, tcache) BEFORE
      *    calling any init functions — init_array entries in libraries
      *    (e.g. libpython) may call malloc, so the arena must be ready. */
@@ -6883,35 +7284,6 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     else
         restore_crash_handlers_if_still_loader(startup_crash_handlers);
 
-    /* 8. Find the exe's entry point and transfer control */
-    uintptr_t entry = 0;
-    uintptr_t exe_phdr = 0;
-    uintptr_t at_base = 0;
-    int exe_phnum = 0;
-    for (int i = 0; i < nobj; i++) {
-        if (!(objs[i].flags & LDR_FLAG_MAIN_EXE)) continue;
-        int mi = idx_map[i];
-        entry = objs[i].base + metas[mi].entry;
-        exe_phdr = objs[i].base + metas[mi].phdr_off;
-        exe_phnum = metas[mi].phdr_num;
-        break;
-    }
-    if (!entry) {
-        ldr_err("no entry point found", NULL);
-        _exit(127);
-    }
-
-    if (is_musl_runtime) {
-        for (int i = 0; i < nobj; i++) {
-            if (objs[i].flags & LDR_FLAG_MAIN_EXE)
-                continue;
-            if (is_musl_libc_path(objs[i].name)) {
-                at_base = objs[i].base;
-                break;
-            }
-        }
-    }
-
     /* 8. Try to call main() directly, bypassing __libc_start_main.
      *    __libc_start_main accesses _rtld_global which requires ld.so.
      *    For musl and newer glibc builds with __libc_early_init, calling
@@ -6923,17 +7295,34 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
      *    they must fall back through _start. */
     ldr_dbg("[loader] resolving main...\n");
     typedef int (*main_fn_t)(int, char **, char **);
-    uint64_t main_addr = 0;
-    for (int i = 0; i < nobj; i++) {
-        if (!(objs[i].flags & LDR_FLAG_MAIN_EXE)) continue;
-        int mi = idx_map[i];
-        if (metas[mi].main_sym != 0) {
-            main_addr = objs[i].base + metas[mi].main_sym;
-            break;
+    uint64_t main_addr = resolve_main_address(objs, nobj, idx_map, metas,
+                                              entry);
+
+#if defined(__aarch64__)
+    if (main_addr && !is_musl_runtime) {
+        uint64_t lsm_addr = resolve_sym(objs, nobj, "__libc_start_main");
+        if (lsm_addr) {
+            typedef int (*libc_start_main_fn_t)(
+                int (*)(int, char **, char **),
+                int, char **,
+                void (*)(void),
+                void (*)(void),
+                void (*)(void),
+                void *);
+            ldr_dbg("[loader] using __libc_start_main bridge...\n");
+            restore_ptr_guard();
+            int rc = ((libc_start_main_fn_t)(uintptr_t)lsm_addr)(
+                (main_fn_t)(uintptr_t)main_addr,
+                argc,
+                argv,
+                NULL,
+                NULL,
+                NULL,
+                (void *)&argv[-1]);
+            _exit(rc);
         }
     }
-    if (!main_addr)
-        main_addr = resolve_sym(objs, nobj, "main");
+#endif
 
     if (main_addr && (is_musl_runtime || g_glibc_early_init_done ||
                       glibc_direct_main_without_early_init_ok())) {

@@ -881,10 +881,26 @@ static int prelink_obj_collect_runtime_fixups(const struct prelink_obj *obj,
 
             if (type == ARCH_RELOC_IRELATIVE ||
                 type == ARCH_RELOC_COPY ||
+                type == ARCH_RELOC_ABS ||
                 type == ARCH_RELOC_TPOFF ||
                 type == ARCH_RELOC_DTPMOD ||
                 type == ARCH_RELOC_DTPOFF) {
-                needs_fixup = 1;
+                if (type == ARCH_RELOC_ABS) {
+                    uint32_t sidx = ELF64_R_SYM(rel->r_info);
+
+                    if (sidx != 0 && sidx < obj->dynsym_count) {
+                        const Elf64_Sym *sym = &obj->dynsym[sidx];
+                        const char *name = obj->dynstr + sym->st_name;
+                        uint64_t slot = *(const uint64_t *)(obj->base + rel->r_offset);
+
+                        if (slot == 0 || runtime_reloc_name_match(name) ||
+                            ELF64_ST_BIND(sym->st_info) != STB_WEAK) {
+                            needs_fixup = 1;
+                        }
+                    }
+                } else {
+                    needs_fixup = 1;
+                }
 #if defined(__aarch64__)
             } else if (type == ARCH_RELOC_TLSDESC) {
                 needs_fixup = 1;
