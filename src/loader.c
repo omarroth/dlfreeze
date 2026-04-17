@@ -441,7 +441,7 @@ static inline void set_loader_errno(int err);
 #if defined(__x86_64__)
 static const uintptr_t g_ptr_guard_off = 48;
 #elif defined(__aarch64__)
-static const uintptr_t g_ptr_guard_off = 24;
+static const uintptr_t g_ptr_guard_off = 0;
 #endif
 
 /*
@@ -459,6 +459,9 @@ static const uintptr_t g_ptr_guard_off = 24;
  */
 static inline void restore_ptr_guard(void)
 {
+#if defined(__aarch64__)
+    return;
+#endif
     if (g_saved_ptr_guard) {
         uintptr_t tp = arch_get_tp();
 
@@ -1874,12 +1877,14 @@ static struct dlfrz_lib_meta g_dl_metas[MAX_TOTAL_OBJS];
 static uint64_t resolve_main_address(struct loaded_obj *objs, int nobj,
                                      const int *idx_map,
                                      const struct dlfrz_lib_meta *metas,
-                                     uintptr_t entry)
+                                     uintptr_t entry,
+                                     int allow_aarch64_start_extract)
 {
     uint64_t main_addr = 0;
 
 #if !defined(__aarch64__)
     (void)entry;
+    (void)allow_aarch64_start_extract;
 #endif
 
     for (int i = 0; i < nobj; i++) {
@@ -1912,7 +1917,7 @@ static uint64_t resolve_main_address(struct loaded_obj *objs, int nobj,
     }
 
 #if defined(__aarch64__)
-    if (!main_addr) {
+    if (!main_addr && allow_aarch64_start_extract) {
         for (int i = 0; i < nobj; i++) {
             if (!(objs[i].flags & LDR_FLAG_MAIN_EXE))
                 continue;
@@ -2217,14 +2222,18 @@ static void *stub_dl_allocate_tls(void *mem)
      * as soon as the new thread starts.  glibc's allocate_stack is
      * expected to set pd->header.self = pd after we return, but on some
      * builds the store is absent or overwritten, so we ensure it here. */
+#if !defined(__aarch64__)
     *(uintptr_t *)(tp + TCB_OFF_SELF)  = tp;   /* tcbhead.tcb  (offset 0)  */
     *(uintptr_t *)(tp + TCB_OFF_SELF2) = tp;   /* tcbhead.self (offset 16) */
+#endif
 
     /* New glibc threads inherit the process-wide canary/pointer guard. */
+#if !defined(__aarch64__)
     if (g_saved_stack_guard)
         *(uintptr_t *)(tp + TCB_OFF_STACK_GUARD) = g_saved_stack_guard;
     if (g_saved_ptr_guard)
         *(uintptr_t *)(tp + TCB_OFF_PTR_GUARD) = g_saved_ptr_guard;
+#endif
 
     /* Copy .tdata for all TLS modules */
     void *ret = stub_dl_allocate_tls_init(mem);
@@ -2736,9 +2745,14 @@ static int vfs_affects_library_path(const char *path)
 
     if (strcmp(base, ".dir") == 0)
         return 0;
+    /* Only materialize archive/object files to the /tmp overlay.  These are
+     * consumed by child linker processes (e.g. Alpine clang spawning ld)
+     * that cannot see the in-process VFS.  Shared libraries (.so) are loaded
+     * in-process via our dlopen/open interceptors, so writing them to /tmp
+     * only wastes I/O when freezing Python programs captured with -f
+     * that embed many extension modules. */
     return vfs_path_has_suffix(base, ".a") ||
-           vfs_path_has_suffix(base, ".o") ||
-           vfs_path_has_suffix(base, ".so");
+           vfs_path_has_suffix(base, ".o");
 }
 
 static int vfs_append_decimal(char *buf, size_t buf_size,
@@ -2860,7 +2874,29 @@ static int vfs_prepare_library_overlay(void)
     g_vfs_overlay_attempted = 1;
     g_vfs_library_path[0] = '\0';
 
-    if (g_vfs_count == 0 || vfs_init_overlay_root() < 0)
+    if (g_vfs_count == 0)
+        return -1;
+
+    /* First pass: check whether any captured entry would land in the
+     * overlay.  Avoids creating /tmp/dlfreeze-vfs-<pid> for workloads that
+     * don't need a child-linker overlay (e.g. Python programs captured
+     * with -f that embed many extension modulesed many extension modules). */
+    {
+        int have_any = 0;
+
+        for (int i = 0; i < (int)VFS_HASH_SIZE; i++) {
+            if (!g_vfs_table[i].path || g_vfs_table[i].size == 0)
+                continue;
+            if (vfs_affects_library_path(g_vfs_table[i].path)) {
+                have_any = 1;
+                break;
+            }
+        }
+        if (!have_any)
+            return -1;
+    }
+
+    if (vfs_init_overlay_root() < 0)
         return -1;
 
     for (int i = 0; i < (int)VFS_HASH_SIZE; i++) {
@@ -3133,15 +3169,12 @@ static void *vfs_opendir(const char *path)
     if (!has_vfs && g_real_opendir)
         return g_real_opendir(path);
 
-    if (has_vfs)
-        vfs_dbg_op("opendir", path, "enter");
+    vfs_dbg_op("opendir", path, "enter");
 
-    if (has_vfs || path) {
-        fd = (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, path,
-                          O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-        if (fd < 0 && !has_vfs)
-            return NULL;
-    }
+    /* Serve captured dirs purely from VFS; do not touch the real FS.
+     * Leave fd_compat = -1 so readdir treats this as virtual-only and
+     * does not skip entries that happen to exist on disk.  vfs_dirfd()
+     * lazily opens a placeholder fd on demand. */
 
     /* Find a free handle */
     for (int i = 0; i < VFS_MAX_DIR_HANDLES; i++) {
@@ -3151,13 +3184,11 @@ static void *vfs_opendir(const char *path)
         h->magic = VFS_FAKE_DIR_MAGIC;
         h->fd_compat = fd;
         if (has_vfs) {
-            /* Merge real and VFS entries when the directory exists on disk,
-             * otherwise serve it from VFS only. */
             h->vfs_path = path;
             h->vfs_path_len = strlen(path);
             h->scan_pos = 0;
-            h->phase = (fd >= 0) ? -1 : 0;
-            vfs_dbg_op("opendir", path, (fd >= 0) ? "merged" : "virtual");
+            h->phase = 0;  /* virtual-only */
+            vfs_dbg_op("opendir", path, "virtual");
         } else {
             /* Pure real dir, no VFS */
             h->vfs_path = NULL;
@@ -3197,10 +3228,11 @@ static void *vfs_fdopendir(int fd)
         if (mapped) {
             h->vfs_path_len = strlen(mapped);
             h->scan_pos = 0;
-            h->phase = (int)VFS_SYSCALL(SYS_faccessat, AT_FDCWD, mapped,
-                                        0 /* F_OK */, 0) == 0 ? -1 : 0;
-            vfs_dbg_op("fdopendir", mapped,
-                       (h->phase == -1) ? "merged" : "virtual");
+            /* Virtual-only: the fd is a synthetic placeholder (opened
+             * against "/"), so draining it via getdents would surface
+             * the root directory contents, not the captured dir. */
+            h->phase = 0;
+            vfs_dbg_op("fdopendir", mapped, "virtual");
         }
         return (void *)h;
     }
@@ -3397,8 +3429,8 @@ static void vfs_rewinddir(void *dirp)
     }
     h->scan_pos = 0;
     if (h->vfs_path) {
-        h->phase = (int)VFS_SYSCALL(SYS_faccessat, AT_FDCWD, h->vfs_path,
-                                    0 /* F_OK */, 0) == 0 ? -1 : 0;
+        /* Virtual-only: never re-enter the real-FS drain phase. */
+        h->phase = 0;
     }
 }
 
@@ -3514,6 +3546,19 @@ static int vfs_open(const char *path, int flags, int mode)
 {
     /* Only intercept absolute paths for read-only opens */
     if (path && path[0] == '/' && (flags & 3) == 0 /* O_RDONLY */) {
+        /* Directory path captured in VFS: serve virtually (no FS touch). */
+        if (vfs_dir_exists(path)) {
+            const struct vfs_entry *ve = vfs_lookup(path);
+            if (!ve || (vfs_is_virtual_entry(ve) &&
+                        vfs_is_dir_marker_path(path))) {
+                int fd = (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, "/",
+                                         O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+                if (fd >= 0)
+                    remember_vfs_dirfd(fd, path);
+                vfs_dbg_op("open", path, "dir-virtual");
+                return fd;
+            }
+        }
         const struct vfs_entry *ve = vfs_lookup(path);
         if (ve && vfs_is_negative_entry(ve)) {
             vfs_dbg_op("open", path, "negative");
@@ -3521,12 +3566,6 @@ static int vfs_open(const char *path, int flags, int mode)
             return -1;
         }
         if (ve && !vfs_is_virtual_entry(ve)) {
-            int ret = (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, path, flags, mode);
-
-            if (ret >= 0) {
-                vfs_dbg_op("open", path, "real-file");
-                return ret;
-            }
             vfs_dbg_op("open", path, "file");
             int fd = vfs_serve_memfd(ve, path);
             if (fd >= 0) return fd;
@@ -3557,6 +3596,23 @@ static int vfs_openat(int dirfd, const char *path, int flags, int mode)
         lookup_path = resolved;
 
     if (lookup_path && lookup_path[0] == '/') {
+        /* Serve captured directories purely from VFS: avoid touching the
+         * host filesystem whenever the VFS already knows the directory.
+         * This applies to both explicit O_DIRECTORY opens and plain
+         * O_RDONLY opens that happen to target a directory path. */
+        if (vfs_dir_exists(lookup_path)) {
+            const struct vfs_entry *ve = vfs_lookup(lookup_path);
+            if (!ve || (vfs_is_virtual_entry(ve) &&
+                        vfs_is_dir_marker_path(lookup_path))) {
+                (void)real_fd;
+                int fd = (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, "/",
+                                         O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+                if (fd >= 0)
+                    remember_vfs_dirfd(fd, lookup_path);
+                vfs_dbg_op("openat", lookup_path, "dir-virtual");
+                return fd;
+            }
+        }
         if ((flags & 3) == 0 /* O_RDONLY */) {
             const struct vfs_entry *ve = vfs_lookup(lookup_path);
             if (ve && vfs_is_negative_entry(ve)) {
@@ -3565,12 +3621,6 @@ static int vfs_openat(int dirfd, const char *path, int flags, int mode)
                 return -1;
             }
             if (ve && !vfs_is_virtual_entry(ve)) {
-                int ret = (int)VFS_SYSCALL(SYS_openat, dirfd, path, flags, mode);
-
-                if (ret >= 0) {
-                    vfs_dbg_op("openat", lookup_path, "real-file");
-                    return ret;
-                }
                 vfs_dbg_op("openat", lookup_path, "file");
                 int fd = vfs_serve_memfd(ve, lookup_path);
                 if (fd >= 0) return fd;
@@ -3585,26 +3635,6 @@ static int vfs_openat(int dirfd, const char *path, int flags, int mode)
                     return fd;
                 }
                 return ret;
-            }
-        }
-        /* O_DIRECTORY: prefer the real directory when it exists so dirfd,
-         * fdopendir, and other directory-fd consumers see the actual path.
-         * Only synthesize a dummy fd for VFS-only directories. */
-        if ((flags & O_DIRECTORY) && vfs_dir_exists(lookup_path)) {
-            real_fd = (int)VFS_SYSCALL(SYS_openat, dirfd, path, flags, mode);
-            if (real_fd >= 0) {
-                vfs_dbg_op("openat", lookup_path, "dir-merged");
-                remember_vfs_dirfd(real_fd, lookup_path);
-                return real_fd;
-            }
-            /* Real dir doesn't exist but VFS knows it */
-            {
-                int fd = (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, "/",
-                                         O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
-                if (fd >= 0)
-                    remember_vfs_dirfd(fd, lookup_path);
-                vfs_dbg_op("openat", lookup_path, "dir-virtual");
-                return fd;
             }
         }
         vfs_dbg_op("openat", lookup_path, "syscall");
@@ -3623,16 +3653,6 @@ static void *vfs_fopen(const char *path, const char *mode)
             vfs_dbg_op("fopen", path, "negative");
             set_loader_errno(ENOENT);
             return (void *)0;
-        }
-        if (g_real_fopen) {
-            void *fp = g_real_fopen(path, mode);
-            int saved_errno = errno;
-
-            restore_ptr_guard();
-            if (fp)
-                return fp;
-            if (saved_errno > 0)
-                sync_glibc_errno_value(saved_errno);
         }
         if (ve && !vfs_is_virtual_entry(ve)) {
             vfs_dbg_op("fopen", path, "file");
@@ -6628,6 +6648,7 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
     }
 
     if (!g_is_musl_runtime) {
+#if !defined(__aarch64__)
         /* Stack canary from AT_RANDOM */
         if (at_random) {
             uintptr_t canary;
@@ -6648,6 +6669,7 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
             uintptr_t old_canary = arch_read_tp_offset(0x28);
             *(uintptr_t *)(tp + TCB_OFF_STACK_GUARD) = old_canary;
         }
+#endif
     }
 
     /* NOTE: .tdata is NOT copied here — it must be copied AFTER
@@ -6660,9 +6682,15 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
     /* Save pointer_guard value and address for crash diagnostics.
      * musl does not keep a glibc-style pointer guard in the TCB header. */
     if (!g_is_musl_runtime) {
+#if !defined(__aarch64__)
         g_saved_stack_guard = *(uintptr_t *)(tp + TCB_OFF_STACK_GUARD);
         g_ptr_guard_addr = tp + TCB_OFF_PTR_GUARD;
         g_saved_ptr_guard = *(uintptr_t *)(tp + TCB_OFF_PTR_GUARD);
+#else
+        g_saved_stack_guard = 0;
+        g_ptr_guard_addr = 0;
+        g_saved_ptr_guard = 0;
+#endif
     } else {
         g_saved_stack_guard = 0;
         g_ptr_guard_addr = 0;
@@ -6692,8 +6720,13 @@ __attribute__((noreturn))
 static void transfer_to_entry(uintptr_t entry, int argc, char **argv,
                                char **envp, uintptr_t phdr, int phnum,
                                uintptr_t at_base, uintptr_t at_entry,
-                               uintptr_t at_random)
+                               uintptr_t at_random,
+                               int is_musl_runtime)
 {
+#if !defined(__aarch64__)
+    (void)is_musl_runtime;
+#endif
+
     /* Count envp */
     int envc = 0;
     while (envp[envc]) envc++;
@@ -6762,13 +6795,22 @@ static void transfer_to_entry(uintptr_t entry, int argc, char **argv,
         : : "r"(sp), "r"(entry) : "memory"
     );
 #elif defined(__aarch64__)
-    __asm__ volatile(
-        "mov sp, %0\n\t"
-        "mov x0, #0\n\t"          /* rtld_fini = NULL */
-        "mov x29, #0\n\t"         /* clear frame pointer */
-        "br %1\n\t"
-        : : "r"(sp), "r"(entry) : "memory"
-    );
+    {
+        uintptr_t start_x0 = is_musl_runtime ? (uintptr_t)sp : 0;
+        if (g_debug) {
+            ldr_hex("[loader] transfer entry=", entry);
+            ldr_hex("[loader] transfer sp=", (uintptr_t)sp);
+            ldr_hex("[loader] transfer start_x0=", start_x0);
+            ldr_hex("[loader] transfer is_musl=", (uint64_t)is_musl_runtime);
+        }
+        __asm__ volatile(
+            "mov sp, %0\n\t"
+            "mov x0, %1\n\t"
+            "mov x29, #0\n\t"         /* clear frame pointer */
+            "br %2\n\t"
+            : : "r"(sp), "r"(start_x0), "r"(entry) : "memory", "x0"
+        );
+    }
 #endif
     __builtin_unreachable();
 }
@@ -7193,42 +7235,21 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     }
 
 #if defined(__aarch64__)
-    if (!is_musl_runtime) {
+    if (!is_musl_runtime && g_glibc_off == &glibc_aarch64_2_35) {
+        if (envp) {
+            char **p = envp;
+            while (*p) p++;
+            p++;  /* skip envp NULL terminator */
+            *(Elf64_auxv_t **)(g_fake_rtld_global_ro + GLRO_DL_AUXV_OFF) =
+                (Elf64_auxv_t *)p;
+        }
         ldr_dbg("[loader] using early _start path (aarch64 glibc)...\n");
         if (g_debug)
             install_crash_handlers();
         restore_ptr_guard();
         transfer_to_entry(entry, argc, argv, envp,
-                          exe_phdr, exe_phnum, at_base, entry, at_random);
-    }
-
-    if (!is_musl_runtime) {
-        typedef int (*main_fn_t)(int, char **, char **);
-        uint64_t early_main = resolve_main_address(objs, nobj, idx_map,
-                                                   metas, entry);
-        if (early_main) {
-            uint64_t lsm_addr = resolve_sym(objs, nobj, "__libc_start_main");
-            if (lsm_addr) {
-                typedef int (*libc_start_main_fn_t)(
-                    int (*)(int, char **, char **),
-                    int, char **,
-                    void (*)(void),
-                    void (*)(void),
-                    void (*)(void),
-                    void *);
-                ldr_dbg("[loader] using early __libc_start_main bridge...\n");
-                restore_ptr_guard();
-                int rc = ((libc_start_main_fn_t)(uintptr_t)lsm_addr)(
-                    (main_fn_t)(uintptr_t)early_main,
-                    argc,
-                    argv,
-                    NULL,
-                    NULL,
-                    NULL,
-                    (void *)&argv[-1]);
-                _exit(rc);
-            }
-        }
+                          exe_phdr, exe_phnum, at_base, entry, at_random,
+                          is_musl_runtime);
     }
 #endif
 
@@ -7296,7 +7317,8 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     ldr_dbg("[loader] resolving main...\n");
     typedef int (*main_fn_t)(int, char **, char **);
     uint64_t main_addr = resolve_main_address(objs, nobj, idx_map, metas,
-                                              entry);
+                                              entry,
+                                              is_musl_runtime ? 0 : 1);
 
 #if defined(__aarch64__)
     if (main_addr && !is_musl_runtime) {
@@ -7368,6 +7390,7 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         install_crash_handlers();
     restore_ptr_guard();
     transfer_to_entry(entry, argc, argv, envp,
-                      exe_phdr, exe_phnum, at_base, entry, at_random);
+                      exe_phdr, exe_phnum, at_base, entry, at_random,
+                      is_musl_runtime);
     /* NOTREACHED */
 }
