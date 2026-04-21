@@ -7235,22 +7235,11 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     }
 
 #if defined(__aarch64__)
-    if (!is_musl_runtime && g_glibc_off == &glibc_aarch64_2_35) {
-        if (envp) {
-            char **p = envp;
-            while (*p) p++;
-            p++;  /* skip envp NULL terminator */
-            *(Elf64_auxv_t **)(g_fake_rtld_global_ro + GLRO_DL_AUXV_OFF) =
-                (Elf64_auxv_t *)p;
-        }
-        ldr_dbg("[loader] using early _start path (aarch64 glibc)...\n");
-        if (g_debug)
-            install_crash_handlers();
-        restore_ptr_guard();
-        transfer_to_entry(entry, argc, argv, envp,
-                          exe_phdr, exe_phnum, at_base, entry, at_random,
-                          is_musl_runtime);
-    }
+    /* Note: an early _start transfer was tried here historically but it
+     * caused vfprintf format-parsing crashes (SIGSEGV at TP+0x198) on
+     * glibc 2.35+ aarch64 because it skipped init_libc_process_state and
+     * the init_array fan-out.  Direct main / __libc_start_main bridge
+     * paths below handle every case correctly. */
 #endif
 
     /* 7. Initialise libc process state (environ, arena, tcache) BEFORE

@@ -399,14 +399,19 @@ int main(int argc, char **argv)
     }
 
     /* 8. build argv for the real program.
-     *    glibc keeps working well when we exec the bundled interpreter
-     *    directly, but musl toolchain drivers such as clang inspect
-     *    /proc/self/exe to re-exec themselves as helper modes (-cc1,
-     *    etc.). Launching musl through ld-musl makes /proc/self/exe
-     *    point at the interpreter instead of the executable, which
-     *    breaks that self-reexec flow. */
+     *    glibc usually works when we exec the bundled interpreter directly,
+     *    but musl toolchain drivers such as clang inspect /proc/self/exe to
+     *    re-exec themselves as helper modes (-cc1, etc.). Launching musl
+     *    through ld-musl makes /proc/self/exe point at the interpreter
+     *    instead of the executable, which breaks that self-reexec flow.
+     *
+     *    On aarch64, launching glibc targets through ld-linux can crash
+     *    python very early, so prefer direct exec there as well. */
     int nac; char **nav;
     int use_interp_launcher = interp_path[0] && !bs_is_musl_interp_path(interp_path);
+#if defined(__aarch64__)
+    use_interp_launcher = 0;
+#endif
     if (use_interp_launcher) {
         nac = argc + 3;
         nav = calloc(nac + 1, sizeof(char *));
