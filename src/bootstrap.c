@@ -381,19 +381,26 @@ int main(int argc, char **argv)
     }
 
     /* 8. build argv for the real program.
-     *    glibc usually works when we exec the bundled interpreter directly,
-     *    but musl toolchain drivers such as clang inspect /proc/self/exe to
-     *    re-exec themselves as helper modes (-cc1, etc.). Launching musl
-     *    through ld-musl makes /proc/self/exe point at the interpreter
-     *    instead of the executable, which breaks that self-reexec flow.
+     *    glibc keeps working when we exec the bundled interpreter directly.
+     *    On x86-64, musl toolchain drivers (e.g. clang) inspect /proc/self/exe
+     *    to re-exec as helper modes (-cc1, etc.); launching them through
+     *    ld-musl makes /proc/self/exe point at the interpreter, breaking that
+     *    self-reexec flow.  On x86-64, system musl is available via musl-tools
+     *    so direct exec works and the self-reexec path is preserved.
      *
-     *    On aarch64, launching glibc targets through ld-linux can crash
-     *    python very early, so prefer direct exec there as well. */
+     *    On aarch64, glibc systems (ubuntu) do not ship system musl, so a
+     *    musl binary's PT_INTERP (/lib/ld-musl-aarch64.so.1) won't be found
+     *    by the kernel.  Use the bundled interpreter for musl on aarch64 too.
+     *    Self-reexec binaries like clang are uncommon in cross-run scenarios
+     *    and are not covered by the cross-run test matrix. */
     int nac; char **nav;
     int is_musl_interp = interp_path[0] && bs_is_musl_interp_path(interp_path);
     int use_interp_launcher = interp_path[0] && !is_musl_interp;
 #if defined(__aarch64__)
-    use_interp_launcher = 0;
+    /* On aarch64 glibc systems, system musl is absent: use the bundled
+     * ld-musl so that frozen musl binaries (python3, ruby, etc.) can run. */
+    if (is_musl_interp && interp_path[0])
+        use_interp_launcher = 1;
 #endif
     if (use_interp_launcher) {
         nac = argc + 3;

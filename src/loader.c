@@ -5265,7 +5265,8 @@ static int apply_all_relocs(struct loaded_obj *obj,
 /* ==== Minimal libc process initialization ============================= */
 
 #define MUSL_ALPINE_ENVIRON_TO_LIBC_OFF      0x24e0
-#define MUSL_ALPINE_ENVIRON_TO_PROGNAME_OFF  0x40
+#define MUSL_ALPINE_ENVIRON_TO_PROGNAME_OFF_OLD  0x40
+#define MUSL_ALPINE_ENVIRON_TO_PROGNAME_OFF_NEW  0x260
 #define MUSL_ALPINE_ENVIRON_TO_SYSINFO_OFF   0x30
 #define MUSL_ALPINE_ENVIRON_TO_HWCAP_OFF     0x48
 #define MUSL_LIBC_GLOBAL_LOCALE_OFF          0x38
@@ -5360,7 +5361,8 @@ static void init_alpine_musl_process_state(struct loaded_obj *objs, int nobj,
     if (!env_addr || !prog_addr)
         return;
     if (prog_addr < env_addr ||
-        prog_addr - env_addr != MUSL_ALPINE_ENVIRON_TO_PROGNAME_OFF) {
+        (prog_addr - env_addr != MUSL_ALPINE_ENVIRON_TO_PROGNAME_OFF_OLD &&
+         prog_addr - env_addr != MUSL_ALPINE_ENVIRON_TO_PROGNAME_OFF_NEW)) {
         if (g_debug)
             ldr_dbg("[loader] alpine musl layout probe failed\n");
         return;
@@ -7185,17 +7187,14 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
      *    where the anonymous reservation leaves pages as RWX and we need
      *    to set proper per-segment permissions. */
     ldr_dbg("[loader] setting protections...\n");
-    if (!prelinked || srcfd < 0) {
-        for (int i = 0; i < nobj; i++)
-            protect_object(&objs[i], &metas[idx_map[i]]);
-    } else if (g_perf_mode) {
-        /* In perf mode for main exe: only protect the main exe (prelinked),
-         * shared libraries stay file-backed and need no extra protection. */
-        for (int i = 0; i < nobj; i++) {
-            if (objs[i].flags & LDR_FLAG_MAIN_EXE)
-                protect_object(&objs[i], &metas[idx_map[i]]);
-        }
-    }
+    /* Always call protect_object for every loaded object so that text
+     * pages are correctly marked PROT_EXEC.  For prelinked non-UPX
+     * binaries the file-backed mmap already sets the right permissions,
+     * but if mmap falls back to memcpy the pages would be PROT_RW only
+     * and executing them would raise SIGILL.  The extra mprotect calls
+     * are a no-op when the permissions already match. */
+    for (int i = 0; i < nobj; i++)
+        protect_object(&objs[i], &metas[idx_map[i]]);
 
     /* Set dlopen support globals before init functions or main() can
      * call dlopen.  g_nobj is the count of objects in g_all_objs. */
