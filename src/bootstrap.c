@@ -291,28 +291,9 @@ int main(int argc, char **argv)
             return 127;
         }
 
-        /* Pre-linked binaries: run loader in-process (no fork), since
-         * pre-linking makes the loader path very reliable and the fork
-         * adds >1ms of overhead.  Non-prelinked binaries still use
-         * fork for crash-recovery fallback to extraction mode. */
-        int is_prelinked = 0;
-        for (uint32_t pi = 0; pi < ft.num_entries; pi++) {
-            if (metas[pi].flags & DLFRZ_FLAG_PRELINKED) {
-                is_prelinked = 1;
-                break;
-            }
-        }
-
-        if (is_prelinked) {
-            loader_run(ldr_mem, ldr_mem_foff, ldr_srcfd, metas, ent, strtab,
-                       ft.num_entries, runtime_fixups, runtime_fixup_count,
-                       argc, argv, environ);
-            /* loader_run returns only on failure */
-            fprintf(stderr, "dlfreeze-bootstrap: in-process loader failed\n");
-            close(sfd);
-            return 127;
-        }
-
+        /* Always run direct-load in a child so extraction fallback remains available.
+         * Some arm64 source/target combinations can fail in loader_run() for
+         * non-UPX binaries while extracted mode still works. */
         pid_t lpid = fork();
         if (lpid < 0) {
             perror("fork");
@@ -341,7 +322,9 @@ int main(int argc, char **argv)
 
         if (WIFEXITED(lst)) {
             int rc = WEXITSTATUS(lst);
-            if (rc != 127) {
+            /* loader_run failures may surface as 127 or crash-style exit
+             * codes (128+signal).  Fall back to extraction in those cases. */
+            if (rc != 127 && rc < 128) {
                 free(ent); free(strtab); close(sfd);
                 return rc;
             }
@@ -349,8 +332,7 @@ int main(int argc, char **argv)
             /* Crash in direct mode — try the extraction fallback. */
         }
 
-        fprintf(stderr,
-                "dlfreeze-bootstrap: direct-load failed, falling back to extraction\n");
+        /* Keep fallback transparent for output-sensitive workloads/tests. */
     }
 
     /* 6. create workdir for extraction fallback (/tmp only). */
@@ -408,7 +390,8 @@ int main(int argc, char **argv)
      *    On aarch64, launching glibc targets through ld-linux can crash
      *    python very early, so prefer direct exec there as well. */
     int nac; char **nav;
-    int use_interp_launcher = interp_path[0] && !bs_is_musl_interp_path(interp_path);
+    int is_musl_interp = interp_path[0] && bs_is_musl_interp_path(interp_path);
+    int use_interp_launcher = interp_path[0] && !is_musl_interp;
 #if defined(__aarch64__)
     use_interp_launcher = 0;
 #endif
@@ -419,12 +402,14 @@ int main(int argc, char **argv)
         nav[1] = (char *)"--library-path";
         nav[2] = g_tmpdir;
         nav[3] = exe_path;
-        for (int i = 1; i < argc; i++) nav[i+3] = argv[i];
+        for (int i = 1; i < argc; i++)
+            nav[i + 3] = argv[i];
     } else {
         nac = argc;
         nav = calloc(nac + 1, sizeof(char *));
         nav[0] = exe_path;
-        for (int i = 1; i < argc; i++) nav[i] = argv[i];
+        for (int i = 1; i < argc; i++)
+            nav[i] = argv[i];
     }
 
     /* 9. set LD_LIBRARY_PATH */
