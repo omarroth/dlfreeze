@@ -24,6 +24,9 @@ LS_BIN="${LS_BIN:-$(find_first_binary /bin/ls ls || true)}"
 PYTHON_BIN="${PYTHON_BIN:-$(find_first_binary python3 || true)}"
 CLANG_BIN="${CLANG_BIN:-$(find_first_binary clang clang-22 clang-21 clang-20 clang-19 clang-18 clang-17 clang-16 clang-15 || true)}"
 FFMPEG_BIN="${FFMPEG_BIN:-$(find_first_binary ffmpeg || true)}"
+PYTHON_DATA_GLOB="${PYTHON_DATA_GLOB:-/usr/lib/python3*}"
+PYTHON_IMPORT_EXPR="${PYTHON_IMPORT_EXPR:-import ctypes, json, sqlite3, ssl, zoneinfo; print(1)}"
+PYTHON_NUMPY_EXPR="${PYTHON_NUMPY_EXPR:-import numpy, numpy.linalg; print(int(numpy.arange(9).reshape(3, 3).trace()))}"
 
 if [[ "${BUILD}" == "-h" || "${BUILD}" == "--help" ]]; then
     cat <<'EOF'
@@ -34,15 +37,20 @@ Environment overrides:
                      Default: ls python clang ffmpeg ffmpeg-traced
   BENCH_RUNS         Number of measured perf runs to average. Default: 1
   BENCH_WARM_CACHE   Run one untimed warm-up before measuring. Default: 1
-  BENCH_DIR          Output directory for frozen binaries/results.
-  LS_BIN             Native ls path.
-  PYTHON_BIN         Native python path.
+    BENCH_DIR          Output directory for frozen binaries/results.
+    LS_BIN             Native ls path.
+    PYTHON_BIN         Native python path.
+    PYTHON_DATA_GLOB   Data-file glob to embed for traced Python cases.
+    PYTHON_IMPORT_EXPR Python expression for the import-heavy traced case.
+    PYTHON_NUMPY_EXPR  Python expression for the numpy/native-extension case.
   CLANG_BIN          Native clang path.
   FFMPEG_BIN         Native ffmpeg path.
 
 Examples:
-  make bench
-  BENCH_CASES=ffmpeg make bench
+    make bench
+    BENCH_CASES=ffmpeg make bench
+    BENCH_CASES=python-imports make bench
+    BENCH_CASES=python-numpy make bench
   BENCH_RUNS=5 BENCH_CASES='clang ffmpeg' make bench
 EOF
     exit 0
@@ -176,6 +184,22 @@ run_case() {
             native_cmd=("$bin" --version)
             frozen_cmd=("$out" --version)
             ;;
+        python-imports)
+            desc="python3 traced imports"
+            bin="$PYTHON_BIN"
+            out="$BENCH_DIR/python3-imports.frozen"
+            freeze_cmd=("$DLFREEZE" -t -f "$PYTHON_DATA_GLOB" -o "$out" -- "$bin" -c "$PYTHON_IMPORT_EXPR")
+            native_cmd=("$bin" -c "$PYTHON_IMPORT_EXPR")
+            frozen_cmd=("$out" -c "$PYTHON_IMPORT_EXPR")
+            ;;
+        python-numpy)
+            desc="python3 numpy imports"
+            bin="$PYTHON_BIN"
+            out="$BENCH_DIR/python3-numpy.frozen"
+            freeze_cmd=("$DLFREEZE" -t -f "$PYTHON_DATA_GLOB" -o "$out" -- "$bin" -c "$PYTHON_NUMPY_EXPR")
+            native_cmd=("$bin" -c "$PYTHON_NUMPY_EXPR")
+            frozen_cmd=("$out" -c "$PYTHON_NUMPY_EXPR")
+            ;;
         clang)
             desc="clang --version"
             bin="$CLANG_BIN"
@@ -208,6 +232,13 @@ run_case() {
     if [[ -z "$bin" || ! -x "$bin" ]]; then
         skip_case "$case_id (missing binary: $bin)"
         return 0
+    fi
+
+    if [[ "$case_id" == "python-numpy" ]]; then
+        if ! "$bin" -c 'import numpy' >/dev/null 2>&1; then
+            skip_case "$case_id (numpy not available in $bin)"
+            return 0
+        fi
     fi
 
     note "--- $case_id ---"

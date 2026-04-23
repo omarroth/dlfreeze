@@ -5,6 +5,8 @@ set -euo pipefail
 BUILD="${1:-build}"
 DLFREEZE="$BUILD/dlfreeze"
 
+mkdir -p "$BUILD"
+
 PASS=0 FAIL=0 SKIP=0
 RED=$'\033[31m' GRN=$'\033[32m' YLW=$'\033[33m' RST=$'\033[0m'
 pass() { echo "${GRN}PASS${RST}: $1"; ((PASS++)) || true; }

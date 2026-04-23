@@ -61,6 +61,13 @@ make bench      # startup benchmarks (requires perf)
 make clean
 ```
 
+For larger-program work, the benchmark harness also exposes traced Python cases that exercise imports and native extensions when available:
+
+```bash
+BENCH_CASES=python-imports make bench
+BENCH_CASES=python-numpy make bench
+```
+
 ## Disclaimer
 
 The majority of code for this project was written by LLMs. Although I've read through the code to make sure there's nothing obviously stupid, do not use this project in a production or security-sensitive environment without vetting it yourself.
