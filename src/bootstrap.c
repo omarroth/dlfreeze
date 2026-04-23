@@ -43,6 +43,27 @@ static int make_workdir(char *out, size_t out_sz)
     return mkdtemp(out) ? 0 : -1;
 }
 
+static int ensure_parent_dirs(const char *path)
+{
+    char buf[PATH_MAX + 256];
+    char *p;
+
+    if (!path || !path[0])
+        return -1;
+    if (snprintf(buf, sizeof(buf), "%s", path) >= (int)sizeof(buf))
+        return -1;
+
+    for (p = buf + 1; *p; p++) {
+        if (*p != '/')
+            continue;
+        *p = '\0';
+        if (mkdir(buf, 0755) < 0 && errno != EEXIST)
+            return -1;
+        *p = '/';
+    }
+    return 0;
+}
+
 /* ---- signal forwarding ------------------------------------------- */
 static void fwd_signal(int sig) {
     if (g_child > 0) kill(g_child, sig);
@@ -86,6 +107,27 @@ static int bs_is_musl_interp_path(const char *path)
     const char *base = bs_basename(path);
 
     return strncmp(base, "ld-musl", 7) == 0;
+}
+
+static int bs_is_python_exe(const char *path)
+{
+    const char *base = bs_basename(path);
+
+    return strncmp(base, "python", 6) == 0;
+}
+
+static int bs_is_ruby_exe(const char *path)
+{
+    const char *base = bs_basename(path);
+
+    return strcmp(base, "ruby") == 0 || strncmp(base, "ruby", 4) == 0;
+}
+
+static int bs_debug_enabled(void)
+{
+    const char *dbg = getenv("DLFREEZE_DEBUG");
+
+    return dbg && dbg[0] && dbg[0] != '0';
 }
 
 static int extract(int srcfd, const char *dst,
@@ -248,6 +290,33 @@ int main(int argc, char **argv)
             }
         }
 
+        int skip_direct_load = 0;
+#if defined(__aarch64__)
+        {
+            const char *force_direct = getenv("DLFREEZE_FORCE_DIRECT");
+            int forced = force_direct && force_direct[0] && force_direct[0] != '0';
+
+            /* UPX binaries use in-memory direct-load which works reliably
+             * on arm64 for python/ruby.  Non-UPX binaries map the file
+             * before pre-linked addresses are set up, which can conflict
+             * on arm64; skip direct-load and fall back to extraction for
+             * those interpreter workloads. */
+            if (!forced && !from_memory) {
+                for (uint32_t i = 0; i < ft.num_entries; i++) {
+                    if ((ent[i].flags & DLFRZ_FLAG_MAIN_EXE) == 0)
+                        continue;
+
+                    const char *main_name = strtab + ent[i].name_offset;
+                    if (bs_is_python_exe(main_name) || bs_is_ruby_exe(main_name))
+                        skip_direct_load = 1;
+                    break;
+                }
+            }
+        }
+#endif
+
+        if (!skip_direct_load) {
+
         /* Set up mem/mem_foff for the loader.
          * Normal path: mmap the entire file.
          * UPX path: payload is already in virtual memory. */
@@ -286,7 +355,8 @@ int main(int argc, char **argv)
             loader_run(ldr_mem, ldr_mem_foff, ldr_srcfd, metas, ent, strtab,
                        ft.num_entries, runtime_fixups, runtime_fixup_count,
                        argc, argv, environ);
-            fprintf(stderr, "dlfreeze-bootstrap: in-process loader failed\n");
+            if (bs_debug_enabled())
+                fprintf(stderr, "dlfreeze-bootstrap: in-process loader failed\n");
             close(sfd);
             return 127;
         }
@@ -307,7 +377,8 @@ int main(int argc, char **argv)
                        ft.num_entries, runtime_fixups, runtime_fixup_count,
                        argc, argv, environ);
             close(sfd);
-            fprintf(stderr, "dlfreeze-bootstrap: in-process loader failed\n");
+            if (bs_debug_enabled())
+                fprintf(stderr, "dlfreeze-bootstrap: in-process loader failed\n");
             _exit(127);
         }
 
@@ -333,6 +404,12 @@ int main(int argc, char **argv)
         }
 
         /* Keep fallback transparent for output-sensitive workloads/tests. */
+        } else {
+            if (bs_debug_enabled())
+                fprintf(stderr,
+                        "dlfreeze-bootstrap: skipping direct-load for aarch64 interpreter workload\n");
+            free(metas);
+        }
     }
 
     /* 6. create workdir for extraction fallback (/tmp only). */
@@ -343,15 +420,30 @@ int main(int argc, char **argv)
     /* 7. extract all files */
     char exe_path[PATH_MAX + 256]    = {0};
     char interp_path[PATH_MAX + 256] = {0};
+    int has_python_stdlib_data = 0;
 
     for (uint32_t i = 0; i < ft.num_entries; i++) {
         const char *name = strtab + ent[i].name_offset;
-        if ((ent[i].flags & DLFRZ_FLAG_DATA_VIRTUAL) != 0)
+        if ((ent[i].flags & DLFRZ_FLAG_DATA) != 0 && name[0] == '/') {
+            if (strncmp(name, "/usr/lib/python", 15) == 0 ||
+                strncmp(name, "/usr/local/lib/python", 21) == 0)
+                has_python_stdlib_data = 1;
+        }
+        if ((ent[i].flags & (DLFRZ_FLAG_DATA_VIRTUAL | DLFRZ_FLAG_DATA_NEGATIVE)) != 0)
             continue;
         char dst[PATH_MAX + 256];
-        snprintf(dst, sizeof(dst), "%s/%s", g_tmpdir, bs_basename(name));
+        if ((ent[i].flags & DLFRZ_FLAG_DATA) != 0 && name[0] == '/')
+            snprintf(dst, sizeof(dst), "%s%s", g_tmpdir, name);
+        else
+            snprintf(dst, sizeof(dst), "%s/%s", g_tmpdir, bs_basename(name));
 
         int is_exec = (ent[i].flags & (DLFRZ_FLAG_MAIN_EXE | DLFRZ_FLAG_INTERP));
+
+        if (ensure_parent_dirs(dst) < 0) {
+            fprintf(stderr, "dlfreeze-bootstrap: mkdir failed: %s\n", dst);
+            rmtree(g_tmpdir);
+            close(sfd); return 127;
+        }
 
         int rc;
         if (from_memory) {
@@ -397,20 +489,32 @@ int main(int argc, char **argv)
     int is_musl_interp = interp_path[0] && bs_is_musl_interp_path(interp_path);
     int use_interp_launcher = interp_path[0] && !is_musl_interp;
 #if defined(__aarch64__)
-    /* On aarch64 glibc systems, system musl is absent: use the bundled
-     * ld-musl so that frozen musl binaries (python3, ruby, etc.) can run. */
-    if (is_musl_interp && interp_path[0])
-        use_interp_launcher = 1;
+    /* On aarch64, always use the bundled interpreter for both musl and glibc
+     * binaries.  For glibc: the bundled ld-linux.so and libc.so.6 must be the
+     * same version; using the system ld-linux with an older or newer bundled
+     * libc causes undefined-symbol errors or SIGILL from mismatched internal
+     * glibc data structures.  For musl: system ld-musl-aarch64.so.1 is absent
+     * on glibc-only targets so the bundled copy is required. */
+    use_interp_launcher = interp_path[0] != '\0';
 #endif
     if (use_interp_launcher) {
-        nac = argc + 3;
-        nav = calloc(nac + 1, sizeof(char *));
-        nav[0] = interp_path;
-        nav[1] = (char *)"--library-path";
-        nav[2] = g_tmpdir;
-        nav[3] = exe_path;
-        for (int i = 1; i < argc; i++)
-            nav[i + 3] = argv[i];
+        if (is_musl_interp) {
+            nac = argc + 1;
+            nav = calloc(nac + 1, sizeof(char *));
+            nav[0] = interp_path;
+            nav[1] = exe_path;
+            for (int i = 1; i < argc; i++)
+                nav[i + 1] = argv[i];
+        } else {
+            nac = argc + 3;
+            nav = calloc(nac + 1, sizeof(char *));
+            nav[0] = interp_path;
+            nav[1] = (char *)"--library-path";
+            nav[2] = g_tmpdir;
+            nav[3] = exe_path;
+            for (int i = 1; i < argc; i++)
+                nav[i + 3] = argv[i];
+        }
     } else {
         nac = argc;
         nav = calloc(nac + 1, sizeof(char *));
@@ -428,6 +532,20 @@ int main(int argc, char **argv)
         snprintf(lp, sizeof(lp), "%s", g_tmpdir);
     setenv("LD_LIBRARY_PATH", lp, 1);
     setenv("DLFREEZE_TMPDIR", g_tmpdir, 1);
+    setenv("DLFREEZE_EXTRACT_ROOT", g_tmpdir, 1);
+
+    if (bs_is_python_exe(exe_path) && has_python_stdlib_data) {
+        char pyhome[PATH_MAX + 256];
+        snprintf(pyhome, sizeof(pyhome), "%s/usr", g_tmpdir);
+        setenv("PYTHONHOME", pyhome, 1);
+        setenv("PYTHONNOUSERSITE", "1", 1);
+    }
+
+    if (bs_is_ruby_exe(exe_path)) {
+        /* Keep extracted cross-distro runs deterministic and avoid host gem
+         * prelude requirements for optional default gems/extensions. */
+        setenv("RUBYOPT", "--disable-gems", 1);
+    }
 
     /* 10. fork→exec, parent waits + cleans up */
     g_child = fork();

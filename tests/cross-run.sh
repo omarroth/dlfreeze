@@ -161,9 +161,6 @@ for src_dir in $FROZEN_GLOB; do
     frozen_py="$src_dir/python3.frozen"
     expected_py="$src_dir/python3.expected"
     if [ -f "$frozen_py" ] && [ -f "$expected_py" ]; then
-        if [ "$IS_ALPINE_TARGET" -eq 0 ] && echo "$src_env" | grep -q '^frozen-alpine-'; then
-            skip "$src_env/python3.frozen" "alpine musl python cross-target on glibc is not yet supported"
-        else
         chmod +x "$frozen_py" 2>/dev/null || true
         rc=0
         actual=$(run_capture "$frozen_py" -c 'print(1+2)' 2>&1) || rc=$?
@@ -173,7 +170,6 @@ for src_dir in $FROZEN_GLOB; do
         else
             fail "$src_env/python3.frozen" "output differs or rc=$rc"
         fi
-        fi
     else
         skip "$src_env/python3.frozen" "artifact not found"
     fi
@@ -181,9 +177,6 @@ for src_dir in $FROZEN_GLOB; do
     # ── python3.upx.frozen ─────────────────────────────────────────
     frozen_py_upx="$src_dir/python3.upx.frozen"
     if [ -f "$frozen_py_upx" ] && [ -f "$expected_py" ]; then
-        if [ "$IS_ALPINE_TARGET" -eq 0 ] && echo "$src_env" | grep -q '^frozen-alpine-'; then
-            skip "$src_env/python3.upx.frozen" "alpine musl python cross-target on glibc is not yet supported"
-        else
         chmod +x "$frozen_py_upx" 2>/dev/null || true
         rc=0
         actual=$(run_capture "$frozen_py_upx" -c 'print(1+2)' 2>&1) || rc=$?
@@ -193,7 +186,6 @@ for src_dir in $FROZEN_GLOB; do
         else
             fail "$src_env/python3.upx.frozen" "output differs or rc=$rc"
         fi
-        fi
     else
         skip "$src_env/python3.upx.frozen" "artifact or expectation not found"
     fi
@@ -202,9 +194,6 @@ for src_dir in $FROZEN_GLOB; do
     frozen_rb="$src_dir/ruby.frozen"
     expected_rb="$src_dir/ruby.expected"
     if [ -f "$frozen_rb" ] && [ -f "$expected_rb" ]; then
-        if [ "$IS_ALPINE_TARGET" -eq 0 ] && echo "$src_env" | grep -q '^frozen-alpine-'; then
-            skip "$src_env/ruby.frozen" "alpine musl ruby cross-target on glibc is not yet supported"
-        else
         chmod +x "$frozen_rb" 2>/dev/null || true
         rc=0
         actual=$(run_capture "$frozen_rb" -e 'puts 1+2' 2>&1) || rc=$?
@@ -214,7 +203,6 @@ for src_dir in $FROZEN_GLOB; do
         else
             fail "$src_env/ruby.frozen" "output differs or rc=$rc"
         fi
-        fi
     else
         skip "$src_env/ruby.frozen" "artifact not found"
     fi
@@ -222,9 +210,6 @@ for src_dir in $FROZEN_GLOB; do
     # ── ruby.upx.frozen ────────────────────────────────────────────
     frozen_rb_upx="$src_dir/ruby.upx.frozen"
     if [ -f "$frozen_rb_upx" ] && [ -f "$expected_rb" ]; then
-        if [ "$IS_ALPINE_TARGET" -eq 0 ] && echo "$src_env" | grep -q '^frozen-alpine-'; then
-            skip "$src_env/ruby.upx.frozen" "alpine musl ruby cross-target on glibc is not yet supported"
-        else
         chmod +x "$frozen_rb_upx" 2>/dev/null || true
         rc=0
         actual=$(run_capture "$frozen_rb_upx" -e 'puts 1+2' 2>&1) || rc=$?
@@ -233,7 +218,6 @@ for src_dir in $FROZEN_GLOB; do
             pass "$src_env/ruby.upx.frozen"
         else
             fail "$src_env/ruby.upx.frozen" "output differs or rc=$rc"
-        fi
         fi
     else
         skip "$src_env/ruby.upx.frozen" "artifact or expectation not found"

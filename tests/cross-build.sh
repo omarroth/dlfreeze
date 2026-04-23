@@ -19,7 +19,7 @@ echo "========================================================"
 # ── Install build dependencies ─────────────────────────────────────
 if [ -f /etc/alpine-release ]; then
     apk add --no-cache \
-        gcc musl-dev make linux-headers bash python3 file binutils
+        gcc musl-dev make linux-headers bash python3 file binutils strace
     apk add --no-cache upx 2>/dev/null || true
     apk add --no-cache ruby 2>/dev/null || true
     # Alpine's gcc IS musl-gcc; create symlink so tests that check
@@ -36,6 +36,7 @@ elif [ -f /etc/debian_version ]; then
         apt-get update -qq
     fi
     apt-get install -y -qq gcc musl-tools make bash file binutils 2>&1 | tail -1
+    apt-get install -y -qq strace 2>/dev/null || true
     apt-get install -y -qq python3 2>/dev/null || true
     apt-get install -y -qq ruby 2>/dev/null || true
     # Prefer UPX ≥ 4.x — the system package may be too old (e.g. 3.95 on

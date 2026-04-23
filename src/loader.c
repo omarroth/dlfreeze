@@ -522,6 +522,9 @@ static void crash_handler(int sig, siginfo_t *info, void *ucontext);
 
 static void crash_handler(int sig, siginfo_t *info, void *ucontext)
 {
+    if (!g_debug)
+        _exit(127);
+
     (void)ucontext;
     const char *name = "UNKNOWN";
     if (sig == SIGSEGV) name = "SIGSEGV";
@@ -5360,12 +5363,26 @@ static void init_alpine_musl_process_state(struct loaded_obj *objs, int nobj,
     prog_addr = prog_sym ? libc_obj->base + prog_sym->st_value : 0;
     if (!env_addr || !prog_addr)
         return;
-    if (prog_addr < env_addr ||
-        (prog_addr - env_addr != MUSL_ALPINE_ENVIRON_TO_PROGNAME_OFF_OLD &&
-         prog_addr - env_addr != MUSL_ALPINE_ENVIRON_TO_PROGNAME_OFF_NEW)) {
+    if (prog_addr < env_addr) {
         if (g_debug)
-            ldr_dbg("[loader] alpine musl layout probe failed\n");
+            ldr_dbg("[loader] alpine musl layout probe failed: prog_addr < env_addr\n");
         return;
+    }
+    
+    /* Accept both known offsets (0x40 and 0x260) and other reasonable offsets up to 0x1000 */
+    uint64_t offset = prog_addr - env_addr;
+    if (offset > 0x1000) {
+        if (g_debug) {
+            ldr_hex("[loader] alpine musl offset ", offset);
+            ldr_dbg(" exceeds reasonable threshold\n");
+        }
+        return;
+    }
+    
+    if (g_debug && offset != MUSL_ALPINE_ENVIRON_TO_PROGNAME_OFF_OLD &&
+        offset != MUSL_ALPINE_ENVIRON_TO_PROGNAME_OFF_NEW) {
+        ldr_hex("[loader] alpine musl layout probe: non-standard offset ", offset);
+        ldr_dbg("\n");
     }
 
     auxv = get_auxv_ptr(envp);
