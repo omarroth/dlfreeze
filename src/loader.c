@@ -3984,7 +3984,7 @@ static int vfs_fxstatat(int ver, int dirfd, const char *path,
 
 /* ==== Resolution cache ================================================ */
 
-#define RESOLVE_CACHE_SIZE 8192U  /* must be power-of-two */
+#define RESOLVE_CACHE_SIZE 65536U  /* must be power-of-two */
 
 enum cache_state {
     CACHE_EMPTY = 0,
@@ -3995,6 +3995,7 @@ enum cache_state {
 struct sym_cache_ent {
     const char *name;
     uint32_t    gh;
+    uint32_t    epoch;
     uint8_t     state;
     uint64_t    value;
 };
@@ -4002,17 +4003,23 @@ struct sym_cache_ent {
 struct tls_cache_ent {
     const char *name;
     uint32_t    gh;
+    uint32_t    epoch;
     uint8_t     state;
     int64_t     value;
 };
 
 static struct sym_cache_ent g_sym_cache[RESOLVE_CACHE_SIZE];
 static struct tls_cache_ent g_tls_cache[RESOLVE_CACHE_SIZE];
+static uint32_t g_cache_epoch = 1;
 
 static void clear_resolution_caches(void)
 {
-    memset(g_sym_cache, 0, sizeof(g_sym_cache));
-    memset(g_tls_cache, 0, sizeof(g_tls_cache));
+    g_cache_epoch++;
+    if (g_cache_epoch == 0) {
+        memset(g_sym_cache, 0, sizeof(g_sym_cache));
+        memset(g_tls_cache, 0, sizeof(g_tls_cache));
+        g_cache_epoch = 1;
+    }
 }
 
 /* Return: 1 found, -1 cached miss, 0 not present in cache */
@@ -4021,7 +4028,7 @@ static int sym_cache_lookup(const char *name, uint32_t gh, uint64_t *out)
     uint32_t idx = gh & (RESOLVE_CACHE_SIZE - 1);
     for (uint32_t n = 0; n < RESOLVE_CACHE_SIZE; n++) {
         struct sym_cache_ent *e = &g_sym_cache[idx];
-        if (e->state == CACHE_EMPTY) return 0;
+        if (e->epoch != g_cache_epoch || e->state == CACHE_EMPTY) return 0;
         if (e->gh == gh && e->name && strcmp(e->name, name) == 0) {
             if (e->state == CACHE_FOUND) { *out = e->value; return 1; }
             return -1;
@@ -4037,10 +4044,11 @@ static void sym_cache_store(const char *name, uint32_t gh,
     uint32_t idx = gh & (RESOLVE_CACHE_SIZE - 1);
     for (uint32_t n = 0; n < RESOLVE_CACHE_SIZE; n++) {
         struct sym_cache_ent *e = &g_sym_cache[idx];
-        if (e->state == CACHE_EMPTY ||
+        if (e->epoch != g_cache_epoch || e->state == CACHE_EMPTY ||
             (e->gh == gh && e->name && strcmp(e->name, name) == 0)) {
             e->name = name;
             e->gh = gh;
+            e->epoch = g_cache_epoch;
             e->state = state;
             e->value = value;
             return;
@@ -4055,7 +4063,7 @@ static int tls_cache_lookup(const char *name, uint32_t gh, int64_t *out)
     uint32_t idx = gh & (RESOLVE_CACHE_SIZE - 1);
     for (uint32_t n = 0; n < RESOLVE_CACHE_SIZE; n++) {
         struct tls_cache_ent *e = &g_tls_cache[idx];
-        if (e->state == CACHE_EMPTY) return 0;
+        if (e->epoch != g_cache_epoch || e->state == CACHE_EMPTY) return 0;
         if (e->gh == gh && e->name && strcmp(e->name, name) == 0) {
             if (e->state == CACHE_FOUND) { *out = e->value; return 1; }
             return -1;
@@ -4071,10 +4079,11 @@ static void tls_cache_store(const char *name, uint32_t gh,
     uint32_t idx = gh & (RESOLVE_CACHE_SIZE - 1);
     for (uint32_t n = 0; n < RESOLVE_CACHE_SIZE; n++) {
         struct tls_cache_ent *e = &g_tls_cache[idx];
-        if (e->state == CACHE_EMPTY ||
+        if (e->epoch != g_cache_epoch || e->state == CACHE_EMPTY ||
             (e->gh == gh && e->name && strcmp(e->name, name) == 0)) {
             e->name = name;
             e->gh = gh;
+            e->epoch = g_cache_epoch;
             e->state = state;
             e->value = value;
             return;
