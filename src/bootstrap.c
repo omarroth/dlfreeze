@@ -291,29 +291,6 @@ int main(int argc, char **argv)
         }
 
         int skip_direct_load = 0;
-#if defined(__aarch64__)
-        {
-            const char *force_direct = getenv("DLFREEZE_FORCE_DIRECT");
-            int forced = force_direct && force_direct[0] && force_direct[0] != '0';
-
-            /* UPX binaries use in-memory direct-load which works reliably
-             * on arm64 for python/ruby.  Non-UPX binaries map the file
-             * before pre-linked addresses are set up, which can conflict
-             * on arm64; skip direct-load and fall back to extraction for
-             * those interpreter workloads. */
-            if (!forced && !from_memory) {
-                for (uint32_t i = 0; i < ft.num_entries; i++) {
-                    if ((ent[i].flags & DLFRZ_FLAG_MAIN_EXE) == 0)
-                        continue;
-
-                    const char *main_name = strtab + ent[i].name_offset;
-                    if (bs_is_python_exe(main_name) || bs_is_ruby_exe(main_name))
-                        skip_direct_load = 1;
-                    break;
-                }
-            }
-        }
-#endif
 
         if (!skip_direct_load) {
 
@@ -432,7 +409,14 @@ int main(int argc, char **argv)
         if ((ent[i].flags & (DLFRZ_FLAG_DATA_VIRTUAL | DLFRZ_FLAG_DATA_NEGATIVE)) != 0)
             continue;
         char dst[PATH_MAX + 256];
-        if ((ent[i].flags & DLFRZ_FLAG_DATA) != 0 && name[0] == '/')
+        /* Extract DATA entries and DLOPEN'd python extension modules at
+         * their full original path so importlib finds them; system
+         * shared libraries (DT_NEEDED-style soname lookup) go flat into
+         * g_tmpdir (used as LD_LIBRARY_PATH). */
+        int use_full_path = (name[0] == '/') &&
+            (((ent[i].flags & DLFRZ_FLAG_DATA) != 0) ||
+             ((ent[i].flags & DLFRZ_FLAG_DLOPEN) != 0));
+        if (use_full_path)
             snprintf(dst, sizeof(dst), "%s%s", g_tmpdir, name);
         else
             snprintf(dst, sizeof(dst), "%s/%s", g_tmpdir, bs_basename(name));

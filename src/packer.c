@@ -1951,12 +1951,28 @@ int pack_frozen(const struct pack_options *opts)
         /* Build dirname(path)/soname — e.g. "/usr/lib/libQt6Core.so.6"
          * The path may have been resolved via realpath() to a versioned
          * name like libQt6Core.so.6.11.0, but we need the soname for
-         * basename matching against DT_NEEDED entries at runtime. */
+         * basename matching against DT_NEEDED entries at runtime.
+         *
+         * Exception: dlopen'd python extension modules (e.g.
+         *   /usr/lib/python3/dist-packages/cryptography/hazmat/bindings/_rust.abi3.so)
+         * are loaded by python's import system using the full file
+         * path, not by DT_NEEDED-style soname lookup, and the soname
+         * (e.g. "libcryptography_rust.so") usually doesn't match the
+         * file basename — so the extraction-fallback path needs the
+         * original full path preserved. */
         {
             const char *rpath = opts->deps->libs[i].path;
             const char *sname = opts->deps->libs[i].name;
             const char *last_slash = strrchr(rpath, '/');
-            if (last_slash) {
+            int is_dlopen = opts->deps->libs[i].from_dlopen;
+            const char *rbase = last_slash ? last_slash + 1 : rpath;
+            int soname_matches = (strcmp(rbase, sname) == 0);
+            if (is_dlopen && !soname_matches) {
+                /* Use full original path so extraction places the file
+                 * exactly where python's importlib expects it. */
+                strcpy(strtab + stroff, rpath);
+                stroff += strlen(rpath) + 1;
+            } else if (last_slash) {
                 size_t dirlen = (size_t)(last_slash - rpath + 1); /* include '/' */
                 memcpy(strtab + stroff, rpath, dirlen);
                 strcpy(strtab + stroff + dirlen, sname);

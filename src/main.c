@@ -253,6 +253,27 @@ static void process_captured_path(const char *exe_path, const char **patterns,
             return;
 
         add_capture_dir(cap_dirs, ncap_dirs, cap_dirs_cap, rpath);
+        /* When a __pycache__ directory is captured, also capture its
+         * parent package directory so the .py source files alongside
+         * the .pyc cache files become available — Python may import
+         * sibling submodules via frozen importlib that bypass the
+         * trace (e.g. importlib._bootstrap loaded by frozen
+         * importlib.machinery). */
+        {
+            const char *slash = strrchr(rpath, '/');
+            if (slash && slash > rpath &&
+                strcmp(slash + 1, "__pycache__") == 0) {
+                char parent[PATH_MAX];
+                size_t plen = (size_t)(slash - rpath);
+                if (plen < sizeof(parent)) {
+                    memcpy(parent, rpath, plen);
+                    parent[plen] = '\0';
+                    if (dir_matches_patterns(parent, patterns, npatterns))
+                        add_capture_dir(cap_dirs, ncap_dirs,
+                                        cap_dirs_cap, parent);
+                }
+            }
+        }
         return;
     }
 
@@ -273,6 +294,37 @@ static void process_captured_path(const char *exe_path, const char **patterns,
         if (match_glob(patterns[i], rpath)) {
             if (sb.st_size > 0)
                 data_file_list_add(out, rpath);
+            /* If the captured file lives inside a __pycache__ directory,
+             * schedule a shallow scan of both that __pycache__ and its
+             * parent package directory.  Frozen importlib can load
+             * sibling submodules (e.g. importlib._bootstrap) without
+             * the trace ever opening the package dir, so we need to
+             * proactively pick up the .py/.pyc siblings. */
+            const char *slash = strrchr(rpath, '/');
+            if (slash && slash > rpath) {
+                char parent[PATH_MAX];
+                size_t plen = (size_t)(slash - rpath);
+                if (plen < sizeof(parent)) {
+                    memcpy(parent, rpath, plen);
+                    parent[plen] = '\0';
+                    const char *pslash = strrchr(parent, '/');
+                    if (pslash && strcmp(pslash + 1, "__pycache__") == 0) {
+                        if (dir_matches_patterns(parent, patterns, npatterns))
+                            add_capture_dir(cap_dirs, ncap_dirs,
+                                            cap_dirs_cap, parent);
+                        char gparent[PATH_MAX];
+                        size_t gplen = (size_t)(pslash - parent);
+                        if (gplen > 0 && gplen < sizeof(gparent)) {
+                            memcpy(gparent, parent, gplen);
+                            gparent[gplen] = '\0';
+                            if (dir_matches_patterns(gparent, patterns,
+                                                     npatterns))
+                                add_capture_dir(cap_dirs, ncap_dirs,
+                                                cap_dirs_cap, gparent);
+                        }
+                    }
+                }
+            }
             return;
         }
     }

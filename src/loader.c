@@ -7335,7 +7335,12 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
                                               is_musl_runtime ? 0 : 1);
 
 #if defined(__aarch64__)
-    if (main_addr && !is_musl_runtime) {
+    /* Prefer the direct-main path when __libc_early_init has run; the
+     * __libc_start_main bridge re-touches initialization state and has
+     * been observed to crash with large in-memory VFS payloads on arm64
+     * (e.g. /usr/* preloaded into a frozen python). Only fall back to
+     * the bridge when direct-main isn't viable. */
+    if (main_addr && !is_musl_runtime && !g_glibc_early_init_done) {
         uint64_t lsm_addr = resolve_sym(objs, nobj, "__libc_start_main");
         if (lsm_addr) {
             typedef int (*libc_start_main_fn_t)(
