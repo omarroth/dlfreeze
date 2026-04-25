@@ -72,8 +72,17 @@ typedef Elf64_Xword Elf64_Relr;
     #define ARCH_RELOC_TLSDESC    R_AARCH64_TLSDESC
   #define ARCH_RELOC_IRELATIVE  R_AARCH64_IRELATIVE
   #define ARCH_RELOC_COPY       R_AARCH64_COPY
+    #define PRELINK_TLS_ABOVE_TP  1
+    #define PRELINK_TLS_TCB_SIZE  0x10
 #else
   #error "Unsupported architecture"
+#endif
+
+#ifndef PRELINK_TLS_ABOVE_TP
+#define PRELINK_TLS_ABOVE_TP 0
+#endif
+#ifndef PRELINK_TLS_TCB_SIZE
+#define PRELINK_TLS_TCB_SIZE 0
 #endif
 
 /* Starting base address for direct-loaded objects (above bootstrap VA) */
@@ -1043,7 +1052,7 @@ static int prelink_objects(const char *output_path,
      * modid must match the loader's scheme: modid = (non-INTERP index) + 1.
      * The loader iterates only non-INTERP, non-DLOPEN objects and assigns
      * oi+1, so we must count the same way. */
-    uint64_t total_tls = 0;
+    uint64_t total_tls = PRELINK_TLS_ABOVE_TP ? PRELINK_TLS_TCB_SIZE : 0;
     int oi = 0;  /* non-INTERP, non-DLOPEN object counter; matches loader's oi */
     for (int i = 0; i < nobj; i++) {
         if (metas[i].flags & DLFRZ_FLAG_INTERP) continue;
@@ -1051,8 +1060,14 @@ static int prelink_objects(const char *output_path,
         if (metas[i].flags & DLFRZ_FLAG_DATA) continue;
         if (objs[i].tls_memsz > 0) {
             uint64_t align = objs[i].tls_align;
-            total_tls = ALIGN_UP(total_tls + objs[i].tls_memsz, align);
-            objs[i].tls_tpoff = -(int64_t)total_tls;
+            if (PRELINK_TLS_ABOVE_TP) {
+                total_tls = ALIGN_UP(total_tls, align);
+                objs[i].tls_tpoff = (int64_t)total_tls;
+                total_tls += objs[i].tls_memsz;
+            } else {
+                total_tls = ALIGN_UP(total_tls + objs[i].tls_memsz, align);
+                objs[i].tls_tpoff = -(int64_t)total_tls;
+            }
             objs[i].tls_modid = (size_t)(oi + 1);  /* matches loader's oi+1 */
         }
         oi++;

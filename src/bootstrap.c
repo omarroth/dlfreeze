@@ -290,10 +290,6 @@ int main(int argc, char **argv)
             }
         }
 
-        int skip_direct_load = 0;
-
-        if (!skip_direct_load) {
-
         /* Set up mem/mem_foff for the loader.
          * Normal path: mmap the entire file.
          * UPX path: payload is already in virtual memory. */
@@ -378,14 +374,6 @@ int main(int argc, char **argv)
             }
         } else if (WIFSIGNALED(lst)) {
             /* Crash in direct mode — try the extraction fallback. */
-        }
-
-        /* Keep fallback transparent for output-sensitive workloads/tests. */
-        } else {
-            if (bs_debug_enabled())
-                fprintf(stderr,
-                        "dlfreeze-bootstrap: skipping direct-load for aarch64 interpreter workload\n");
-            free(metas);
         }
     }
 

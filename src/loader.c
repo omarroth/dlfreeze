@@ -1636,6 +1636,11 @@ static int stub_dl_rtld_di_serinfo(void) { return -1; }
 #define TCB_OFF_SELF         8    /* void *private (unused) */
 #define TCB_OFF_SELF2        8
 #define TCB_OFF_SELF3       16    /* musl thread self       */
+/* AArch64 glibc keeps struct pthread immediately below TP and places
+ * static TLS at positive TP offsets after the two-word TCB header. */
+#define GLIBC_AARCH64_PTHREAD_SIZE       0x740
+#define GLIBC_AARCH64_TCB_SIZE           0x10
+#define GLIBC_AARCH64_PTHREAD_TID_OFF    0x0d0
 /* On aarch64 glibc the stack guard and pointer guard live in struct
  * pthread, which sits at a negative offset from the thread pointer.
  * These offsets are from the TP (positive, into the TCB header area).
@@ -1678,6 +1683,41 @@ static inline int musl_tls_above_tp(void)
     return 1;
 #else
     return 0;
+#endif
+}
+
+static inline int glibc_tls_above_tp(void)
+{
+#if defined(__aarch64__)
+    return !g_is_musl_runtime;
+#else
+    return 0;
+#endif
+}
+
+static inline int static_tls_above_tp(void)
+{
+    return (g_is_musl_runtime && musl_tls_above_tp()) ||
+           glibc_tls_above_tp();
+}
+
+static inline uint64_t static_tls_first_tpoff(void)
+{
+#if defined(__aarch64__)
+    if (glibc_tls_above_tp())
+        return GLIBC_AARCH64_TCB_SIZE;
+#endif
+    if (g_is_musl_runtime && musl_tls_above_tp())
+        return MUSL_TLS_GAP_ABOVE_TP;
+    return 0;
+}
+
+static inline uintptr_t glibc_aarch64_pthread_self_from_tp(uintptr_t tp)
+{
+#if defined(__aarch64__)
+    return tp - GLIBC_AARCH64_PTHREAD_SIZE;
+#else
+    return tp;
 #endif
 }
 
@@ -6466,9 +6506,8 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
      * Layout: [TLS block N ... TLS block 1] [TCB]
      *                                        ^ TP (= FS register)
      */
-    uint64_t total_tls = (g_is_musl_runtime && musl_tls_above_tp())
-        ? MUSL_TLS_GAP_ABOVE_TP
-        : 0;
+    int tls_above_tp = static_tls_above_tp();
+    uint64_t total_tls = tls_above_tp ? static_tls_first_tpoff() : 0;
     for (int oi = 0; oi < nobj; oi++) {
         /* Find the matching manifest index */
         int mi = idx_map[oi];
@@ -6481,7 +6520,7 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
             uint64_t align = phdrs[j].p_align ? phdrs[j].p_align : 1;
             if (align > max_tls_align)
                 max_tls_align = align;
-            if (g_is_musl_runtime && musl_tls_above_tp()) {
+            if (tls_above_tp) {
                 total_tls = ALIGN_UP(total_tls, align);
                 objs[oi].tls.tpoff = (int64_t)total_tls;
                 total_tls += phdrs[j].p_memsz;
@@ -6556,6 +6595,18 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
             return 0;
         }
         tp = ALIGN_UP((uintptr_t)block + g_musl_tp_self_delta, max_tls_align);
+    } else if (glibc_tls_above_tp()) {
+        size_t tls_aligned = ALIGN_UP(total_tls, 64);
+
+        alloc = GLIBC_AARCH64_PTHREAD_SIZE + tls_aligned + max_tls_align;
+        block = mmap(NULL, alloc, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (block == MAP_FAILED) {
+            ldr_err("TLS mmap failed", NULL);
+            return 0;
+        }
+        tp = ALIGN_UP((uintptr_t)block + GLIBC_AARCH64_PTHREAD_SIZE,
+                      max_tls_align);
     } else {
         size_t tls_aligned = ALIGN_UP(total_tls, 64);
 
@@ -6622,8 +6673,15 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
 
     /* glibc stores the current TID in the TCB header; musl keeps it in
      * struct pthread and seeds it later in init_alpine_musl_process_state(). */
-    if (!g_is_musl_runtime)
+    if (!g_is_musl_runtime) {
+#if defined(__aarch64__)
+        uintptr_t self = glibc_aarch64_pthread_self_from_tp(tp);
+        *(int32_t *)(self + GLIBC_AARCH64_PTHREAD_TID_OFF) =
+            (int32_t)syscall(SYS_gettid);
+#else
         *(int32_t *)(tp + TCB_OFF_TID) = (int32_t)syscall(SYS_gettid);
+#endif
+    }
 
     /*
      * Minimal DTV (Dynamic Thread Vector).
