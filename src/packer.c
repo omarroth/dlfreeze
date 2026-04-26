@@ -1980,9 +1980,10 @@ int pack_frozen(const struct pack_options *opts)
             const char *sname = opts->deps->libs[i].name;
             const char *last_slash = strrchr(rpath, '/');
             int is_dlopen = opts->deps->libs[i].from_dlopen;
+            int is_dlopen_direct = opts->deps->libs[i].dlopen_direct;
             const char *rbase = last_slash ? last_slash + 1 : rpath;
             int soname_matches = (strcmp(rbase, sname) == 0);
-            if (is_dlopen && !soname_matches) {
+            if (is_dlopen && is_dlopen_direct && !soname_matches) {
                 /* Use full original path so extraction places the file
                  * exactly where python's importlib expects it. */
                 strcpy(strtab + stroff, rpath);

@@ -143,13 +143,19 @@ static char *resolve_from_ldconfig(const char *name)
 /* ------------------------------------------------------------------ */
 /*  dep_list helpers                                                  */
 /* ------------------------------------------------------------------ */
-static int dep_list_add(struct dep_list *deps,
-                        const char *name, const char *path, int from_dlopen)
+static int dep_list_add(struct dep_list *deps, const char *name,
+                        const char *path, int from_dlopen,
+                        int dlopen_direct)
 {
     /* deduplicate by resolved path */
     for (int i = 0; i < deps->count; i++) {
         if (strcmp(deps->libs[i].path, path) != 0)
             continue;
+
+        if (!from_dlopen)
+            deps->libs[i].from_dlopen = 0;
+        if (dlopen_direct)
+            deps->libs[i].dlopen_direct = 1;
 
         /* If the existing entry used a fully-versioned basename from a
          * traced realpath(), but we later discover the DT_SONAME, prefer
@@ -180,6 +186,7 @@ static int dep_list_add(struct dep_list *deps,
     deps->libs[deps->count].name        = strdup(name);
     deps->libs[deps->count].path        = strdup(path);
     deps->libs[deps->count].from_dlopen = from_dlopen;
+    deps->libs[deps->count].dlopen_direct = dlopen_direct;
     deps->count++;
     return 1; /* added */
 }
@@ -343,7 +350,7 @@ static void resolve_needed(struct elf_info *info, const char *origin,
             fprintf(stderr, "dlfreeze: warning: library not found: %s\n", name);
             continue;
         }
-        int added = dep_list_add(deps, name, path, dlopen_flag);
+        int added = dep_list_add(deps, name, path, dlopen_flag, 0);
         if (added > 0) bfs_push(q, path);
         free(path);
     }
@@ -414,7 +421,7 @@ int dep_resolve(const char *exe_path, struct dep_list *deps)
             char *p = find_library(glibc_runtime_libs[i], NULL, NULL, origin,
                                    deps->interp_path);
             if (p) {
-                int added = dep_list_add(deps, glibc_runtime_libs[i], p, 0);
+                int added = dep_list_add(deps, glibc_runtime_libs[i], p, 0, 0);
                 if (added > 0) bfs_push(&q2, p);
                 free(p);
             }
@@ -476,7 +483,7 @@ int dep_add_dlopen_libs(struct dep_list *deps, const char *trace_file)
             elf_info_free(&info);
         }
 
-        int added = dep_list_add(deps, name, rp, 1);
+        int added = dep_list_add(deps, name, rp, 1, 1);
         if (added > 0) bfs_push(&q, rp);
         free(rp);
     }

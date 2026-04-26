@@ -5,6 +5,7 @@ struct resolved_lib {
     char *name;          /* soname (e.g. "libc.so.6") */
     char *path;          /* resolved absolute path     */
     int   from_dlopen;   /* found via dlopen tracing   */
+    int   dlopen_direct; /* path appeared in trace file */
 };
 
 struct dep_list {

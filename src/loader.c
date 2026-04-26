@@ -75,15 +75,16 @@ typedef Elf64_Xword Elf64_Relr;
 #endif
 
 #if defined(__x86_64__)
-  #define ARCH_RELOC_RELATIVE   R_X86_64_RELATIVE
-  #define ARCH_RELOC_GLOB_DAT   R_X86_64_GLOB_DAT
-  #define ARCH_RELOC_JUMP_SLOT  R_X86_64_JUMP_SLOT
-  #define ARCH_RELOC_ABS        R_X86_64_64
-  #define ARCH_RELOC_TPOFF      R_X86_64_TPOFF64
-  #define ARCH_RELOC_DTPMOD     R_X86_64_DTPMOD64
-  #define ARCH_RELOC_DTPOFF     R_X86_64_DTPOFF64
-  #define ARCH_RELOC_IRELATIVE  R_X86_64_IRELATIVE
-  #define ARCH_RELOC_COPY       R_X86_64_COPY
+#define ARCH_ELF_MACHINE      EM_X86_64
+#define ARCH_RELOC_RELATIVE   R_X86_64_RELATIVE
+#define ARCH_RELOC_GLOB_DAT   R_X86_64_GLOB_DAT
+#define ARCH_RELOC_JUMP_SLOT  R_X86_64_JUMP_SLOT
+#define ARCH_RELOC_ABS        R_X86_64_64
+#define ARCH_RELOC_TPOFF      R_X86_64_TPOFF64
+#define ARCH_RELOC_DTPMOD     R_X86_64_DTPMOD64
+#define ARCH_RELOC_DTPOFF     R_X86_64_DTPOFF64
+#define ARCH_RELOC_IRELATIVE  R_X86_64_IRELATIVE
+#define ARCH_RELOC_COPY       R_X86_64_COPY
 
   static inline uintptr_t arch_get_tp(void) {
       uintptr_t tp;
@@ -110,16 +111,17 @@ typedef Elf64_Xword Elf64_Relr;
       return val;
   }
 #elif defined(__aarch64__)
-  #define ARCH_RELOC_RELATIVE   R_AARCH64_RELATIVE
-  #define ARCH_RELOC_GLOB_DAT   R_AARCH64_GLOB_DAT
-  #define ARCH_RELOC_JUMP_SLOT  R_AARCH64_JUMP_SLOT
-  #define ARCH_RELOC_ABS        R_AARCH64_ABS64
-  #define ARCH_RELOC_TPOFF      R_AARCH64_TLS_TPREL
-  #define ARCH_RELOC_DTPMOD     R_AARCH64_TLS_DTPMOD
-  #define ARCH_RELOC_DTPOFF     R_AARCH64_TLS_DTPREL
-    #define ARCH_RELOC_TLSDESC    R_AARCH64_TLSDESC
-  #define ARCH_RELOC_IRELATIVE  R_AARCH64_IRELATIVE
-  #define ARCH_RELOC_COPY       R_AARCH64_COPY
+#define ARCH_ELF_MACHINE      EM_AARCH64
+#define ARCH_RELOC_RELATIVE   R_AARCH64_RELATIVE
+#define ARCH_RELOC_GLOB_DAT   R_AARCH64_GLOB_DAT
+#define ARCH_RELOC_JUMP_SLOT  R_AARCH64_JUMP_SLOT
+#define ARCH_RELOC_ABS        R_AARCH64_ABS64
+#define ARCH_RELOC_TPOFF      R_AARCH64_TLS_TPREL
+#define ARCH_RELOC_DTPMOD     R_AARCH64_TLS_DTPMOD
+#define ARCH_RELOC_DTPOFF     R_AARCH64_TLS_DTPREL
+#define ARCH_RELOC_TLSDESC    R_AARCH64_TLSDESC
+#define ARCH_RELOC_IRELATIVE  R_AARCH64_IRELATIVE
+#define ARCH_RELOC_COPY       R_AARCH64_COPY
 
   static inline uintptr_t arch_get_tp(void) {
       uintptr_t tp;
@@ -5872,6 +5874,11 @@ static struct loaded_obj *load_elf_from_file(const char *path)
         dl_set_error(path, ": not a 64-bit shared object");
         return NULL;
     }
+    if (ehdr.e_machine != ARCH_ELF_MACHINE) {
+        close(fd);
+        dl_set_error(path, ": wrong architecture");
+        return NULL;
+    }
 
     /* Read program headers */
     Elf64_Phdr phdr_buf[64];
@@ -6595,7 +6602,9 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
             return 0;
         }
         tp = ALIGN_UP((uintptr_t)block + g_musl_tp_self_delta, max_tls_align);
-    } else if (glibc_tls_above_tp()) {
+    }
+#if defined(__aarch64__)
+    else if (glibc_tls_above_tp()) {
         size_t tls_aligned = ALIGN_UP(total_tls, 64);
 
         alloc = GLIBC_AARCH64_PTHREAD_SIZE + tls_aligned + max_tls_align;
@@ -6607,7 +6616,9 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
         }
         tp = ALIGN_UP((uintptr_t)block + GLIBC_AARCH64_PTHREAD_SIZE,
                       max_tls_align);
-    } else {
+    }
+#endif
+    else {
         size_t tls_aligned = ALIGN_UP(total_tls, 64);
 
         alloc = tls_aligned + TCB_ALLOC;
@@ -7393,11 +7404,7 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
                                               is_musl_runtime ? 0 : 1);
 
 #if defined(__aarch64__)
-    /* Prefer the direct-main path when __libc_early_init has run; the
-     * __libc_start_main bridge re-touches initialization state and has
-     * been observed to crash with large in-memory VFS payloads on arm64
-     * (e.g. /usr/* preloaded into a frozen python). Only fall back to
-     * the bridge when direct-main isn't viable. */
+     /* Prefer direct main after __libc_early_init; the bridge can crash on large VFS payloads. */
     if (main_addr && !is_musl_runtime && !g_glibc_early_init_done) {
         uint64_t lsm_addr = resolve_sym(objs, nobj, "__libc_start_main");
         if (lsm_addr) {
