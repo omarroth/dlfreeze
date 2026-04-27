@@ -432,6 +432,29 @@ int main(int argc, char **argv)
             close(sfd); return 127;
         }
 
+        if (use_full_path && (ent[i].flags & DLFRZ_FLAG_DLOPEN) != 0) {
+            char flat[PATH_MAX + 256];
+            snprintf(flat, sizeof(flat), "%s/%s", g_tmpdir, bs_basename(name));
+            if (strcmp(flat, dst) != 0) {
+                unlink(flat);
+                if (link(dst, flat) < 0) {
+                    if (from_memory) {
+                        rc = extract_mem(mem_base, g_loader_info.payload_foff,
+                                         flat, ent[i].data_offset,
+                                         ent[i].data_size, is_exec);
+                    } else {
+                        rc = extract(sfd, flat, ent[i].data_offset,
+                                     ent[i].data_size, is_exec);
+                    }
+                    if (rc < 0) {
+                        fprintf(stderr, "dlfreeze-bootstrap: extract failed: %s\n", name);
+                        rmtree(g_tmpdir);
+                        close(sfd); return 127;
+                    }
+                }
+            }
+        }
+
         if (ent[i].flags & DLFRZ_FLAG_MAIN_EXE)
             snprintf(exe_path, sizeof(exe_path), "%s", dst);
         if (ent[i].flags & DLFRZ_FLAG_INTERP)

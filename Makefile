@@ -4,6 +4,7 @@ LDFLAGS  =
 
 BUILD    = build
 SRC      = src
+BUILD_ARCH := $(shell uname -m)
 
 # ── sources for the main dlfreeze tool ──────────────────────────────
 TOOL_SRCS = $(SRC)/main.c $(SRC)/elf_parser.c $(SRC)/dep_resolver.c $(SRC)/packer.c
@@ -17,15 +18,25 @@ PRELOAD   = $(BUILD)/dlfreeze-preload.so
 # Use musl-gcc for static tools when available; fall back to system gcc.
 TOOL_CC := $(shell command -v musl-gcc 2>/dev/null || echo $(CC))
 
-.PHONY: all clean test bench local-verify local-cross
+.DEFAULT_GOAL := all
 
-all: $(DLFREEZE) $(BOOTSTRAP) $(PRELOAD)
+.PHONY: all clean test bench local-verify local-cross prepare-build
+
+prepare-build:
+	@if [ -f "$(BUILD)/.arch" ] && [ "`cat $(BUILD)/.arch`" != "$(BUILD_ARCH)" ]; then \
+		echo "build arch changed (`cat $(BUILD)/.arch` -> $(BUILD_ARCH)); cleaning $(BUILD)"; \
+		rm -rf "$(BUILD)"; \
+	fi
+	@mkdir -p "$(BUILD)"
+	@printf '%s\n' "$(BUILD_ARCH)" > "$(BUILD)/.arch"
+
+all: prepare-build $(DLFREEZE) $(BOOTSTRAP) $(PRELOAD)
 
 $(BUILD):
 	mkdir -p $(BUILD)
 
 # ── main tool ───────────────────────────────────────────────────────
-$(BUILD)/%.o: $(SRC)/%.c | $(BUILD)
+$(BUILD)/%.o: $(SRC)/%.c | prepare-build
 	$(TOOL_CC) $(CFLAGS) -c -o $@ $<
 
 # Link at 0x40000000 so the default 0x400000 range is free for non-PIE
@@ -41,7 +52,7 @@ $(DLFREEZE): $(TOOL_OBJS)
 BOOTSTRAP_CC := $(shell command -v musl-gcc 2>/dev/null || echo $(CC))
 INC      = include
 
-$(BOOTSTRAP): $(SRC)/bootstrap.c $(SRC)/loader.c $(INC)/common.h $(INC)/loader.h | $(BUILD)
+$(BOOTSTRAP): $(SRC)/bootstrap.c $(SRC)/loader.c $(INC)/common.h $(INC)/loader.h | prepare-build
 	$(BOOTSTRAP_CC) -Wall -Wextra -O2 -D_GNU_SOURCE -Iinclude -fno-stack-protector \
 	    -ffunction-sections -fdata-sections \
 	    -static -Wl,--gc-sections -Wl,-Ttext-segment=0x40000000 \
@@ -50,7 +61,7 @@ $(BOOTSTRAP): $(SRC)/bootstrap.c $(SRC)/loader.c $(INC)/common.h $(INC)/loader.h
 # ── LD_PRELOAD library for tracing dlopen ──────────────────────────
 # -U_FORTIFY_SOURCE: glibc fortification (__fprintf_chk etc.) is not
 # available on musl, so disable it for cross-platform portability.
-$(PRELOAD): $(SRC)/dlopen_preload.c | $(BUILD)
+$(PRELOAD): $(SRC)/dlopen_preload.c | prepare-build
 	$(CC) $(CFLAGS) -U_FORTIFY_SOURCE -shared -fPIC -o $@ $< -ldl -lpthread
 
 # ── test suite ─────────────────────────────────────────────────────

@@ -954,12 +954,10 @@ static const struct glibc_ver_offsets glibc_aarch64_2_31 = {
  * Ubuntu 22.04 arm64 (glibc 2.35) through Ubuntu 24.04 arm64 (glibc 2.39).
  * Lock callbacks removed (same as x86-64 2.34+).
  * TLS static size/align fields now in _rtld_global_ro.
- * All offsets verified empirically via probe on Ubuntu 24.04 arm64 glibc 2.39.
- * _rtld_global_ro offsets = x86-64 glibc_2_37 offsets - 264 (no x86 CPU feats).
- * _rtld_global offsets = x86-64 glibc_2_37 offsets + 152 (larger link_map). */
+ * Offsets verified from Ubuntu 24.04 arm64 glibc 2.39 debug layout. */
 static const struct glibc_ver_offsets glibc_aarch64_2_35 = {
-    .glro_tls_static_size  = 448,   /* 0x1C0 */
-    .glro_tls_static_align = 456,   /* 0x1C8 */
+     .glro_tls_static_size  = 464,   /* 0x1D0 */
+     .glro_tls_static_align = 472,   /* 0x1D8 */
     .glro_debug_printf     = 584,   /* 0x248 */
     .glro_mcount           = 592,   /* 0x250 */
     .glro_open             = 608,   /* 0x260 */
@@ -969,7 +967,7 @@ static const struct glibc_ver_offsets glibc_aarch64_2_35 = {
     .glro_find_object      = 656,   /* 0x290 */
     .gl_tls_static_size    = -1,
     .gl_tls_static_align   = -1,
-    .gl_nns                = 2712,  /* 0x0A98 */
+    .gl_nns                = 2688,  /* 0x0A80 */
     .gl_stack_flags        = 4360,  /* 0x1108 */
     .gl_tls_generation     = 4416,  /* 0x1140 */
     .gl_stack_used         = 4432,  /* 0x1150 */
@@ -1643,6 +1641,9 @@ static int stub_dl_rtld_di_serinfo(void) { return -1; }
 #define GLIBC_AARCH64_PTHREAD_SIZE       0x740
 #define GLIBC_AARCH64_TCB_SIZE           0x10
 #define GLIBC_AARCH64_PTHREAD_TID_OFF    0x0d0
+#define GLIBC_AARCH64_PTHREAD_RSEQ_OFF   0x720
+#define GLIBC_AARCH64_PTHREAD_RSEQ_CPU_ID_OFF 0x724
+#define GLIBC_RSEQ_CPU_ID_REGISTRATION_FAILED (-2)
 /* On aarch64 glibc the stack guard and pointer guard live in struct
  * pthread, which sits at a negative offset from the thread pointer.
  * These offsets are from the TP (positive, into the TCB header area).
@@ -6575,11 +6576,19 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
                 = tls_align;
     }
 
+#if defined(__aarch64__)
+    if (!g_is_musl_runtime) {
+        g_rseq_offset = (int64_t)GLIBC_AARCH64_PTHREAD_RSEQ_OFF -
+                        (int64_t)GLIBC_AARCH64_PTHREAD_SIZE;
+        g_rseq_size = 0;
+    }
+#else
     if (!g_is_musl_runtime && min_static_tpoff < 0) {
         int64_t rseq_off = min_static_tpoff - (int64_t)32;
 
         g_rseq_offset = rseq_off & ~((int64_t)31);
     }
+#endif
 
     if (g_is_musl_runtime) {
         old_tp = arch_get_tp_syscall();
@@ -6689,6 +6698,8 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
         uintptr_t self = glibc_aarch64_pthread_self_from_tp(tp);
         *(int32_t *)(self + GLIBC_AARCH64_PTHREAD_TID_OFF) =
             (int32_t)syscall(SYS_gettid);
+        *(int32_t *)(self + GLIBC_AARCH64_PTHREAD_RSEQ_CPU_ID_OFF) =
+            GLIBC_RSEQ_CPU_ID_REGISTRATION_FAILED;
 #else
         *(int32_t *)(tp + TCB_OFF_TID) = (int32_t)syscall(SYS_gettid);
 #endif
