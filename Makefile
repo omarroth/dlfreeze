@@ -5,6 +5,10 @@ LDFLAGS  =
 BUILD    = build
 SRC      = src
 BUILD_ARCH := $(shell uname -m)
+BUILD_TRIPLE := $(shell $(CC) -dumpmachine 2>/dev/null || uname -m)
+BUILD_OS := $(shell if [ -r /etc/os-release ]; then . /etc/os-release; fi; printf '%s:%s' "$${ID:-unknown}" "$${VERSION_ID:-unknown}")
+BUILD_LIBC := $(shell ldd --version 2>&1 | head -n 1 || true)
+BUILD_STAMP := $(BUILD_ARCH)|$(BUILD_TRIPLE)|$(BUILD_OS)|$(BUILD_LIBC)
 
 # ── sources for the main dlfreeze tool ──────────────────────────────
 TOOL_SRCS = $(SRC)/main.c $(SRC)/elf_parser.c $(SRC)/dep_resolver.c $(SRC)/packer.c
@@ -23,12 +27,18 @@ TOOL_CC := $(shell command -v musl-gcc 2>/dev/null || echo $(CC))
 .PHONY: all clean test bench local-verify local-cross prepare-build
 
 prepare-build:
-	@if [ -f "$(BUILD)/.arch" ] && [ "`cat $(BUILD)/.arch`" != "$(BUILD_ARCH)" ]; then \
-		echo "build arch changed (`cat $(BUILD)/.arch` -> $(BUILD_ARCH)); cleaning $(BUILD)"; \
-		rm -rf "$(BUILD)"; \
+	@if [ -d "$(BUILD)" ]; then \
+		old_stamp=; \
+		if [ -f "$(BUILD)/.build-stamp" ]; then old_stamp=`cat "$(BUILD)/.build-stamp"`; \
+		elif [ -f "$(BUILD)/.arch" ]; then old_stamp=`cat "$(BUILD)/.arch"`; fi; \
+		if [ -n "$$old_stamp" ] && [ "$$old_stamp" != "$(BUILD_STAMP)" ]; then \
+			echo "build environment changed ($$old_stamp -> $(BUILD_STAMP)); cleaning $(BUILD)"; \
+			rm -rf "$(BUILD)"; \
+		fi; \
 	fi
 	@mkdir -p "$(BUILD)"
-	@printf '%s\n' "$(BUILD_ARCH)" > "$(BUILD)/.arch"
+	@printf '%s\n' "$(BUILD_STAMP)" > "$(BUILD)/.build-stamp"
+	@rm -f "$(BUILD)/.arch"
 
 all: prepare-build $(DLFREEZE) $(BOOTSTRAP) $(PRELOAD)
 

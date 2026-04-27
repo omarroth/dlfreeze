@@ -688,6 +688,7 @@ int main(int argc, char **argv)
     }
 
     /* resolve target */
+    const char *requested_exe = argv[optind];
     char *exe_path = resolve_exe(argv[optind]);
     if (!exe_path) {
         fprintf(stderr, "dlfreeze: cannot find: %s\n", argv[optind]);
@@ -768,7 +769,7 @@ int main(int argc, char **argv)
                     int tstart = optind + 1;  /* args after the executable */
                     int nargs = 1 + (argc - tstart);
                     char **tav = calloc(nargs + 1, sizeof(char *));
-                    tav[0] = exe_path;
+                    tav[0] = (char *)requested_exe;
                     for (int i = tstart; i < argc; i++)
                         tav[1 + i - tstart] = argv[i];
                     tav[nargs] = NULL;
@@ -820,6 +821,7 @@ int main(int argc, char **argv)
     printf("Packing %d files into %s …\n", nfiles, out_path);
     struct pack_options po = {
         .exe_path       = exe_path,
+        .exe_name       = requested_exe,
         .output_path    = out_path,
         .bootstrap_path = bootstrap,
         .deps           = &deps,

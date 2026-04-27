@@ -1918,7 +1918,9 @@ int pack_frozen(const struct pack_options *opts)
      * libQt6Core.so.6.11.0, but DT_NEEDED uses soname "libQt6Core.so.6",
      * so we use dirname(resolved_path)/soname for libraries. */
     size_t strsz = 0;
-    strsz += strlen(opts->exe_path) + 1;
+    const char *main_name = opts->exe_name ? opts->exe_name : opts->exe_path;
+
+    strsz += strlen(main_name) + 1;
     if (opts->deps->interp_path)
         strsz += strlen(opts->deps->interp_path) + 1;
     for (int i = 0; i < opts->deps->count; i++)
@@ -1936,7 +1938,7 @@ int pack_frozen(const struct pack_options *opts)
     entries[eidx].data_offset = off;
     entries[eidx].flags       = DLFRZ_FLAG_MAIN_EXE;
     entries[eidx].name_offset = stroff;
-    strcpy(strtab + stroff, opts->exe_path); stroff += strlen(opts->exe_path) + 1;
+    strcpy(strtab + stroff, main_name); stroff += strlen(main_name) + 1;
     if (append_file(out, opts->exe_path, &written) < 0) goto fail2;
     entries[eidx].data_size = written;
     src_paths[eidx] = opts->exe_path;

@@ -18,7 +18,8 @@ void data_file_list_add_negative(struct data_file_list *dl, const char *path);
 void data_file_list_free(struct data_file_list *dl);
 
 struct pack_options {
-    const char      *exe_path;        /* original executable           */
+    const char      *exe_path;        /* resolved executable to embed  */
+    const char      *exe_name;        /* runtime name/path for argv[0] */
     const char      *output_path;     /* frozen output file            */
     const char      *bootstrap_path;  /* statically-linked bootstrap   */
     struct dep_list *deps;            /* resolved dependencies         */

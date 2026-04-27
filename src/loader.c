@@ -357,8 +357,10 @@ static struct aarch64_tlsdesc_arg *alloc_aarch64_tlsdesc_arg(void)
 }
 #endif
 
-#define MUSL_INIT_FINI_LIST_PTR_OFF      0xa9f48
-#define MUSL_INIT_FINI_LIST_SENTINEL_OFF 0xa9840
+#define MUSL_INIT_FINI_LIST_PTR_OFF_OLD      0xa9f48
+#define MUSL_INIT_FINI_LIST_SENTINEL_OFF_OLD 0xa9840
+#define MUSL_AARCH64_INIT_FINI_LIST_PTR_OFF      0xc2a78
+#define MUSL_AARCH64_INIT_FINI_LIST_SENTINEL_OFF 0xc1f90
 
 static const char *path_basename(const char *path)
 {
@@ -1891,22 +1893,47 @@ struct loaded_obj {
     struct obj_tls    tls;
 };
 
+static const Elf64_Sym *lookup_linear(const struct loaded_obj *obj,
+                                      const char *name);
+
 static void seed_musl_startup_globals(struct loaded_obj *objs, int nobj)
 {
-    uintptr_t libc_base = 0;
+    const struct loaded_obj *libc_obj = NULL;
+    uintptr_t ptr_off = MUSL_INIT_FINI_LIST_PTR_OFF_OLD;
+    uintptr_t sentinel_off = MUSL_INIT_FINI_LIST_SENTINEL_OFF_OLD;
+    uintptr_t ptr_addr;
+    uintptr_t sentinel_addr;
 
     for (int i = 0; i < nobj; i++) {
         if (objs[i].name && is_musl_libc_path(objs[i].name)) {
-            libc_base = objs[i].base;
+            libc_obj = &objs[i];
             break;
         }
     }
 
-    if (!libc_base)
+    if (!libc_obj)
         return;
 
-    *(uintptr_t *)(libc_base + MUSL_INIT_FINI_LIST_PTR_OFF) =
-        libc_base + MUSL_INIT_FINI_LIST_SENTINEL_OFF;
+#if defined(__aarch64__)
+    const Elf64_Sym *env_sym = lookup_linear(libc_obj, "__environ");
+    if (env_sym && env_sym->st_value >= 0xc0000) {
+        ptr_off = MUSL_AARCH64_INIT_FINI_LIST_PTR_OFF;
+        sentinel_off = MUSL_AARCH64_INIT_FINI_LIST_SENTINEL_OFF;
+    }
+#endif
+
+    ptr_addr = libc_obj->base + ptr_off;
+    sentinel_addr = libc_obj->base + sentinel_off;
+    if (ptr_addr < libc_obj->map_start ||
+        ptr_addr + sizeof(uintptr_t) > libc_obj->map_end ||
+        sentinel_addr < libc_obj->map_start ||
+        sentinel_addr >= libc_obj->map_end) {
+        if (g_debug)
+            ldr_dbg("[loader] musl startup list seed skipped: offset outside map\n");
+        return;
+    }
+
+    *(uintptr_t *)ptr_addr = sentinel_addr;
 }
 
 /* ---- dlopen support globals ------------------------------------------ */
@@ -5319,7 +5346,8 @@ static int apply_all_relocs(struct loaded_obj *obj,
 
 /* ==== Minimal libc process initialization ============================= */
 
-#define MUSL_ALPINE_ENVIRON_TO_LIBC_OFF      0x24e0
+#define MUSL_ALPINE_ENVIRON_TO_LIBC_OFF_OLD  0x24e0
+#define MUSL_ALPINE_ENVIRON_TO_LIBC_DELTA_NEW 0x270
 #define MUSL_ALPINE_ENVIRON_TO_PROGNAME_OFF_OLD  0x40
 #define MUSL_ALPINE_ENVIRON_TO_PROGNAME_OFF_NEW  0x260
 #define MUSL_ALPINE_ENVIRON_TO_SYSINFO_OFF   0x30
@@ -5387,6 +5415,7 @@ static void init_alpine_musl_process_state(struct loaded_obj *objs, int nobj,
     uint64_t prog_addr;
     Elf64_auxv_t *auxv;
     struct musl_libc_state *libc;
+    intptr_t libc_delta = -(intptr_t)MUSL_ALPINE_ENVIRON_TO_LIBC_OFF_OLD;
     uintptr_t hwcap = 0;
     uintptr_t sysinfo = 0;
     uintptr_t pagesz = 4096;
@@ -5431,6 +5460,9 @@ static void init_alpine_musl_process_state(struct loaded_obj *objs, int nobj,
         return;
     }
     
+    if (offset == MUSL_ALPINE_ENVIRON_TO_PROGNAME_OFF_NEW)
+        libc_delta = MUSL_ALPINE_ENVIRON_TO_LIBC_DELTA_NEW;
+
     if (g_debug && offset != MUSL_ALPINE_ENVIRON_TO_PROGNAME_OFF_OLD &&
         offset != MUSL_ALPINE_ENVIRON_TO_PROGNAME_OFF_NEW) {
         ldr_hex("[loader] alpine musl layout probe: non-standard offset ", offset);
@@ -5466,8 +5498,13 @@ static void init_alpine_musl_process_state(struct loaded_obj *objs, int nobj,
         secure = (uid != euid) || (gid != egid);
     }
 
-    libc = (struct musl_libc_state *)(uintptr_t)
-        (env_addr - MUSL_ALPINE_ENVIRON_TO_LIBC_OFF);
+    libc = (struct musl_libc_state *)(uintptr_t)(env_addr + libc_delta);
+    if ((uintptr_t)libc < libc_obj->map_start ||
+        (uintptr_t)libc + sizeof(*libc) > libc_obj->map_end) {
+        if (g_debug)
+            ldr_dbg("[loader] alpine musl libc state probe failed: outside map\n");
+        return;
+    }
     memset(g_musl_tls_modules, 0, sizeof(g_musl_tls_modules));
     for (int i = 0; i < nobj; i++) {
         if (objs[i].tls.memsz == 0)
@@ -6508,6 +6545,9 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
     uintptr_t old_self = 0;
     uint64_t max_tls_align = 1;
     int64_t min_static_tpoff = 0;
+#if defined(__aarch64__)
+    (void)at_random;
+#endif
 
     /* Discover PT_TLS for each object and compute total static TLS size.
      * x86-64 uses Variant II: TLS blocks at negative TP offsets.
@@ -7412,7 +7452,7 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     typedef int (*main_fn_t)(int, char **, char **);
     uint64_t main_addr = resolve_main_address(objs, nobj, idx_map, metas,
                                               entry,
-                                              is_musl_runtime ? 0 : 1);
+                                              1);
 
 #if defined(__aarch64__)
      /* Prefer direct main after __libc_early_init; the bridge can crash on large VFS payloads. */
