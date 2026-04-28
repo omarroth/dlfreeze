@@ -47,7 +47,7 @@ jobs:
           cp build/dlfreeze dist/${RELEASE_NAME}/
           cp build/dlfreeze-bootstrap dist/${RELEASE_NAME}/
           cp build/dlfreeze-preload.so dist/${RELEASE_NAME}/
-          cp README.md CONTRIBUTING.md PUBLISHING.md dist/${RELEASE_NAME}/
+          cp README.md dist/${RELEASE_NAME}/
           tar -C dist -czf dist/${RELEASE_NAME}.tar.gz ${RELEASE_NAME}
           sha256sum dist/${RELEASE_NAME}.tar.gz > dist/${RELEASE_NAME}.sha256
 
