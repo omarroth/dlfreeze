@@ -5768,6 +5768,22 @@ static const char *dl_basename(const char *path)
     return base;
 }
 
+static int dl_name_matches(const char *path, const char *name)
+{
+    const char *base;
+    size_t n;
+
+    if (!path || !name)
+        return 0;
+
+    base = dl_basename(path);
+    if (strcmp(base, name) == 0)
+        return 1;
+
+    n = strlen(name);
+    return n > 0 && strncmp(base, name, n) == 0 && base[n] == '.';
+}
+
 static const char *dl_store_name(const char *s)
 {
     size_t n = 0;
@@ -5867,7 +5883,7 @@ static void dl_load_needed(struct loaded_obj *obj,
         int found = 0;
         for (int j = 0; j < g_nobj; j++) {
             if (!g_all_objs[j].name) continue;
-            if (strcmp(dl_basename(g_all_objs[j].name), needed) == 0) {
+            if (dl_name_matches(g_all_objs[j].name, needed)) {
                 found = 1;
                 break;
             }
@@ -6162,7 +6178,7 @@ static struct loaded_obj *load_embedded_object(uint32_t mi)
                 for (int j = 0; j < g_nobj; j++) {
                     if (!g_all_objs[j].name && !g_all_objs[j].base) continue;
                     if (g_all_objs[j].name &&
-                        strcmp(dl_basename(g_all_objs[j].name), needed) == 0) {
+                        dl_name_matches(g_all_objs[j].name, needed)) {
                         found = 1; break;
                     }
                 }
@@ -6173,8 +6189,10 @@ static struct loaded_obj *load_embedded_object(uint32_t mi)
                 int dep_found = 0;
                 for (uint32_t fi = 0; fi < g_frozen_num_entries; fi++) {
                     if (g_frozen_metas[fi].flags & LDR_FLAG_INTERP) continue;
+                    if (g_frozen_metas[fi].flags & LDR_FLAG_DATA) continue;
+                    if (!(g_frozen_metas[fi].flags & LDR_FLAG_SHLIB)) continue;
                     const char *fn = g_frozen_strtab + g_frozen_entries[fi].name_offset;
-                    if (strcmp(dl_basename(fn), needed) == 0) {
+                    if (dl_name_matches(fn, needed)) {
                         load_embedded_object(fi);
                         dep_found = 1;
                         break;
@@ -6263,7 +6281,7 @@ static void *my_dlopen(const char *path, int flags)
     const char *bn = dl_basename(path);
     for (int i = 0; i < g_nobj; i++) {
         if (!g_all_objs[i].name) continue;
-        if (strcmp(dl_basename(g_all_objs[i].name), bn) == 0)
+        if (dl_name_matches(g_all_objs[i].name, bn))
             return &g_all_objs[i];
     }
 
@@ -6272,8 +6290,9 @@ static void *my_dlopen(const char *path, int flags)
         for (uint32_t i = 0; i < g_frozen_num_entries; i++) {
             if (!(g_frozen_metas[i].flags & LDR_FLAG_DLOPEN)) continue;
             if (g_frozen_metas[i].flags & LDR_FLAG_INTERP) continue;
+            if (g_frozen_metas[i].flags & LDR_FLAG_DATA) continue;
             const char *ename = g_frozen_strtab + g_frozen_entries[i].name_offset;
-            if (strcmp(dl_basename(ename), bn) == 0) {
+            if (dl_name_matches(ename, bn)) {
                 struct loaded_obj *obj = load_embedded_object(i);
                 if (obj) {
                     restore_ptr_guard();

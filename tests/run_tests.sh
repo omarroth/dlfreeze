@@ -25,11 +25,36 @@ docker_host_platform() {
     esac
 }
 
+repo_root_path() {
+    cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd
+}
+
+docker_mount_path() {
+    local path="$1" repo_root host_repo_root
+
+    repo_root=$(repo_root_path)
+    host_repo_root=${DLFREEZE_DOCKER_REPO_ROOT:-}
+    if [ -n "$host_repo_root" ]; then
+        if [ "$path" = "$repo_root" ]; then
+            printf '%s\n' "$host_repo_root"
+            return
+        fi
+        case "$path" in
+            "$repo_root"/*)
+                printf '%s/%s\n' "$host_repo_root" "${path#"$repo_root"/}"
+                return
+                ;;
+        esac
+    fi
+
+    printf '%s\n' "$path"
+}
+
 docker_alpine_run() {
     local repo_root build_abs platform
 
-    repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-    build_abs=$(readlink -f "$BUILD")
+    repo_root=$(docker_mount_path "$(repo_root_path)")
+    build_abs=$(docker_mount_path "$(readlink -f "$BUILD")")
     platform=$(docker_host_platform) || platform=
     if [ -n "$platform" ]; then
         docker run --rm --platform "$platform" \
@@ -49,8 +74,8 @@ docker_alpine_run() {
 docker_alpine_edge_run() {
     local repo_root build_abs platform
 
-    repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-    build_abs=$(readlink -f "$BUILD")
+    repo_root=$(docker_mount_path "$(repo_root_path)")
+    build_abs=$(docker_mount_path "$(readlink -f "$BUILD")")
     platform=$(docker_host_platform) || platform=
     if [ -n "$platform" ]; then
         docker run --rm --platform "$platform" \
@@ -70,8 +95,8 @@ docker_alpine_edge_run() {
 docker_ubuntu2004_amd64_run() {
     local repo_root build_abs
 
-    repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-    build_abs=$(readlink -f "$BUILD")
+    repo_root=$(docker_mount_path "$(repo_root_path)")
+    build_abs=$(docker_mount_path "$(readlink -f "$BUILD")")
     docker run --rm --platform linux/amd64 \
         -v "$repo_root":/work \
         -v "$build_abs":/dlfreeze-build \
@@ -101,7 +126,7 @@ freeze_and_compare() {
         pass "$label"
     else
         fail "$label" "output or exit code differs (exit $rc_e vs $rc_a)"
-        diff --color=auto <(echo "$expect") <(echo "$actual") | head -20 || true
+        diff -u <(echo "$expect") <(echo "$actual") | head -20 || true
     fi
 }
 
@@ -132,7 +157,7 @@ C
     actual=$("$out" foo bar 2>&1 | tail -n +2)
     if [ "$expect" = "$actual" ]; then pass "hello"; else
         fail "hello" "output differs"
-        diff --color=auto <(echo "$expect") <(echo "$actual") | head -20 || true
+        diff -u <(echo "$expect") <(echo "$actual") | head -20 || true
     fi
     rm -f "$src" "$bin" "$out"
 }
@@ -638,13 +663,19 @@ test_ubuntu2004_python_cryptography_host_run() {
         return
     fi
 
-    local tmpdir actual rc=0
-    tmpdir=$(mktemp -d)
+    local tmpdir tmpdir_abs tmpdir_docker repo_root actual rc=0
+    tmpdir="$BUILD/ubuntu2004-host-run.$$"
+    rm -rf "$tmpdir"
+    mkdir -p "$tmpdir"
     trap 'rm -rf "$tmpdir"' RETURN
 
+    tmpdir_abs=$(readlink -f "$tmpdir")
+    tmpdir_docker=$(docker_mount_path "$tmpdir_abs")
+    repo_root=$(docker_mount_path "$(repo_root_path)")
+
     actual=$(docker run --rm --platform linux/amd64 \
-        -v "$(pwd)":/work \
-        -v "$tmpdir":/probe \
+        -v "$repo_root":/work \
+        -v "$tmpdir_docker":/probe \
         -w /work \
         ubuntu:20.04 sh -lc 'set -e; export DEBIAN_FRONTEND=noninteractive; apt-get update >/dev/null 2>&1; apt-get install -y python3 python3-cryptography strace >/dev/null 2>&1; printf "from cryptography.fernet import Fernet\nmsg = b\"hello\"\ncipher = Fernet(Fernet.generate_key())\nprint(cipher.decrypt(cipher.encrypt(msg)).decode())\n" > /probe/crypt.py; /work/'"$BUILD"'/dlfreeze -d -t -f "/usr/*" -o /probe/python38-host.frozen -- python3 /probe/crypt.py >/probe/freeze.out 2>/probe/freeze.err' 2>&1) || rc=$?
     if [ "$rc" != 0 ]; then
@@ -653,11 +684,7 @@ test_ubuntu2004_python_cryptography_host_run() {
         return
     fi
 
-    actual=$(timeout 90 "$tmpdir/python38-host.frozen" "$tmpdir/crypt.py" 2>&1) || rc=$?
-    if [ "$rc" = 139 ]; then
-        skip "ubuntu 20.04 python cryptography host-run" "known host direct-load crash (SIGSEGV)"
-        return
-    fi
+    actual=$(timeout 90 "$tmpdir_abs/python38-host.frozen" "$tmpdir_abs/crypt.py" 2>&1) || rc=$?
     if [ "$rc" = 0 ] && [ "$actual" = "hello" ]; then
         pass "ubuntu 20.04 python cryptography host-run"
     else
@@ -1278,7 +1305,7 @@ CPP
         pass "glibc tls-dtor direct-load"
     else
         fail "glibc tls-dtor direct-load" "output or exit code differs (exit $rc_e vs $rc_a)"
-        diff --color=auto <(echo "$expect") <(echo "$actual") | head -20 || true
+        diff -u <(echo "$expect") <(echo "$actual") | head -20 || true
     fi
 
     rm -f "$lib_src" "$main_src" "$lib" "$bin" "$out"
@@ -1319,7 +1346,7 @@ test_ruby_direct_host_run() {
         pass "ruby direct host-run"
     else
         fail "ruby direct host-run" "output or exit code differs (exit $rc_e vs $rc_a)"
-        diff --color=auto <(echo "$expect") <(echo "$actual") | head -20 || true
+        diff -u <(echo "$expect") <(echo "$actual") | head -20 || true
     fi
 
     rm -rf "$home"
