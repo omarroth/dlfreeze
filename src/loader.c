@@ -25,6 +25,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <pthread.h>
+#include <locale.h>
 
 #include "common.h"
 #include "loader.h"
@@ -357,10 +358,11 @@ static struct aarch64_tlsdesc_arg *alloc_aarch64_tlsdesc_arg(void)
 }
 #endif
 
-#define MUSL_INIT_FINI_LIST_PTR_OFF_OLD      0xa9f48
-#define MUSL_INIT_FINI_LIST_SENTINEL_OFF_OLD 0xa9840
-#define MUSL_AARCH64_INIT_FINI_LIST_PTR_OFF      0xc2a78
-#define MUSL_AARCH64_INIT_FINI_LIST_SENTINEL_OFF 0xc1f90
+#define MUSL_PROGNAME_NEAR_ENVIRON_MAX              0x100
+#define MUSL_ENVIRON_TO_INIT_FINI_LIST_PTR_OLD      0x1a8
+#define MUSL_ENVIRON_TO_INIT_FINI_LIST_SENTINEL_OLD 0x560
+#define MUSL_ENVIRON_TO_INIT_FINI_LIST_PTR_NEW      0xa70
+#define MUSL_ENVIRON_TO_INIT_FINI_LIST_SENTINEL_NEW 0x78
 
 static const char *path_basename(const char *path)
 {
@@ -1660,27 +1662,63 @@ static int stub_dl_rtld_di_serinfo(void) { return -1; }
 
 #if defined(__x86_64__)
 #define MUSL_TLS_GAP_ABOVE_TP              0
-#define MUSL_THREAD_DTV_OFF                0x08
-#define MUSL_THREAD_PREV_OFF               0x10
-#define MUSL_THREAD_NEXT_OFF               0x18
-#define MUSL_THREAD_SYSINFO_OFF            0x20
-#define MUSL_THREAD_TID_OFF                0x30
-#define MUSL_THREAD_ERRNO_OFF              0x34
-#define MUSL_THREAD_DETACH_STATE_OFF       0x38
-#define MUSL_THREAD_ROBUST_HEAD_OFF        0x88
-#define MUSL_THREAD_LOCALE_OFF             0xa8
+#define MUSL_THREAD_DTV_OFF_DEFAULT                0x08
+#define MUSL_THREAD_PREV_OFF_DEFAULT               0x10
+#define MUSL_THREAD_NEXT_OFF_DEFAULT               0x18
+#define MUSL_THREAD_SYSINFO_OFF_DEFAULT            0x20
+#define MUSL_THREAD_TID_OFF_DEFAULT                0x30
+#define MUSL_THREAD_ERRNO_OFF_DEFAULT              0x34
+#define MUSL_THREAD_DETACH_STATE_OFF_DEFAULT       0x38
+#define MUSL_THREAD_ROBUST_HEAD_OFF_DEFAULT        0x88
+#define MUSL_THREAD_LOCALE_OFF_DEFAULT             0xa8
 #elif defined(__aarch64__)
 #define MUSL_TLS_GAP_ABOVE_TP              16
-#define MUSL_THREAD_DTV_OFF                0xc0
-#define MUSL_THREAD_PREV_OFF               0x08
-#define MUSL_THREAD_NEXT_OFF               0x10
-#define MUSL_THREAD_SYSINFO_OFF            0x18
-#define MUSL_THREAD_TID_OFF                0x20
-#define MUSL_THREAD_ERRNO_OFF              0x24
-#define MUSL_THREAD_DETACH_STATE_OFF       0x28
-#define MUSL_THREAD_ROBUST_HEAD_OFF        0x78
-#define MUSL_THREAD_LOCALE_OFF             0x98
+#define MUSL_THREAD_DTV_OFF_DEFAULT                0xc0
+#define MUSL_THREAD_PREV_OFF_DEFAULT               0x08
+#define MUSL_THREAD_NEXT_OFF_DEFAULT               0x10
+#define MUSL_THREAD_SYSINFO_OFF_DEFAULT            0x18
+#define MUSL_THREAD_TID_OFF_DEFAULT                0x20
+#define MUSL_THREAD_ERRNO_OFF_DEFAULT              0x24
+#define MUSL_THREAD_DETACH_STATE_OFF_DEFAULT       0x28
+#define MUSL_THREAD_ROBUST_HEAD_OFF_DEFAULT        0x78
+#define MUSL_THREAD_LOCALE_OFF_DEFAULT             0x98
 #endif
+
+#define MUSL_THREAD_PROBE_LIMIT 0x180
+
+struct musl_thread_layout {
+    size_t dtv;
+    size_t prev;
+    size_t next;
+    size_t sysinfo;
+    size_t tid;
+    size_t errno_off;
+    size_t detach_state;
+    size_t robust_head;
+    size_t locale;
+};
+
+static struct musl_thread_layout g_musl_thread = {
+    .dtv          = MUSL_THREAD_DTV_OFF_DEFAULT,
+    .prev         = MUSL_THREAD_PREV_OFF_DEFAULT,
+    .next         = MUSL_THREAD_NEXT_OFF_DEFAULT,
+    .sysinfo      = MUSL_THREAD_SYSINFO_OFF_DEFAULT,
+    .tid          = MUSL_THREAD_TID_OFF_DEFAULT,
+    .errno_off    = MUSL_THREAD_ERRNO_OFF_DEFAULT,
+    .detach_state = MUSL_THREAD_DETACH_STATE_OFF_DEFAULT,
+    .robust_head  = MUSL_THREAD_ROBUST_HEAD_OFF_DEFAULT,
+    .locale       = MUSL_THREAD_LOCALE_OFF_DEFAULT,
+};
+
+#define MUSL_THREAD_DTV_OFF          (g_musl_thread.dtv)
+#define MUSL_THREAD_PREV_OFF         (g_musl_thread.prev)
+#define MUSL_THREAD_NEXT_OFF         (g_musl_thread.next)
+#define MUSL_THREAD_SYSINFO_OFF      (g_musl_thread.sysinfo)
+#define MUSL_THREAD_TID_OFF          (g_musl_thread.tid)
+#define MUSL_THREAD_ERRNO_OFF        (g_musl_thread.errno_off)
+#define MUSL_THREAD_DETACH_STATE_OFF (g_musl_thread.detach_state)
+#define MUSL_THREAD_ROBUST_HEAD_OFF  (g_musl_thread.robust_head)
+#define MUSL_THREAD_LOCALE_OFF       (g_musl_thread.locale)
 
 static inline int musl_tls_above_tp(void)
 {
@@ -1734,6 +1772,83 @@ static inline uintptr_t musl_thread_self_ptr(uintptr_t tp)
 static inline uintptr_t *musl_thread_dtv_slot(uintptr_t tp)
 {
     return (uintptr_t *)(musl_thread_self_ptr(tp) + MUSL_THREAD_DTV_OFF);
+}
+
+static int musl_thread_ptr_external(uintptr_t self, uintptr_t val)
+{
+    return val != 0 && val != self &&
+           !(val >= self && val < self + MUSL_THREAD_PROBE_LIMIT);
+}
+
+static void probe_musl_thread_layout(uintptr_t old_self, uintptr_t old_tp)
+{
+    size_t word = sizeof(uintptr_t);
+    long tid;
+    uintptr_t locale;
+    int dtv_probed = 0;
+
+    if (!old_self)
+        return;
+
+    for (size_t off = word; off + word < MUSL_THREAD_PROBE_LIMIT; off += word) {
+        uintptr_t first = *(uintptr_t *)(old_self + off);
+        uintptr_t second = *(uintptr_t *)(old_self + off + word);
+
+        if (first == old_self && second == old_self) {
+            g_musl_thread.prev = off;
+            g_musl_thread.next = off + word;
+            break;
+        }
+    }
+
+    if (old_tp >= old_self && old_tp - old_self < MUSL_THREAD_PROBE_LIMIT) {
+        size_t off = (size_t)(old_tp - old_self);
+        uintptr_t val = *(uintptr_t *)(old_self + off);
+
+        if (musl_thread_ptr_external(old_self, val))
+            g_musl_thread.dtv = off;
+        dtv_probed = musl_thread_ptr_external(old_self, val);
+    }
+    if (!dtv_probed) {
+        for (size_t off = word; off < MUSL_THREAD_PROBE_LIMIT; off += word) {
+            uintptr_t val = *(uintptr_t *)(old_self + off);
+
+            if (musl_thread_ptr_external(old_self, val)) {
+                g_musl_thread.dtv = off;
+                dtv_probed = 1;
+                break;
+            }
+        }
+    }
+
+    tid = syscall(SYS_gettid);
+    for (size_t off = 0; off + sizeof(int) <= MUSL_THREAD_PROBE_LIMIT; off += sizeof(int)) {
+        if (*(int *)(old_self + off) == (int)tid) {
+            g_musl_thread.tid = off;
+            if (off + 2 * sizeof(int) < MUSL_THREAD_PROBE_LIMIT) {
+                g_musl_thread.errno_off = off + sizeof(int);
+                g_musl_thread.detach_state = off + 2 * sizeof(int);
+            }
+            break;
+        }
+    }
+
+    for (size_t off = word; off < MUSL_THREAD_PROBE_LIMIT; off += word) {
+        if (*(uintptr_t *)(old_self + off) == old_self + off) {
+            g_musl_thread.robust_head = off;
+            break;
+        }
+    }
+
+    locale = (uintptr_t)uselocale((locale_t)0);
+    if (locale && locale != (uintptr_t)-1) {
+        for (size_t off = word; off < MUSL_THREAD_PROBE_LIMIT; off += word) {
+            if (*(uintptr_t *)(old_self + off) == locale) {
+                g_musl_thread.locale = off;
+                break;
+            }
+        }
+    }
 }
 
 #if defined(__aarch64__)
@@ -1857,6 +1972,8 @@ struct loaded_obj {
     const char       *name;
     uint64_t          base;
     uint32_t          flags;
+    const uint8_t    *elf;
+    size_t            elf_size;
 
     /* Dynamic symbol table */
     const Elf64_Sym  *dynsym;
@@ -1895,39 +2012,313 @@ struct loaded_obj {
 
 static const Elf64_Sym *lookup_linear(const struct loaded_obj *obj,
                                       const char *name);
+static uint64_t lookup_elf_symbol_addr(const struct loaded_obj *obj,
+                                       const char *name);
 
-static void seed_musl_startup_globals(struct loaded_obj *objs, int nobj)
+static int loaded_obj_contains(const struct loaded_obj *obj,
+                               uintptr_t addr, size_t size)
 {
-    const struct loaded_obj *libc_obj = NULL;
-    uintptr_t ptr_off = MUSL_INIT_FINI_LIST_PTR_OFF_OLD;
-    uintptr_t sentinel_off = MUSL_INIT_FINI_LIST_SENTINEL_OFF_OLD;
-    uintptr_t ptr_addr;
-    uintptr_t sentinel_addr;
+    return addr >= obj->map_start &&
+           addr <= obj->map_end &&
+           size <= obj->map_end - addr;
+}
 
+static const struct loaded_obj *find_musl_libc(struct loaded_obj *objs, int nobj)
+{
     for (int i = 0; i < nobj; i++) {
-        if (objs[i].name && is_musl_libc_path(objs[i].name)) {
-            libc_obj = &objs[i];
-            break;
+        const char *name = objs[i].name;
+
+        if (!name)
+            continue;
+        if (is_musl_libc_path(name))
+            return &objs[i];
+    }
+    return NULL;
+}
+
+static uint64_t musl_defined_symbol_addr(const struct loaded_obj *obj,
+                                         const char *name)
+{
+    const Elf64_Sym *sym = lookup_linear(obj, name);
+
+    if (!sym || sym->st_shndx == SHN_UNDEF || sym->st_size == 0)
+        return lookup_elf_symbol_addr(obj, name);
+    return obj->base + sym->st_value;
+}
+
+static uint32_t read_u32_le(const uint8_t *p)
+{
+    uint32_t v;
+
+    memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+#if defined(__x86_64__)
+static int read_i32_le(const uint8_t *p)
+{
+    return (int32_t)read_u32_le(p);
+}
+
+static int decode_x86_64_musl_errno_offset(const uint8_t *code, size_t len,
+                                           size_t *off_out)
+{
+    for (size_t i = 0; i + 4 <= len; i++) {
+        if (code[i] == 0x48 && code[i + 1] == 0x83 && code[i + 2] == 0xc0) {
+            *off_out = code[i + 3];
+            return *off_out < MUSL_THREAD_PROBE_LIMIT;
+        }
+        if (i + 6 <= len && code[i] == 0x48 && code[i + 1] == 0x05) {
+            int off = read_i32_le(code + i + 2);
+
+            if (off >= 0 && off < MUSL_THREAD_PROBE_LIMIT) {
+                *off_out = (size_t)off;
+                return 1;
+            }
         }
     }
+    return 0;
+}
+
+static int decode_x86_64_musl_dtv_offset(const uint8_t *code, size_t len,
+                                         size_t *off_out)
+{
+    for (size_t i = 0; i + 4 <= len; i++) {
+        if (code[i] != 0x48 || code[i + 1] != 0x8b)
+            continue;
+
+        if ((code[i + 2] & 0xc7) == 0x40) {
+            *off_out = code[i + 3];
+            return *off_out < MUSL_THREAD_PROBE_LIMIT;
+        }
+        if (i + 7 <= len && (code[i + 2] & 0xc7) == 0x80) {
+            int off = read_i32_le(code + i + 3);
+
+            if (off >= 0 && off < MUSL_THREAD_PROBE_LIMIT) {
+                *off_out = (size_t)off;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+#endif
+
+#if defined(__aarch64__)
+static int aarch64_is_mrs_tpidr_el0(uint32_t insn, int *rt)
+{
+    if ((insn & 0xffffffe0u) != 0xd53bd040u)
+        return 0;
+    *rt = (int)(insn & 0x1f);
+    return 1;
+}
+
+static int aarch64_decode_addsub_imm(uint32_t insn, int rn, int rd,
+                                     int64_t *imm_out)
+{
+    uint64_t imm;
+
+    if ((insn & 0x80000000u) == 0 || (insn & 0x20000000u) != 0 ||
+        (insn & 0x1f000000u) != 0x11000000u)
+        return 0;
+    if ((int)((insn >> 5) & 0x1f) != rn || (int)(insn & 0x1f) != rd)
+        return 0;
+
+    imm = (insn >> 10) & 0xfff;
+    if ((insn >> 22) & 1)
+        imm <<= 12;
+    if (imm >= MUSL_THREAD_PROBE_LIMIT * 8)
+        return 0;
+
+    *imm_out = (insn & 0x40000000u) ? -(int64_t)imm : (int64_t)imm;
+    return 1;
+}
+
+static int aarch64_decode_ldr64_unsigned(uint32_t insn, int rn,
+                                         size_t *off_out)
+{
+    size_t off;
+
+    if ((insn & 0xffc00000u) != 0xf9400000u)
+        return 0;
+    if ((int)((insn >> 5) & 0x1f) != rn)
+        return 0;
+
+    off = ((insn >> 10) & 0xfff) * sizeof(uint64_t);
+    if (off >= MUSL_THREAD_PROBE_LIMIT)
+        return 0;
+    *off_out = off;
+    return 1;
+}
+
+static int decode_aarch64_musl_self_delta(const uint8_t *code, size_t len,
+                                          size_t *delta_out)
+{
+    for (size_t i = 0; i + 4 <= len; i += 4) {
+        uint32_t insn = read_u32_le(code + i);
+        int rt;
+
+        if (!aarch64_is_mrs_tpidr_el0(insn, &rt))
+            continue;
+        if (i + 8 <= len && read_u32_le(code + i + 4) == 0xd65f03c0u &&
+            rt == 0) {
+            *delta_out = 0;
+            return 1;
+        }
+        if (i + 8 <= len) {
+            int64_t imm;
+
+            if (aarch64_decode_addsub_imm(read_u32_le(code + i + 4), rt, 0, &imm) &&
+                imm <= 0) {
+                *delta_out = (size_t)-imm;
+                return *delta_out < MUSL_THREAD_PROBE_LIMIT;
+            }
+        }
+    }
+    return 0;
+}
+
+static int decode_aarch64_musl_tp_relative(const uint8_t *code, size_t len,
+                                           int64_t *tp_rel_out)
+{
+    for (size_t i = 0; i + 8 <= len; i += 4) {
+        uint32_t insn = read_u32_le(code + i);
+        int rt;
+
+        if (!aarch64_is_mrs_tpidr_el0(insn, &rt))
+            continue;
+        if (aarch64_decode_addsub_imm(read_u32_le(code + i + 4), rt, 0,
+                                      tp_rel_out))
+            return 1;
+    }
+    return 0;
+}
+
+static int decode_aarch64_musl_dtv_offset(const uint8_t *code, size_t len,
+                                          size_t self_delta,
+                                          size_t *off_out)
+{
+    for (size_t i = 0; i + 8 <= len; i += 4) {
+        uint32_t insn = read_u32_le(code + i);
+        int rt;
+
+        if (!aarch64_is_mrs_tpidr_el0(insn, &rt))
+            continue;
+        for (size_t j = i + 4; j + 4 <= len && j <= i + 24; j += 4) {
+            size_t tp_off;
+
+            if (aarch64_decode_ldr64_unsigned(read_u32_le(code + j), rt, &tp_off) &&
+                self_delta + tp_off < MUSL_THREAD_PROBE_LIMIT) {
+                *off_out = self_delta + tp_off;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+#endif
+
+static void probe_musl_thread_layout_from_target(const struct loaded_obj *libc_obj)
+{
+#if defined(__x86_64__)
+    uint64_t addr;
+    size_t off;
 
     if (!libc_obj)
         return;
 
-#if defined(__aarch64__)
-    const Elf64_Sym *env_sym = lookup_linear(libc_obj, "__environ");
-    if (env_sym && env_sym->st_value >= 0xc0000) {
-        ptr_off = MUSL_AARCH64_INIT_FINI_LIST_PTR_OFF;
-        sentinel_off = MUSL_AARCH64_INIT_FINI_LIST_SENTINEL_OFF;
+    addr = musl_defined_symbol_addr(libc_obj, "__errno_location");
+    if (addr && loaded_obj_contains(libc_obj, (uintptr_t)addr, 32) &&
+        decode_x86_64_musl_errno_offset((const uint8_t *)(uintptr_t)addr, 32, &off)) {
+        g_musl_thread.errno_off = off;
+        if (off >= sizeof(int))
+            g_musl_thread.tid = off - sizeof(int);
+        if (off + sizeof(int) < MUSL_THREAD_PROBE_LIMIT)
+            g_musl_thread.detach_state = off + sizeof(int);
     }
-#endif
 
-    ptr_addr = libc_obj->base + ptr_off;
-    sentinel_addr = libc_obj->base + sentinel_off;
-    if (ptr_addr < libc_obj->map_start ||
-        ptr_addr + sizeof(uintptr_t) > libc_obj->map_end ||
-        sentinel_addr < libc_obj->map_start ||
-        sentinel_addr >= libc_obj->map_end) {
+    addr = musl_defined_symbol_addr(libc_obj, "__tls_get_addr");
+    if (addr && loaded_obj_contains(libc_obj, (uintptr_t)addr, 48) &&
+        decode_x86_64_musl_dtv_offset((const uint8_t *)(uintptr_t)addr, 48, &off))
+        g_musl_thread.dtv = off;
+#elif defined(__aarch64__)
+    uint64_t addr;
+    size_t off;
+
+    if (!libc_obj)
+        return;
+
+    addr = musl_defined_symbol_addr(libc_obj, "pthread_self");
+    if (addr && loaded_obj_contains(libc_obj, (uintptr_t)addr, 32) &&
+        decode_aarch64_musl_self_delta((const uint8_t *)(uintptr_t)addr, 32, &off))
+        g_musl_tp_self_delta = off;
+
+    addr = musl_defined_symbol_addr(libc_obj, "__errno_location");
+    if (addr && loaded_obj_contains(libc_obj, (uintptr_t)addr, 32)) {
+        int64_t tp_rel;
+
+        if (decode_aarch64_musl_tp_relative((const uint8_t *)(uintptr_t)addr, 32, &tp_rel) &&
+            tp_rel + (int64_t)g_musl_tp_self_delta >= 0 &&
+            tp_rel + (int64_t)g_musl_tp_self_delta < MUSL_THREAD_PROBE_LIMIT) {
+            off = (size_t)(tp_rel + (int64_t)g_musl_tp_self_delta);
+            g_musl_thread.errno_off = off;
+            if (off >= sizeof(int))
+                g_musl_thread.tid = off - sizeof(int);
+            if (off + sizeof(int) < MUSL_THREAD_PROBE_LIMIT)
+                g_musl_thread.detach_state = off + sizeof(int);
+        }
+    }
+
+    addr = musl_defined_symbol_addr(libc_obj, "__tls_get_addr");
+    if (addr && loaded_obj_contains(libc_obj, (uintptr_t)addr, 64) &&
+        decode_aarch64_musl_dtv_offset((const uint8_t *)(uintptr_t)addr, 64,
+                                       g_musl_tp_self_delta, &off))
+        g_musl_thread.dtv = off;
+#else
+    (void)libc_obj;
+#endif
+}
+
+static void seed_musl_startup_globals(struct loaded_obj *objs, int nobj)
+{
+    const struct loaded_obj *libc_obj;
+    uint64_t env_addr;
+    uint64_t prog_addr;
+    uint64_t prog_full_addr;
+    uint64_t first_prog_addr = 0;
+    uintptr_t ptr_delta = MUSL_ENVIRON_TO_INIT_FINI_LIST_PTR_OLD;
+    uintptr_t sentinel_delta = MUSL_ENVIRON_TO_INIT_FINI_LIST_SENTINEL_OLD;
+    uintptr_t ptr_addr;
+    uintptr_t sentinel_addr;
+
+    libc_obj = find_musl_libc(objs, nobj);
+    if (!libc_obj)
+        return;
+
+    env_addr = musl_defined_symbol_addr(libc_obj, "__environ");
+    if (!env_addr)
+        return;
+
+    prog_addr = musl_defined_symbol_addr(libc_obj, "__progname");
+    prog_full_addr = musl_defined_symbol_addr(libc_obj, "__progname_full");
+    if (prog_addr && prog_addr > env_addr)
+        first_prog_addr = prog_addr;
+    if (prog_full_addr && prog_full_addr > env_addr &&
+        (!first_prog_addr || prog_full_addr < first_prog_addr))
+        first_prog_addr = prog_full_addr;
+
+    if (first_prog_addr &&
+        first_prog_addr - env_addr >= MUSL_PROGNAME_NEAR_ENVIRON_MAX) {
+        ptr_delta = MUSL_ENVIRON_TO_INIT_FINI_LIST_PTR_NEW;
+        sentinel_delta = MUSL_ENVIRON_TO_INIT_FINI_LIST_SENTINEL_NEW;
+    }
+
+    if (env_addr < sentinel_delta)
+        return;
+    ptr_addr = (uintptr_t)(env_addr + ptr_delta);
+    sentinel_addr = (uintptr_t)(env_addr - sentinel_delta);
+    if (!loaded_obj_contains(libc_obj, ptr_addr, sizeof(uintptr_t)) ||
+        !loaded_obj_contains(libc_obj, sentinel_addr, 1)) {
         if (g_debug)
             ldr_dbg("[loader] musl startup list seed skipped: offset outside map\n");
         return;
@@ -4230,6 +4621,81 @@ static const Elf64_Sym *lookup_linear(const struct loaded_obj *obj,
     return NULL;
 }
 
+static int elf_strtab_name_eq(const char *strtab, size_t strtab_size,
+                              uint32_t off, const char *name)
+{
+    size_t i = 0;
+
+    if (off >= strtab_size)
+        return 0;
+    while (name[i]) {
+        if (off + i >= strtab_size || strtab[off + i] != name[i])
+            return 0;
+        i++;
+    }
+    return off + i < strtab_size && strtab[off + i] == '\0';
+}
+
+static uint64_t lookup_elf_symbol_addr(const struct loaded_obj *obj,
+                                       const char *name)
+{
+    const Elf64_Ehdr *ehdr;
+    const Elf64_Shdr *shdrs;
+
+    if (!obj->elf || obj->elf_size < sizeof(*ehdr))
+        return 0;
+
+    ehdr = (const Elf64_Ehdr *)obj->elf;
+    if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0 ||
+        ehdr->e_ident[EI_CLASS] != ELFCLASS64 ||
+        ehdr->e_shoff == 0 || ehdr->e_shnum == 0 ||
+        ehdr->e_shentsize < sizeof(Elf64_Shdr))
+        return 0;
+    if (ehdr->e_shoff > obj->elf_size ||
+        (uint64_t)ehdr->e_shnum * ehdr->e_shentsize >
+            obj->elf_size - ehdr->e_shoff)
+        return 0;
+
+    shdrs = (const Elf64_Shdr *)(obj->elf + ehdr->e_shoff);
+    for (uint16_t si = 0; si < ehdr->e_shnum; si++) {
+        const Elf64_Shdr *sym_sh = &shdrs[si];
+        const Elf64_Shdr *str_sh;
+        const Elf64_Sym *syms;
+        const char *strtab;
+        size_t sym_count;
+
+        if (sym_sh->sh_type != SHT_SYMTAB && sym_sh->sh_type != SHT_DYNSYM)
+            continue;
+        if (sym_sh->sh_entsize < sizeof(Elf64_Sym) ||
+            sym_sh->sh_link >= ehdr->e_shnum)
+            continue;
+        str_sh = &shdrs[sym_sh->sh_link];
+        if (sym_sh->sh_offset > obj->elf_size ||
+            sym_sh->sh_size > obj->elf_size - sym_sh->sh_offset ||
+            str_sh->sh_offset > obj->elf_size ||
+            str_sh->sh_size > obj->elf_size - str_sh->sh_offset)
+            continue;
+
+        syms = (const Elf64_Sym *)(obj->elf + sym_sh->sh_offset);
+        strtab = (const char *)(obj->elf + str_sh->sh_offset);
+        sym_count = sym_sh->sh_size / sym_sh->sh_entsize;
+        for (size_t i = 1; i < sym_count; i++) {
+            const Elf64_Sym *sym = (const Elf64_Sym *)((const uint8_t *)syms +
+                                  i * sym_sh->sh_entsize);
+            unsigned type = ELF64_ST_TYPE(sym->st_info);
+
+            if (sym->st_shndx == SHN_UNDEF || sym->st_name == 0)
+                continue;
+            if (type == STT_SECTION || type == STT_FILE)
+                continue;
+            if (!elf_strtab_name_eq(strtab, str_sh->sh_size, sym->st_name, name))
+                continue;
+            return obj->base + sym->st_value;
+        }
+    }
+    return 0;
+}
+
 /* ---- dlopen override ------------------------------------------------- */
 
 /* Forward declarations for dlopen replacements */
@@ -5011,6 +5477,8 @@ static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     }
 
     obj->base = base;
+    obj->elf = elf_base;
+    obj->elf_size = ent->data_size;
     return 0;
 }
 
@@ -5346,21 +5814,10 @@ static int apply_all_relocs(struct loaded_obj *obj,
 
 /* ==== Minimal libc process initialization ============================= */
 
-#define MUSL_ALPINE_ENVIRON_TO_LIBC_OFF_OLD  0x24e0
-#define MUSL_ALPINE_ENVIRON_TO_LIBC_DELTA_NEW 0x270
-#define MUSL_ALPINE_ENVIRON_TO_PROGNAME_OFF_OLD  0x40
-#define MUSL_ALPINE_ENVIRON_TO_PROGNAME_OFF_NEW  0x260
-#define MUSL_ALPINE_ENVIRON_TO_SYSINFO_OFF   0x30
-#define MUSL_ALPINE_ENVIRON_TO_HWCAP_OFF     0x48
+#define MUSL_ENVIRON_TO_LIBC_OFF_OLD         0x24e0
+#define MUSL_ENVIRON_TO_SYSINFO_OFF          0x30
+#define MUSL_ENVIRON_TO_HWCAP_OFF            0x48
 #define MUSL_LIBC_GLOBAL_LOCALE_OFF          0x38
-#define MUSL_PTHREAD_PREV_OFF                0x10
-#define MUSL_PTHREAD_NEXT_OFF                0x18
-#define MUSL_PTHREAD_SYSINFO_OFF             0x20
-#define MUSL_PTHREAD_TID_OFF                 0x30
-#define MUSL_PTHREAD_ERRNO_OFF               0x34
-#define MUSL_PTHREAD_DETACH_STATE_OFF        0x38
-#define MUSL_PTHREAD_ROBUST_HEAD_OFF         0x88
-#define MUSL_PTHREAD_LOCALE_OFF              0xa8
 #define MUSL_THREAD_SIZE_GUESS               0x100
 
 struct musl_tls_module_state {
@@ -5392,82 +5849,90 @@ static const Elf64_Sym *lookup_linear(const struct loaded_obj *obj,
                                       const char *name);
 static struct musl_tls_module_state g_musl_tls_modules[MAX_TOTAL_OBJS];
 
-static int uses_alpine_musl_libc(struct loaded_obj *objs, int nobj)
+static uint64_t detect_musl_libc_state_addr(const struct loaded_obj *libc_obj,
+                                            uint64_t env_addr,
+                                            uint64_t prog_addr)
 {
-    for (int i = 0; i < nobj; i++) {
-        const char *name = objs[i].name;
+    uint64_t libc_addr;
+    uint64_t prog_full_addr;
 
-        if (!name)
-            continue;
-        if (strncmp(path_basename(name), "libc.musl-", 10) == 0)
-            return 1;
+    libc_addr = musl_defined_symbol_addr(libc_obj, "__libc");
+    if (libc_addr)
+        return libc_addr;
+
+    prog_full_addr = musl_defined_symbol_addr(libc_obj, "__progname_full");
+    if (env_addr && prog_addr && prog_full_addr &&
+        prog_addr > env_addr && prog_full_addr > env_addr) {
+        uint64_t first = prog_addr < prog_full_addr ? prog_addr : prog_full_addr;
+        uint64_t second = prog_addr < prog_full_addr ? prog_full_addr : prog_addr;
+
+        if (second - first == sizeof(uintptr_t) &&
+            first - env_addr >= MUSL_PROGNAME_NEAR_ENVIRON_MAX)
+            return second + sizeof(uintptr_t);
     }
+
+    if (env_addr >= MUSL_ENVIRON_TO_LIBC_OFF_OLD)
+        return env_addr - MUSL_ENVIRON_TO_LIBC_OFF_OLD;
     return 0;
 }
 
-static void init_alpine_musl_process_state(struct loaded_obj *objs, int nobj,
-                                           char **envp)
+static uint64_t detect_musl_global_locale_addr(const struct loaded_obj *libc_obj,
+                                               uint64_t libc_addr)
 {
-    const struct loaded_obj *libc_obj = NULL;
-    const Elf64_Sym *env_sym;
-    const Elf64_Sym *prog_sym;
+    static const char *const names[] = {
+        "__global_locale",
+        "global_locale",
+        "c_locale",
+        "C_locale",
+    };
+
+    for (size_t i = 0; i < sizeof(names)/sizeof(names[0]); i++) {
+        uint64_t addr = musl_defined_symbol_addr(libc_obj, names[i]);
+
+        if (addr && loaded_obj_contains(libc_obj, (uintptr_t)addr, sizeof(uintptr_t)))
+            return addr;
+    }
+
+    if (libc_addr && loaded_obj_contains(libc_obj,
+                                         (uintptr_t)(libc_addr + MUSL_LIBC_GLOBAL_LOCALE_OFF),
+                                         sizeof(uintptr_t)))
+        return libc_addr + MUSL_LIBC_GLOBAL_LOCALE_OFF;
+    return 0;
+}
+
+static void init_musl_process_state(struct loaded_obj *objs, int nobj,
+                                    char **envp)
+{
+    const struct loaded_obj *libc_obj;
     uint64_t env_addr;
     uint64_t prog_addr;
     Elf64_auxv_t *auxv;
     struct musl_libc_state *libc;
-    intptr_t libc_delta = -(intptr_t)MUSL_ALPINE_ENVIRON_TO_LIBC_OFF_OLD;
+    uint64_t libc_addr;
+    uint64_t locale_addr;
     uintptr_t hwcap = 0;
     uintptr_t sysinfo = 0;
     uintptr_t pagesz = 4096;
+    uint64_t sysinfo_addr;
+    uint64_t hwcap_addr;
     uintptr_t tp = 0;
     int secure = 0;
     size_t max_modid = 0;
     size_t max_offset = 0;
     size_t max_align = sizeof(uintptr_t);
 
-    if (!g_is_musl_runtime || !uses_alpine_musl_libc(objs, nobj))
+    if (!g_is_musl_runtime)
         return;
 
-    for (int i = 0; i < nobj; i++) {
-        if (objs[i].name &&
-            strncmp(path_basename(objs[i].name), "libc.musl-", 10) == 0) {
-            libc_obj = &objs[i];
-            break;
-        }
-    }
+    libc_obj = find_musl_libc(objs, nobj);
     if (!libc_obj)
         return;
 
-    env_sym = lookup_linear(libc_obj, "__environ");
-    prog_sym = lookup_linear(libc_obj, "__progname");
-    env_addr = env_sym ? libc_obj->base + env_sym->st_value : 0;
-    prog_addr = prog_sym ? libc_obj->base + prog_sym->st_value : 0;
-    if (!env_addr || !prog_addr)
+    env_addr = musl_defined_symbol_addr(libc_obj, "__environ");
+    prog_addr = musl_defined_symbol_addr(libc_obj, "__progname");
+    libc_addr = detect_musl_libc_state_addr(libc_obj, env_addr, prog_addr);
+    if (!env_addr || !prog_addr || !libc_addr)
         return;
-    if (prog_addr < env_addr) {
-        if (g_debug)
-            ldr_dbg("[loader] alpine musl layout probe failed: prog_addr < env_addr\n");
-        return;
-    }
-    
-    /* Accept both known offsets (0x40 and 0x260) and other reasonable offsets up to 0x1000 */
-    uint64_t offset = prog_addr - env_addr;
-    if (offset > 0x1000) {
-        if (g_debug) {
-            ldr_hex("[loader] alpine musl offset ", offset);
-            ldr_dbg(" exceeds reasonable threshold\n");
-        }
-        return;
-    }
-    
-    if (offset == MUSL_ALPINE_ENVIRON_TO_PROGNAME_OFF_NEW)
-        libc_delta = MUSL_ALPINE_ENVIRON_TO_LIBC_DELTA_NEW;
-
-    if (g_debug && offset != MUSL_ALPINE_ENVIRON_TO_PROGNAME_OFF_OLD &&
-        offset != MUSL_ALPINE_ENVIRON_TO_PROGNAME_OFF_NEW) {
-        ldr_hex("[loader] alpine musl layout probe: non-standard offset ", offset);
-        ldr_dbg("\n");
-    }
 
     auxv = get_auxv_ptr(envp);
     for (Elf64_auxv_t *entry = auxv; entry->a_type != AT_NULL; entry++) {
@@ -5498,11 +5963,10 @@ static void init_alpine_musl_process_state(struct loaded_obj *objs, int nobj,
         secure = (uid != euid) || (gid != egid);
     }
 
-    libc = (struct musl_libc_state *)(uintptr_t)(env_addr + libc_delta);
-    if ((uintptr_t)libc < libc_obj->map_start ||
-        (uintptr_t)libc + sizeof(*libc) > libc_obj->map_end) {
+    libc = (struct musl_libc_state *)(uintptr_t)libc_addr;
+    if (!loaded_obj_contains(libc_obj, (uintptr_t)libc, sizeof(*libc))) {
         if (g_debug)
-            ldr_dbg("[loader] alpine musl libc state probe failed: outside map\n");
+            ldr_dbg("[loader] musl libc state probe failed: outside map\n");
         return;
     }
     memset(g_musl_tls_modules, 0, sizeof(g_musl_tls_modules));
@@ -5566,14 +6030,22 @@ static void init_alpine_musl_process_state(struct loaded_obj *objs, int nobj,
         *(int *)(self + MUSL_THREAD_DETACH_STATE_OFF) = 2;
         *(uintptr_t *)(self + MUSL_THREAD_ROBUST_HEAD_OFF) =
             self + MUSL_THREAD_ROBUST_HEAD_OFF;
-        *(uintptr_t *)(self + MUSL_THREAD_LOCALE_OFF) =
-            (uintptr_t)((uint8_t *)libc + MUSL_LIBC_GLOBAL_LOCALE_OFF);
+        locale_addr = detect_musl_global_locale_addr(libc_obj, libc_addr);
+        if (locale_addr)
+            *(uintptr_t *)(self + MUSL_THREAD_LOCALE_OFF) = (uintptr_t)locale_addr;
     }
 
-    *(uintptr_t *)(uintptr_t)(env_addr + MUSL_ALPINE_ENVIRON_TO_SYSINFO_OFF) =
-        sysinfo;
-    *(uintptr_t *)(uintptr_t)(env_addr + MUSL_ALPINE_ENVIRON_TO_HWCAP_OFF) =
-        hwcap;
+    sysinfo_addr = musl_defined_symbol_addr(libc_obj, "__sysinfo");
+    if (!sysinfo_addr)
+        sysinfo_addr = env_addr + MUSL_ENVIRON_TO_SYSINFO_OFF;
+    if (loaded_obj_contains(libc_obj, (uintptr_t)sysinfo_addr, sizeof(uintptr_t)))
+        *(uintptr_t *)(uintptr_t)sysinfo_addr = sysinfo;
+
+    hwcap_addr = musl_defined_symbol_addr(libc_obj, "__hwcap");
+    if (!hwcap_addr)
+        hwcap_addr = env_addr + MUSL_ENVIRON_TO_HWCAP_OFF;
+    if (loaded_obj_contains(libc_obj, (uintptr_t)hwcap_addr, sizeof(uintptr_t)))
+        *(uintptr_t *)(uintptr_t)hwcap_addr = hwcap;
 }
 
 static void init_libc_process_state(struct loaded_obj *objs, int nobj,
@@ -5628,7 +6100,7 @@ static void init_libc_process_state(struct loaded_obj *objs, int nobj,
     addr = resolve_sym(objs, nobj, "__libc_stack_end");
     if (addr) *(void **)(uintptr_t)addr = (void *)&argv[-1];
 
-    init_alpine_musl_process_state(objs, nobj, auxv_envp);
+    init_musl_process_state(objs, nobj, auxv_envp);
 
     /* glibc stdio exposes both FILE objects and pointer aliases. */
     uint64_t io_stdin  = resolve_sym(objs, nobj, "_IO_2_1_stdin_");
@@ -6562,6 +7034,7 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
 {
     uintptr_t old_tp = 0;
     uintptr_t old_self = 0;
+    size_t bootstrap_self_to_tp = 0;
     uint64_t max_tls_align = 1;
     int64_t min_static_tpoff = 0;
 #if defined(__aarch64__)
@@ -6652,8 +7125,12 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
     if (g_is_musl_runtime) {
         old_tp = arch_get_tp_syscall();
         old_self = (uintptr_t)pthread_self();
-        if (old_tp >= old_self)
-            g_musl_tp_self_delta = old_tp - old_self;
+        if (old_tp >= old_self) {
+            bootstrap_self_to_tp = old_tp - old_self;
+            g_musl_tp_self_delta = bootstrap_self_to_tp;
+        }
+        probe_musl_thread_layout(old_self, old_tp);
+        probe_musl_thread_layout_from_target(find_musl_libc(objs, nobj));
     }
 
     /* Allocate TLS block + TCB */
@@ -6719,9 +7196,14 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
         uintptr_t *musl_dtv = mmap(NULL, musl_dtv_bytes,
                                    PROT_READ | PROT_WRITE,
                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (g_musl_tp_self_delta != 0 && old_self)
-            memcpy((void *)self, (void *)old_self, g_musl_tp_self_delta);
-        else if (old_tp)
+        if (bootstrap_self_to_tp != 0 && old_self) {
+            size_t preserve_len = bootstrap_self_to_tp;
+
+            if (preserve_len > g_musl_tp_self_delta)
+                preserve_len = g_musl_tp_self_delta;
+            if (preserve_len)
+                memcpy((void *)self, (void *)old_self, preserve_len);
+        } else if (old_tp)
             /* Preserve the bootstrap musl main thread state beyond the
              * ABI header. This carries over initialized locale/pthread
              * fields that direct-loaded musl code may read via %fs. */
@@ -6751,7 +7233,7 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
     }
 
     /* glibc stores the current TID in the TCB header; musl keeps it in
-     * struct pthread and seeds it later in init_alpine_musl_process_state(). */
+     * struct pthread and seeds it later in init_musl_process_state(). */
     if (!g_is_musl_runtime) {
 #if defined(__aarch64__)
         uintptr_t self = glibc_aarch64_pthread_self_from_tp(tp);
