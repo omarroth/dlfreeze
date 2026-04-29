@@ -4735,6 +4735,7 @@ static uint64_t lookup_elf_symbol_addr(const struct loaded_obj *obj,
 
 /* Forward declarations for dlopen replacements */
 static void *my_dlopen(const char *path, int flags);
+static void *my_dlmopen(long lmid, const char *path, int flags);
 static void *my_dlsym(void *handle, const char *symbol);
 static int   my_dlclose(void *handle);
 static char *my_dlerror(void);
@@ -4772,6 +4773,7 @@ static int bootstrap_strcmp(const char *lhs, const char *rhs)
  * which can load .so files from the filesystem at runtime. */
 static const struct stub_sym g_overrides[] = {
     { "dlopen",          (void *)my_dlopen          },
+    { "dlmopen",         (void *)my_dlmopen         },
     { "dlsym",           (void *)my_dlsym           },
     { "dlclose",         (void *)my_dlclose         },
     { "dlerror",         (void *)my_dlerror         },
@@ -6811,15 +6813,40 @@ static void *my_dlopen(const char *path, int flags)
         }
     }
 
-    void *ret = load_elf_from_file(path);
+    /* Fall back to the filesystem.  Per dlopen(3) semantics:
+     *   - if `path` contains a slash it is used as a path directly
+     *     (absolute or relative to the current working directory);
+     *   - otherwise it is treated as a bare soname and resolved against
+     *     the standard runtime library directories. */
+    void *ret;
+    int has_slash = 0;
+    for (const char *p = path; *p; p++) {
+        if (*p == '/') { has_slash = 1; break; }
+    }
+    if (has_slash)
+        ret = load_elf_from_file(path);
+    else
+        ret = load_needed_from_filesystem(path);
     if (ret) {
         /* Loaded from disk — this library should have been captured */
         ldr_msg("dlfreeze: warning: dlopen loading '");
         ldr_msg(bn);
         ldr_msg("' from disk (not in frozen image)\n");
+    } else {
+        dl_set_error(path, ": cannot open shared object file");
     }
     restore_ptr_guard();
     return ret;
+}
+
+/* dlmopen(LMID, file, flags) — we don't implement separate link-map
+ * namespaces, but we can satisfy the common case by ignoring the namespace
+ * argument and routing the request through dlopen.  This lets programs that
+ * use dlmopen for its side effect of loading a library still work. */
+static void *my_dlmopen(long /*Lmid_t*/ lmid, const char *path, int flags)
+{
+    (void)lmid;
+    return my_dlopen(path, flags);
 }
 
 static void *my_dlsym(void *handle, const char *symbol)

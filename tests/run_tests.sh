@@ -1039,6 +1039,162 @@ test_ruby_direct_host_run() {
 }
 
 # ===================================================================
+# Test 14: dlopen by bare soname in direct-load mode
+#   Real-world: many programs do dlopen("libcrypto.so.3", ...) without an
+#   absolute path, expecting the dynamic loader to search the standard
+#   library directories.  In direct-load mode we must replicate that.
+# ===================================================================
+test_dlopen_soname_direct() {
+    echo "--- dlopen by soname direct-load ---"
+    local soname=""
+    for cand in libm.so.6 libcrypt.so.2 libcrypto.so.3 libz.so.1; do
+        for d in /lib /lib64 /usr/lib /usr/lib64 \
+                 /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu \
+                 /lib/aarch64-linux-gnu /usr/lib/aarch64-linux-gnu; do
+            if [ -e "$d/$cand" ]; then soname="$cand"; break; fi
+        done
+        [ -n "$soname" ] && break
+    done
+    if [ -z "$soname" ]; then
+        skip "dlopen-soname-direct" "no system soname found"
+        return
+    fi
+
+    local src="$BUILD/dlopen_soname.c" bin="$BUILD/dlopen_soname"
+    local out="$BUILD/dlopen_soname.frozen"
+    cat > "$src" <<C
+#include <stdio.h>
+#include <dlfcn.h>
+int main(void) {
+    void *h = dlopen("$soname", RTLD_NOW);
+    if (!h) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }
+    printf("opened\n");
+    return 0;
+}
+C
+    gcc -o "$bin" "$src" -ldl
+
+    if ! "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
+        fail "dlopen-soname-direct" "dlfreeze failed"
+        rm -f "$src" "$bin" "$out"
+        return
+    fi
+
+    local actual rc=0
+    actual=$(timeout 10 "$out" 2>&1) || rc=$?
+    # Allow the "loading from disk" warning that dlfreeze prints.
+    actual=$(echo "$actual" | grep -v '^dlfreeze: warning:' || true)
+    if [ "$actual" = "opened" ] && [ "$rc" = "0" ]; then
+        pass "dlopen by soname direct-load"
+    else
+        fail "dlopen by soname direct-load" "rc=$rc out=$actual"
+    fi
+    rm -f "$src" "$bin" "$out"
+}
+
+# ===================================================================
+# Test 15: dlopen with a relative slash path in direct-load mode
+#   Per dlopen(3): if the name contains a slash it is interpreted as a
+#   path (absolute or relative to cwd); only bare sonames are searched.
+# ===================================================================
+test_dlopen_relpath_direct() {
+    echo "--- dlopen relative path direct-load ---"
+    local libsrc="$BUILD/dlrel_lib.c"  lib="$BUILD/libdlrel.so"
+    local src="$BUILD/dlrel_main.c"    bin="$BUILD/dlrel_main"
+    local out="$BUILD/dlrel_main.frozen"
+
+    cat > "$libsrc" <<'C'
+int answer(void) { return 42; }
+C
+    gcc -shared -fPIC -o "$lib" "$libsrc"
+
+    cat > "$src" <<'C'
+#include <stdio.h>
+#include <dlfcn.h>
+int main(void) {
+    void *h = dlopen("./libdlrel.so", RTLD_NOW);
+    if (!h) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }
+    int (*answer)(void) = dlsym(h, "answer");
+    if (!answer) { fprintf(stderr, "dlsym: %s\n", dlerror()); return 1; }
+    printf("%d\n", answer());
+    return 0;
+}
+C
+    gcc -o "$bin" "$src" -ldl
+
+    if ! "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
+        fail "dlopen-relpath-direct" "dlfreeze failed"
+        rm -f "$libsrc" "$lib" "$src" "$bin" "$out"
+        return
+    fi
+
+    local actual rc=0
+    actual=$(cd "$BUILD" && timeout 10 "$out" 2>&1) || rc=$?
+    actual=$(echo "$actual" | grep -v '^dlfreeze: warning:' || true)
+    if [ "$actual" = "42" ] && [ "$rc" = "0" ]; then
+        pass "dlopen relative path direct-load"
+    else
+        fail "dlopen relative path direct-load" "rc=$rc out=$actual"
+    fi
+    rm -f "$libsrc" "$lib" "$src" "$bin" "$out"
+}
+
+# ===================================================================
+# Test 16: dlmopen behaves as dlopen (namespace ignored)
+# ===================================================================
+test_dlmopen_direct() {
+    echo "--- dlmopen direct-load ---"
+    local soname=""
+    for cand in libm.so.6 libz.so.1; do
+        for d in /lib /lib64 /usr/lib /usr/lib64 \
+                 /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu \
+                 /lib/aarch64-linux-gnu /usr/lib/aarch64-linux-gnu; do
+            if [ -e "$d/$cand" ]; then soname="$cand"; break; fi
+        done
+        [ -n "$soname" ] && break
+    done
+    if [ -z "$soname" ]; then
+        skip "dlmopen-direct" "no system soname found"
+        return
+    fi
+
+    local src="$BUILD/dlmopen_main.c" bin="$BUILD/dlmopen_main"
+    local out="$BUILD/dlmopen_main.frozen"
+    cat > "$src" <<C
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <dlfcn.h>
+int main(void) {
+    void *h = dlmopen(LM_ID_NEWLM, "$soname", RTLD_NOW);
+    if (!h) { fprintf(stderr, "dlmopen: %s\n", dlerror()); return 1; }
+    printf("opened\n");
+    return 0;
+}
+C
+    if ! gcc -o "$bin" "$src" -ldl 2>/dev/null; then
+        skip "dlmopen-direct" "compiler does not support dlmopen (likely musl)"
+        rm -f "$src" "$bin" "$out"
+        return
+    fi
+
+    if ! "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
+        fail "dlmopen-direct" "dlfreeze failed"
+        rm -f "$src" "$bin" "$out"
+        return
+    fi
+
+    local actual rc=0
+    actual=$(timeout 10 "$out" 2>&1) || rc=$?
+    actual=$(echo "$actual" | grep -v '^dlfreeze: warning:' || true)
+    if [ "$actual" = "opened" ] && [ "$rc" = "0" ]; then
+        pass "dlmopen direct-load"
+    else
+        fail "dlmopen direct-load" "rc=$rc out=$actual"
+    fi
+    rm -f "$src" "$bin" "$out"
+}
+
+# ===================================================================
 echo "======== dlfreeze test suite ========"
 echo "build dir: $BUILD"
 echo ""
@@ -1063,6 +1219,9 @@ test_direct_dlopen_fallback
 test_python3_direct
 test_glibc_tls_dtor_direct
 test_ruby_direct_host_run
+test_dlopen_soname_direct
+test_dlopen_relpath_direct
+test_dlmopen_direct
 
 echo ""
 echo "======== ${GRN}$PASS passed${RST}, ${RED}$FAIL failed${RST}, ${YLW}$SKIP skipped${RST} ========"
