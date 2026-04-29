@@ -1801,7 +1801,15 @@ static void probe_musl_thread_layout(uintptr_t old_self, uintptr_t old_tp)
         }
     }
 
-    if (old_tp >= old_self && old_tp - old_self < MUSL_THREAD_PROBE_LIMIT) {
+    if (old_tp >= old_self + word && old_tp - old_self < MUSL_THREAD_PROBE_LIMIT) {
+        size_t off = (size_t)(old_tp - old_self - word);
+        uintptr_t val = *(uintptr_t *)(old_self + off);
+
+        if (musl_thread_ptr_external(old_self, val))
+            g_musl_thread.dtv = off;
+        dtv_probed = musl_thread_ptr_external(old_self, val);
+    }
+    if (!dtv_probed && old_tp >= old_self && old_tp - old_self < MUSL_THREAD_PROBE_LIMIT) {
         size_t off = (size_t)(old_tp - old_self);
         uintptr_t val = *(uintptr_t *)(old_self + off);
 
@@ -2151,6 +2159,26 @@ static int aarch64_decode_ldr64_unsigned(uint32_t insn, int rn,
     return 1;
 }
 
+static int aarch64_decode_ldur64_signed(uint32_t insn, int rn,
+                                        int64_t *off_out)
+{
+    int64_t off;
+
+    if ((insn & 0xffe00c00u) != 0xf8400000u)
+        return 0;
+    if ((int)((insn >> 5) & 0x1f) != rn)
+        return 0;
+
+    off = (insn >> 12) & 0x1ff;
+    if (off & 0x100)
+        off -= 0x200;
+    if (off <= -(int64_t)MUSL_THREAD_PROBE_LIMIT ||
+        off >= (int64_t)MUSL_THREAD_PROBE_LIMIT)
+        return 0;
+    *off_out = off;
+    return 1;
+}
+
 static int decode_aarch64_musl_self_delta(const uint8_t *code, size_t len,
                                           size_t *delta_out)
 {
@@ -2206,10 +2234,17 @@ static int decode_aarch64_musl_dtv_offset(const uint8_t *code, size_t len,
             continue;
         for (size_t j = i + 4; j + 4 <= len && j <= i + 24; j += 4) {
             size_t tp_off;
+            int64_t tp_rel;
 
             if (aarch64_decode_ldr64_unsigned(read_u32_le(code + j), rt, &tp_off) &&
                 self_delta + tp_off < MUSL_THREAD_PROBE_LIMIT) {
                 *off_out = self_delta + tp_off;
+                return 1;
+            }
+            if (aarch64_decode_ldur64_signed(read_u32_le(code + j), rt, &tp_rel) &&
+                (int64_t)self_delta + tp_rel >= 0 &&
+                (int64_t)self_delta + tp_rel < MUSL_THREAD_PROBE_LIMIT) {
+                *off_out = (size_t)((int64_t)self_delta + tp_rel);
                 return 1;
             }
         }
@@ -5868,7 +5903,7 @@ static uint64_t detect_musl_libc_state_addr(const struct loaded_obj *libc_obj,
 
         if (second - first == sizeof(uintptr_t) &&
             first - env_addr >= MUSL_PROGNAME_NEAR_ENVIRON_MAX)
-            return second + sizeof(uintptr_t);
+            return second + 2 * sizeof(uintptr_t);
     }
 
     if (env_addr >= MUSL_ENVIRON_TO_LIBC_OFF_OLD)
