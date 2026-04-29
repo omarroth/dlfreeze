@@ -299,6 +299,9 @@ struct aarch64_tlsdesc_arg {
 
 extern uintptr_t dlfreeze_aarch64_tlsdesc_static(void *);
 extern uintptr_t dlfreeze_aarch64_tlsdesc_dynamic(void *);
+static int64_t dlfreeze_aarch64_tlsdesc_resolve_c(void *arg_in);
+static void *musl_lazy_install_tls(uintptr_t tp, unsigned long modid,
+                                   unsigned long ti_offset);
 
 struct aarch64_tlsdesc_page {
     struct aarch64_tlsdesc_page *next;
@@ -318,6 +321,11 @@ __asm__(
     "\tldr x0, [x0, #8]\n"
     "\tret\n"
     ".size dlfreeze_aarch64_tlsdesc_static, .-dlfreeze_aarch64_tlsdesc_static\n"
+    /* Dynamic TLSDESC resolver.  AArch64 TLSDESC ABI: only x0 (and the
+     * flags) may be clobbered; all other GPRs and FP registers must be
+     * preserved.  Fast path inline; slow path (empty DTV slot) calls
+     * dlfreeze_aarch64_tlsdesc_resolve_c which lazily allocates a per-
+     * thread TLS block. */
     ".global dlfreeze_aarch64_tlsdesc_dynamic\n"
     ".hidden dlfreeze_aarch64_tlsdesc_dynamic\n"
     ".type dlfreeze_aarch64_tlsdesc_dynamic, %function\n"
@@ -325,16 +333,44 @@ __asm__(
     "\tstp x1, x2, [sp, #-16]!\n"
     "\tstp x3, x4, [sp, #-16]!\n"
     "\tmrs x1, tpidr_el0\n"
-    "\tldr x0, [x0, #8]\n"
-    "\tldp x2, x3, [x0]\n"
-    "\tldr x4, [x0, #16]\n"
-    "\tldr x0, [x0, #24]\n"
-    "\tadd x4, x1, x4\n"
-    "\tldr x4, [x4]\n"
-    "\tlsl x2, x2, x0\n"
-    "\tldr x0, [x4, x2]\n"
-    "\tadd x0, x0, x3\n"
-    "\tsub x0, x0, x1\n"
+    "\tldr x0, [x0, #8]\n"            /* x0 = arg pointer (kept until end) */
+    "\tldp x2, x3, [x0]\n"            /* x2=modid, x3=offset */
+    "\tldr x4, [x0, #16]\n"           /* x4=dtv_offset */
+    "\tldr x4, [x1, x4]\n"            /* x4 = DTV pointer */
+    "\tcbz x4, 1f\n"                  /* no DTV — slow path */
+    "\tldr x2, [x0, #24]\n"           /* x2 = entry_shift (overwrite modid) */
+    "\tldr x4, [x0]\n"                /* x4 = modid */
+    "\tlsl x2, x4, x2\n"              /* x2 = modid << shift */
+    "\tldr x4, [x0, #16]\n"           /* reload dtv_offset */
+    "\tldr x4, [x1, x4]\n"            /* DTV again */
+    "\tldr x4, [x4, x2]\n"            /* x4 = DTV[byte_idx] */
+    "\tcbz x4, 1f\n"                  /* empty slot — slow path */
+    "\tadd x0, x4, x3\n"              /* tls_block + offset */
+    "\tsub x0, x0, x1\n"              /* return relative to tp */
+    "\tldp x3, x4, [sp], #16\n"
+    "\tldp x1, x2, [sp], #16\n"
+    "\tret\n"
+    "1:\n"
+    /* Slow path: x0 still holds the arg pointer.  Save remaining
+     * caller-clobbered GPRs and call into C. */
+    "\tstp x29, x30, [sp, #-16]!\n"
+    "\tmov x29, sp\n"
+    "\tstp x5, x6,   [sp, #-16]!\n"
+    "\tstp x7, x8,   [sp, #-16]!\n"
+    "\tstp x9, x10,  [sp, #-16]!\n"
+    "\tstp x11, x12, [sp, #-16]!\n"
+    "\tstp x13, x14, [sp, #-16]!\n"
+    "\tstp x15, x16, [sp, #-16]!\n"
+    "\tstp x17, x18, [sp, #-16]!\n"
+    "\tbl dlfreeze_aarch64_tlsdesc_resolve_c\n"
+    "\tldp x17, x18, [sp], #16\n"
+    "\tldp x15, x16, [sp], #16\n"
+    "\tldp x13, x14, [sp], #16\n"
+    "\tldp x11, x12, [sp], #16\n"
+    "\tldp x9, x10,  [sp], #16\n"
+    "\tldp x7, x8,   [sp], #16\n"
+    "\tldp x5, x6,   [sp], #16\n"
+    "\tldp x29, x30, [sp], #16\n"
     "\tldp x3, x4, [sp], #16\n"
     "\tldp x1, x2, [sp], #16\n"
     "\tret\n"
@@ -355,6 +391,21 @@ static struct aarch64_tlsdesc_arg *alloc_aarch64_tlsdesc_arg(void)
     }
 
     return &page->args[page->used++];
+}
+
+/* Slow-path C helper for the dynamic AArch64 TLSDESC resolver.  Called
+ * by the asm trampoline above when the calling thread's DTV is missing
+ * a slot for the requested module.  Returns the address of the TLS
+ * variable relative to tpidr_el0 (so the caller can use the value as
+ * a tpoff). */
+static int64_t dlfreeze_aarch64_tlsdesc_resolve_c(void *arg_in) __attribute__((used));
+static int64_t dlfreeze_aarch64_tlsdesc_resolve_c(void *arg_in)
+{
+    struct aarch64_tlsdesc_arg *arg = (struct aarch64_tlsdesc_arg *)arg_in;
+    uintptr_t tp = arch_get_tp();
+    uintptr_t tls_addr = (uintptr_t)musl_lazy_install_tls(
+        tp, (unsigned long)arg->modid, (unsigned long)arg->offset);
+    return (int64_t)(tls_addr - tp);
 }
 #endif
 
@@ -1874,6 +1925,11 @@ static void current_aarch64_tlsdesc_layout(int64_t *dtv_offset,
 }
 #endif
 
+/* Lazy per-thread musl TLS install — defined later (after `struct
+ * loaded_obj`).  Forward declaration so __tls_get_addr can call it. */
+static void *musl_lazy_install_tls(uintptr_t tp, unsigned long modid,
+                                   unsigned long ti_offset);
+
 /* __tls_get_addr — GD/LD TLS model accessor.
  * Looks up the DTV entry for the module and adds the offset. */
 struct tls_index { unsigned long ti_module; unsigned long ti_offset; };
@@ -1883,26 +1939,24 @@ static void *stub_tls_get_addr(struct tls_index *ti)
     uintptr_t *dtv = g_is_musl_runtime
         ? *(uintptr_t **)musl_thread_dtv_slot(tp)
         : *(uintptr_t **)(tp + TCB_OFF_DTV);
+    if (g_is_musl_runtime) {
+        size_t cur_slots = dtv ? dtv[0] : 0;
+        if (dtv && ti->ti_module <= cur_slots && dtv[ti->ti_module]) {
+            return (void *)(dtv[ti->ti_module] + ti->ti_offset);
+        }
+        /* Slot missing — lazily allocate per-thread block. */
+        return musl_lazy_install_tls(tp, ti->ti_module, ti->ti_offset);
+    }
     if (dtv) {
-        if (g_is_musl_runtime) {
-            uintptr_t tls_block = dtv[ti->ti_module];
-            if (tls_block)
-                return (void *)(tls_block + ti->ti_offset);
-            if (g_debug) {
-                ldr_msg("[tls] musl DTV slot empty mod=");
-                ldr_hex("", ti->ti_module);
-            }
-        } else {
         /* glibc convention: tcb->dtv points to dtv[1] in the raw array.
          * dtv[modid] = {val, to_free} — each slot is 2 uintptr_t's.
          * So dtv[modid * 2] = pointer to start of that module's TLS block */
-            uintptr_t tls_block = dtv[ti->ti_module * 2];
-            if (tls_block)
-                return (void *)(tls_block + ti->ti_offset);
-            if (g_debug) {
-                ldr_msg("[tls] DTV slot empty mod=");
-                ldr_hex("", ti->ti_module);
-            }
+        uintptr_t tls_block = dtv[ti->ti_module * 2];
+        if (tls_block)
+            return (void *)(tls_block + ti->ti_offset);
+        if (g_debug) {
+            ldr_msg("[tls] DTV slot empty mod=");
+            ldr_hex("", ti->ti_module);
         }
     }
     /* Fallback: single-module approximation */
@@ -2527,6 +2581,71 @@ static int install_musl_dlopen_tls(struct loaded_obj *obj)
     return 0;
 }
 
+/* Lazily install a per-thread DTV slot for a musl-runtime module that
+ * was dlopen'd after the calling thread was created.  musl's pthread
+ * allocates the static TLS area + DTV at thread creation time and does
+ * not know about modules loaded later, so __tls_get_addr finds an empty
+ * (or missing) slot.  We grow the DTV as needed and allocate a fresh
+ * TLS block initialized from the module's .tdata image.  Forward-
+ * declared near stub_tls_get_addr above. */
+static void *musl_lazy_install_tls(uintptr_t tp, unsigned long modid,
+                                   unsigned long ti_offset)
+{
+    struct loaded_obj *obj = NULL;
+    for (int i = 0; i < g_nobj; i++) {
+        if (g_all_objs[i].tls.modid == modid &&
+            g_all_objs[i].tls.memsz != 0) {
+            obj = &g_all_objs[i];
+            break;
+        }
+    }
+    if (!obj)
+        return (void *)(tp + ti_offset);
+
+    uintptr_t *dtv = *(uintptr_t **)musl_thread_dtv_slot(tp);
+    size_t cur_slots = dtv ? dtv[0] : 0;
+    if (!dtv || cur_slots < modid) {
+        size_t new_slots = modid;
+        size_t bytes = (new_slots + 1) * sizeof(uintptr_t);
+        bytes = (bytes + 4095) & ~4095UL;
+        uintptr_t *new_dtv = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
+                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (new_dtv == MAP_FAILED)
+            return (void *)(tp + ti_offset);
+        memset(new_dtv, 0, bytes);
+        if (dtv && cur_slots > 0)
+            memcpy(new_dtv, dtv, (cur_slots + 1) * sizeof(uintptr_t));
+        new_dtv[0] = new_slots;
+        *(uintptr_t **)musl_thread_dtv_slot(tp) = new_dtv;
+        dtv = new_dtv;
+    }
+
+    if (!dtv[modid]) {
+        size_t align = obj->tls.align ? (size_t)obj->tls.align
+                                       : sizeof(uintptr_t);
+        size_t map_len = ALIGN_UP(obj->tls.memsz + align, 4096);
+        void *map = mmap(NULL, map_len, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (map == MAP_FAILED)
+            return (void *)(tp + ti_offset);
+        uintptr_t base = ALIGN_UP((uintptr_t)map, align);
+        memcpy((void *)base, (const void *)(obj->base + obj->tls.vaddr),
+               obj->tls.filesz);
+        if (obj->tls.memsz > obj->tls.filesz)
+            memset((void *)(base + obj->tls.filesz), 0,
+                   obj->tls.memsz - obj->tls.filesz);
+        dtv[modid] = base;
+        if (g_debug) {
+            ldr_msg("[tls] musl lazy install ");
+            ldr_msg(obj->name ? obj->name : "?");
+            ldr_dbg_hex(" mod=", modid);
+            ldr_dbg_hex(" blk=", base);
+        }
+    }
+
+    return (void *)(dtv[modid] + ti_offset);
+}
+
 /* install_glibc_dlopen_tls — allocate a TLS block for a dlopen'd module
  * and install it in the calling thread's DTV.  glibc convention:
  *   tcb->dtv = &raw_dtv[1]   (in dtv_t units, each 2×uintptr_t)
@@ -2634,10 +2753,30 @@ static void *stub_dl_allocate_tls_init(void *mem)
     }
     for (int i = 0; i < g_nobj; i++) {
         if (g_all_objs[i].tls.memsz == 0) continue;
-        /* dlopen'd modules (tpoff==0) get TLS via separate DTV blocks,
-         * not the static TLS area.  Skip them here — their .tdata is
-         * copied during DTV block allocation in stub_dl_allocate_tls. */
-        if (g_all_objs[i].tls.tpoff == 0) continue;
+        /* dlopen'd modules (tpoff==0) live in separate per-thread TLS
+         * blocks pointed to by the DTV.  When glibc recycles a cached
+         * stack, _dl_allocate_tls_init is called without _dl_allocate_tls,
+         * so the existing DTV block is reused and must be reset back to
+         * the module's .tdata/.tbss image.  Otherwise __thread variables
+         * defined in dlopened libraries would leak across threads. */
+        if (g_all_objs[i].tls.tpoff == 0) {
+            uintptr_t *dtv = *(uintptr_t **)(tp + TCB_OFF_DTV);
+            if (!dtv) continue;
+            uintptr_t blk = dtv[g_all_objs[i].tls.modid * 2];
+            if (!blk) continue;
+            uint8_t *dst = (uint8_t *)blk;
+            const uint8_t *src = (const uint8_t *)(
+                g_all_objs[i].base + g_all_objs[i].tls.vaddr);
+            memcpy(dst, src, g_all_objs[i].tls.filesz);
+            size_t bss = g_all_objs[i].tls.memsz - g_all_objs[i].tls.filesz;
+            if (bss > 0)
+                memset(dst + g_all_objs[i].tls.filesz, 0, bss);
+            ldr_dbg("[loader] tls_init dlopen: ");
+            ldr_dbg(g_all_objs[i].name ? g_all_objs[i].name : "?");
+            ldr_dbg_hex(" mod=", g_all_objs[i].tls.modid);
+            ldr_dbg_hex(" blk=", blk);
+            continue;
+        }
         uint8_t *dst = (uint8_t *)(tp + g_all_objs[i].tls.tpoff);
         const uint8_t *src = (const uint8_t *)(
             g_all_objs[i].base + g_all_objs[i].tls.vaddr);

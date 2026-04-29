@@ -1195,6 +1195,68 @@ C
 }
 
 # ===================================================================
+# Test 17: __thread variables in a dlopened shared library are
+# per-thread (not shared across threads).
+#   Repro for the bug: when glibc recycles a cached pthread stack it
+#   calls _dl_allocate_tls_init without _dl_allocate_tls, so the DTV
+#   block for a dlopened TLS module is reused.  Without re-initialising
+#   it from the module's .tdata image, __thread state from the previous
+#   thread leaks into the next one.
+# ===================================================================
+test_dlopen_tls_per_thread_direct() {
+    echo "--- dlopen TLS per-thread direct-load ---"
+    local libsrc="$BUILD/tlslib.c"  lib="$BUILD/libtlsperthread.so"
+    local src="$BUILD/tlsuse.c"     bin="$BUILD/tlsuse"
+    local out="$BUILD/tlsuse.frozen"
+
+    cat > "$libsrc" <<'C'
+__thread int counter = 0;
+int bump(void) { return ++counter; }
+C
+    gcc -shared -fPIC -o "$lib" "$libsrc"
+
+    cat > "$src" <<C
+#include <stdio.h>
+#include <pthread.h>
+#include <dlfcn.h>
+static int (*bump)(void);
+static void *worker(void *arg) {
+    long id = (long)arg;
+    for (int i = 0; i < 3; i++) printf("t%ld %d\n", id, bump());
+    return NULL;
+}
+int main(void) {
+    void *h = dlopen("$(realpath "$lib")", RTLD_NOW);
+    if (!h) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }
+    bump = dlsym(h, "bump");
+    if (!bump) { fprintf(stderr, "dlsym: %s\n", dlerror()); return 1; }
+    pthread_t t1, t2;
+    pthread_create(&t1, NULL, worker, (void*)1L); pthread_join(t1, NULL);
+    pthread_create(&t2, NULL, worker, (void*)2L); pthread_join(t2, NULL);
+    return 0;
+}
+C
+    gcc -o "$bin" "$src" -ldl -lpthread
+
+    if ! "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
+        fail "dlopen-tls-per-thread-direct" "dlfreeze failed"
+        rm -f "$libsrc" "$lib" "$src" "$bin" "$out"
+        return
+    fi
+
+    local expect actual
+    expect=$("$bin" 2>&1)
+    actual=$(timeout 30 "$out" 2>&1 | grep -v '^dlfreeze: warning:')
+    if [ "$expect" = "$actual" ]; then
+        pass "dlopen TLS per-thread direct-load"
+    else
+        fail "dlopen TLS per-thread direct-load" "output differs"
+        diff -u <(echo "$expect") <(echo "$actual") | head -20 || true
+    fi
+    rm -f "$libsrc" "$lib" "$src" "$bin" "$out"
+}
+
+# ===================================================================
 echo "======== dlfreeze test suite ========"
 echo "build dir: $BUILD"
 echo ""
@@ -1222,6 +1284,7 @@ test_ruby_direct_host_run
 test_dlopen_soname_direct
 test_dlopen_relpath_direct
 test_dlmopen_direct
+test_dlopen_tls_per_thread_direct
 
 echo ""
 echo "======== ${GRN}$PASS passed${RST}, ${RED}$FAIL failed${RST}, ${YLW}$SKIP skipped${RST} ========"
