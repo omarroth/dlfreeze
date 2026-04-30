@@ -893,6 +893,15 @@ struct glibc_ver_offsets {
     int gl_rtld_lock_recursive;   /* -1 if removed (glibc ≥ 2.34) */
     int gl_rtld_unlock_recursive;
     int gl_make_stack_executable; /* -1 if absent or unused */
+    /* AArch64 struct pthread layout (per-glibc-version).  -1 keeps the
+     * compiled-in default macro value.  Ignored on x86-64 (struct
+     * pthread sits AT the TP there, not below it). */
+    int pthread_size;             /* sizeof(struct pthread) */
+    int pthread_tid_off;          /* offsetof(struct pthread, tid) */
+    int pthread_rseq_off;         /* offsetof(struct pthread, rseq_area)
+                                   * — set to -1 when no rseq area exists
+                                   * (pre-glibc-2.34). */
+    int pthread_rseq_cpu_id_off;  /* offsetof rseq_area.cpu_id */
 };
 
 /* glibc 2.17–2.28 (x86-64): _rtld_global_ro=440B, _rtld_global=3960B
@@ -900,6 +909,12 @@ struct glibc_ver_offsets {
  * No _dl_catch_error/_dl_error_free/_dl_find_object.
  * No _dl_stack_used/_dl_stack_user/_dl_stack_cache. */
 static const struct glibc_ver_offsets glibc_2_17 = {
+    /* x86-64: pthread struct layout fields are unused (TP points to
+     * the head of struct pthread).  Leave all -1. */
+    .pthread_size               = -1,
+    .pthread_tid_off            = -1,
+    .pthread_rseq_off           = -1,
+    .pthread_rseq_cpu_id_off    = -1,
     .glro_tls_static_size  = -1,    /* TLS fields in _rtld_global */
     .glro_tls_static_align = -1,
     .glro_debug_printf     = 360,
@@ -926,6 +941,10 @@ static const struct glibc_ver_offsets glibc_2_17 = {
  * Same structural pattern as 2.17: TLS fields in _rtld_global,
  * no catch_error/error_free/find_object, no stack lists. */
 static const struct glibc_ver_offsets glibc_2_29 = {
+    .pthread_size               = -1,
+    .pthread_tid_off            = -1,
+    .pthread_rseq_off           = -1,
+    .pthread_rseq_cpu_id_off    = -1,
     .glro_tls_static_size  = -1,
     .glro_tls_static_align = -1,
     .glro_debug_printf     = 464,
@@ -955,6 +974,11 @@ static const struct glibc_ver_offsets glibc_2_29 = {
  * We stub them out because the frozen loader is single-threaded here.
  * _dl_make_stack_executable is also routed via _rtld_global. */
 static const struct glibc_ver_offsets glibc_aarch64_2_27 = {
+    /* AArch64 glibc 2.27: struct pthread is 0x710 bytes, no rseq area. */
+    .pthread_size               = 0x710,
+    .pthread_tid_off            = 0xd0,
+    .pthread_rseq_off           = -1,
+    .pthread_rseq_cpu_id_off    = -1,
     .glro_tls_static_size  = -1,
     .glro_tls_static_align = -1,
     .glro_debug_printf     = -1,
@@ -983,6 +1007,12 @@ static const struct glibc_ver_offsets glibc_aarch64_2_27 = {
  * present in _rtld_global.  The layout differs again from both x86-64
  * and glibc 2.27 AArch64, so detect it explicitly by ld.so symbol size. */
 static const struct glibc_ver_offsets glibc_aarch64_2_31 = {
+    /* AArch64 glibc 2.31 (Ubuntu 20.04): struct pthread is 0x720 bytes,
+     * no rseq area yet.  TID at offset 0xd0. */
+    .pthread_size               = 0x720,
+    .pthread_tid_off            = 0xd0,
+    .pthread_rseq_off           = -1,
+    .pthread_rseq_cpu_id_off    = -1,
     .glro_tls_static_size  = -1,
     .glro_tls_static_align = -1,
     .glro_debug_printf     = -1,
@@ -1011,6 +1041,12 @@ static const struct glibc_ver_offsets glibc_aarch64_2_31 = {
  * TLS static size/align fields now in _rtld_global_ro.
  * Offsets verified from Ubuntu 24.04 arm64 glibc 2.39 debug layout. */
 static const struct glibc_ver_offsets glibc_aarch64_2_35 = {
+    /* AArch64 glibc 2.35–2.39: struct pthread is 0x740, rseq area at
+     * 0x720, cpu_id at 0x724. */
+    .pthread_size               = 0x740,
+    .pthread_tid_off            = 0xd0,
+    .pthread_rseq_off           = 0x720,
+    .pthread_rseq_cpu_id_off    = 0x724,
      .glro_tls_static_size  = 464,   /* 0x1D0 */
      .glro_tls_static_align = 472,   /* 0x1D8 */
     .glro_debug_printf     = 584,   /* 0x248 */
@@ -1038,6 +1074,10 @@ static const struct glibc_ver_offsets glibc_aarch64_2_35 = {
  * find_object.  Has stack lists.  Same glro layout as 2.40+ but
  * different (larger) _rtld_global. */
 static const struct glibc_ver_offsets glibc_2_34 = {
+    .pthread_size               = -1,
+    .pthread_tid_off            = -1,
+    .pthread_rseq_off           = -1,
+    .pthread_rseq_cpu_id_off    = -1,
     .glro_tls_static_size  = 680,
     .glro_tls_static_align = 688,
     .glro_debug_printf     = 816,
@@ -1062,6 +1102,10 @@ static const struct glibc_ver_offsets glibc_2_34 = {
 
 /* glibc 2.37–2.39 (x86-64): _rtld_global_ro=952B, _rtld_global=4352B */
 static const struct glibc_ver_offsets glibc_2_37 = {
+    .pthread_size               = -1,
+    .pthread_tid_off            = -1,
+    .pthread_rseq_off           = -1,
+    .pthread_rseq_cpu_id_off    = -1,
     .glro_tls_static_size  = 712,   /* 0x2C8 */
     .glro_tls_static_align = 720,   /* 0x2D0 */
     .glro_debug_printf     = 848,
@@ -1086,6 +1130,10 @@ static const struct glibc_ver_offsets glibc_2_37 = {
 
 /* glibc 2.40+ (x86-64): _rtld_global_ro=928B, _rtld_global=2120B */
 static const struct glibc_ver_offsets glibc_2_40 = {
+    .pthread_size               = -1,
+    .pthread_tid_off            = -1,
+    .pthread_rseq_off           = -1,
+    .pthread_rseq_cpu_id_off    = -1,
     .glro_tls_static_size  = 672,   /* 0x2A0 */
     .glro_tls_static_align = 680,   /* 0x2A8 */
     .glro_debug_printf     = 816,
@@ -1693,12 +1741,48 @@ static int stub_dl_rtld_di_serinfo(void) { return -1; }
 #define TCB_OFF_SELF3       16    /* musl thread self       */
 /* AArch64 glibc keeps struct pthread immediately below TP and places
  * static TLS at positive TP offsets after the two-word TCB header. */
-#define GLIBC_AARCH64_PTHREAD_SIZE       0x740
-#define GLIBC_AARCH64_TCB_SIZE           0x10
-#define GLIBC_AARCH64_PTHREAD_TID_OFF    0x0d0
-#define GLIBC_AARCH64_PTHREAD_RSEQ_OFF   0x720
-#define GLIBC_AARCH64_PTHREAD_RSEQ_CPU_ID_OFF 0x724
+#define GLIBC_AARCH64_PTHREAD_SIZE_DEFAULT       0x740
+#define GLIBC_AARCH64_TCB_SIZE                   0x10
+#define GLIBC_AARCH64_PTHREAD_TID_OFF_DEFAULT    0x0d0
+#define GLIBC_AARCH64_PTHREAD_RSEQ_OFF_DEFAULT   0x720
+#define GLIBC_AARCH64_PTHREAD_RSEQ_CPU_ID_OFF_DEFAULT 0x724
 #define GLIBC_RSEQ_CPU_ID_REGISTRATION_FAILED (-2)
+
+/* Runtime accessors that consult the detected glibc version profile.
+ * If the profile leaves the field at -1 we fall back to the default
+ * compiled-in macro value (so untested glibc versions still get a
+ * reasonable layout — matching modern glibc 2.34+ aarch64). */
+static inline size_t glibc_aarch64_pthread_size(void)
+{
+    if (g_glibc_off && g_glibc_off->pthread_size > 0)
+        return (size_t)g_glibc_off->pthread_size;
+    return GLIBC_AARCH64_PTHREAD_SIZE_DEFAULT;
+}
+static inline size_t glibc_aarch64_pthread_tid_off(void)
+{
+    if (g_glibc_off && g_glibc_off->pthread_tid_off > 0)
+        return (size_t)g_glibc_off->pthread_tid_off;
+    return GLIBC_AARCH64_PTHREAD_TID_OFF_DEFAULT;
+}
+static inline int glibc_aarch64_has_rseq_area(void)
+{
+    if (g_glibc_off && g_glibc_off->pthread_rseq_off >= 0)
+        return g_glibc_off->pthread_rseq_off > 0;
+    /* Default profile assumes modern glibc with rseq area. */
+    return 1;
+}
+static inline size_t glibc_aarch64_pthread_rseq_off(void)
+{
+    if (g_glibc_off && g_glibc_off->pthread_rseq_off > 0)
+        return (size_t)g_glibc_off->pthread_rseq_off;
+    return GLIBC_AARCH64_PTHREAD_RSEQ_OFF_DEFAULT;
+}
+static inline size_t glibc_aarch64_pthread_rseq_cpu_id_off(void)
+{
+    if (g_glibc_off && g_glibc_off->pthread_rseq_cpu_id_off > 0)
+        return (size_t)g_glibc_off->pthread_rseq_cpu_id_off;
+    return GLIBC_AARCH64_PTHREAD_RSEQ_CPU_ID_OFF_DEFAULT;
+}
 /* On aarch64 glibc the stack guard and pointer guard live in struct
  * pthread, which sits at a negative offset from the thread pointer.
  * These offsets are from the TP (positive, into the TCB header area).
@@ -1809,7 +1893,7 @@ static inline uint64_t static_tls_first_tpoff(void)
 static inline uintptr_t glibc_aarch64_pthread_self_from_tp(uintptr_t tp)
 {
 #if defined(__aarch64__)
-    return tp - GLIBC_AARCH64_PTHREAD_SIZE;
+    return tp - glibc_aarch64_pthread_size();
 #else
     return tp;
 #endif
@@ -7311,8 +7395,13 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
 
 #if defined(__aarch64__)
     if (!g_is_musl_runtime) {
-        g_rseq_offset = (int64_t)GLIBC_AARCH64_PTHREAD_RSEQ_OFF -
-                        (int64_t)GLIBC_AARCH64_PTHREAD_SIZE;
+        if (glibc_aarch64_has_rseq_area()) {
+            g_rseq_offset = (int64_t)glibc_aarch64_pthread_rseq_off() -
+                            (int64_t)glibc_aarch64_pthread_size();
+        } else {
+            /* Pre-2.34 glibc: no rseq area in struct pthread. */
+            g_rseq_offset = 0;
+        }
         g_rseq_size = 0;
     }
 #else
@@ -7352,15 +7441,16 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
 #if defined(__aarch64__)
     else if (glibc_tls_above_tp()) {
         size_t tls_aligned = ALIGN_UP(total_tls, 64);
+        size_t pthread_size = glibc_aarch64_pthread_size();
 
-        alloc = GLIBC_AARCH64_PTHREAD_SIZE + tls_aligned + max_tls_align;
+        alloc = pthread_size + tls_aligned + max_tls_align;
         block = mmap(NULL, alloc, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (block == MAP_FAILED) {
             ldr_err("TLS mmap failed", NULL);
             return 0;
         }
-        tp = ALIGN_UP((uintptr_t)block + GLIBC_AARCH64_PTHREAD_SIZE,
+        tp = ALIGN_UP((uintptr_t)block + pthread_size,
                       max_tls_align);
     }
 #endif
@@ -7438,10 +7528,12 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
     if (!g_is_musl_runtime) {
 #if defined(__aarch64__)
         uintptr_t self = glibc_aarch64_pthread_self_from_tp(tp);
-        *(int32_t *)(self + GLIBC_AARCH64_PTHREAD_TID_OFF) =
+        *(int32_t *)(self + glibc_aarch64_pthread_tid_off()) =
             (int32_t)syscall(SYS_gettid);
-        *(int32_t *)(self + GLIBC_AARCH64_PTHREAD_RSEQ_CPU_ID_OFF) =
-            GLIBC_RSEQ_CPU_ID_REGISTRATION_FAILED;
+        if (glibc_aarch64_has_rseq_area()) {
+            *(int32_t *)(self + glibc_aarch64_pthread_rseq_cpu_id_off()) =
+                GLIBC_RSEQ_CPU_ID_REGISTRATION_FAILED;
+        }
 #else
         *(int32_t *)(tp + TCB_OFF_TID) = (int32_t)syscall(SYS_gettid);
 #endif
