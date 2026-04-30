@@ -967,6 +967,40 @@ static const struct glibc_ver_offsets glibc_2_29 = {
     .gl_make_stack_executable = -1,
 };
 
+/* glibc 2.31 Debian variant (x86-64): _rtld_global_ro=544B, _rtld_global=4000B
+ * Debian 11 ships glibc 2.31 with a downstream patch that grows
+ * _rtld_global_ro by 8 bytes (one extra word inserted before the
+ * function-pointer block) and _rtld_global by 8 bytes.  The _rtld_global
+ * field offsets we touch are unchanged versus 2.29, but every glro_*
+ * function pointer is shifted by +8.  Confirmed by reading the live
+ * struct on debian:11 amd64 (see /memories/repo). */
+static const struct glibc_ver_offsets glibc_2_31_debian = {
+    .pthread_size               = -1,
+    .pthread_tid_off            = -1,
+    .pthread_rseq_off           = -1,
+    .pthread_rseq_cpu_id_off    = -1,
+    .glro_tls_static_size  = -1,
+    .glro_tls_static_align = -1,
+    .glro_debug_printf     = 472,  /* 0x1d8 (was 0x1d0) */
+    .glro_mcount           = 480,  /* 0x1e0 */
+    .glro_open             = 496,  /* 0x1f0 */
+    .glro_close            = 504,  /* 0x1f8 */
+    .glro_catch_error      = -1,
+    .glro_error_free       = -1,
+    .glro_find_object      = -1,
+    .gl_tls_static_size    = 3928,
+    .gl_tls_static_align   = 3944,
+    .gl_nns                = 2304,
+    .gl_stack_flags        = 3896,
+    .gl_tls_generation     = 3960,
+    .gl_stack_used         = -1,
+    .gl_stack_user         = -1,
+    .gl_stack_cache        = -1,
+    .gl_rtld_lock_recursive   = 3848,  /* 0xf08 */
+    .gl_rtld_unlock_recursive = 3856,  /* 0xf10 */
+    .gl_make_stack_executable = -1,
+};
+
 /* glibc 2.27 (AArch64): _rtld_global_ro=520B, _rtld_global=4088B
  * Older AArch64 glibc still routes _dl_addr through recursive lock
  * callbacks stored in _rtld_global, but their offsets differ from the
@@ -1515,7 +1549,8 @@ static const struct {
 } glibc_layout_table[] = {
     { 440,  3960, &glibc_2_17 },    /* glibc 2.17–2.28 x86-64 */
     { 520,  4088, &glibc_aarch64_2_27 }, /* glibc 2.27     AArch64 */
-    { 536,  3992, &glibc_2_29 },    /* glibc 2.29–2.33 x86-64 */
+    { 536,  3992, &glibc_2_29 },    /* glibc 2.29–2.33 x86-64 (Ubuntu) */
+    { 544,  4000, &glibc_2_31_debian }, /* glibc 2.31     x86-64 (Debian 11) */
     { 624,  4152, &glibc_aarch64_2_31 }, /* glibc 2.31     AArch64 */
     { 688,  4504, &glibc_aarch64_2_35 }, /* glibc 2.35–2.39 AArch64 */
     { 928,  4304, &glibc_2_34 },    /* glibc 2.34–2.36 x86-64 */
