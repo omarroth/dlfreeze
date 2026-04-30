@@ -1128,8 +1128,9 @@ C
         return
     fi
 
-    local actual rc=0
-    actual=$(cd "$BUILD" && timeout 10 "$out" 2>&1) || rc=$?
+    local actual rc=0 out_abs
+    out_abs=$(readlink -f "$out")
+    actual=$(cd "$BUILD" && timeout 10 "$out_abs" 2>&1) || rc=$?
     actual=$(echo "$actual" | grep -v '^dlfreeze: warning:' || true)
     if [ "$actual" = "42" ] && [ "$rc" = "0" ]; then
         pass "dlopen relative path direct-load"
