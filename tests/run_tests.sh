@@ -1258,6 +1258,52 @@ C
 }
 
 # ===================================================================
+# Test 18: dlvsym (versioned symbol lookup) direct-load
+#   Real-world programs (libgcc's pthread shim, KCrash, various Qt/KDE
+#   plugins) probe for libpthread/libc features via
+#     dlvsym(RTLD_DEFAULT, "pthread_self", "GLIBC_2.2.5")
+#   When dlvsym is unimplemented those probes return NULL and the host
+#   library aborts with "Unable to find symbol X version Y. Aborting."
+#   This test ensures dlvsym at least returns the unversioned symbol
+#   when the name resolves, matching the pragmatic feature-probe use case.
+# ===================================================================
+test_dlvsym_direct() {
+    echo "--- dlvsym direct-load ---"
+    local src="$BUILD/dlv_main.c" bin="$BUILD/dlv_main"
+    local out="$BUILD/dlv_main.frozen"
+
+    cat > "$src" <<'C'
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <dlfcn.h>
+int main(void) {
+    void *p = dlvsym(RTLD_DEFAULT, "pthread_self", "GLIBC_2.2.5");
+    void *q = dlsym (RTLD_DEFAULT, "pthread_self");
+    if (!p) { fprintf(stderr, "dlvsym returned NULL\n"); return 1; }
+    if (p != q) { fprintf(stderr, "dlvsym != dlsym\n"); return 2; }
+    printf("ok\n");
+    return 0;
+}
+C
+    gcc -o "$bin" "$src" -ldl -lpthread
+
+    if ! "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
+        fail "dlvsym direct-load" "dlfreeze failed"
+        rm -f "$src" "$bin" "$out"
+        return
+    fi
+
+    local actual rc=0
+    actual=$(timeout 10 "$out" 2>&1 | grep -v '^dlfreeze: warning:') || rc=$?
+    if [ "$actual" = "ok" ] && [ "$rc" = "0" ]; then
+        pass "dlvsym direct-load"
+    else
+        fail "dlvsym direct-load" "rc=$rc out=$actual"
+    fi
+    rm -f "$src" "$bin" "$out"
+}
+
+# ===================================================================
 echo "======== dlfreeze test suite ========"
 echo "build dir: $BUILD"
 echo ""
@@ -1286,6 +1332,7 @@ test_dlopen_soname_direct
 test_dlopen_relpath_direct
 test_dlmopen_direct
 test_dlopen_tls_per_thread_direct
+test_dlvsym_direct
 
 echo ""
 echo "======== ${GRN}$PASS passed${RST}, ${RED}$FAIL failed${RST}, ${YLW}$SKIP skipped${RST} ========"

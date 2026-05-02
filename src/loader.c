@@ -4995,6 +4995,7 @@ static uint64_t lookup_elf_symbol_addr(const struct loaded_obj *obj,
 static void *my_dlopen(const char *path, int flags);
 static void *my_dlmopen(long lmid, const char *path, int flags);
 static void *my_dlsym(void *handle, const char *symbol);
+static void *my_dlvsym(void *handle, const char *symbol, const char *version);
 static int   my_dlclose(void *handle);
 static char *my_dlerror(void);
 static int   my_dl_iterate_phdr(
@@ -5033,6 +5034,7 @@ static const struct stub_sym g_overrides[] = {
     { "dlopen",          (void *)my_dlopen          },
     { "dlmopen",         (void *)my_dlmopen         },
     { "dlsym",           (void *)my_dlsym           },
+    { "dlvsym",          (void *)my_dlvsym          },
     { "dlclose",         (void *)my_dlclose         },
     { "dlerror",         (void *)my_dlerror         },
     { "dl_iterate_phdr", (void *)my_dl_iterate_phdr },
@@ -6577,6 +6579,89 @@ static void dl_set_error(const char *a, const char *b)
 static struct loaded_obj *load_elf_from_file(const char *path);
 static struct loaded_obj *load_embedded_object(uint32_t mi);
 
+/* file_has_static_tls — peek at an ELF file on disk and report whether
+ * its dynamic section sets DF_STATIC_TLS.  Such objects expect their
+ * TLS block to live at a fixed negative TPOFF inside the main thread's
+ * static TLS area.  glibc's real rtld refuses to dlopen them after
+ * startup unless static-TLS surplus exists, because the dynamic TLS
+ * model would relocate __thread accesses to the wrong addresses.
+ *
+ * Our in-process loader has no such surplus and would happily allocate
+ * a regular DTV slot, so subsequent IE-model TPOFF relocs and ifunc
+ * resolvers in the freshly mapped library scribble over the calling
+ * thread's TLS.  The result is "*** stack smashing detected ***" or
+ * a SIGSEGV inside whichever __thread variable was clobbered.
+ *
+ * Returning 1 here lets my_dlopen turn the request into a graceful
+ * NULL+dlerror, mirroring glibc's "cannot allocate memory in static
+ * TLS block" failure mode that callers already handle. */
+static int file_has_static_tls(const char *path)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+
+    Elf64_Ehdr eh;
+    if (read(fd, &eh, sizeof(eh)) != (ssize_t)sizeof(eh)) {
+        close(fd);
+        return 0;
+    }
+    if (memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0 ||
+        eh.e_ident[EI_CLASS] != ELFCLASS64 ||
+        eh.e_type != ET_DYN ||
+        eh.e_phnum == 0 || eh.e_phnum > 64) {
+        close(fd);
+        return 0;
+    }
+
+    Elf64_Phdr ph[64];
+    size_t phsz = (size_t)eh.e_phnum * eh.e_phentsize;
+    if (phsz > sizeof(ph) ||
+        pread(fd, ph, phsz, eh.e_phoff) != (ssize_t)phsz) {
+        close(fd);
+        return 0;
+    }
+
+    /* Locate PT_DYNAMIC and PT_TLS.  DF_STATIC_TLS is only meaningful
+     * if the object actually has a non-empty TLS template — many glibc
+     * libs (e.g. libm.so.6) carry the flag for legacy reasons but
+     * declare zero TLS, so loading them is harmless. */
+    const Elf64_Phdr *dyn_ph = NULL;
+    uint64_t tls_memsz = 0;
+    for (int i = 0; i < eh.e_phnum; i++) {
+        if (ph[i].p_type == PT_DYNAMIC) dyn_ph = &ph[i];
+        else if (ph[i].p_type == PT_TLS) tls_memsz = ph[i].p_memsz;
+    }
+    if (!dyn_ph || dyn_ph->p_filesz == 0 ||
+        dyn_ph->p_filesz > 64 * 1024 ||
+        tls_memsz == 0) {
+        close(fd);
+        return 0;
+    }
+
+    /* Read the dynamic table */
+    Elf64_Dyn *dyn = malloc(dyn_ph->p_filesz);
+    if (!dyn) { close(fd); return 0; }
+    if (pread(fd, dyn, dyn_ph->p_filesz, dyn_ph->p_offset) !=
+        (ssize_t)dyn_ph->p_filesz) {
+        free(dyn);
+        close(fd);
+        return 0;
+    }
+    close(fd);
+
+    int found = 0;
+    size_t n = dyn_ph->p_filesz / sizeof(Elf64_Dyn);
+    for (size_t i = 0; i < n && dyn[i].d_tag != DT_NULL; i++) {
+        if (dyn[i].d_tag == DT_FLAGS &&
+            (dyn[i].d_un.d_val & 0x10 /* DF_STATIC_TLS */)) {
+            found = 1;
+            break;
+        }
+    }
+    free(dyn);
+    return found;
+}
+
 static const char *g_runtime_search_dirs[] = {
     "/lib",
     "/lib64",
@@ -6671,6 +6756,23 @@ static struct loaded_obj *load_elf_from_file(const char *path)
     int idx = g_nobj;
     if (idx >= MAX_TOTAL_OBJS) {
         dl_set_error("too many loaded objects", NULL);
+        return NULL;
+    }
+
+    /* Refuse libraries built with DF_STATIC_TLS — they cannot be loaded
+     * after startup without overwriting the calling thread's static TLS
+     * area (see file_has_static_tls comment).  Surface this as a normal
+     * dlopen failure so callers fall back to alternative ICDs / plugins
+     * instead of taking down the process. */
+    if (file_has_static_tls(path)) {
+        dl_set_error(path,
+            ": cannot dlopen DF_STATIC_TLS library after startup "
+            "(would clobber main thread TLS)");
+        if (g_debug) {
+            ldr_msg("[loader] refusing dlopen of DF_STATIC_TLS lib: ");
+            ldr_msg(path);
+            ldr_msg("\n");
+        }
         return NULL;
     }
 
@@ -7046,6 +7148,7 @@ static void *my_dlopen(const char *path, int flags)
 
     /* Check if already loaded (basename match) */
     const char *bn = dl_basename(path);
+
     for (int i = 0; i < g_nobj; i++) {
         if (!g_all_objs[i].name) continue;
         if (dl_name_matches(g_all_objs[i].name, bn))
@@ -7140,6 +7243,33 @@ static void *my_dlsym(void *handle, const char *symbol)
     if (addr) return (void *)(uintptr_t)addr;
 
     dl_set_error("undefined symbol: ", symbol);
+    return NULL;
+}
+
+/* dlvsym(handle, name, version) — versioned symbol lookup.
+ *
+ * The frozen loader does not maintain GNU symbol-version tables for the
+ * libraries it embeds, so it cannot truly verify that a symbol has the
+ * requested version.  However, the dominant real-world use of dlvsym is
+ * a feature probe ("is this versioned symbol available at all?") rather
+ * than strict version matching — e.g. libgcc's pthread shim does
+ *   dlvsym(RTLD_DEFAULT, "pthread_self", "GLIBC_2.2.5")
+ * to detect a real libpthread, and KCrash / various Qt/KDE plugins do
+ * similar probes during startup.  Returning the unversioned symbol when
+ * the name resolves is therefore the pragmatic and compatible behaviour
+ * (and matches what glibc does for the default version of a symbol).
+ *
+ * If lookup fails we set the same error format glibc uses, so callers
+ * that fall back to dlerror() see a familiar message. */
+static void *my_dlvsym(void *handle, const char *symbol, const char *version)
+{
+    void *p = my_dlsym(handle, symbol);
+    if (p) return p;
+    /* my_dlsym already populated dlerror with "undefined symbol: ...";
+     * leave it in place so the caller can read a sensible error.  We
+     * deliberately don't surface the requested version here because the
+     * common failure mode is the symbol not existing at all. */
+    (void)version;
     return NULL;
 }
 
@@ -7792,6 +7922,40 @@ static void transfer_to_entry(uintptr_t entry, int argc, char **argv,
     __builtin_unreachable();
 }
 
+/* DFS topological sort: visit dependencies of obj before obj itself.
+ * state[]: 0 = unvisited, 1 = on stack (cycle marker), 2 = appended to order.
+ * Walks PT_DYNAMIC for DT_NEEDED, finds matching loaded obj by basename. */
+static void topo_visit_init(int idx, struct loaded_obj *objs, int nobj,
+                            char *state, int *order, int *order_count)
+{
+    if (state[idx] != 0) return;
+    state[idx] = 1;
+    struct loaded_obj *obj = &objs[idx];
+    if (obj->phdr && obj->dynstr) {
+        for (int p = 0; p < obj->phdr_num; p++) {
+            if (obj->phdr[p].p_type != PT_DYNAMIC) continue;
+            const Elf64_Dyn *dyn = (const Elf64_Dyn *)
+                (obj->base + obj->phdr[p].p_vaddr);
+            for (int d = 0; dyn[d].d_tag != DT_NULL; d++) {
+                if (dyn[d].d_tag != DT_NEEDED) continue;
+                const char *needed = obj->dynstr + dyn[d].d_un.d_val;
+                for (int j = 0; j < nobj; j++) {
+                    if (j == idx) continue;
+                    if (state[j] != 0) continue; /* done or cycle */
+                    if (dl_name_matches(objs[j].name, needed)) {
+                        topo_visit_init(j, objs, nobj, state, order,
+                                        order_count);
+                        break;
+                    }
+                }
+            }
+            break;
+        }
+    }
+    state[idx] = 2;
+    order[(*order_count)++] = idx;
+}
+
 /* ==== Main entry point ================================================= */
 
 int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
@@ -8235,19 +8399,30 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     if (prelinked)
         begin_crash_handler_guard_from_saved(startup_crash_handlers);
 
-    /* Call in reverse order: libraries without dependents first (libc, libm,
-     * etc.) then libraries that depend on them (libpython, etc.).
-     * The packer stores objects as: exe, direct-deps, transitive-deps...
-     * so reversing gives a correct dependency-leaf-first order. */
-    for (int i = nobj - 1; i >= 0; i--) {
-        if (objs[i].flags & LDR_FLAG_MAIN_EXE) continue;
-        ldr_dbg("[loader] init: ");
-        ldr_dbg(objs[i].name);
-        ldr_dbg("\n");
-        if (objs[i].init_func)
-            ((init_fn_t)objs[i].init_func)(argc, argv, runtime_envp);
-        for (size_t j = 0; j < objs[i].init_array_sz; j++)
-            ((init_fn_t)objs[i].init_array[j])(argc, argv, runtime_envp);
+    /* Topologically sort objects so dependencies init before dependents.
+     * The packer's array order is not always a strict BFS dep order — e.g.
+     * libGLX.so.0 may appear at a higher index than its dep libGLdispatch.so.0
+     * even though libGLX's constructor calls into libGLdispatch.  A real
+     * topo sort over DT_NEEDED edges is the only robust ordering. */
+    {
+        int order[nobj > 0 ? nobj : 1];
+        char state[nobj > 0 ? nobj : 1];
+        int order_count = 0;
+        for (int i = 0; i < nobj; i++) state[i] = 0;
+        for (int i = 0; i < nobj; i++)
+            topo_visit_init(i, objs, nobj, state, order, &order_count);
+
+        for (int oi = 0; oi < order_count; oi++) {
+            int i = order[oi];
+            if (objs[i].flags & LDR_FLAG_MAIN_EXE) continue;
+            ldr_dbg("[loader] init: ");
+            ldr_dbg(objs[i].name);
+            ldr_dbg("\n");
+            if (objs[i].init_func)
+                ((init_fn_t)objs[i].init_func)(argc, argv, runtime_envp);
+            for (size_t j = 0; j < objs[i].init_array_sz; j++)
+                ((init_fn_t)objs[i].init_array[j])(argc, argv, runtime_envp);
+        }
     }
 
     for (int i = 0; i < nobj; i++) {

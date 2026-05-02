@@ -23,6 +23,9 @@
 #include <fnmatch.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <signal.h>
+#include <time.h>
+#include <errno.h>
 
 #include "elf_parser.h"
 #include "dep_resolver.h"
@@ -547,6 +550,8 @@ static int capture_data_files(const char *exe_path, int argc, char **argv,
     }
 
     if (pid == 0) {
+        /* New process group so we can SIGTERM the whole tree on timeout. */
+        setpgid(0, 0);
         int tstart = optind_val + 1;  /* args after the executable */
 
         if (have_preload) {
@@ -586,7 +591,13 @@ static int capture_data_files(const char *exe_path, int argc, char **argv,
     }
 
     int st;
-    waitpid(pid, &st, 0);
+    if (waitpid(pid, &st, 0) < 0) {
+        perror("waitpid");
+        unlink(tracef);
+        if (have_preload) unlink(dlopen_tracef);
+        if (!have_preload) unlink(elf_tracef);
+        return -1;
+    }
     if (!WIFEXITED(st) || (!have_preload && WEXITSTATUS(st) == 127)) {
         if (have_preload)
             fprintf(stderr, "dlfreeze: traced execution failed\n");
@@ -763,6 +774,7 @@ int main(int argc, char **argv)
 
                 pid_t pid = fork();
                 if (pid == 0) {
+                    setpgid(0, 0);
                     setenv("LD_PRELOAD", preload, 1);
                     setenv("DLFREEZE_TRACE_FILE", tracef, 1);
 
