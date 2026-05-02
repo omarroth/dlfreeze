@@ -81,7 +81,17 @@ ENVS=(
     "ubuntu-20.04|ubuntu:20.04"
     "ubuntu-24.04|ubuntu:24.04"
     "alpine-3.20|alpine:3.20"
+    "debian-12|debian:12"
+    "debian-trixie|debian:trixie"
+    "fedora-41|fedora:41"
+    "fedora-rawhide|fedora:rawhide"
 )
+# Arch's official image is amd64-only; use the community arm64 fork on arm64.
+if [[ "$ARCH" == "arm64" ]]; then
+    ENVS+=("arch-latest|menci/archlinuxarm:base")
+else
+    ENVS+=("arch-latest|archlinux:latest")
+fi
 
 run_in_image() {
     local image="$1"

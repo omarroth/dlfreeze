@@ -39,6 +39,7 @@
 #define LDR_FLAG_NEEDS_RTLD  0x20
 #define LDR_FLAG_DATA        0x40
 #define LDR_FLAG_RUNTIME_SCAN 0x80
+#define LDR_FLAG_FROZEN_MOUNT 0x400
 
 #define LDR_PRELINK_FIXUP_JMPREL 0x80000000u
 
@@ -3228,6 +3229,110 @@ static uint32_t vfs_hash(const char *s)
 static void vfs_init_dirs(void);
 static void vfs_init_pyc_aliases(void);
 static int vfs_dir_exists(const char *path);
+static const struct vfs_entry *vfs_lookup(const char *path);
+static int frozen_dlopen_find(const char *path);
+
+/* ---- Frozen-mount patterns (sealed VFS boundaries) -------------------- */
+/*
+ * The user's `-f GLOB` arguments at freeze time are persisted as
+ * DLFRZ_FLAG_FROZEN_MOUNT manifest entries.  At runtime, any absolute
+ * path that matches a pattern is considered to live "inside" the
+ * frozen mount: lookups that miss the captured VFS contents return
+ * ENOENT instead of falling through to the host filesystem.  This
+ * makes the frozen image behave like an immutable bind mount of the
+ * directory tree as it existed when the binary was created.
+ */
+#define VFS_MAX_FROZEN_MOUNTS 64
+static const char *g_frozen_mount_patterns[VFS_MAX_FROZEN_MOUNTS];
+static int g_frozen_mount_count;
+
+/* fnmatch-equivalent supporting `*` (does not cross '/') and `?`.
+ * Returns 0 on match (POSIX convention), non-zero otherwise. */
+static int vfs_fnmatch(const char *pat, const char *str)
+{
+    while (*pat) {
+        char p = *pat;
+        if (p == '*') {
+            /* Skip runs of '*' */
+            while (*pat == '*') pat++;
+            if (!*pat) {
+                /* Trailing '*': match any run of non-'/' to end of str */
+                while (*str && *str != '/') str++;
+                return *str ? 1 : 0;
+            }
+            /* Try to match the rest at every position up to next '/' */
+            while (*str) {
+                if (vfs_fnmatch(pat, str) == 0) return 0;
+                if (*str == '/') break;
+                str++;
+            }
+            return vfs_fnmatch(pat, str);
+        } else if (p == '?') {
+            if (!*str || *str == '/') return 1;
+            pat++; str++;
+        } else {
+            if (*str != p) return 1;
+            pat++; str++;
+        }
+    }
+    return *str ? 1 : 0;
+}
+
+/* Match `path` against a single freeze-time glob, mirroring main.c's
+ * match_glob():
+ *   - Direct fnmatch ('*' does not cross '/')
+ *   - For patterns ending in "/" + "*": also match deeper paths via prefix
+ *   - For patterns ending in "/" + "*": also match the parent dir itself
+ *     (so -f /usr/lib/python3.14/+star seals stat() of /usr/lib/python3.14)
+ */
+static int vfs_pattern_matches(const char *pat, const char *path)
+{
+    if (vfs_fnmatch(pat, path) == 0)
+        return 1;
+    int plen = (int)strlen(pat);
+    if (plen >= 2 && pat[plen - 1] == '*' && pat[plen - 2] == '/') {
+        if (strncmp(path, pat, plen - 1) == 0)
+            return 1;
+        /* Parent dir without trailing slash */
+        if (strncmp(path, pat, plen - 2) == 0 && path[plen - 2] == '\0')
+            return 1;
+    }
+    return 0;
+}
+
+static int path_is_frozen_mount(const char *path)
+{
+    if (!path || path[0] != '/' || g_frozen_mount_count == 0)
+        return 0;
+    for (int i = 0; i < g_frozen_mount_count; i++) {
+        if (vfs_pattern_matches(g_frozen_mount_patterns[i], path))
+            return 1;
+    }
+    return 0;
+}
+
+/* True when `path` lives inside a frozen mount but no VFS entry, dir
+ * mapping, or frozen-DLOPEN ELF covers it.  The VFS wrappers should
+ * short-circuit to ENOENT for these and skip the host syscall. */
+static int vfs_path_is_sealed_miss(const char *path)
+{
+    if (!path_is_frozen_mount(path))
+        return 0;
+    if (vfs_lookup(path)) return 0;
+    if (vfs_dir_exists(path)) return 0;
+    if (frozen_dlopen_find(path) >= 0) return 0;
+    return 1;
+}
+
+static void vfs_seal_log(const char *op, const char *path)
+{
+    if (!g_debug) return;
+    ldr_msg("vfs sealed ");
+    ldr_msg(op);
+    ldr_msg(": ");
+    ldr_msg(path);
+    ldr_msg(" (frozen mount, not captured) -> ENOENT\n");
+}
 
 static void vfs_init(const uint8_t *mem, uint64_t mem_foff,
                      const struct dlfrz_entry *entries,
@@ -3249,6 +3354,27 @@ static void vfs_init(const uint8_t *mem, uint64_t mem_foff,
     if (g_debug && g_vfs_count > 0) {
         ldr_dbg_hex("[loader] vfs: 0x", g_vfs_count);
         ldr_msg(" data files registered\n");
+    }
+    /* Collect frozen-mount patterns: paths matching any of these are
+     * served exclusively from the VFS; misses ENOENT instead of
+     * falling through to the host filesystem. */
+    g_frozen_mount_count = 0;
+    for (uint32_t i = 0; i < num_entries; i++) {
+        if (!(entries[i].flags & DLFRZ_FLAG_FROZEN_MOUNT)) continue;
+        if (g_frozen_mount_count >= (int)(sizeof(g_frozen_mount_patterns) /
+                                          sizeof(g_frozen_mount_patterns[0])))
+            break;
+        g_frozen_mount_patterns[g_frozen_mount_count++] =
+            strtab + entries[i].name_offset;
+    }
+    if (g_debug && g_frozen_mount_count > 0) {
+        ldr_dbg_hex("[loader] vfs: 0x", g_frozen_mount_count);
+        ldr_msg(" frozen-mount patterns registered\n");
+        for (int i = 0; i < g_frozen_mount_count; i++) {
+            ldr_msg("  ");
+            ldr_msg(g_frozen_mount_patterns[i]);
+            ldr_msg("\n");
+        }
     }
     if (g_vfs_count > 0) {
         vfs_init_dirs();
@@ -4327,6 +4453,15 @@ static int vfs_open(const char *path, int flags, int mode)
             int fd = vfs_serve_memfd(ve, path);
             if (fd >= 0) return fd;
         }
+        /* Sealed mount: refuse host fall-through for paths that match a
+         * frozen-mount glob but were not captured.  This prevents the
+         * frozen binary from reading files that exist on the host but
+         * were not present at freeze time. */
+        if (vfs_path_is_sealed_miss(path)) {
+            vfs_seal_log("open", path);
+            set_loader_errno(ENOENT);
+            return -1;
+        }
         int ret = (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, path, flags, mode);
         if (ret >= 0) return ret;
         /* Probe-open for a DLOPEN ELF (e.g. Ruby's require checking .so exists) */
@@ -4382,6 +4517,12 @@ static int vfs_openat(int dirfd, const char *path, int flags, int mode)
                 int fd = vfs_serve_memfd(ve, lookup_path);
                 if (fd >= 0) return fd;
             }
+            /* Sealed mount: refuse host fall-through for matching misses */
+            if (vfs_path_is_sealed_miss(lookup_path)) {
+                vfs_seal_log("openat", lookup_path);
+                set_loader_errno(ENOENT);
+                return -1;
+            }
             /* Fallback: probe-open for a DLOPEN ELF path not in VFS data */
             {
                 int ret = (int)VFS_SYSCALL(SYS_openat, dirfd, path, flags, mode);
@@ -4417,6 +4558,11 @@ static void *vfs_fopen(const char *path, const char *mode)
             if (fd >= 0 && g_real_fdopen)
                 return g_real_fdopen(fd, mode);
             if (fd >= 0) VFS_SYSCALL(SYS_close, fd);
+        }
+        if (vfs_path_is_sealed_miss(path)) {
+            vfs_seal_log("fopen", path);
+            set_loader_errno(ENOENT);
+            return (void *)0;
         }
         vfs_dbg_op("fopen", path, "syscall");
     }
@@ -4523,6 +4669,12 @@ static int vfs_stat(const char *path, struct stat *buf)
         }
     }
 vfs_stat_fallthrough:;
+    /* Sealed mount: don't touch the host FS for misses inside a frozen mount. */
+    if (vfs_path_is_sealed_miss(path)) {
+        vfs_seal_log("stat", path);
+        set_loader_errno(ENOENT);
+        return -1;
+    }
     /* Directories & everything else: real FS first, VFS fallback */
     int ret = (int)VFS_SYSCALL(SYS_newfstatat, AT_FDCWD, path, buf, 0);
     if (ret == 0) return 0;
@@ -4580,6 +4732,11 @@ static int vfs_fstatat(int dirfd, const char *path, struct stat *buf, int flag)
         }
     }
 vfs_fstatat_fallthrough:;
+    if (vfs_path_is_sealed_miss(lookup_path)) {
+        vfs_seal_log("fstatat", lookup_path);
+        set_loader_errno(ENOENT);
+        return -1;
+    }
     int ret = (int)VFS_SYSCALL(SYS_newfstatat, dirfd, path, buf, flag);
     if (ret == 0) return 0;
     if (lookup_path && lookup_path[0] == '/') {
@@ -4621,6 +4778,11 @@ static int vfs_access(const char *path, int amode)
             return 0;
         }
     }
+    if (vfs_path_is_sealed_miss(path)) {
+        vfs_seal_log("access", path);
+        set_loader_errno(ENOENT);
+        return -1;
+    }
     int ret = (int)VFS_SYSCALL(SYS_faccessat, AT_FDCWD, path, amode, 0);
     if (ret == 0) return 0;
     if (path && path[0] == '/') {
@@ -4656,6 +4818,11 @@ static int vfs_faccessat(int dirfd, const char *path, int amode, int flag)
             vfs_dbg_op("faccessat", lookup_path, "file");
             return 0;
         }
+    }
+    if (vfs_path_is_sealed_miss(lookup_path)) {
+        vfs_seal_log("faccessat", lookup_path);
+        set_loader_errno(ENOENT);
+        return -1;
     }
     int ret = (int)VFS_SYSCALL(SYS_faccessat, dirfd, path, amode, flag);
     if (ret == 0) return 0;
@@ -8038,7 +8205,8 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     for (uint32_t i = 0; i < num_entries; i++)
         if (!(metas[i].flags & LDR_FLAG_INTERP) &&
             !(metas[i].flags & LDR_FLAG_DLOPEN) &&
-            !(metas[i].flags & LDR_FLAG_DATA)) nobj++;
+            !(metas[i].flags & LDR_FLAG_DATA) &&
+            !(metas[i].flags & LDR_FLAG_FROZEN_MOUNT)) nobj++;
 
     if (nobj == 0) { ldr_err("no objects to load", NULL); return -1; }
     if (nobj > MAX_TOTAL_OBJS) { ldr_err("too many objects", NULL); return -1; }
@@ -8054,6 +8222,7 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         if (metas[i].flags & LDR_FLAG_INTERP) continue;
         if (metas[i].flags & LDR_FLAG_DLOPEN) continue;
         if (metas[i].flags & LDR_FLAG_DATA) continue;
+        if (metas[i].flags & LDR_FLAG_FROZEN_MOUNT) continue;
         if (!(metas[i].flags & LDR_FLAG_MAIN_EXE)) continue;
         objs[oi].name  = strtab + entries[i].name_offset;
         objs[oi].flags = metas[i].flags;
@@ -8064,6 +8233,7 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         if (metas[i].flags & LDR_FLAG_INTERP) continue;
         if (metas[i].flags & LDR_FLAG_DLOPEN) continue;
         if (metas[i].flags & LDR_FLAG_DATA) continue;
+        if (metas[i].flags & LDR_FLAG_FROZEN_MOUNT) continue;
         if (metas[i].flags & LDR_FLAG_MAIN_EXE) continue;
         objs[oi].name  = strtab + entries[i].name_offset;
         objs[oi].flags = metas[i].flags;

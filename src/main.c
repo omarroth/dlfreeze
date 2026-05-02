@@ -839,6 +839,8 @@ int main(int argc, char **argv)
         .deps           = &deps,
         .direct_load    = direct_load,
         .data_files     = data_files.count > 0 ? &data_files : NULL,
+        .frozen_patterns = nfile_patterns > 0 ? file_patterns : NULL,
+        .frozen_pattern_count = nfile_patterns,
     };
     int rc = pack_frozen(&po);
 

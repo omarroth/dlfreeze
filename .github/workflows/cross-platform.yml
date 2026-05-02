@@ -21,15 +21,27 @@ jobs:
       matrix:
         include:
           # x86_64
-          - { env: ubuntu-18.04, image: "ubuntu:18.04", arch: amd64 }
-          - { env: ubuntu-20.04, image: "ubuntu:20.04", arch: amd64 }
-          - { env: ubuntu-24.04, image: "ubuntu:24.04", arch: amd64 }
-          - { env: alpine-3.20,  image: "alpine:3.20",  arch: amd64 }
+          - { env: ubuntu-18.04,  image: "ubuntu:18.04",      arch: amd64 }
+          - { env: ubuntu-20.04,  image: "ubuntu:20.04",      arch: amd64 }
+          - { env: ubuntu-24.04,  image: "ubuntu:24.04",      arch: amd64 }
+          - { env: alpine-3.20,   image: "alpine:3.20",       arch: amd64 }
+          - { env: debian-12,     image: "debian:12",         arch: amd64 }
+          - { env: debian-trixie, image: "debian:trixie",     arch: amd64 }
+          - { env: fedora-41,     image: "fedora:41",         arch: amd64 }
+          - { env: fedora-rawhide,image: "fedora:rawhide",    arch: amd64 }
+          - { env: arch-latest,   image: "archlinux:latest",  arch: amd64 }
           # aarch64 (via QEMU)
-          - { env: ubuntu-18.04, image: "ubuntu:18.04", arch: arm64 }
-          - { env: ubuntu-20.04, image: "ubuntu:20.04", arch: arm64 }
-          - { env: ubuntu-24.04, image: "ubuntu:24.04", arch: arm64 }
-          - { env: alpine-3.20,  image: "alpine:3.20",  arch: arm64 }
+          - { env: ubuntu-18.04,  image: "ubuntu:18.04",      arch: arm64 }
+          - { env: ubuntu-20.04,  image: "ubuntu:20.04",      arch: arm64 }
+          - { env: ubuntu-24.04,  image: "ubuntu:24.04",      arch: arm64 }
+          - { env: alpine-3.20,   image: "alpine:3.20",       arch: arm64 }
+          - { env: debian-12,     image: "debian:12",         arch: arm64 }
+          - { env: debian-trixie, image: "debian:trixie",     arch: arm64 }
+          - { env: fedora-41,     image: "fedora:41",         arch: arm64 }
+          - { env: fedora-rawhide,image: "fedora:rawhide",    arch: arm64 }
+          # Arch's official image only ships amd64; arm64 requires
+          # the community-maintained menci/archlinuxarm fork.
+          - { env: arch-latest,   image: "menci/archlinuxarm:base", arch: arm64 }
     steps:
       - uses: actions/checkout@v4
 
@@ -60,15 +72,25 @@ jobs:
       matrix:
         include:
           # x86_64
-          - { env: ubuntu-18.04, image: "ubuntu:18.04", arch: amd64 }
-          - { env: ubuntu-20.04, image: "ubuntu:20.04", arch: amd64 }
-          - { env: ubuntu-24.04, image: "ubuntu:24.04", arch: amd64 }
-          - { env: alpine-3.20,  image: "alpine:3.20",  arch: amd64 }
+          - { env: ubuntu-18.04,  image: "ubuntu:18.04",      arch: amd64 }
+          - { env: ubuntu-20.04,  image: "ubuntu:20.04",      arch: amd64 }
+          - { env: ubuntu-24.04,  image: "ubuntu:24.04",      arch: amd64 }
+          - { env: alpine-3.20,   image: "alpine:3.20",       arch: amd64 }
+          - { env: debian-12,     image: "debian:12",         arch: amd64 }
+          - { env: debian-trixie, image: "debian:trixie",     arch: amd64 }
+          - { env: fedora-41,     image: "fedora:41",         arch: amd64 }
+          - { env: fedora-rawhide,image: "fedora:rawhide",    arch: amd64 }
+          - { env: arch-latest,   image: "archlinux:latest",  arch: amd64 }
           # aarch64
-          - { env: ubuntu-18.04, image: "ubuntu:18.04", arch: arm64 }
-          - { env: ubuntu-20.04, image: "ubuntu:20.04", arch: arm64 }
-          - { env: ubuntu-24.04, image: "ubuntu:24.04", arch: arm64 }
-          - { env: alpine-3.20,  image: "alpine:3.20",  arch: arm64 }
+          - { env: ubuntu-18.04,  image: "ubuntu:18.04",      arch: arm64 }
+          - { env: ubuntu-20.04,  image: "ubuntu:20.04",      arch: arm64 }
+          - { env: ubuntu-24.04,  image: "ubuntu:24.04",      arch: arm64 }
+          - { env: alpine-3.20,   image: "alpine:3.20",       arch: arm64 }
+          - { env: debian-12,     image: "debian:12",         arch: arm64 }
+          - { env: debian-trixie, image: "debian:trixie",     arch: arm64 }
+          - { env: fedora-41,     image: "fedora:41",         arch: arm64 }
+          - { env: fedora-rawhide,image: "fedora:rawhide",    arch: arm64 }
+          - { env: arch-latest,   image: "menci/archlinuxarm:base", arch: arm64 }
     steps:
       - uses: actions/checkout@v4
 

@@ -16,6 +16,7 @@
 #define DLFRZ_FLAG_RUNTIME_SCAN 0x80 /* needs runtime special/IRELATIVE scan      */
 #define DLFRZ_FLAG_DATA_VIRTUAL  0x100 /* placeholder data entry, not openable      */
 #define DLFRZ_FLAG_DATA_NEGATIVE 0x200 /* negative entry: not found at freeze time  */
+#define DLFRZ_FLAG_FROZEN_MOUNT  0x400 /* entry's name is a sealed-mount glob       */
 
 struct dlfrz_entry {
     uint64_t data_offset;

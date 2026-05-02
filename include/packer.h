@@ -25,6 +25,8 @@ struct pack_options {
     struct dep_list *deps;            /* resolved dependencies         */
     int              direct_load;     /* 1 = embed loader metadata     */
     struct data_file_list *data_files; /* non-ELF files to embed       */
+    const char *const *frozen_patterns; /* user -f globs (sealed mount) */
+    int              frozen_pattern_count;
 };
 
 /* Create a frozen (self-extracting) ELF binary. */

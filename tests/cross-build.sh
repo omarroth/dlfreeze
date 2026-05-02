@@ -27,6 +27,29 @@ if [ -f /etc/alpine-release ]; then
     if ! command -v musl-gcc >/dev/null 2>&1; then
         ln -sf "$(command -v gcc)" /usr/local/bin/musl-gcc
     fi
+elif [ -f /etc/arch-release ]; then
+    pacman -Sy --noconfirm --needed \
+        gcc musl make bash python file binutils strace 2>&1 | tail -3
+    pacman -S --noconfirm --needed upx 2>/dev/null || true
+    pacman -S --noconfirm --needed ruby 2>/dev/null || true
+    # Arch ships musl as a separate package providing /usr/bin/musl-gcc
+    if ! command -v musl-gcc >/dev/null 2>&1; then
+        # fall back to plain gcc; static-musl link will be dropped
+        ln -sf "$(command -v gcc)" /usr/local/bin/musl-gcc
+    fi
+elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+    PKG=$(command -v dnf || command -v yum)
+    "$PKG" install -y -q \
+        gcc make bash python3 file binutils glibc-static 2>&1 | tail -3
+    "$PKG" install -y -q strace 2>/dev/null || true
+    "$PKG" install -y -q ruby 2>/dev/null || true
+    "$PKG" install -y -q upx 2>/dev/null || true
+    # Fedora doesn't ship musl-gcc in repos — fall back to plain gcc.
+    # The Makefile uses musl-gcc for the static bootstrap; on glibc-only
+    # systems we link statically against glibc instead.
+    if ! command -v musl-gcc >/dev/null 2>&1; then
+        ln -sf "$(command -v gcc)" /usr/local/bin/musl-gcc
+    fi
 elif [ -f /etc/debian_version ]; then
     export DEBIAN_FRONTEND=noninteractive
     if ! apt-get update -qq 2>/dev/null; then
