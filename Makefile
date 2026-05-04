@@ -22,6 +22,14 @@ PRELOAD   = $(BUILD)/dlfreeze-preload.so
 # Use musl-gcc for static tools when available; fall back to system gcc.
 TOOL_CC := $(shell command -v musl-gcc 2>/dev/null || echo $(CC))
 
+# Some toolchains (gcc >= 16) inject -latomic_asneeded into the link line,
+# but musl-gcc.specs only adds -L/usr/lib/musl/lib so the system copy
+# isn't found.  Add /usr/lib via LIBRARY_PATH (searched AFTER gcc's own
+# -L paths, so musl's -lc still wins) when the host file exists.
+ifneq (,$(wildcard /usr/lib/libatomic_asneeded.a))
+MUSL_LIB_PATH := LIBRARY_PATH=/usr/lib
+endif
+
 .DEFAULT_GOAL := all
 
 .PHONY: all clean test bench local-verify local-cross prepare-build
@@ -52,7 +60,7 @@ $(BUILD)/%.o: $(SRC)/%.c | prepare-build
 # Link at 0x40000000 so the default 0x400000 range is free for non-PIE
 # executables in the prelinker child process.
 $(DLFREEZE): $(TOOL_OBJS)
-	$(TOOL_CC) $(CFLAGS) -static -Wl,-Ttext-segment=0x40000000 -o $@ $^ $(LDFLAGS)
+	$(MUSL_LIB_PATH) $(TOOL_CC) $(CFLAGS) -static -Wl,-Ttext-segment=0x40000000 -o $@ $^ $(LDFLAGS)
 
 # ── bootstrap (statically linked, includes in-process loader) ──────
 # Use musl-gcc for much smaller static binary (fewer page faults).
@@ -63,7 +71,7 @@ BOOTSTRAP_CC := $(shell command -v musl-gcc 2>/dev/null || echo $(CC))
 INC      = include
 
 $(BOOTSTRAP): $(SRC)/bootstrap.c $(SRC)/loader.c $(INC)/common.h $(INC)/loader.h | prepare-build
-	$(BOOTSTRAP_CC) -Wall -Wextra -O2 -D_GNU_SOURCE -Iinclude -fno-stack-protector \
+	$(MUSL_LIB_PATH) $(BOOTSTRAP_CC) -Wall -Wextra -O2 -D_GNU_SOURCE -Iinclude -fno-stack-protector \
 	    -ffunction-sections -fdata-sections \
 	    -static -Wl,--gc-sections -Wl,-Ttext-segment=0x40000000 \
 	    -o $@ $(SRC)/bootstrap.c $(SRC)/loader.c

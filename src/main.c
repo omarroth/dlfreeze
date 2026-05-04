@@ -127,20 +127,40 @@ static void scan_dir_shallow(const char *dirpath,
             continue;
         char child[PATH_MAX];
         snprintf(child, sizeof(child), "%s/%s", dirpath, e->d_name);
+
+        /* Use lstat first so we can detect symlinks before following.
+         * scan_dir_shallow is meant to pick up sibling files inside an
+         * already-captured directory; following a symlink that points
+         * *outside* the captured tree (e.g. _pcbnew.so -> /usr/bin/...)
+         * pulls in unrelated megabytes the program never used.  Only
+         * follow links whose realpath stays under the captured dir. */
+        struct stat lsb;
+        if (lstat(child, &lsb) != 0) continue;
+
         char rpath[PATH_MAX];
-        if (!realpath(child, rpath)) continue;
+        if (S_ISLNK(lsb.st_mode)) {
+            if (!realpath(child, rpath)) continue;
+            size_t dlen = strlen(dirpath);
+            if (strncmp(rpath, dirpath, dlen) != 0 ||
+                (rpath[dlen] != '/' && rpath[dlen] != '\0'))
+                continue;  /* link target escapes captured dir */
+        } else {
+            if (!realpath(child, rpath)) continue;
+        }
 
         struct stat sb;
         if (stat(rpath, &sb) != 0) continue;
 
-        /* Subdirectory: add a virtual .dir marker so the VFS dir table
-         * will include this subdir in the parent's listing. */
-        if (S_ISDIR(sb.st_mode)) {
-            char marker[PATH_MAX];
-            snprintf(marker, sizeof(marker), "%s/.dir", rpath);
-            data_file_list_add_virtual(out, marker);
+        /* Subdirectory: skip.  We deliberately do NOT add a .dir
+         * marker here because that would make vfs_dir_exists() report
+         * the subdir as present even when none of its contents were
+         * captured, causing Python's import machinery to treat it as
+         * an (empty) namespace package and shadow the real module
+         * (e.g. /usr/lib/python3.14/re becoming an empty 're'
+         * package).  Subdirs that actually have captured files will
+         * appear in the VFS dir table via those entries' parents. */
+        if (S_ISDIR(sb.st_mode))
             continue;
-        }
 
         if (!S_ISREG(sb.st_mode)) continue;
 
@@ -164,6 +184,27 @@ static void scan_dir_shallow(const char *dirpath,
         if (skip) {
             data_file_list_add_virtual(out, rpath);
         } else {
+            /* Sibling ELF files that aren't known deps were never
+             * dlopen'd or executed by the traced program.  Bundling
+             * them as real payload bloats the frozen binary by tens
+             * of MB (e.g. cv2.so, libtorrent.so in site-packages).
+             * If the program later tries to load one at runtime it
+             * will get ENOENT — same as if -f had not matched it. */
+            if (elf_check(rpath))
+                continue;
+            /* .pth files in site-packages execute Python code at
+             * interpreter startup (site.addpackage).  Many of them
+             * (e.g. *-nspkg.pth) call importlib to load namespace
+             * packages we didn't capture, which raises and forces
+             * Python to load `traceback` -> `re` etc. that the trace
+             * never opened.  Skip them — site.py tolerates an empty
+             * site-packages just fine. */
+            const char *base = strrchr(rpath, '/');
+            if (base) {
+                size_t blen = strlen(base);
+                if (blen >= 4 && strcmp(base + blen - 4, ".pth") == 0)
+                    continue;
+            }
             data_file_list_add(out, rpath);
         }
     }
@@ -255,28 +296,40 @@ static void process_captured_path(const char *exe_path, const char **patterns,
         if (!dir_matches_patterns(rpath, patterns, npatterns))
             return;
 
-        add_capture_dir(cap_dirs, ncap_dirs, cap_dirs_cap, rpath);
-        /* When a __pycache__ directory is captured, also capture its
-         * parent package directory so the .py source files alongside
-         * the .pyc cache files become available — Python may import
-         * sibling submodules via frozen importlib that bypass the
-         * trace (e.g. importlib._bootstrap loaded by frozen
-         * importlib.machinery). */
-        {
-            const char *slash = strrchr(rpath, '/');
-            if (slash && slash > rpath &&
-                strcmp(slash + 1, "__pycache__") == 0) {
-                char parent[PATH_MAX];
-                size_t plen = (size_t)(slash - rpath);
-                if (plen < sizeof(parent)) {
-                    memcpy(parent, rpath, plen);
-                    parent[plen] = '\0';
-                    if (dir_matches_patterns(parent, patterns, npatterns))
-                        add_capture_dir(cap_dirs, ncap_dirs,
-                                        cap_dirs_cap, parent);
-                }
+        /* Only auto-shallow-scan __pycache__ dirs (and their parent
+         * package dir).  Frozen importlib loads sibling .py/.pyc
+         * files for these without going through our open() hook, so
+         * we must proactively pull them in.
+         *
+         * For other opendir'd dirs (site-packages, encodings, etc.)
+         * the program will open() any file it actually needs and
+         * those F records carry the file in.  Adding the entire dir
+         * to cap_dirs would bulk-pull every untouched sibling — .pth
+         * files, large stand-alone .py modules (pcbnew.py, etc.),
+         * inflating the frozen binary by tens of MB.  Just record a
+         * .dir VFS marker so directory listings still see the dir. */
+        const char *slash = strrchr(rpath, '/');
+        int is_pycache = slash && slash > rpath &&
+                         strcmp(slash + 1, "__pycache__") == 0;
+        if (is_pycache) {
+            add_capture_dir(cap_dirs, ncap_dirs, cap_dirs_cap, rpath);
+            char parent[PATH_MAX];
+            size_t plen = (size_t)(slash - rpath);
+            if (plen < sizeof(parent)) {
+                memcpy(parent, rpath, plen);
+                parent[plen] = '\0';
+                if (dir_matches_patterns(parent, patterns, npatterns))
+                    add_capture_dir(cap_dirs, ncap_dirs,
+                                    cap_dirs_cap, parent);
             }
         }
+        /* For non-__pycache__ dirs we do nothing.  Adding a .dir
+         * marker here would make the VFS report the dir as present
+         * (and empty) even when no contents were captured, which
+         * causes Python's import machinery to treat it as a
+         * namespace package shadowing the real module.  The dir will
+         * still appear in vfs_dir_exists() automatically once any
+         * file inside it is captured (via its parent registration). */
         return;
     }
 
@@ -292,6 +345,21 @@ static void process_captured_path(const char *exe_path, const char **patterns,
 
     if (path_is_known_dep(rpath, exe_path, deps))
         return;
+
+    /* Skip site-packages .pth files.  Python's site.addpackage() execs
+     * each .pth's contents at interpreter startup; namespace-package
+     * .pth files (e.g. *-nspkg.pth) try to importlib-load packages
+     * we never captured, raising and forcing the traceback module to
+     * load `re` etc. that the trace never opened either.  Dropping
+     * them keeps site.py happy with an effectively empty site-pkgs. */
+    {
+        const char *base = strrchr(rpath, '/');
+        if (base) {
+            size_t blen = strlen(base);
+            if (blen >= 4 && strcmp(base + blen - 4, ".pth") == 0)
+                return;
+        }
+    }
 
     for (int i = 0; i < npatterns; i++) {
         if (match_glob(patterns[i], rpath)) {
@@ -833,14 +901,12 @@ int main(int argc, char **argv)
     printf("Packing %d files into %s …\n", nfiles, out_path);
     struct pack_options po = {
         .exe_path       = exe_path,
-        .exe_name       = requested_exe,
+        .exe_name       = exe_path,
         .output_path    = out_path,
         .bootstrap_path = bootstrap,
         .deps           = &deps,
         .direct_load    = direct_load,
         .data_files     = data_files.count > 0 ? &data_files : NULL,
-        .frozen_patterns = nfile_patterns > 0 ? file_patterns : NULL,
-        .frozen_pattern_count = nfile_patterns,
     };
     int rc = pack_frozen(&po);
 

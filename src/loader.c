@@ -39,7 +39,6 @@
 #define LDR_FLAG_NEEDS_RTLD  0x20
 #define LDR_FLAG_DATA        0x40
 #define LDR_FLAG_RUNTIME_SCAN 0x80
-#define LDR_FLAG_FROZEN_MOUNT 0x400
 
 #define LDR_PRELINK_FIXUP_JMPREL 0x80000000u
 
@@ -3232,96 +3231,42 @@ static int vfs_dir_exists(const char *path);
 static const struct vfs_entry *vfs_lookup(const char *path);
 static int frozen_dlopen_find(const char *path);
 
-/* ---- Frozen-mount patterns (sealed VFS boundaries) -------------------- */
+/* ---- VFS sealing ----------------------------------------------------- */
 /*
- * The user's `-f GLOB` arguments at freeze time are persisted as
- * DLFRZ_FLAG_FROZEN_MOUNT manifest entries.  At runtime, any absolute
- * path that matches a pattern is considered to live "inside" the
- * frozen mount: lookups that miss the captured VFS contents return
- * ENOENT instead of falling through to the host filesystem.  This
- * makes the frozen image behave like an immutable bind mount of the
- * directory tree as it existed when the binary was created.
+ * The seal scope is derived from the captured file set: any directory
+ * that contains at least one captured file is treated as a sealed
+ * mount.  Lookups for non-captured paths inside such a directory
+ * return ENOENT instead of falling through to the host filesystem,
+ * so the frozen image behaves like an immutable bind mount of the
+ * directories the program actually used at freeze time.
+ *
+ * Files outside any captured directory pass through to the host
+ * unchanged.
  */
-#define VFS_MAX_FROZEN_MOUNTS 64
-static const char *g_frozen_mount_patterns[VFS_MAX_FROZEN_MOUNTS];
-static int g_frozen_mount_count;
 
-/* fnmatch-equivalent supporting `*` (does not cross '/') and `?`.
- * Returns 0 on match (POSIX convention), non-zero otherwise. */
-static int vfs_fnmatch(const char *pat, const char *str)
-{
-    while (*pat) {
-        char p = *pat;
-        if (p == '*') {
-            /* Skip runs of '*' */
-            while (*pat == '*') pat++;
-            if (!*pat) {
-                /* Trailing '*': match any run of non-'/' to end of str */
-                while (*str && *str != '/') str++;
-                return *str ? 1 : 0;
-            }
-            /* Try to match the rest at every position up to next '/' */
-            while (*str) {
-                if (vfs_fnmatch(pat, str) == 0) return 0;
-                if (*str == '/') break;
-                str++;
-            }
-            return vfs_fnmatch(pat, str);
-        } else if (p == '?') {
-            if (!*str || *str == '/') return 1;
-            pat++; str++;
-        } else {
-            if (*str != p) return 1;
-            pat++; str++;
-        }
-    }
-    return *str ? 1 : 0;
-}
-
-/* Match `path` against a single freeze-time glob, mirroring main.c's
- * match_glob():
- *   - Direct fnmatch ('*' does not cross '/')
- *   - For patterns ending in "/" + "*": also match deeper paths via prefix
- *   - For patterns ending in "/" + "*": also match the parent dir itself
- *     (so -f /usr/lib/python3.14/+star seals stat() of /usr/lib/python3.14)
- */
-static int vfs_pattern_matches(const char *pat, const char *path)
-{
-    if (vfs_fnmatch(pat, path) == 0)
-        return 1;
-    int plen = (int)strlen(pat);
-    if (plen >= 2 && pat[plen - 1] == '*' && pat[plen - 2] == '/') {
-        if (strncmp(path, pat, plen - 1) == 0)
-            return 1;
-        /* Parent dir without trailing slash */
-        if (strncmp(path, pat, plen - 2) == 0 && path[plen - 2] == '\0')
-            return 1;
-    }
-    return 0;
-}
-
-static int path_is_frozen_mount(const char *path)
-{
-    if (!path || path[0] != '/' || g_frozen_mount_count == 0)
-        return 0;
-    for (int i = 0; i < g_frozen_mount_count; i++) {
-        if (vfs_pattern_matches(g_frozen_mount_patterns[i], path))
-            return 1;
-    }
-    return 0;
-}
-
-/* True when `path` lives inside a frozen mount but no VFS entry, dir
- * mapping, or frozen-DLOPEN ELF covers it.  The VFS wrappers should
- * short-circuit to ENOENT for these and skip the host syscall. */
+/* True when `path`'s parent directory is in the VFS dir table but the
+ * path itself has no VFS entry / dir mapping / frozen-DLOPEN ELF. */
 static int vfs_path_is_sealed_miss(const char *path)
 {
-    if (!path_is_frozen_mount(path))
+    if (!path || path[0] != '/' || g_vfs_count == 0)
         return 0;
     if (vfs_lookup(path)) return 0;
     if (vfs_dir_exists(path)) return 0;
     if (frozen_dlopen_find(path) >= 0) return 0;
-    return 1;
+    /* Compute parent directory length (offset of last '/'). */
+    const char *slash = NULL;
+    for (const char *p = path; *p; p++)
+        if (*p == '/') slash = p;
+    if (!slash) return 0;
+    /* Stack-allocate a small buffer for the parent path; bail if too
+     * long.  Most kernel paths fit easily in PATH_MAX. */
+    size_t plen = (size_t)(slash - path);
+    if (plen == 0) return 0;            /* "/foo" — root not sealed */
+    if (plen >= 4096) return 0;
+    char parent[4096];
+    memcpy(parent, path, plen);
+    parent[plen] = '\0';
+    return vfs_dir_exists(parent);
 }
 
 static void vfs_seal_log(const char *op, const char *path)
@@ -3331,7 +3276,7 @@ static void vfs_seal_log(const char *op, const char *path)
     ldr_msg(op);
     ldr_msg(": ");
     ldr_msg(path);
-    ldr_msg(" (frozen mount, not captured) -> ENOENT\n");
+    ldr_msg(" (parent dir captured, file not in image) -> ENOENT\n");
 }
 
 static void vfs_init(const uint8_t *mem, uint64_t mem_foff,
@@ -3354,27 +3299,6 @@ static void vfs_init(const uint8_t *mem, uint64_t mem_foff,
     if (g_debug && g_vfs_count > 0) {
         ldr_dbg_hex("[loader] vfs: 0x", g_vfs_count);
         ldr_msg(" data files registered\n");
-    }
-    /* Collect frozen-mount patterns: paths matching any of these are
-     * served exclusively from the VFS; misses ENOENT instead of
-     * falling through to the host filesystem. */
-    g_frozen_mount_count = 0;
-    for (uint32_t i = 0; i < num_entries; i++) {
-        if (!(entries[i].flags & DLFRZ_FLAG_FROZEN_MOUNT)) continue;
-        if (g_frozen_mount_count >= (int)(sizeof(g_frozen_mount_patterns) /
-                                          sizeof(g_frozen_mount_patterns[0])))
-            break;
-        g_frozen_mount_patterns[g_frozen_mount_count++] =
-            strtab + entries[i].name_offset;
-    }
-    if (g_debug && g_frozen_mount_count > 0) {
-        ldr_dbg_hex("[loader] vfs: 0x", g_frozen_mount_count);
-        ldr_msg(" frozen-mount patterns registered\n");
-        for (int i = 0; i < g_frozen_mount_count; i++) {
-            ldr_msg("  ");
-            ldr_msg(g_frozen_mount_patterns[i]);
-            ldr_msg("\n");
-        }
     }
     if (g_vfs_count > 0) {
         vfs_init_dirs();
@@ -3526,6 +3450,28 @@ static void vfs_init_dirs(void)
             if (vfs_dir_exists_n(path, j))
                 break;  /* this dir (and all its parents) already known */
             vfs_dir_insert(path, j);
+        }
+    }
+    /* Also derive parent directories from frozen DLOPEN entries so that
+     * directories whose only contents are dlopen-served .so files
+     * (e.g. /usr/lib/python3.14/lib-dynload, /usr/lib/ossl-modules)
+     * report as existing.  Otherwise vfs_path_is_sealed_miss seals
+     * them as ENOENT, hiding the lib-dynload directory from Python's
+     * importer and breaking C-extension imports. */
+    if (g_frozen_metas && g_frozen_entries && g_frozen_strtab) {
+        for (uint32_t i = 0; i < g_frozen_num_entries; i++) {
+            if (!(g_frozen_metas[i].flags & LDR_FLAG_DLOPEN)) continue;
+            if (g_frozen_metas[i].flags & LDR_FLAG_INTERP) continue;
+            const char *path = g_frozen_strtab +
+                g_frozen_entries[i].name_offset;
+            if (!path || path[0] != '/') continue;
+            int len = strlen(path);
+            for (int j = len - 1; j > 0; j--) {
+                if (path[j] != '/') continue;
+                if (vfs_dir_exists_n(path, j))
+                    break;
+                vfs_dir_insert(path, j);
+            }
         }
     }
     if (g_debug && g_vfs_dir_count > 0) {
@@ -4179,8 +4125,9 @@ static struct dirent *vfs_readdir(void *dirp)
     if (h->vfs_path) {
         /* ---- Phase 0: yield VFS-only child files ----
          * ---- Phase 1: yield VFS-only child subdirs ----
+         * ---- Phase 2: yield frozen DLOPEN child .so files ----
          * Skip entries that already exist on disk (real dir covered them). */
-        while (h->phase < 2) {
+        while (h->phase < 3) {
             if (h->phase == 0) {
                 while (h->scan_pos < (int)VFS_HASH_SIZE) {
                     int si = h->scan_pos++;
@@ -4242,6 +4189,45 @@ static struct dirent *vfs_readdir(void *dirp)
                     return &h->result;
                 }
                 h->phase = 2;
+                h->scan_pos = 0;
+            }
+            if (h->phase == 2) {
+                /* Frozen DLOPEN entries (e.g. lib-dynload .so files
+                 * served via memfd) are not in g_vfs_table; enumerate
+                 * them here so Python's FileFinder can discover them. */
+                if (g_frozen_metas && g_frozen_entries && g_frozen_strtab) {
+                    while (h->scan_pos < (int)g_frozen_num_entries) {
+                        uint32_t si = (uint32_t)h->scan_pos++;
+                        if (!(g_frozen_metas[si].flags & LDR_FLAG_DLOPEN))
+                            continue;
+                        if (g_frozen_metas[si].flags & LDR_FLAG_INTERP)
+                            continue;
+                        const char *fp = g_frozen_strtab +
+                            g_frozen_entries[si].name_offset;
+                        if (!fp || fp[0] != '/') continue;
+                        if (strncmp(fp, h->vfs_path, h->vfs_path_len) != 0)
+                            continue;
+                        if (fp[h->vfs_path_len] != '/') continue;
+                        const char *rest = fp + h->vfs_path_len + 1;
+                        if (strchr(rest, '/')) continue; /* not direct child */
+                        if (h->fd_compat >= 0) {
+                            int r = (int)VFS_SYSCALL(SYS_faccessat, AT_FDCWD,
+                                                     fp, 0, 0);
+                            if (r == 0) continue;
+                        }
+                        h->result.d_ino = (ino_t)(2 * VFS_HASH_SIZE + si + 1);
+                        h->result.d_off = ((off_t)3 << 32) |
+                                          (uint32_t)h->scan_pos;
+                        h->result.d_reclen = sizeof(struct dirent);
+                        h->result.d_type = DT_REG;
+                        int nlen = strlen(rest);
+                        if (nlen > 255) nlen = 255;
+                        memcpy(h->result.d_name, rest, nlen);
+                        h->result.d_name[nlen] = '\0';
+                        return &h->result;
+                    }
+                }
+                h->phase = 3;
             }
         }
         return NULL; /* end of merged listing */
@@ -4427,10 +4413,16 @@ static int vfs_serve_memfd(const struct vfs_entry *ve, const char *path)
 
 static int vfs_open(const char *path, int flags, int mode)
 {
-    /* Only intercept absolute paths for read-only opens */
-    if (path && path[0] == '/' && (flags & 3) == 0 /* O_RDONLY */) {
+    /* For absolute paths inside the captured tree, intercept all
+     * accesses (read or write) so we never touch the host filesystem.
+     * Writes to captured paths are refused (EROFS) since the frozen
+     * image is read-only; this prevents Python's .pyc bytecode cache
+     * (and similar tools) from silently writing to the original
+     * /usr/lib/... locations on the host. */
+    if (path && path[0] == '/') {
+        int is_write = (flags & 3) != 0 /* O_WRONLY or O_RDWR */;
         /* Directory path captured in VFS: serve virtually (no FS touch). */
-        if (vfs_dir_exists(path)) {
+        if (!is_write && vfs_dir_exists(path)) {
             const struct vfs_entry *ve = vfs_lookup(path);
             if (!ve || (vfs_is_virtual_entry(ve) &&
                         vfs_is_dir_marker_path(path))) {
@@ -4449,30 +4441,36 @@ static int vfs_open(const char *path, int flags, int mode)
             return -1;
         }
         if (ve && !vfs_is_virtual_entry(ve)) {
+            if (is_write) {
+                vfs_dbg_op("open", path, "write-refused");
+                set_loader_errno(EROFS);
+                return -1;
+            }
             vfs_dbg_op("open", path, "file");
             int fd = vfs_serve_memfd(ve, path);
             if (fd >= 0) return fd;
         }
         /* Sealed mount: refuse host fall-through for paths that match a
-         * frozen-mount glob but were not captured.  This prevents the
-         * frozen binary from reading files that exist on the host but
-         * were not present at freeze time. */
+         * frozen-mount glob but were not captured.  Applies to writes
+         * too — otherwise Python's .pyc cache, dpkg's lock files, etc.
+         * would silently write to the host's /usr tree. */
         if (vfs_path_is_sealed_miss(path)) {
             vfs_seal_log("open", path);
-            set_loader_errno(ENOENT);
+            set_loader_errno(is_write ? EROFS : ENOENT);
             return -1;
         }
-        int ret = (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, path, flags, mode);
-        if (ret >= 0) return ret;
-        /* Probe-open for a DLOPEN ELF (e.g. Ruby's require checking .so exists) */
-        {
+        if (!is_write) {
+            int ret = (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, path, flags, mode);
+            if (ret >= 0) return ret;
+            /* Probe-open for a DLOPEN ELF (e.g. Ruby's require checking
+             * .so exists) */
             int fd = frozen_dlopen_serve_memfd(path);
             if (fd >= 0) {
                 vfs_dbg_op("open", path, "dlopen-elf");
                 return fd;
             }
+            return ret;
         }
-        return ret;
     }
     return (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, path, flags, mode);
 }
@@ -4482,21 +4480,22 @@ static int vfs_openat(int dirfd, const char *path, int flags, int mode)
     char resolved[PATH_MAX];
     const char *lookup_path = path;
     int real_fd;
+    (void)real_fd;
 
     if (path && path[0] != '/' &&
         resolve_vfs_path_at(dirfd, path, resolved, sizeof(resolved)))
         lookup_path = resolved;
 
     if (lookup_path && lookup_path[0] == '/') {
+        int is_write = (flags & 3) != 0 /* O_WRONLY or O_RDWR */;
         /* Serve captured directories purely from VFS: avoid touching the
          * host filesystem whenever the VFS already knows the directory.
          * This applies to both explicit O_DIRECTORY opens and plain
          * O_RDONLY opens that happen to target a directory path. */
-        if (vfs_dir_exists(lookup_path)) {
+        if (!is_write && vfs_dir_exists(lookup_path)) {
             const struct vfs_entry *ve = vfs_lookup(lookup_path);
             if (!ve || (vfs_is_virtual_entry(ve) &&
                         vfs_is_dir_marker_path(lookup_path))) {
-                (void)real_fd;
                 int fd = (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, "/",
                                          O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
                 if (fd >= 0)
@@ -4505,35 +4504,39 @@ static int vfs_openat(int dirfd, const char *path, int flags, int mode)
                 return fd;
             }
         }
-        if ((flags & 3) == 0 /* O_RDONLY */) {
-            const struct vfs_entry *ve = vfs_lookup(lookup_path);
-            if (ve && vfs_is_negative_entry(ve)) {
-                vfs_dbg_op("openat", lookup_path, "negative");
-                set_loader_errno(ENOENT);
+        const struct vfs_entry *ve = vfs_lookup(lookup_path);
+        if (ve && vfs_is_negative_entry(ve)) {
+            vfs_dbg_op("openat", lookup_path, "negative");
+            set_loader_errno(ENOENT);
+            return -1;
+        }
+        if (ve && !vfs_is_virtual_entry(ve)) {
+            if (is_write) {
+                vfs_dbg_op("openat", lookup_path, "write-refused");
+                set_loader_errno(EROFS);
                 return -1;
             }
-            if (ve && !vfs_is_virtual_entry(ve)) {
-                vfs_dbg_op("openat", lookup_path, "file");
-                int fd = vfs_serve_memfd(ve, lookup_path);
-                if (fd >= 0) return fd;
-            }
-            /* Sealed mount: refuse host fall-through for matching misses */
-            if (vfs_path_is_sealed_miss(lookup_path)) {
-                vfs_seal_log("openat", lookup_path);
-                set_loader_errno(ENOENT);
-                return -1;
-            }
+            vfs_dbg_op("openat", lookup_path, "file");
+            int fd = vfs_serve_memfd(ve, lookup_path);
+            if (fd >= 0) return fd;
+        }
+        /* Sealed mount: refuse host fall-through for matching misses.
+         * Applies to writes too so .pyc cache writes etc. don't leak. */
+        if (vfs_path_is_sealed_miss(lookup_path)) {
+            vfs_seal_log("openat", lookup_path);
+            set_loader_errno(is_write ? EROFS : ENOENT);
+            return -1;
+        }
+        if (!is_write) {
             /* Fallback: probe-open for a DLOPEN ELF path not in VFS data */
-            {
-                int ret = (int)VFS_SYSCALL(SYS_openat, dirfd, path, flags, mode);
-                if (ret >= 0) return ret;
-                int fd = frozen_dlopen_serve_memfd(lookup_path);
-                if (fd >= 0) {
-                    vfs_dbg_op("openat", lookup_path, "dlopen-elf");
-                    return fd;
-                }
-                return ret;
+            int ret = (int)VFS_SYSCALL(SYS_openat, dirfd, path, flags, mode);
+            if (ret >= 0) return ret;
+            int fd = frozen_dlopen_serve_memfd(lookup_path);
+            if (fd >= 0) {
+                vfs_dbg_op("openat", lookup_path, "dlopen-elf");
+                return fd;
             }
+            return ret;
         }
         vfs_dbg_op("openat", lookup_path, "syscall");
     }
@@ -4675,18 +4678,19 @@ vfs_stat_fallthrough:;
         set_loader_errno(ENOENT);
         return -1;
     }
-    /* Directories & everything else: real FS first, VFS fallback */
-    int ret = (int)VFS_SYSCALL(SYS_newfstatat, AT_FDCWD, path, buf, 0);
-    if (ret == 0) return 0;
+    /* Captured directories: synthesise the result so we never reach the
+     * host filesystem for paths that are part of the frozen image. */
+    if (path && path[0] == '/' && vfs_dir_exists(path)) {
+        vfs_dbg_op("stat", path, "dir");
+        __builtin_memset(buf, 0, sizeof(*buf));
+        buf->st_mode  = 040755;  /* directory, rwxr-xr-x */
+        buf->st_nlink = 2;
+        buf->st_blksize = 4096;
+        return 0;
+    }
+    /* Frozen DLOPEN ELFs: synthesise so we never touch the host FS
+     * even when a same-named .so happens to exist there. */
     if (path && path[0] == '/') {
-        if (vfs_dir_exists(path)) {
-            vfs_dbg_op("stat", path, "dir");
-            __builtin_memset(buf, 0, sizeof(*buf));
-            buf->st_mode  = 040755;  /* directory, rwxr-xr-x */
-            buf->st_nlink = 2;
-            buf->st_blksize = 4096;
-            return 0;
-        }
         int64_t elf_sz = frozen_dlopen_elf_size(path);
         if (elf_sz >= 0) {
             vfs_dbg_op("stat", path, "dlopen-elf");
@@ -4699,7 +4703,8 @@ vfs_stat_fallthrough:;
             return 0;
         }
     }
-    return ret;
+    /* Everything else: real FS */
+    return (int)VFS_SYSCALL(SYS_newfstatat, AT_FDCWD, path, buf, 0);
 }
 
 static int vfs_fstatat(int dirfd, const char *path, struct stat *buf, int flag)
@@ -4737,17 +4742,17 @@ vfs_fstatat_fallthrough:;
         set_loader_errno(ENOENT);
         return -1;
     }
-    int ret = (int)VFS_SYSCALL(SYS_newfstatat, dirfd, path, buf, flag);
-    if (ret == 0) return 0;
+    if (lookup_path && lookup_path[0] == '/' && vfs_dir_exists(lookup_path)) {
+        vfs_dbg_op("fstatat", lookup_path, "dir");
+        __builtin_memset(buf, 0, sizeof(*buf));
+        buf->st_mode  = 040755;
+        buf->st_nlink = 2;
+        buf->st_blksize = 4096;
+        return 0;
+    }
+    /* Frozen DLOPEN ELFs: synthesise so we never touch the host FS
+     * even when a same-named .so happens to exist there. */
     if (lookup_path && lookup_path[0] == '/') {
-        if (vfs_dir_exists(lookup_path)) {
-            vfs_dbg_op("fstatat", lookup_path, "dir");
-            __builtin_memset(buf, 0, sizeof(*buf));
-            buf->st_mode  = 040755;
-            buf->st_nlink = 2;
-            buf->st_blksize = 4096;
-            return 0;
-        }
         int64_t elf_sz = frozen_dlopen_elf_size(lookup_path);
         if (elf_sz >= 0) {
             vfs_dbg_op("fstatat", lookup_path, "dlopen-elf");
@@ -4760,7 +4765,7 @@ vfs_fstatat_fallthrough:;
             return 0;
         }
     }
-    return ret;
+    return (int)VFS_SYSCALL(SYS_newfstatat, dirfd, path, buf, flag);
 }
 
 /* vfs_access / vfs_faccessat — Python calls os.access() / os.path.exists() */
@@ -4783,19 +4788,16 @@ static int vfs_access(const char *path, int amode)
         set_loader_errno(ENOENT);
         return -1;
     }
-    int ret = (int)VFS_SYSCALL(SYS_faccessat, AT_FDCWD, path, amode, 0);
-    if (ret == 0) return 0;
-    if (path && path[0] == '/') {
-        if (vfs_dir_exists(path)) {
-            vfs_dbg_op("access", path, "dir");
-            return 0;
-        }
-        if (frozen_dlopen_elf_size(path) >= 0) {
-            vfs_dbg_op("access", path, "dlopen-elf");
-            return 0;
-        }
+    if (path && path[0] == '/' && vfs_dir_exists(path)) {
+        vfs_dbg_op("access", path, "dir");
+        return 0;
     }
-    return ret;
+    if (path && path[0] == '/' &&
+        frozen_dlopen_elf_size(path) >= 0) {
+        vfs_dbg_op("access", path, "dlopen-elf");
+        return 0;
+    }
+    return (int)VFS_SYSCALL(SYS_faccessat, AT_FDCWD, path, amode, 0);
 }
 
 static int vfs_faccessat(int dirfd, const char *path, int amode, int flag)
@@ -4824,25 +4826,32 @@ static int vfs_faccessat(int dirfd, const char *path, int amode, int flag)
         set_loader_errno(ENOENT);
         return -1;
     }
-    int ret = (int)VFS_SYSCALL(SYS_faccessat, dirfd, path, amode, flag);
-    if (ret == 0) return 0;
-    if (lookup_path && lookup_path[0] == '/') {
-        if (vfs_dir_exists(lookup_path)) {
-            vfs_dbg_op("faccessat", lookup_path, "dir");
-            return 0;
-        }
-        if (frozen_dlopen_elf_size(lookup_path) >= 0) {
-            vfs_dbg_op("faccessat", lookup_path, "dlopen-elf");
-            return 0;
-        }
+    if (lookup_path && lookup_path[0] == '/' && vfs_dir_exists(lookup_path)) {
+        vfs_dbg_op("faccessat", lookup_path, "dir");
+        return 0;
     }
-    return ret;
+    if (lookup_path && lookup_path[0] == '/' &&
+        frozen_dlopen_elf_size(lookup_path) >= 0) {
+        vfs_dbg_op("faccessat", lookup_path, "dlopen-elf");
+        return 0;
+    }
+    return (int)VFS_SYSCALL(SYS_faccessat, dirfd, path, amode, flag);
 }
 
 static int vfs_xstat(int ver, const char *path, struct stat *buf)
 {
     (void)ver;
     return vfs_stat(path, buf);
+}
+
+/* Modern glibc (>= 2.33) exposes lstat / lstat64 as direct symbols rather
+ * than the legacy __lxstat / __lxstat64 inline wrappers.  Python (and
+ * other recent code compiled against current glibc) resolves these
+ * symbols, so we must intercept them too — otherwise lstat() falls
+ * through to the host filesystem and we leak stats on /usr/lib/... */
+static int vfs_lstat(const char *path, struct stat *buf)
+{
+    return vfs_fstatat(AT_FDCWD, path, buf, AT_SYMLINK_NOFOLLOW);
 }
 
 static char *vfs_realpath(const char *path, char *resolved)
@@ -4901,6 +4910,72 @@ static int vfs_fxstatat(int ver, int dirfd, const char *path,
 {
     (void)ver;
     return vfs_fstatat(dirfd, path, buf, flag);
+}
+
+/* Return the path of the main executable as captured at freeze time
+ * (e.g. "/usr/bin/python3.14"), or NULL if unavailable.  Used by the
+ * /proc/self/exe readlink hook so programs that resolve their resource
+ * trees relative to /proc/self/exe (Python's sys.prefix discovery,
+ * Ruby's RbConfig, dpkg, etc.) see the original install location and
+ * find their captured data files in the VFS, instead of resolving
+ * relative to the frozen binary's location (e.g. /tmp/foo.frozen). */
+static const char *vfs_main_exe_path(void)
+{
+    if (!g_frozen_metas || !g_frozen_entries || !g_frozen_strtab)
+        return NULL;
+    for (uint32_t i = 0; i < g_frozen_num_entries; i++) {
+        if (!(g_frozen_metas[i].flags & LDR_FLAG_MAIN_EXE))
+            continue;
+        const char *p = g_frozen_strtab + g_frozen_entries[i].name_offset;
+        if (p && p[0] == '/')
+            return p;
+        return NULL;
+    }
+    return NULL;
+}
+
+/* Match "/proc/self/exe" or "/proc/<our-pid>/exe". */
+static int vfs_path_is_self_exe(const char *path)
+{
+    if (!path) return 0;
+    if (strcmp(path, "/proc/self/exe") == 0)
+        return 1;
+    if (strncmp(path, "/proc/", 6) != 0)
+        return 0;
+    const char *p = path + 6;
+    long pid = 0;
+    while (*p >= '0' && *p <= '9') {
+        pid = pid * 10 + (*p - '0');
+        p++;
+    }
+    if (p == path + 6) return 0;
+    if (strcmp(p, "/exe") != 0) return 0;
+    return pid == (long)VFS_SYSCALL(SYS_getpid);
+}
+
+static ssize_t vfs_readlinkat(int dirfd, const char *path,
+                              char *buf, size_t bufsiz)
+{
+    if (path && vfs_path_is_self_exe(path)) {
+        const char *exe = vfs_main_exe_path();
+        if (exe) {
+            size_t n = strlen(exe);
+            if (n > bufsiz) n = bufsiz;
+            memcpy(buf, exe, n);
+            return (ssize_t)n;
+        }
+    }
+    long ret = VFS_SYSCALL(SYS_readlinkat, dirfd, path, buf, bufsiz);
+    if (ret < 0) {
+        set_loader_errno((int)-ret);
+        return -1;
+    }
+    return (ssize_t)ret;
+}
+
+static ssize_t vfs_readlink(const char *path, char *buf, size_t bufsiz)
+{
+    return vfs_readlinkat(AT_FDCWD, path, buf, bufsiz);
 }
 
 /* ==== Resolution cache ================================================ */
@@ -5225,12 +5300,15 @@ static const struct stub_sym g_vfs_overrides[] = {
     { "realpath",        (void *)vfs_realpath       },
     { "stat",            (void *)vfs_stat           },
     { "stat64",          (void *)vfs_stat           },
+    { "lstat",           (void *)vfs_lstat          },
+    { "lstat64",         (void *)vfs_lstat          },
     { "__xstat",         (void *)vfs_xstat          },
     { "__xstat64",       (void *)vfs_xstat          },
     { "__lxstat",        (void *)vfs_lxstat         },
     { "__lxstat64",      (void *)vfs_lxstat         },
     { "fstatat",         (void *)vfs_fstatat        },
     { "fstatat64",       (void *)vfs_fstatat        },
+    { "newfstatat",      (void *)vfs_fstatat        },
     { "__fxstatat",      (void *)vfs_fxstatat       },
     { "__fxstatat64",    (void *)vfs_fxstatat       },
     { "access",          (void *)vfs_access         },
@@ -5246,6 +5324,8 @@ static const struct stub_sym g_vfs_overrides[] = {
     { "closedir",        (void *)vfs_closedir       },
     { "fopen",           (void *)vfs_fopen          },
     { "fopen64",         (void *)vfs_fopen          },
+    { "readlink",        (void *)vfs_readlink       },
+    { "readlinkat",      (void *)vfs_readlinkat     },
     { NULL, NULL }
 };
 
@@ -8205,8 +8285,7 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     for (uint32_t i = 0; i < num_entries; i++)
         if (!(metas[i].flags & LDR_FLAG_INTERP) &&
             !(metas[i].flags & LDR_FLAG_DLOPEN) &&
-            !(metas[i].flags & LDR_FLAG_DATA) &&
-            !(metas[i].flags & LDR_FLAG_FROZEN_MOUNT)) nobj++;
+            !(metas[i].flags & LDR_FLAG_DATA)) nobj++;
 
     if (nobj == 0) { ldr_err("no objects to load", NULL); return -1; }
     if (nobj > MAX_TOTAL_OBJS) { ldr_err("too many objects", NULL); return -1; }
@@ -8222,7 +8301,6 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         if (metas[i].flags & LDR_FLAG_INTERP) continue;
         if (metas[i].flags & LDR_FLAG_DLOPEN) continue;
         if (metas[i].flags & LDR_FLAG_DATA) continue;
-        if (metas[i].flags & LDR_FLAG_FROZEN_MOUNT) continue;
         if (!(metas[i].flags & LDR_FLAG_MAIN_EXE)) continue;
         objs[oi].name  = strtab + entries[i].name_offset;
         objs[oi].flags = metas[i].flags;
@@ -8233,7 +8311,6 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         if (metas[i].flags & LDR_FLAG_INTERP) continue;
         if (metas[i].flags & LDR_FLAG_DLOPEN) continue;
         if (metas[i].flags & LDR_FLAG_DATA) continue;
-        if (metas[i].flags & LDR_FLAG_FROZEN_MOUNT) continue;
         if (metas[i].flags & LDR_FLAG_MAIN_EXE) continue;
         objs[oi].name  = strtab + entries[i].name_offset;
         objs[oi].flags = metas[i].flags;

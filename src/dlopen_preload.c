@@ -226,7 +226,7 @@ void *dlopen(const char *filename, int flags)
     resolve_symbols();
     h = real_dlopen ? real_dlopen(filename, flags) : NULL;
 
-    if (h && filename && g_dlopen_trace_fd >= 0) {
+    if (h && filename && (g_dlopen_trace_fd >= 0 || g_file_trace_fd >= 0)) {
         struct link_map *lm = NULL;
 
         if (dlinfo(h, RTLD_DI_LINKMAP, &lm) == 0 &&
@@ -235,7 +235,18 @@ void *dlopen(const char *filename, int flags)
 
             snprintf(resolved, sizeof(resolved), "%s", lm->l_name);
             canonicalize_path(resolved, sizeof(resolved));
-            write_trace_line(g_dlopen_trace_fd, "", resolved);
+            if (g_dlopen_trace_fd >= 0)
+                write_trace_line(g_dlopen_trace_fd, "", resolved);
+            /* Also record in the file-trace.  Inside glibc, dlopen()
+             * uses an internal openat() that bypasses our open() hook,
+             * so .so files loaded via dlopen (e.g. Python's lib-dynload
+             * extension modules like _struct.so) never appear as F
+             * records via the open path.  Without an explicit F record
+             * here the packer wouldn't know to embed them, breaking
+             * imports that depend on dynamically-loaded extension
+             * modules. */
+            if (g_file_trace_fd >= 0 && resolved[0] == '/')
+                write_trace_line(g_file_trace_fd, "F ", resolved);
         }
     }
 

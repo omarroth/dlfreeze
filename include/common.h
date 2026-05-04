@@ -16,9 +16,6 @@
 #define DLFRZ_FLAG_RUNTIME_SCAN 0x80 /* needs runtime special/IRELATIVE scan      */
 #define DLFRZ_FLAG_DATA_VIRTUAL 0x100 /* placeholder data entry, not openable      */
 #define DLFRZ_FLAG_DATA_NEGATIVE 0x200 /* path was probed at trace and did not exist */
-#define DLFRZ_FLAG_FROZEN_MOUNT  0x400 /* entry's name is a glob pattern; the runtime
-                                        * VFS treats matching paths as a sealed mount
-                                        * (any non-VFS access returns ENOENT)        */
 
 struct dlfrz_entry {
     uint64_t data_offset;

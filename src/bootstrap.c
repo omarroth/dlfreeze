@@ -394,7 +394,7 @@ int main(int argc, char **argv)
                 strncmp(name, "/usr/local/lib/python", 21) == 0)
                 has_python_stdlib_data = 1;
         }
-        if ((ent[i].flags & (DLFRZ_FLAG_DATA_VIRTUAL | DLFRZ_FLAG_DATA_NEGATIVE | DLFRZ_FLAG_FROZEN_MOUNT)) != 0)
+        if ((ent[i].flags & (DLFRZ_FLAG_DATA_VIRTUAL | DLFRZ_FLAG_DATA_NEGATIVE)) != 0)
             continue;
         char dst[PATH_MAX + 256];
         /* Extract DATA entries and DLOPEN'd python extension modules at

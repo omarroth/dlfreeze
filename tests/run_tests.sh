@@ -7,6 +7,16 @@ DLFREEZE="$BUILD/dlfreeze"
 
 mkdir -p "$BUILD"
 
+# Some host toolchains (gcc >= 16 on Arch) auto-inject -latomic_asneeded
+# into musl-gcc's link line, but musl-gcc.specs uses -nostdlib and only
+# adds -L/usr/lib/musl/lib so the system /usr/lib/libatomic_asneeded.a
+# isn't found.  Make /usr/lib visible so linking succeeds without
+# overriding musl's own libc.  Searched after gcc's -L paths so musl
+# wins for -lc.
+if [ -e /usr/lib/libatomic_asneeded.a ]; then
+    export LIBRARY_PATH="${LIBRARY_PATH:+$LIBRARY_PATH:}/usr/lib"
+fi
+
 PASS=0 FAIL=0 SKIP=0
 RED=$'\033[31m' GRN=$'\033[32m' YLW=$'\033[33m' RST=$'\033[0m'
 pass() { echo "${GRN}PASS${RST}: $1"; ((PASS++)) || true; }

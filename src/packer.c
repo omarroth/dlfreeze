@@ -1902,10 +1902,9 @@ int pack_frozen(const struct pack_options *opts)
     size_t bootstrap_sz = written;
     off += written;
 
-    /* total entries: main-exe + interpreter? + libs + data files + frozen patterns */
+    /* total entries: main-exe + interpreter? + libs + data files */
     int ndata = opts->data_files ? opts->data_files->count : 0;
-    int npatterns = opts->frozen_patterns ? opts->frozen_pattern_count : 0;
-    int nent = 1 + (opts->deps->interp_path ? 1 : 0) + opts->deps->count + ndata + npatterns;
+    int nent = 1 + (opts->deps->interp_path ? 1 : 0) + opts->deps->count + ndata;
     struct dlfrz_entry *entries = calloc(nent, sizeof(*entries));
     struct dlfrz_lib_meta *metas = NULL;
     /* Parallel array of source paths for lib_meta computation */
@@ -1928,8 +1927,6 @@ int pack_frozen(const struct pack_options *opts)
         strsz += strlen(opts->deps->libs[i].path) + strlen(opts->deps->libs[i].name) + 2;
     for (int i = 0; i < ndata; i++)
         strsz += strlen(opts->data_files->paths[i]) + 1;
-    for (int i = 0; i < npatterns; i++)
-        strsz += strlen(opts->frozen_patterns[i]) + 1;
 
     char *strtab = calloc(1, strsz);
     size_t stroff = 0;
@@ -2036,24 +2033,6 @@ int pack_frozen(const struct pack_options *opts)
         off += written; eidx++;
     }
 
-    /* 4c. frozen-mount pattern entries ----------------------------- */
-    /* Each entry's name is the literal -f glob.  The runtime VFS uses
-     * these to seal directories: any access to a path that matches a
-     * pattern but has no captured VFS entry returns ENOENT instead of
-     * falling through to the host filesystem. */
-    for (int i = 0; i < npatterns; i++) {
-        entries[eidx].data_offset = off;   /* no payload, but keep the
-                                              field deterministic */
-        entries[eidx].data_size   = 0;
-        entries[eidx].flags       = DLFRZ_FLAG_FROZEN_MOUNT;
-        entries[eidx].name_offset = stroff;
-        const char *pat = opts->frozen_patterns[i];
-        strcpy(strtab + stroff, pat);
-        stroff += strlen(pat) + 1;
-        src_paths[eidx] = NULL;
-        eidx++;
-    }
-
     /* 5. string table ---------------------------------------------- */
     write_pad(out, off, 8); off = ALIGN_UP(off, 8);
     size_t strtab_off = off;
@@ -2077,14 +2056,6 @@ int pack_frozen(const struct pack_options *opts)
         for (int i = 0; i < eidx; i++) {
             if (entries[i].flags & DLFRZ_FLAG_DATA) {
                 metas[i].flags = DLFRZ_FLAG_DATA; /* mark so loader can skip */
-                continue;
-            }
-            if (entries[i].flags & DLFRZ_FLAG_FROZEN_MOUNT) {
-                /* Also set DATA so the prelink/symtab paths (which
-                 * already skip DATA entries as "not ELFs") skip these
-                 * pseudo-entries.  The loader distinguishes them via
-                 * the FROZEN_MOUNT bit. */
-                metas[i].flags = DLFRZ_FLAG_FROZEN_MOUNT | DLFRZ_FLAG_DATA;
                 continue;
             }
             if (compute_lib_meta(src_paths[i], base, entries[i].flags,
