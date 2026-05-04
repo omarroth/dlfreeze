@@ -28,7 +28,13 @@ if [ -f /etc/alpine-release ]; then
         ln -sf "$(command -v gcc)" /usr/local/bin/musl-gcc
     fi
 elif [ -f /etc/arch-release ]; then
-    pacman -Sy --noconfirm --needed \
+    # Arch is a rolling distro and forbids partial upgrades.  Using
+    # `pacman -Sy` to install fresh packages on top of a stale base
+    # image will pull in a new bash that requires readline symbols
+    # (e.g. `rl_completion_rewrite_hook`) that the image's older
+    # readline does not yet provide, breaking /bin/sh for the rest
+    # of the script.  Always do a full `-Syu` first.
+    pacman -Syu --noconfirm --needed \
         gcc musl make bash python file binutils strace 2>&1 | tail -3
     pacman -S --noconfirm --needed upx 2>/dev/null || true
     pacman -S --noconfirm --needed ruby 2>/dev/null || true
