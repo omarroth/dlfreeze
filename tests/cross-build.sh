@@ -12,6 +12,39 @@ distro_name() {
     fi
 }
 
+# Fetch a modern UPX from GitHub when the distro lacks one (Fedora has
+# no upx in core repos) or ships one too old to compress our binaries
+# (older Debian/Ubuntu).  No-op when a sufficiently new UPX is present.
+fetch_upx_from_github() {
+    if command -v upx >/dev/null 2>&1; then
+        upx_ver=$(upx --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
+        case "$upx_ver" in
+            [4-9].*|[1-9][0-9]*.*) return 0 ;;  # already modern enough
+        esac
+    fi
+    case "$(uname -m)" in
+        x86_64)  upx_arch=amd64 ;;
+        aarch64) upx_arch=arm64 ;;
+        *)       upx_arch=$(uname -m) ;;
+    esac
+    fetcher=
+    if command -v curl >/dev/null 2>&1; then fetcher=curl;
+    elif command -v wget >/dev/null 2>&1; then fetcher=wget;
+    else echo "WARNING: no curl/wget for UPX download"; return 1; fi
+    url="https://github.com/upx/upx/releases/download/v4.2.4/upx-4.2.4-${upx_arch}_linux.tar.xz"
+    if [ "$fetcher" = curl ]; then
+        curl -fsSL "$url" -o /tmp/upx.tar.xz || { echo "WARNING: UPX download failed"; return 1; }
+    else
+        wget -q "$url" -O /tmp/upx.tar.xz || { echo "WARNING: UPX download failed"; return 1; }
+    fi
+    tar -xJf /tmp/upx.tar.xz -C /tmp \
+        && cp "/tmp/upx-4.2.4-${upx_arch}_linux/upx" /usr/local/bin/upx \
+        && chmod +x /usr/local/bin/upx \
+        && ln -sf /usr/local/bin/upx /usr/bin/upx \
+        && echo "Installed UPX $(/usr/local/bin/upx --version 2>/dev/null | head -1)" \
+        || { echo "WARNING: failed to install UPX"; return 1; }
+}
+
 echo "========================================================"
 echo "Cross-build: $(uname -m) | $(distro_name)"
 echo "========================================================"
@@ -49,7 +82,11 @@ elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
         gcc make bash python3 file binutils glibc-static 2>&1 | tail -3
     "$PKG" install -y -q strace 2>/dev/null || true
     "$PKG" install -y -q ruby 2>/dev/null || true
+    # Fedora's core repos do not include UPX, so the package install is
+    # expected to fail.  Fall through to the GitHub fetch helper below.
     "$PKG" install -y -q upx 2>/dev/null || true
+    "$PKG" install -y -q curl tar xz 2>/dev/null || true
+    fetch_upx_from_github || true
     # Fedora doesn't ship musl-gcc in repos — fall back to plain gcc.
     # The Makefile uses musl-gcc for the static bootstrap; on glibc-only
     # systems we link statically against glibc instead.
@@ -73,30 +110,8 @@ elif [ -f /etc/debian_version ]; then
     if ! apt-get install -y -qq upx-ucl 2>/dev/null; then
         apt-get install -y -qq upx 2>/dev/null || true
     fi
-    # Verify the installed UPX can actually compress; if not, fetch a
-    # modern static binary from GitHub.
-    if command -v upx >/dev/null 2>&1; then
-        upx_ver=$(upx --version 2>/dev/null | head -1 | grep -oP '\d+\.\d+' | head -1)
-        case "$upx_ver" in
-            3.*|"")
-                echo "System UPX ($upx_ver) too old, fetching UPX 4.2.4…"
-                apt-get install -y -qq wget xz-utils 2>&1 | tail -1
-                # UPX release uses amd64/arm64 naming, not x86_64/aarch64
-                case "$(uname -m)" in
-                    x86_64)  upx_arch=amd64 ;;
-                    aarch64) upx_arch=arm64 ;;
-                    *)       upx_arch=$(uname -m) ;;
-                esac
-                wget -q "https://github.com/upx/upx/releases/download/v4.2.4/upx-4.2.4-${upx_arch}_linux.tar.xz" -O /tmp/upx.tar.xz 2>/dev/null \
-                    && tar -xJf /tmp/upx.tar.xz -C /tmp \
-                    && cp /tmp/upx-4.2.4-${upx_arch}_linux/upx /usr/local/bin/upx \
-                    && chmod +x /usr/local/bin/upx \
-                    && ln -sf /usr/local/bin/upx /usr/bin/upx \
-                    && echo "Installed UPX $(/usr/local/bin/upx --version 2>/dev/null | head -1)" \
-                    || echo "WARNING: failed to fetch newer UPX"
-                ;;
-        esac
-    fi
+    apt-get install -y -qq wget xz-utils ca-certificates 2>/dev/null || true
+    fetch_upx_from_github || true
 fi
 
 echo ""

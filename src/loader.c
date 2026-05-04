@@ -1190,6 +1190,43 @@ static const struct glibc_ver_offsets glibc_2_40 = {
     .gl_make_stack_executable = -1,
 };
 
+/* glibc 2.41 Debian/trixie (x86-64): _rtld_global_ro=952B, _rtld_global=2888B
+ *
+ * This is a hybrid layout: glro is the larger "pre-2.40" size (952) because
+ * the cpu_features struct retains its older size, but gl is the smaller
+ * "post-2.40" layout (2888) because the trailing pthread/dl_load_lock
+ * compatibility fields were trimmed in 2.40.  Field offsets verified with
+ *   gdb -batch -ex 'ptype /o struct rtld_global_ro' \
+ *               -ex 'ptype /o struct rtld_global' /lib64/ld-linux-x86-64.so.2
+ * on debian:trixie (glibc 2.41-12+deb13u2).
+ */
+static const struct glibc_ver_offsets glibc_2_41_debian = {
+    .pthread_size               = -1,
+    .pthread_tid_off            = -1,
+    .pthread_rseq_off           = -1,
+    .pthread_rseq_cpu_id_off    = -1,
+    .glro_tls_static_size  = 704,   /* 0x2C0 */
+    .glro_tls_static_align = 712,   /* 0x2C8 */
+    .glro_debug_printf     = 848,
+    .glro_mcount           = 856,
+    .glro_open             = 872,
+    .glro_close            = 880,
+    .glro_catch_error      = 888,
+    .glro_error_free       = 896,
+    .glro_find_object      = 920,
+    .gl_tls_static_size    = -1,
+    .gl_tls_static_align   = -1,
+    .gl_nns                = 2560,  /* 0xA00 */
+    .gl_stack_flags        = 2744,  /* 0xAB8 */
+    .gl_tls_generation     = 2800,  /* 0xAF0 */
+    .gl_stack_used         = 2816,  /* 0xB00 */
+    .gl_stack_user         = 2832,  /* 0xB10 */
+    .gl_stack_cache        = 2848,  /* 0xB20 */
+    .gl_rtld_lock_recursive   = -1,
+    .gl_rtld_unlock_recursive = -1,
+    .gl_make_stack_executable = -1,
+};
+
 static uint8_t *g_fake_rtld_global;
 static uint8_t *g_fake_rtld_global_ro;
 static const struct glibc_ver_offsets *g_glibc_off = &glibc_2_40;
@@ -1556,6 +1593,7 @@ static const struct {
     { 928,  4304, &glibc_2_34 },    /* glibc 2.34–2.36 x86-64 */
     { 952,  4352, &glibc_2_37 },    /* glibc 2.37–2.39 x86-64 */
     { 928,  2120, &glibc_2_40 },    /* glibc 2.40+     x86-64 */
+    { 952,  2888, &glibc_2_41_debian }, /* glibc 2.41    x86-64 (Debian/trixie) */
 };
 
 /* Convert a virtual address to a file offset using PT_LOAD segments. */
