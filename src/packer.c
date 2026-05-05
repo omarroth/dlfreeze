@@ -52,6 +52,9 @@ typedef Elf64_Xword Elf64_Relr;
 
 /* ---- architecture-specific relocation types --------------------------- */
 #if defined(__x86_64__)
+  #ifndef R_X86_64_TLSDESC
+  #define R_X86_64_TLSDESC      36
+  #endif
   #define ARCH_RELOC_RELATIVE   R_X86_64_RELATIVE
   #define ARCH_RELOC_GLOB_DAT   R_X86_64_GLOB_DAT
   #define ARCH_RELOC_JUMP_SLOT  R_X86_64_JUMP_SLOT
@@ -59,6 +62,7 @@ typedef Elf64_Xword Elf64_Relr;
   #define ARCH_RELOC_TPOFF      R_X86_64_TPOFF64
   #define ARCH_RELOC_DTPMOD     R_X86_64_DTPMOD64
   #define ARCH_RELOC_DTPOFF     R_X86_64_DTPOFF64
+  #define ARCH_RELOC_TLSDESC    R_X86_64_TLSDESC
   #define ARCH_RELOC_IRELATIVE  R_X86_64_IRELATIVE
   #define ARCH_RELOC_COPY       R_X86_64_COPY
 #elif defined(__aarch64__)
@@ -846,14 +850,12 @@ static int pl_apply_rela(struct prelink_obj *obj,
              * them after it has built the live TLS image. */
             break;
 
-#if defined(__aarch64__)
         case ARCH_RELOC_TLSDESC:
             /* TLSDESC descriptors embed resolver function pointers.
              * These must be synthesized by the runtime loader, where the
              * loader stub addresses are known, so keep the file contents
              * untouched and record a runtime fixup instead. */
             break;
-#endif
 
         default:
             break;
@@ -910,10 +912,8 @@ static int prelink_obj_collect_runtime_fixups(const struct prelink_obj *obj,
                 } else {
                     needs_fixup = 1;
                 }
-#if defined(__aarch64__)
             } else if (type == ARCH_RELOC_TLSDESC) {
                 needs_fixup = 1;
-#endif
             } else if (type == ARCH_RELOC_GLOB_DAT ||
                        type == ARCH_RELOC_JUMP_SLOT) {
                 uint32_t sidx = ELF64_R_SYM(rel->r_info);

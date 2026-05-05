@@ -76,6 +76,9 @@ typedef Elf64_Xword Elf64_Relr;
 #endif
 
 #if defined(__x86_64__)
+#ifndef R_X86_64_TLSDESC
+#define R_X86_64_TLSDESC      36
+#endif
 #define ARCH_ELF_MACHINE      EM_X86_64
 #define ARCH_RELOC_RELATIVE   R_X86_64_RELATIVE
 #define ARCH_RELOC_GLOB_DAT   R_X86_64_GLOB_DAT
@@ -84,6 +87,7 @@ typedef Elf64_Xword Elf64_Relr;
 #define ARCH_RELOC_TPOFF      R_X86_64_TPOFF64
 #define ARCH_RELOC_DTPMOD     R_X86_64_DTPMOD64
 #define ARCH_RELOC_DTPOFF     R_X86_64_DTPOFF64
+#define ARCH_RELOC_TLSDESC    R_X86_64_TLSDESC
 #define ARCH_RELOC_IRELATIVE  R_X86_64_IRELATIVE
 #define ARCH_RELOC_COPY       R_X86_64_COPY
 
@@ -407,6 +411,23 @@ static int64_t dlfreeze_aarch64_tlsdesc_resolve_c(void *arg_in)
         tp, (unsigned long)arg->modid, (unsigned long)arg->offset);
     return (int64_t)(tls_addr - tp);
 }
+#endif
+
+#if defined(__x86_64__)
+/* x86_64 TLSDESC ABI: caller does `lea desc(%rip), %rax; call *(%rax)`.
+ * Resolver may clobber %rax and the flags only; all other registers
+ * (including arg registers) must be preserved.  Returns the TP offset
+ * (i.e. value to be combined as `%fs:(%rax)`) in %rax. */
+extern uintptr_t dlfreeze_x86_64_tlsdesc_static(void *);
+__asm__(
+    ".text\n"
+    ".global dlfreeze_x86_64_tlsdesc_static\n"
+    ".hidden dlfreeze_x86_64_tlsdesc_static\n"
+    ".type dlfreeze_x86_64_tlsdesc_static, @function\n"
+    "dlfreeze_x86_64_tlsdesc_static:\n"
+    "\tmovq 8(%rax), %rax\n"
+    "\tret\n"
+    ".size dlfreeze_x86_64_tlsdesc_static, .-dlfreeze_x86_64_tlsdesc_static\n");
 #endif
 
 #define MUSL_PROGNAME_NEAR_ENVIRON_MAX              0x100
@@ -5548,7 +5569,7 @@ static int resolve_tpoff(struct loaded_obj *objs, int nobj,
     return -1;
 }
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(__x86_64__)
 static int resolve_tlsdesc_target(struct loaded_obj *obj,
                                   struct loaded_obj *all, int nobj,
                                   uint32_t sidx, uint64_t addend,
@@ -5626,6 +5647,7 @@ static int resolve_tlsdesc_target(struct loaded_obj *obj,
     return 0;
 }
 
+#if defined(__aarch64__)
 static int apply_aarch64_tlsdesc_reloc(struct loaded_obj *obj,
                                        struct loaded_obj *all, int nobj,
                                        const Elf64_Rela *rel)
@@ -5673,6 +5695,41 @@ static int apply_aarch64_tlsdesc_reloc(struct loaded_obj *obj,
 }
 #endif
 
+#if defined(__x86_64__)
+static int apply_x86_64_tlsdesc_reloc(struct loaded_obj *obj,
+                                      struct loaded_obj *all, int nobj,
+                                      const Elf64_Rela *rel)
+{
+    size_t modid;
+    uint64_t offset;
+    int64_t tprel;
+    int have_tprel;
+    uint64_t *slot = (uint64_t *)(obj->base + rel->r_offset);
+
+    if (resolve_tlsdesc_target(obj, all, nobj,
+                               ELF64_R_SYM(rel->r_info),
+                               rel->r_addend,
+                               &modid, &offset,
+                               &tprel, &have_tprel) < 0) {
+        ldr_err("unresolved TLSDESC symbol", obj->name);
+        return -1;
+    }
+
+    if (have_tprel) {
+        slot[0] = (uint64_t)(uintptr_t)dlfreeze_x86_64_tlsdesc_static;
+        slot[1] = (uint64_t)tprel;
+        return 0;
+    }
+
+    /* Dynamic (DTV-based) TLSDESC is not yet implemented for x86_64.
+     * Initial-exec / locally-defined TLS variables (the common case for
+     * libpython, libssl, etc.) are covered by the static path above. */
+    ldr_err("dynamic TLSDESC unsupported on x86_64", obj->name);
+    return -1;
+}
+#endif
+#endif /* __aarch64__ || __x86_64__ */
+
 static void apply_prelinked_runtime_reloc(struct loaded_obj *obj,
                                           struct loaded_obj *objs, int nobj,
                                           const Elf64_Rela *rel)
@@ -5684,6 +5741,12 @@ static void apply_prelinked_runtime_reloc(struct loaded_obj *obj,
 #if defined(__aarch64__)
     if (type == ARCH_RELOC_TLSDESC) {
         apply_aarch64_tlsdesc_reloc(obj, objs, nobj, rel);
+        return;
+    }
+#endif
+#if defined(__x86_64__)
+    if (type == ARCH_RELOC_TLSDESC) {
+        apply_x86_64_tlsdesc_reloc(obj, objs, nobj, rel);
         return;
     }
 #endif
@@ -6295,6 +6358,12 @@ copy_done:
 #if defined(__aarch64__)
         case ARCH_RELOC_TLSDESC:
             if (apply_aarch64_tlsdesc_reloc(obj, all, nobj, r) < 0)
+                return -1;
+            break;
+#endif
+#if defined(__x86_64__)
+        case ARCH_RELOC_TLSDESC:
+            if (apply_x86_64_tlsdesc_reloc(obj, all, nobj, r) < 0)
                 return -1;
             break;
 #endif

@@ -163,7 +163,7 @@ for src_dir in $FROZEN_GLOB; do
     if [ -f "$frozen_py" ] && [ -f "$expected_py" ]; then
         chmod +x "$frozen_py" 2>/dev/null || true
         rc=0
-        actual=$(run_capture "$frozen_py" -c 'print(1+2)' 2>&1) || rc=$?
+        actual=$(run_capture "$frozen_py" -c 'print(1+2)' 2>/dev/null) || rc=$?
         exp=$(cat "$expected_py")
         if [ "$actual" = "$exp" ] && [ "$rc" -eq 0 ]; then
             pass "$src_env/python3.frozen"
