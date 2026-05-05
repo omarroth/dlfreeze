@@ -151,16 +151,54 @@ static void scan_dir_shallow(const char *dirpath,
         struct stat sb;
         if (stat(rpath, &sb) != 0) continue;
 
-        /* Subdirectory: skip.  We deliberately do NOT add a .dir
-         * marker here because that would make vfs_dir_exists() report
-         * the subdir as present even when none of its contents were
-         * captured, causing Python's import machinery to treat it as
-         * an (empty) namespace package and shadow the real module
-         * (e.g. /usr/lib/python3.14/re becoming an empty 're'
-         * package).  Subdirs that actually have captured files will
-         * appear in the VFS dir table via those entries' parents. */
-        if (S_ISDIR(sb.st_mode))
+        /* Subdirectory: by default skip.  Adding a .dir marker for
+         * an empty subdir would make vfs_dir_exists() report it as
+         * present and Python's import machinery then treats it as a
+         * namespace package shadowing the real module
+         * (e.g. /usr/lib/python3.14/re).
+         *
+         * Exception: when a subdir holds ELF binary extensions
+         * (e.g. /usr/lib/pythonX.Y/lib-dynload) we MUST report it as
+         * present even when the trace didn't dlopen any of them.
+         * Python's getpath walks the filesystem looking for
+         * lib-dynload to compute sys.exec_prefix; if it can't find
+         * the directory it prints "Could not find platform dependent
+         * libraries <exec_prefix>" on stderr.  Such a dir contains
+         * only ELF .so files (no __init__.py), so namespace-pkg
+         * shadowing of a sibling .py module is not a concern.  Add a
+         * .dir marker for it so vfs_dir_exists() succeeds. */
+        if (S_ISDIR(sb.st_mode)) {
+            DIR *sd = opendir(rpath);
+            if (sd) {
+                int has_elf = 0, has_py_init = 0;
+                struct dirent *se;
+                while ((se = readdir(sd))) {
+                    if (se->d_name[0] == '.') continue;
+                    /* __init__.py marks a pure-Python package; skip
+                     * such dirs to avoid namespace-pkg shadowing. */
+                    if (strcmp(se->d_name, "__init__.py") == 0) {
+                        has_py_init = 1;
+                        break;
+                    }
+                    size_t nl = strlen(se->d_name);
+                    if (nl < 4) continue;
+                    /* Quick filename heuristic: .so / .so.* extension */
+                    if (strcmp(se->d_name + nl - 3, ".so") == 0 ||
+                        strstr(se->d_name, ".so.") != NULL) {
+                        char ec[PATH_MAX];
+                        snprintf(ec, sizeof(ec), "%s/%s", rpath, se->d_name);
+                        if (elf_check(ec)) { has_elf = 1; }
+                    }
+                }
+                closedir(sd);
+                if (has_elf && !has_py_init) {
+                    char marker[PATH_MAX];
+                    snprintf(marker, sizeof(marker), "%s/.dir", rpath);
+                    data_file_list_add_virtual(out, marker);
+                }
+            }
             continue;
+        }
 
         if (!S_ISREG(sb.st_mode)) continue;
 
