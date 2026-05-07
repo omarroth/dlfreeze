@@ -1124,6 +1124,39 @@ static const struct glibc_ver_offsets glibc_aarch64_2_35 = {
     .gl_make_stack_executable = -1,
 };
 
+/* glibc 2.41 (AArch64): _rtld_global_ro=704B, _rtld_global=3040B
+ * Debian trixie (glibc 2.41-12+deb13u2).  Compared to 2.35–2.39 (688/4504):
+ *  - _dl_hwcap3, _dl_hwcap4 added in glro (+16 bytes)
+ *  - TLS fields shifted +8 (after _dl_aarch64_cap_flags)
+ *  - PTHREAD_IN_LIBC removed several gl fields, gl shrank from 4504→3040
+ * Verified via gdb -ex 'ptype /o struct rtld_global{,_ro}' on debian:trixie arm64. */
+static const struct glibc_ver_offsets glibc_aarch64_2_41 = {
+    .pthread_size               = 0x740,
+    .pthread_tid_off            = 0xd0,
+    .pthread_rseq_off           = 0x720,
+    .pthread_rseq_cpu_id_off    = 0x724,
+    .glro_tls_static_size  = 472,   /* 0x1D8 */
+    .glro_tls_static_align = 480,   /* 0x1E0 */
+    .glro_debug_printf     = 600,   /* 0x258 */
+    .glro_mcount           = 608,   /* 0x260 */
+    .glro_open             = 624,   /* 0x270 */
+    .glro_close            = 632,   /* 0x278 */
+    .glro_catch_error      = 640,   /* 0x280 */
+    .glro_error_free       = 648,   /* 0x288 */
+    .glro_find_object      = 672,   /* 0x2A0 */
+    .gl_tls_static_size    = -1,
+    .gl_tls_static_align   = -1,
+    .gl_nns                = 2688,  /* 0x0A80 */
+    .gl_stack_flags        = 2896,  /* 0x0B50 */
+    .gl_tls_generation     = 2952,  /* 0x0B88 */
+    .gl_stack_used         = 2968,  /* 0x0B98 */
+    .gl_stack_user         = 2984,  /* 0x0BA8 */
+    .gl_stack_cache        = 3000,  /* 0x0BB8 */
+    .gl_rtld_lock_recursive   = -1,
+    .gl_rtld_unlock_recursive = -1,
+    .gl_make_stack_executable = -1,
+};
+
 /* glibc 2.34–2.36 (x86-64): _rtld_global_ro=928B, _rtld_global=4304B
  * TLS fields moved to _rtld_global_ro.  Has catch_error/error_free/
  * find_object.  Has stack lists.  Same glro layout as 2.40+ but
@@ -1611,6 +1644,7 @@ static const struct {
     { 544,  4000, &glibc_2_31_debian }, /* glibc 2.31     x86-64 (Debian 11) */
     { 624,  4152, &glibc_aarch64_2_31 }, /* glibc 2.31     AArch64 */
     { 688,  4504, &glibc_aarch64_2_35 }, /* glibc 2.35–2.39 AArch64 */
+    { 704,  3040, &glibc_aarch64_2_41 }, /* glibc 2.41     AArch64 (Debian/trixie) */
     { 928,  4304, &glibc_2_34 },    /* glibc 2.34–2.36 x86-64 */
     { 952,  4352, &glibc_2_37 },    /* glibc 2.37–2.39 x86-64 */
     { 928,  2120, &glibc_2_40 },    /* glibc 2.40+     x86-64 */
