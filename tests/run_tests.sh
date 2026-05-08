@@ -1035,7 +1035,15 @@ test_ruby_direct_host_run() {
         rm -rf "$home"
         return
     fi
-    actual=$(HOME="$home" timeout 30 "$out" -e 'puts 1+2' 2>&1) || rc_a=$?
+    # Capture through a regular file, not the surrounding $() pipe.  Under
+    # qemu-user/aarch64, frozen Ruby can leave a worker alive after timeout
+    # kills the main process; if that worker inherited the pipe, bash waits
+    # forever for EOF.  A regular file has no pipe EOF dependency.
+    local outfile="$BUILD/ruby-host.out"
+    rm -f "$outfile"
+    HOME="$home" timeout --kill-after=5 30 "$out" -e 'puts 1+2' >"$outfile" 2>&1 || rc_a=$?
+    actual=$(cat "$outfile")
+    rm -f "$outfile"
 
     if [ "$expect" = "$actual" ] && [ "$rc_e" = "$rc_a" ]; then
         pass "ruby direct host-run"
