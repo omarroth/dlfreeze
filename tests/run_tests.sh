@@ -23,6 +23,81 @@ pass() { echo "${GRN}PASS${RST}: $1"; ((PASS++)) || true; }
 fail() { echo "${RED}FAIL${RST}: $1 — $2"; ((FAIL++)) || true; }
 skip() { echo "${YLW}SKIP${RST}: $1 — $2"; ((SKIP++)) || true; }
 
+TEST_RUN_TIMEOUT="${TEST_RUN_TIMEOUT:-30}"
+TEST_FREEZE_TIMEOUT="${TEST_FREEZE_TIMEOUT:-180}"
+TEST_TIMEOUT_KILL_AFTER="${TEST_TIMEOUT_KILL_AFTER:-5}"
+
+run_with_timeout_seconds() {
+    local limit="$1"
+    shift
+
+    if command -v timeout &>/dev/null; then
+        if timeout --help 2>&1 | grep -q -- '--kill-after'; then
+            timeout --kill-after="$TEST_TIMEOUT_KILL_AFTER" "$limit" "$@"
+        else
+            timeout "$limit" "$@"
+        fi
+    else
+        "$@"
+    fi
+}
+
+run_with_timeout() {
+    run_with_timeout_seconds "$TEST_RUN_TIMEOUT" "$@"
+}
+
+run_freeze() {
+    run_with_timeout_seconds "$TEST_FREEZE_TIMEOUT" "$@"
+}
+
+capture_output() {
+    local __var="$1" __tmp __rc
+    shift
+
+    __tmp=$(mktemp)
+    set +e
+    run_with_timeout "$@" >"$__tmp" 2>&1
+    __rc=$?
+    set -e
+    printf -v "$__var" '%s' "$(cat "$__tmp")"
+    rm -f "$__tmp"
+    return "$__rc"
+}
+
+capture_output_in_dir() {
+    local __var="$1" __dir="$2" __tmp __rc
+    shift 2
+
+    __tmp=$(mktemp)
+    set +e
+    (cd "$__dir" && run_with_timeout "$@") >"$__tmp" 2>&1
+    __rc=$?
+    set -e
+    printf -v "$__var" '%s' "$(cat "$__tmp")"
+    rm -f "$__tmp"
+    return "$__rc"
+}
+
+capture_output_split() {
+    local __stdout_var="$1" __stderr_var="$2" __out __err __rc
+    shift 2
+
+    __out=$(mktemp)
+    __err=$(mktemp)
+    set +e
+    run_with_timeout "$@" >"$__out" 2>"$__err"
+    __rc=$?
+    set -e
+    printf -v "$__stdout_var" '%s' "$(cat "$__out")"
+    printf -v "$__stderr_var" '%s' "$(cat "$__err")"
+    rm -f "$__out" "$__err"
+    return "$__rc"
+}
+
+strip_dlfreeze_warnings() {
+    grep -v '^dlfreeze: warning:' || true
+}
+
 # ===================================================================
 # Helper: freeze, run, compare
 # ===================================================================
@@ -30,7 +105,7 @@ freeze_and_compare() {
     local label="$1" binary="$2" output="$3"
     shift 3  # remaining args are passed to both runs
 
-    if ! "$DLFREEZE" -v -o "$output" "$binary"; then
+    if ! run_freeze "$DLFREEZE" -v -o "$output" "$binary"; then
         fail "$label" "dlfreeze failed"; return 1
     fi
     if [ ! -x "$output" ]; then
@@ -38,8 +113,8 @@ freeze_and_compare() {
     fi
 
     local expect actual rc_e=0 rc_a=0
-    expect=$("$binary" "$@" 2>&1) || rc_e=$?
-    actual=$("$output" "$@" 2>&1) || rc_a=$?
+    capture_output expect "$binary" "$@" || rc_e=$?
+    capture_output actual "$output" "$@" || rc_a=$?
 
     if [ "$expect" = "$actual" ] && [ "$rc_e" = "$rc_a" ]; then
         pass "$label"
@@ -69,11 +144,13 @@ C
     gcc -o "$bin" "$src" -lm
 
     # compare (ignore argv[0] line by using args 1+)
-    if ! "$DLFREEZE" -v -o "$out" "$bin"; then fail "hello" "dlfreeze failed"; return; fi
+    if ! run_freeze "$DLFREEZE" -v -o "$out" "$bin"; then fail "hello" "dlfreeze failed"; return; fi
 
-    local expect actual
-    expect=$("$bin" foo bar 2>&1 | tail -n +2)
-    actual=$("$out" foo bar 2>&1 | tail -n +2)
+    local expect actual rc_e=0 rc_a=0
+    capture_output expect "$bin" foo bar || rc_e=$?
+    capture_output actual "$out" foo bar || rc_a=$?
+    expect=$(printf '%s\n' "$expect" | tail -n +2)
+    actual=$(printf '%s\n' "$actual" | tail -n +2)
     if [ "$expect" = "$actual" ]; then pass "hello"; else
         fail "hello" "output differs"
         diff -u <(echo "$expect") <(echo "$actual") | head -20 || true
@@ -113,15 +190,15 @@ C
     fi
 
     local expect actual
-    expect=$("$bin" 2>&1)
+    capture_output expect "$bin"
 
-    if ! "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
+    if ! run_freeze "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
         fail "musl-hello-direct" "dlfreeze failed"
         rm -f "$src" "$bin" "$out"
         return
     fi
 
-    actual=$("$out" 2>&1)
+    capture_output actual "$out"
     if [ "$expect" = "$actual" ]; then
         pass "musl hello direct-load"
     else
@@ -173,15 +250,15 @@ C
     fi
 
     local expect actual rc_e=0 rc_a=0
-    expect=$("$bin" 2>&1) || rc_e=$?
+    capture_output expect "$bin" || rc_e=$?
 
-    if ! "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
+    if ! run_freeze "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
         fail "musl-ctor-direct" "dlfreeze failed"
         rm -f "$src" "$bin" "$out"
         return
     fi
 
-    actual=$("$out" 2>&1) || rc_a=$?
+    capture_output actual "$out" || rc_a=$?
     if [ "$expect" = "$actual" ] && [ "$rc_e" = "$rc_a" ]; then
         pass "musl ctor direct-load"
     else
@@ -233,15 +310,15 @@ C
     fi
 
     local expect actual rc_e=0 rc_a=0
-    expect=$("$bin" 2>&1) || rc_e=$?
+    capture_output expect "$bin" || rc_e=$?
 
-    if ! "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
+    if ! run_freeze "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
         fail "musl-copy-reloc-direct" "dlfreeze failed"
         rm -f "$src" "$bin" "$out"
         return
     fi
 
-    actual=$("$out" 2>&1) || rc_a=$?
+    capture_output actual "$out" || rc_a=$?
     if [ "$expect" = "$actual" ] && [ "$rc_e" = "$rc_a" ]; then
         pass "musl copy-reloc direct-load"
     else
@@ -291,15 +368,15 @@ C
     fi
 
     local expect actual rc_e=0 rc_a=0
-    expect=$("$bin" 2>&1) || rc_e=$?
+    capture_output expect "$bin" || rc_e=$?
 
-    if ! "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
+    if ! run_freeze "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
         fail "musl-multibyte-direct" "dlfreeze failed"
         rm -f "$src" "$bin" "$out"
         return
     fi
 
-    actual=$("$out" 2>&1) || rc_a=$?
+    capture_output actual "$out" || rc_a=$?
     if [ "$expect" = "$actual" ] && [ "$rc_e" = "$rc_a" ]; then
         pass "musl multibyte direct-load"
     else
@@ -366,15 +443,15 @@ C
     fi
 
     local expect actual rc_e=0 rc_a=0
-    expect=$("$bin" 2>&1) || rc_e=$?
+    capture_output expect "$bin" || rc_e=$?
 
-    if ! "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
+    if ! run_freeze "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
         fail "musl-shared-tls-direct" "dlfreeze failed"
         rm -f "$src_lib" "$src_main" "$lib" "$bin" "$out"
         return
     fi
 
-    actual=$("$out" 2>&1) || rc_a=$?
+    capture_output actual "$out" || rc_a=$?
     if [ "$expect" = "$actual" ] && [ "$rc_e" = "$rc_a" ]; then
         pass "musl shared-tls direct-load"
     else
@@ -434,15 +511,15 @@ C
     fi
 
     local expect actual rc_e=0 rc_a=0
-    expect=$("$bin" 2>&1) || rc_e=$?
+    capture_output expect "$bin" || rc_e=$?
 
-    if ! "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
+    if ! run_freeze "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
         fail "glibc-stack-end-direct" "dlfreeze failed"
         rm -f "$src" "$bin" "$out"
         return
     fi
 
-    actual=$("$out" 2>&1) || rc_a=$?
+    capture_output actual "$out" || rc_a=$?
     if [ "$expect" = "$actual" ] && [ "$rc_e" = "$rc_a" ]; then
         pass "glibc stack-end direct-load"
     else
@@ -465,15 +542,15 @@ test_exit_code() {
 int main(int ac, char **av) { return ac > 1 ? atoi(av[1]) : 42; }
 C
     gcc -o "$bin" "$src"
-    if ! "$DLFREEZE" -o "$out" "$bin"; then fail "exit-code" "dlfreeze failed"; return; fi
+    if ! run_freeze "$DLFREEZE" -o "$out" "$bin"; then fail "exit-code" "dlfreeze failed"; return; fi
 
     local e0 a0 e42 a42 ed ad
-    "$bin"   0  || e0=$?;  e0=${e0:-0}
-    "$out"   0  || a0=$?;  a0=${a0:-0}
-    "$bin"   42 || e42=$?; e42=${e42:-0}
-    "$out"   42 || a42=$?; a42=${a42:-0}
-    "$bin"      || ed=$?;  ed=${ed:-0}
-    "$out"      || ad=$?;  ad=${ad:-0}
+    run_with_timeout "$bin"   0  || e0=$?;  e0=${e0:-0}
+    run_with_timeout "$out"   0  || a0=$?;  a0=${a0:-0}
+    run_with_timeout "$bin"   42 || e42=$?; e42=${e42:-0}
+    run_with_timeout "$out"   42 || a42=$?; a42=${a42:-0}
+    run_with_timeout "$bin"      || ed=$?;  ed=${ed:-0}
+    run_with_timeout "$out"      || ad=$?;  ad=${ad:-0}
 
     if [[ "$e0" == "$a0" && "$e42" == "$a42" && "$ed" == "$ad" ]]; then
         pass "exit-code"
@@ -512,10 +589,10 @@ test_cat() {
     rm -f "$out"
 
     # stdin
-    if ! "$DLFREEZE" -o "$out" /bin/cat; then fail "cat stdin" "dlfreeze failed"; return; fi
+    if ! run_freeze "$DLFREEZE" -o "$out" /bin/cat; then fail "cat stdin" "dlfreeze failed"; return; fi
     local expect actual
     expect=$(echo "hello world" | /bin/cat)
-    actual=$(echo "hello world" | "$out")
+    actual=$(echo "hello world" | run_with_timeout "$out")
     if [ "$expect" = "$actual" ]; then pass "cat stdin"; else fail "cat stdin" "output differs"; fi
     rm -f "$out"
 }
@@ -530,14 +607,14 @@ test_python3() {
     local pypath out="$BUILD/python3.frozen"
     pypath=$(readlink -f "$(which python3)")
 
-    if ! "$DLFREEZE" -v -t -o "$out" -- "$pypath" -c 'import json; print("ok")'; then
+    if ! run_freeze "$DLFREEZE" -v -t -o "$out" -- "$pypath" -c 'import json; print("ok")'; then
         fail "python3" "dlfreeze failed"; return
     fi
 
     # simple print
     local expect actual
-    expect=$(python3 -c 'print("Hello from Python!")' 2>&1)
-    actual=$("$out" -c 'print("Hello from Python!")' 2>&1)
+    capture_output expect python3 -c 'print("Hello from Python!")'
+    capture_output actual "$out" -c 'print("Hello from Python!")'
     if [ "$expect" = "$actual" ]; then pass "python3 print"; else
         fail "python3 print" "output differs"
         echo "  expect: $expect"
@@ -545,15 +622,15 @@ test_python3() {
     fi
 
     # math
-    expect=$(python3 -c 'import math; print(math.pi)' 2>&1)
-    actual=$("$out" -c 'import math; print(math.pi)' 2>&1)
+    capture_output expect python3 -c 'import math; print(math.pi)'
+    capture_output actual "$out" -c 'import math; print(math.pi)'
     if [ "$expect" = "$actual" ]; then pass "python3 math"; else
         fail "python3 math" "output differs"
     fi
 
     # json (pure-python module)
-    expect=$(python3 -c 'import json; print(json.dumps({"a":1}))' 2>&1)
-    actual=$("$out" -c 'import json; print(json.dumps({"a":1}))' 2>&1)
+    capture_output expect python3 -c 'import json; print(json.dumps({"a":1}))'
+    capture_output actual "$out" -c 'import json; print(json.dumps({"a":1}))'
     if [ "$expect" = "$actual" ]; then pass "python3 json"; else
         fail "python3 json" "output differs"
     fi
@@ -596,16 +673,16 @@ C
 
     # the regular program needs LD_LIBRARY_PATH to find the .so
     local expect actual
-    expect=$(LD_LIBRARY_PATH="$BUILD" "$prog" 2>&1)
+    capture_output expect env LD_LIBRARY_PATH="$BUILD" "$prog"
 
     # Freeze with dlopen tracing — LD_LIBRARY_PATH is needed during trace
-    if ! LD_LIBRARY_PATH="$BUILD" "$DLFREEZE" -v -t -o "$out" "$prog" \
+    if ! run_freeze env LD_LIBRARY_PATH="$BUILD" "$DLFREEZE" -v -t -o "$out" "$prog" \
             -- 2>&1; then
         fail "dlopen" "dlfreeze failed"; return
     fi
 
     # The frozen binary should work without LD_LIBRARY_PATH
-    actual=$(unset LD_LIBRARY_PATH; "$out" 2>&1)
+    capture_output actual env -u LD_LIBRARY_PATH "$out"
 
     if [ "$expect" = "$actual" ]; then pass "dlopen (traced)"; else
         fail "dlopen (traced)" "output differs"
@@ -652,15 +729,15 @@ C
     gcc -o "$prog" "$prog_src" -ldl
 
     # Freeze WITHOUT tracing — libfallback.so will NOT be embedded
-    if ! "$DLFREEZE" -v -o "$out" "$prog"; then
+    if ! run_freeze "$DLFREEZE" -v -o "$out" "$prog"; then
         fail "dlopen-fallback" "dlfreeze failed"; return
     fi
 
     # The frozen binary should still work because the bundled ld.so
     # falls back to loading from the real filesystem.
     local expect actual
-    expect=$("$prog" 2>&1)
-    actual=$("$out" 2>&1)
+    capture_output expect "$prog"
+    capture_output actual "$out"
 
     if [ "$expect" = "$actual" ]; then pass "dlopen fallback (system lib)"; else
         fail "dlopen fallback" "output differs"
@@ -682,27 +759,27 @@ test_python3_advanced() {
     pypath=$(readlink -f "$(which python3)")
 
     # Trace with a broader import set
-    if ! "$DLFREEZE" -t -o "$out" -- "$pypath" -c \
+    if ! run_freeze "$DLFREEZE" -t -o "$out" -- "$pypath" -c \
          'import os,sys,json,hashlib,socket,ssl,sqlite3; print("traced")' 2>/dev/null; then
         fail "python3-adv" "dlfreeze failed"; return
     fi
 
     # os module
     local expect actual
-    expect=$(python3 -c 'import os; print(os.getpid.__name__)' 2>&1)
-    actual=$("$out" -c 'import os; print(os.getpid.__name__)' 2>&1)
+    capture_output expect python3 -c 'import os; print(os.getpid.__name__)'
+    capture_output actual "$out" -c 'import os; print(os.getpid.__name__)'
     if [ "$expect" = "$actual" ]; then pass "python3 os"; else
         fail "python3 os" "output differs: $expect vs $actual"; fi
 
     # hashlib
-    expect=$(python3 -c 'import hashlib; print(hashlib.sha256(b"test").hexdigest())' 2>&1)
-    actual=$("$out" -c 'import hashlib; print(hashlib.sha256(b"test").hexdigest())' 2>&1)
+    capture_output expect python3 -c 'import hashlib; print(hashlib.sha256(b"test").hexdigest())'
+    capture_output actual "$out" -c 'import hashlib; print(hashlib.sha256(b"test").hexdigest())'
     if [ "$expect" = "$actual" ]; then pass "python3 hashlib"; else
         fail "python3 hashlib" "output differs"; fi
 
     # sqlite3
-    expect=$(python3 -c 'import sqlite3; c=sqlite3.connect(":memory:"); print(c.execute("SELECT 1+1").fetchone()[0])' 2>&1)
-    actual=$("$out" -c 'import sqlite3; c=sqlite3.connect(":memory:"); print(c.execute("SELECT 1+1").fetchone()[0])' 2>&1)
+    capture_output expect python3 -c 'import sqlite3; c=sqlite3.connect(":memory:"); print(c.execute("SELECT 1+1").fetchone()[0])'
+    capture_output actual "$out" -c 'import sqlite3; c=sqlite3.connect(":memory:"); print(c.execute("SELECT 1+1").fetchone()[0])'
     if [ "$expect" = "$actual" ]; then pass "python3 sqlite3"; else
         fail "python3 sqlite3" "output differs: expected=$expect actual=$actual"; fi
 
@@ -743,10 +820,10 @@ C
     gcc -o "$prog" "$prog_src" -ldl
 
     local expect
-    expect=$(LD_LIBRARY_PATH="$BUILD" "$prog" 2>&1)
+    capture_output expect env LD_LIBRARY_PATH="$BUILD" "$prog"
 
     # Freeze with -d (direct) and -t (trace dlopen)
-    if ! LD_LIBRARY_PATH="$BUILD" "$DLFREEZE" -d -t -o "$out" "$prog" -- \
+    if ! run_freeze env LD_LIBRARY_PATH="$BUILD" "$DLFREEZE" -d -t -o "$out" "$prog" -- \
             2>/dev/null; then
         fail "direct-dlopen-embedded" "dlfreeze failed"; return
     fi
@@ -755,7 +832,7 @@ C
     # NOT from the filesystem.  Remove the .so to prove it.
     mv "$shlib" "${shlib}.bak"
     local actual rc=0
-    actual=$(unset LD_LIBRARY_PATH; "$out" 2>&1) || rc=$?
+    capture_output actual env -u LD_LIBRARY_PATH "$out" || rc=$?
     mv "${shlib}.bak" "$shlib"
 
     if [ "$expect" = "$actual" ] && [ "$rc" -eq 0 ]; then
@@ -808,10 +885,10 @@ C
     gcc -o "$prog" "$prog_src" -ldl
 
     local expect
-    expect=$(LD_LIBRARY_PATH="$BUILD" "$prog" 2>&1)
+    capture_output expect env LD_LIBRARY_PATH="$BUILD" "$prog"
 
     # Freeze with -d -t — both libtop.so and libdep.so should be captured
-    if ! LD_LIBRARY_PATH="$BUILD" "$DLFREEZE" -d -t -o "$out" "$prog" -- \
+    if ! run_freeze env LD_LIBRARY_PATH="$BUILD" "$DLFREEZE" -d -t -o "$out" "$prog" -- \
             2>/dev/null; then
         fail "direct-dlopen-deps" "dlfreeze failed"; return
     fi
@@ -820,7 +897,7 @@ C
     mv "$dep" "${dep}.bak"
     mv "$top" "${top}.bak"
     local actual rc=0
-    actual=$(unset LD_LIBRARY_PATH; "$out" 2>&1) || rc=$?
+    capture_output actual env -u LD_LIBRARY_PATH "$out" || rc=$?
     mv "${dep}.bak" "$dep"
     mv "${top}.bak" "$top"
 
@@ -870,17 +947,16 @@ C
     gcc -o "$prog" "$prog_src" -ldl
 
     local expect
-    expect=$("$prog" 2>&1)
+    capture_output expect "$prog"
 
     # Freeze with -d but WITHOUT -t — no dlopen tracing, lib won't be embedded
-    if ! "$DLFREEZE" -d -o "$out" "$prog" 2>/dev/null; then
+    if ! run_freeze "$DLFREEZE" -d -o "$out" "$prog" 2>/dev/null; then
         fail "direct-dlopen-fallback" "dlfreeze failed"; return
     fi
 
     # Run — should see warning on stderr but succeed
     local actual stderr_out rc=0
-    actual=$("$out" 2>/tmp/dlfreeze_test_stderr) || rc=$?
-    stderr_out=$(cat /tmp/dlfreeze_test_stderr)
+    capture_output_split actual stderr_out "$out" || rc=$?
 
     if [ "$expect" = "$actual" ] && [ "$rc" -eq 0 ]; then
         if echo "$stderr_out" | grep -q "warning.*not in frozen image" 2>/dev/null; then
@@ -894,7 +970,7 @@ C
         echo "  actual: $actual"
     fi
 
-    rm -f "$shlib_src" "$shlib" "$prog_src" "$prog" "$out" /tmp/dlfreeze_test_stderr
+    rm -f "$shlib_src" "$shlib" "$prog_src" "$prog" "$out"
 }
 
 # ===================================================================
@@ -908,21 +984,21 @@ test_python3_direct() {
     pypath=$(readlink -f "$(which python3)")
 
     # Freeze with -d (direct) and -t (trace dlopen) to capture C extensions
-    if ! "$DLFREEZE" -d -t -o "$out" -- "$pypath" -c \
+    if ! run_freeze "$DLFREEZE" -d -t -o "$out" -- "$pypath" -c \
          'import hashlib,sqlite3; print("traced")' 2>/dev/null; then
         fail "python3-direct" "dlfreeze failed"; return
     fi
 
     # hashlib — C extension that loads libcrypto.so via DT_NEEDED
     local expect actual
-    expect=$(python3 -c 'import hashlib; print(hashlib.sha256(b"hello").hexdigest())' 2>&1)
-    actual=$("$out" -c 'import hashlib; print(hashlib.sha256(b"hello").hexdigest())' 2>&1)
+    capture_output expect python3 -c 'import hashlib; print(hashlib.sha256(b"hello").hexdigest())'
+    capture_output actual "$out" -c 'import hashlib; print(hashlib.sha256(b"hello").hexdigest())'
     if [ "$expect" = "$actual" ]; then pass "python3 direct hashlib"; else
         fail "python3 direct hashlib" "output differs: expected=$expect actual=$actual"; fi
 
     # sqlite3 — C extension that loads libsqlite3.so
-    expect=$(python3 -c 'import sqlite3; c=sqlite3.connect(":memory:"); c.execute("CREATE TABLE t(x)"); c.execute("INSERT INTO t VALUES(42)"); print(c.execute("SELECT x FROM t").fetchone()[0])' 2>&1)
-    actual=$("$out" -c 'import sqlite3; c=sqlite3.connect(":memory:"); c.execute("CREATE TABLE t(x)"); c.execute("INSERT INTO t VALUES(42)"); print(c.execute("SELECT x FROM t").fetchone()[0])' 2>&1)
+    capture_output expect python3 -c 'import sqlite3; c=sqlite3.connect(":memory:"); c.execute("CREATE TABLE t(x)"); c.execute("INSERT INTO t VALUES(42)"); print(c.execute("SELECT x FROM t").fetchone()[0])'
+    capture_output actual "$out" -c 'import sqlite3; c=sqlite3.connect(":memory:"); c.execute("CREATE TABLE t(x)"); c.execute("INSERT INTO t VALUES(42)"); print(c.execute("SELECT x FROM t").fetchone()[0])'
     if [ "$expect" = "$actual" ]; then pass "python3 direct sqlite3"; else
         fail "python3 direct sqlite3" "output differs: expected=$expect actual=$actual"; fi
 
@@ -987,14 +1063,14 @@ CPP
         fail "glibc-tls-dtor-direct" "g++ failed building executable"
         return
     fi
-    if ! "$DLFREEZE" -d -o "$out" -- "$bin" 2>/dev/null; then
+    if ! run_freeze "$DLFREEZE" -d -o "$out" -- "$bin" 2>/dev/null; then
         fail "glibc-tls-dtor-direct" "dlfreeze failed"
         return
     fi
 
     local expect actual rc_e=0 rc_a=0
-    expect=$("$bin" 2>&1) || rc_e=$?
-    actual=$(timeout 30 "$out" 2>&1) || rc_a=$?
+    capture_output expect "$bin" || rc_e=$?
+    capture_output actual "$out" || rc_a=$?
 
     if [ "$expect" = "$actual" ] && [ "$rc_e" = "$rc_a" ]; then
         pass "glibc tls-dtor direct-load"
@@ -1024,13 +1100,13 @@ test_ruby_direct_host_run() {
 
     rm -rf "$home"
 
-    expect=$(HOME="$home" "$rubypath" -e 'puts 1+2' 2>&1) || rc_e=$?
+    capture_output expect env HOME="$home" "$rubypath" -e 'puts 1+2' || rc_e=$?
     if [ "$rc_e" -ne 0 ]; then
         fail "ruby-direct-host-run" "native ruby failed (exit $rc_e)"
         rm -rf "$home"
         return
     fi
-    if ! HOME="$home" "$DLFREEZE" -d -t -f '/usr/*' -o "$out" -- "$rubypath" -e 'puts 1+2' 2>/dev/null; then
+    if ! run_freeze env HOME="$home" "$DLFREEZE" -d -t -f '/usr/*' -o "$out" -- "$rubypath" -e 'puts 1+2' 2>/dev/null; then
         fail "ruby-direct-host-run" "dlfreeze failed"
         rm -rf "$home"
         return
@@ -1041,7 +1117,7 @@ test_ruby_direct_host_run() {
     # forever for EOF.  A regular file has no pipe EOF dependency.
     local outfile="$BUILD/ruby-host.out"
     rm -f "$outfile"
-    HOME="$home" timeout --kill-after=5 30 "$out" -e 'puts 1+2' >"$outfile" 2>&1 || rc_a=$?
+    run_with_timeout env HOME="$home" "$out" -e 'puts 1+2' >"$outfile" 2>&1 || rc_a=$?
     actual=$(cat "$outfile")
     rm -f "$outfile"
 
@@ -1092,16 +1168,16 @@ int main(void) {
 C
     gcc -o "$bin" "$src" -ldl
 
-    if ! "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
+    if ! run_freeze "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
         fail "dlopen-soname-direct" "dlfreeze failed"
         rm -f "$src" "$bin" "$out"
         return
     fi
 
     local actual rc=0
-    actual=$(timeout 10 "$out" 2>&1) || rc=$?
+    capture_output actual "$out" || rc=$?
     # Allow the "loading from disk" warning that dlfreeze prints.
-    actual=$(echo "$actual" | grep -v '^dlfreeze: warning:' || true)
+    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
     if [ "$actual" = "opened" ] && [ "$rc" = "0" ]; then
         pass "dlopen by soname direct-load"
     else
@@ -1140,7 +1216,7 @@ int main(void) {
 C
     gcc -o "$bin" "$src" -ldl
 
-    if ! "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
+    if ! run_freeze "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
         fail "dlopen-relpath-direct" "dlfreeze failed"
         rm -f "$libsrc" "$lib" "$src" "$bin" "$out"
         return
@@ -1148,8 +1224,8 @@ C
 
     local actual rc=0 out_abs
     out_abs=$(readlink -f "$out")
-    actual=$(cd "$BUILD" && timeout 10 "$out_abs" 2>&1) || rc=$?
-    actual=$(echo "$actual" | grep -v '^dlfreeze: warning:' || true)
+    capture_output_in_dir actual "$BUILD" "$out_abs" || rc=$?
+    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
     if [ "$actual" = "42" ] && [ "$rc" = "0" ]; then
         pass "dlopen relative path direct-load"
     else
@@ -1196,15 +1272,15 @@ C
         return
     fi
 
-    if ! "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
+    if ! run_freeze "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
         fail "dlmopen-direct" "dlfreeze failed"
         rm -f "$src" "$bin" "$out"
         return
     fi
 
     local actual rc=0
-    actual=$(timeout 10 "$out" 2>&1) || rc=$?
-    actual=$(echo "$actual" | grep -v '^dlfreeze: warning:' || true)
+    capture_output actual "$out" || rc=$?
+    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
     if [ "$actual" = "opened" ] && [ "$rc" = "0" ]; then
         pass "dlmopen direct-load"
     else
@@ -1257,15 +1333,16 @@ int main(void) {
 C
     gcc -o "$bin" "$src" -ldl -lpthread
 
-    if ! "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
+    if ! run_freeze "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
         fail "dlopen-tls-per-thread-direct" "dlfreeze failed"
         rm -f "$libsrc" "$lib" "$src" "$bin" "$out"
         return
     fi
 
     local expect actual
-    expect=$("$bin" 2>&1)
-    actual=$(timeout 30 "$out" 2>&1 | grep -v '^dlfreeze: warning:')
+    capture_output expect "$bin"
+    capture_output actual "$out"
+    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
     if [ "$expect" = "$actual" ]; then
         pass "dlopen TLS per-thread direct-load"
     else
@@ -1305,14 +1382,15 @@ int main(void) {
 C
     gcc -o "$bin" "$src" -ldl -lpthread
 
-    if ! "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
+    if ! run_freeze "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
         fail "dlvsym direct-load" "dlfreeze failed"
         rm -f "$src" "$bin" "$out"
         return
     fi
 
     local actual rc=0
-    actual=$(timeout 10 "$out" 2>&1 | grep -v '^dlfreeze: warning:') || rc=$?
+    capture_output actual "$out" || rc=$?
+    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
     if [ "$actual" = "ok" ] && [ "$rc" = "0" ]; then
         pass "dlvsym direct-load"
     else

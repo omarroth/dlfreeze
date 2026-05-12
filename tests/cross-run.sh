@@ -16,21 +16,44 @@ fail() { echo "${RED}FAIL${RST}: $1 — $2"; FAIL=$((FAIL + 1)); }
 skip() { echo "${YLW}SKIP${RST}: $1 — $2"; SKIP=$((SKIP + 1)); }
 
 RUN_TIMEOUT="${RUN_TIMEOUT:-15}"
+RUN_TIMEOUT_KILL_AFTER="${RUN_TIMEOUT_KILL_AFTER:-5}"
 
-run_capture() {
+run_with_timeout() {
     if command -v timeout >/dev/null 2>&1; then
-        timeout "$RUN_TIMEOUT" "$@"
+        if timeout --help 2>&1 | grep -q -- '--kill-after'; then
+            timeout --kill-after="$RUN_TIMEOUT_KILL_AFTER" "$RUN_TIMEOUT" "$@"
+        else
+            timeout "$RUN_TIMEOUT" "$@"
+        fi
     else
         "$@"
     fi
 }
 
+run_capture() {
+    tmp=$(mktemp)
+    set +e
+    run_with_timeout "$@" >"$tmp" 2>&1
+    rc=$?
+    set -e
+    cat "$tmp"
+    rm -f "$tmp"
+    return "$rc"
+}
+
+run_capture_stdout() {
+    tmp=$(mktemp)
+    set +e
+    run_with_timeout "$@" >"$tmp" 2>/dev/null
+    rc=$?
+    set -e
+    cat "$tmp"
+    rm -f "$tmp"
+    return "$rc"
+}
+
 run_quiet() {
-    if command -v timeout >/dev/null 2>&1; then
-        timeout "$RUN_TIMEOUT" "$@"
-    else
-        "$@"
-    fi
+    run_with_timeout "$@"
 }
 
 distro_name() {
@@ -80,7 +103,7 @@ for src_dir in $FROZEN_GLOB; do
     if [ -f "$frozen" ] && [ -f "$expected" ]; then
         chmod +x "$frozen" 2>/dev/null || true
         rc=0
-        actual=$(run_capture "$frozen" foo bar 2>&1) || rc=$?
+        actual=$(run_capture "$frozen" foo bar) || rc=$?
         exp=$(cat "$expected")
         if [ "$actual" = "$exp" ] && [ "$rc" -eq 0 ]; then
             pass "$src_env/hello.frozen"
@@ -98,7 +121,7 @@ for src_dir in $FROZEN_GLOB; do
     if [ -f "$frozen_upx" ] && [ -f "$expected" ]; then
         chmod +x "$frozen_upx" 2>/dev/null || true
         rc=0
-        actual=$(run_capture "$frozen_upx" foo bar 2>&1) || rc=$?
+        actual=$(run_capture "$frozen_upx" foo bar) || rc=$?
         exp=$(cat "$expected")
         if [ "$actual" = "$exp" ] && [ "$rc" -eq 0 ]; then
             pass "$src_env/hello.upx.frozen"
@@ -163,7 +186,7 @@ for src_dir in $FROZEN_GLOB; do
     if [ -f "$frozen_py" ] && [ -f "$expected_py" ]; then
         chmod +x "$frozen_py" 2>/dev/null || true
         rc=0
-        actual=$(run_capture "$frozen_py" -c 'print(1+2)' 2>/dev/null) || rc=$?
+        actual=$(run_capture_stdout "$frozen_py" -c 'print(1+2)') || rc=$?
         exp=$(cat "$expected_py")
         if [ "$actual" = "$exp" ] && [ "$rc" -eq 0 ]; then
             pass "$src_env/python3.frozen"
@@ -179,7 +202,7 @@ for src_dir in $FROZEN_GLOB; do
     if [ -f "$frozen_py_upx" ] && [ -f "$expected_py" ]; then
         chmod +x "$frozen_py_upx" 2>/dev/null || true
         rc=0
-        actual=$(run_capture "$frozen_py_upx" -c 'print(1+2)' 2>/dev/null) || rc=$?
+        actual=$(run_capture_stdout "$frozen_py_upx" -c 'print(1+2)') || rc=$?
         exp=$(cat "$expected_py")
         if [ "$actual" = "$exp" ] && [ "$rc" -eq 0 ]; then
             pass "$src_env/python3.upx.frozen"
@@ -196,7 +219,7 @@ for src_dir in $FROZEN_GLOB; do
     if [ -f "$frozen_rb" ] && [ -f "$expected_rb" ]; then
         chmod +x "$frozen_rb" 2>/dev/null || true
         rc=0
-        actual=$(run_capture "$frozen_rb" -e 'puts 1+2' 2>&1) || rc=$?
+        actual=$(run_capture "$frozen_rb" -e 'puts 1+2') || rc=$?
         exp=$(cat "$expected_rb")
         if [ "$actual" = "$exp" ] && [ "$rc" -eq 0 ]; then
             pass "$src_env/ruby.frozen"
@@ -212,7 +235,7 @@ for src_dir in $FROZEN_GLOB; do
     if [ -f "$frozen_rb_upx" ] && [ -f "$expected_rb" ]; then
         chmod +x "$frozen_rb_upx" 2>/dev/null || true
         rc=0
-        actual=$(run_capture "$frozen_rb_upx" -e 'puts 1+2' 2>&1) || rc=$?
+        actual=$(run_capture "$frozen_rb_upx" -e 'puts 1+2') || rc=$?
         exp=$(cat "$expected_rb")
         if [ "$actual" = "$exp" ] && [ "$rc" -eq 0 ]; then
             pass "$src_env/ruby.upx.frozen"

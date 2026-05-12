@@ -8,6 +8,38 @@ RUN_SMOKE=1
 RUN_CROSS=1
 CROSS_ARCH=""
 
+TEST_RUN_TIMEOUT="${TEST_RUN_TIMEOUT:-30}"
+TEST_FREEZE_TIMEOUT="${TEST_FREEZE_TIMEOUT:-180}"
+TEST_SUITE_TIMEOUT="${TEST_SUITE_TIMEOUT:-1200}"
+TEST_TIMEOUT_KILL_AFTER="${TEST_TIMEOUT_KILL_AFTER:-5}"
+
+run_with_timeout_seconds() {
+    local limit="$1"
+    shift
+
+    if command -v timeout &>/dev/null; then
+        if timeout --help 2>&1 | grep -q -- '--kill-after'; then
+            timeout --kill-after="$TEST_TIMEOUT_KILL_AFTER" "$limit" "$@"
+        else
+            timeout "$limit" "$@"
+        fi
+    else
+        "$@"
+    fi
+}
+
+run_with_timeout() {
+    run_with_timeout_seconds "$TEST_RUN_TIMEOUT" "$@"
+}
+
+run_freeze() {
+    run_with_timeout_seconds "$TEST_FREEZE_TIMEOUT" "$@"
+}
+
+run_suite() {
+    run_with_timeout_seconds "$TEST_SUITE_TIMEOUT" "$@"
+}
+
 usage() {
     cat <<'EOF'
 Usage: tests/local-verify.sh [options]
@@ -68,17 +100,17 @@ make BUILD="$BUILD_DIR" -j"$(nproc)"
 
 if [[ "$RUN_SUITE" -eq 1 ]]; then
     echo "[local-verify] running full test suite"
-    bash tests/run_tests.sh "$BUILD_DIR"
+    run_suite bash tests/run_tests.sh "$BUILD_DIR"
 fi
 
 if [[ "$RUN_SMOKE" -eq 1 ]]; then
     echo "[local-verify] Ruby gems-enabled freeze smoke"
-    "$BUILD_DIR"/dlfreeze -t -f '/usr/*' -o /tmp/ruby.local.frozen -- ruby -e 'puts 1+2'
-    /tmp/ruby.local.frozen -e 'puts 1+2'
+    run_freeze "$BUILD_DIR"/dlfreeze -t -f '/usr/*' -o /tmp/ruby.local.frozen -- ruby -e 'puts 1+2'
+    run_with_timeout /tmp/ruby.local.frozen -e 'puts 1+2'
 
     echo "[local-verify] Python freeze smoke"
-    "$BUILD_DIR"/dlfreeze -t -f '/usr/*' -o /tmp/python.local.frozen -- python3 -c 'print(1+2)'
-    /tmp/python.local.frozen -c 'print(1+2)'
+    run_freeze "$BUILD_DIR"/dlfreeze -t -f '/usr/*' -o /tmp/python.local.frozen -- python3 -c 'print(1+2)'
+    run_with_timeout /tmp/python.local.frozen -c 'print(1+2)'
 fi
 
 if [[ "$RUN_CROSS" -eq 1 ]]; then

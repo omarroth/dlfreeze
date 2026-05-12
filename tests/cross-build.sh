@@ -3,6 +3,34 @@
 # binaries.  Called inside Docker containers by the cross-platform CI workflow.
 set -eu
 
+TEST_RUN_TIMEOUT="${TEST_RUN_TIMEOUT:-30}"
+TEST_FREEZE_TIMEOUT="${TEST_FREEZE_TIMEOUT:-180}"
+TEST_SUITE_TIMEOUT="${TEST_SUITE_TIMEOUT:-1200}"
+TEST_TIMEOUT_KILL_AFTER="${TEST_TIMEOUT_KILL_AFTER:-5}"
+
+run_with_timeout_seconds() {
+    limit="$1"
+    shift
+
+    if command -v timeout >/dev/null 2>&1; then
+        if timeout --help 2>&1 | grep -q -- '--kill-after'; then
+            timeout --kill-after="$TEST_TIMEOUT_KILL_AFTER" "$limit" "$@"
+        else
+            timeout "$limit" "$@"
+        fi
+    else
+        "$@"
+    fi
+}
+
+run_freeze() {
+    run_with_timeout_seconds "$TEST_FREEZE_TIMEOUT" "$@"
+}
+
+run_suite() {
+    run_with_timeout_seconds "$TEST_SUITE_TIMEOUT" "$@"
+}
+
 distro_name() {
     if [ -f /etc/os-release ]; then
         . /etc/os-release
@@ -134,7 +162,7 @@ echo "--- Test suite ---"
 # The test suite skips tests whose prerequisites are missing (Docker,
 # specific relocation types, etc.).  We run it for coverage but do not
 # gate the build on it — the cross-run job is the hard compatibility gate.
-if bash tests/run_tests.sh build; then
+if run_suite bash tests/run_tests.sh build; then
     echo "Test suite: all passed"
 else
     echo "WARNING: test suite had failures (may be expected in this environment)"
@@ -162,7 +190,7 @@ int main(int argc, char **argv) {
 EOF
 gcc -o /tmp/cross_hello /tmp/cross_hello.c -lm
 /tmp/cross_hello foo bar > "$OUTDIR/hello.expected"
-/work/build/dlfreeze -v -d -o "$OUTDIR/hello.frozen" /tmp/cross_hello
+run_freeze /work/build/dlfreeze -v -d -o "$OUTDIR/hello.frozen" /tmp/cross_hello
 chmod +x "$OUTDIR/hello.frozen"
 
 # 2. Exit code preservation
@@ -173,7 +201,7 @@ int main(int argc, char **argv) {
 }
 EOF
 gcc -o /tmp/cross_exit /tmp/cross_exit.c
-/work/build/dlfreeze -v -d -o "$OUTDIR/exitcode.frozen" /tmp/cross_exit
+run_freeze /work/build/dlfreeze -v -d -o "$OUTDIR/exitcode.frozen" /tmp/cross_exit
 chmod +x "$OUTDIR/exitcode.frozen"
 
 # 3. UPX-compressed variants (best effort)
@@ -192,7 +220,7 @@ fi
 
 # 4. Python3 — freeze a simple deterministic script (best effort)
 if command -v python3 >/dev/null 2>&1; then
-    if /work/build/dlfreeze -v -d -t -f '/usr/*' -o "$OUTDIR/python3.frozen" -- python3 -c 'print(1+2)' 2>/dev/null; then
+    if run_freeze /work/build/dlfreeze -v -d -t -f '/usr/*' -o "$OUTDIR/python3.frozen" -- python3 -c 'print(1+2)' 2>/dev/null; then
         chmod +x "$OUTDIR/python3.frozen"
         echo "3" > "$OUTDIR/python3.expected"
         if command -v upx >/dev/null 2>&1; then
@@ -208,7 +236,7 @@ fi
 
 # 5. Ruby — freeze a simple deterministic script (best effort)
 if command -v ruby >/dev/null 2>&1; then
-    if /work/build/dlfreeze -v -d -t -f '/usr/*' -o "$OUTDIR/ruby.frozen" -- ruby -e 'puts 1+2' 2>/dev/null; then
+    if run_freeze /work/build/dlfreeze -v -d -t -f '/usr/*' -o "$OUTDIR/ruby.frozen" -- ruby -e 'puts 1+2' 2>/dev/null; then
         chmod +x "$OUTDIR/ruby.frozen"
         echo "3" > "$OUTDIR/ruby.expected"
         if command -v upx >/dev/null 2>&1; then
