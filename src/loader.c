@@ -1129,12 +1129,15 @@ static const struct glibc_ver_offsets glibc_aarch64_2_35 = {
  *  - _dl_hwcap3, _dl_hwcap4 added in glro (+16 bytes)
  *  - TLS fields shifted +8 (after _dl_aarch64_cap_flags)
  *  - PTHREAD_IN_LIBC removed several gl fields, gl shrank from 4504→3040
- * Verified via gdb -ex 'ptype /o struct rtld_global{,_ro}' on debian:trixie arm64. */
+ *  - struct pthread shrank to 0x720 and no longer has an rseq_area;
+ *    using the old 0x740/rseq offsets aliases pthread exit_lock.
+ * Verified via gdb -ex 'ptype /o struct rtld_global{,_ro}' and
+ * 'ptype /o struct pthread' on debian:trixie arm64. */
 static const struct glibc_ver_offsets glibc_aarch64_2_41 = {
-    .pthread_size               = 0x740,
+    .pthread_size               = 0x720,
     .pthread_tid_off            = 0xd0,
-    .pthread_rseq_off           = 0x720,
-    .pthread_rseq_cpu_id_off    = 0x724,
+    .pthread_rseq_off           = -1,
+    .pthread_rseq_cpu_id_off    = -1,
     .glro_tls_static_size  = 472,   /* 0x1D8 */
     .glro_tls_static_align = 480,   /* 0x1E0 */
     .glro_debug_printf     = 600,   /* 0x258 */
@@ -1306,10 +1309,12 @@ static uint8_t g_fake_link_map[0x500] __attribute__((aligned(64)));
  * offset 0 (= the TCB itself).  On thread cleanup glibc memsets the
  * rseq area, destroying the TCB and causing SIGSEGV.
  *
- * We provide our own copies.  __rseq_offset is set at runtime once the
- * static TLS layout is known so the 32-byte rseq area sits below every
- * TLS block copied into the thread image.
- * __rseq_size = 32 is the minimum kernel rseq struct size.
+ * We provide our own copies.  For layouts with a real pthread rseq area,
+ * __rseq_offset is set at runtime once the static TLS layout is known and
+ * __rseq_size remains 32, the minimum kernel rseq struct size.  For known
+ * no-rseq pthread layouts, setup_tls() sets __rseq_size to 0, uses safe
+ * pthread padding as synthetic cpu-id storage, and clears glibc's per-thread
+ * rseq-registered bit before the thread startup path reaches the syscall.
  */
 static int64_t  g_rseq_offset = -160;
 static uint32_t g_rseq_size   = 32;
@@ -1874,6 +1879,8 @@ static int stub_dl_rtld_di_serinfo(void) { return -1; }
 #define GLIBC_AARCH64_PTHREAD_TID_OFF_DEFAULT    0x0d0
 #define GLIBC_AARCH64_PTHREAD_RSEQ_OFF_DEFAULT   0x720
 #define GLIBC_AARCH64_PTHREAD_RSEQ_CPU_ID_OFF_DEFAULT 0x724
+#define GLIBC_AARCH64_PTHREAD_CANCELHANDLING_OFF_DEFAULT 0x108
+#define GLIBC_RSEQ_REGISTERED_BIT 0x80
 #define GLIBC_RSEQ_CPU_ID_REGISTRATION_FAILED (-2)
 
 /* Runtime accessors that consult the detected glibc version profile.
@@ -1894,7 +1901,7 @@ static inline size_t glibc_aarch64_pthread_tid_off(void)
 }
 static inline int glibc_aarch64_has_rseq_area(void)
 {
-    if (g_glibc_off && g_glibc_off->pthread_rseq_off >= 0)
+    if (g_glibc_off)
         return g_glibc_off->pthread_rseq_off > 0;
     /* Default profile assumes modern glibc with rseq area. */
     return 1;
@@ -2026,6 +2033,22 @@ static inline uintptr_t glibc_aarch64_pthread_self_from_tp(uintptr_t tp)
     return tp;
 #endif
 }
+
+#if defined(__aarch64__)
+static void glibc_aarch64_disable_rseq_for_thread(uintptr_t tp)
+{
+    if (g_is_musl_runtime || g_rseq_size != 0)
+        return;
+
+    uintptr_t self = glibc_aarch64_pthread_self_from_tp(tp);
+    int32_t *cancelhandling = (int32_t *)(self +
+        GLIBC_AARCH64_PTHREAD_CANCELHANDLING_OFF_DEFAULT);
+    uintptr_t rseq_base = (uintptr_t)((int64_t)tp + g_rseq_offset);
+
+    *cancelhandling &= ~GLIBC_RSEQ_REGISTERED_BIT;
+    *(int32_t *)(rseq_base + 4) = GLIBC_RSEQ_CPU_ID_REGISTRATION_FAILED;
+}
+#endif
 
 static inline uintptr_t musl_thread_self_ptr(uintptr_t tp)
 {
@@ -3007,6 +3030,10 @@ static void *stub_dl_allocate_tls_init(void *mem)
      * and the stored self-pointer might have been cleared). */
     *(uintptr_t *)(tp + TCB_OFF_SELF)  = tp;
     *(uintptr_t *)(tp + TCB_OFF_SELF2) = tp;
+
+#if defined(__aarch64__)
+    glibc_aarch64_disable_rseq_for_thread(tp);
+#endif
 
     return mem;
 }
@@ -6433,38 +6460,52 @@ static void apply_relr(struct loaded_obj *obj)
 }
 
 /*
- * Pre-seed _rtld_global / _rtld_global_ro GOT entries before any
+ * Pre-seed _rtld_global / _rtld_global_ro and __rseq_* GOT entries before any
  * relocations run.  IFUNC resolvers in glibc (memcpy, mempcpy, etc.)
  * read _rtld_global_ro through the GOT.  If a GLOB_DAT for an IFUNC
  * symbol is processed before _rtld_global_ro's own GLOB_DAT in the
  * same rela table, resolve_sym calls the IFUNC resolver → crash.
- * This pre-pass ensures the GOT slots are already populated.
- *
- * Optimised: only matches "_rtld_global" / "_rtld_global_ro" (2 names)
- * with a first-char + 6th-char filter and early exit once both found.
+ * glibc's thread start path can also read __rseq_* before the generic
+ * runtime-fixup pass reaches the symbol.  This pre-pass ensures those
+ * startup-critical GOT slots are already populated.
  */
 static void preseed_rtld_got(struct loaded_obj *obj)
 {
     uint64_t base = obj->base;
-    int found = 0;   /* bitmask: bit 0 = _rtld_global, bit 1 = _rtld_global_ro */
 
     const Elf64_Rela *tabs[] = { obj->rela, obj->jmprel };
     size_t counts[] = { obj->rela_count, obj->jmprel_count };
-    for (int t = 0; t < 2 && found != 3; t++) {
+    for (int t = 0; t < 2; t++) {
         for (size_t i = 0; i < counts[t]; i++) {
             const Elf64_Rela *r = &tabs[t][i];
             uint32_t type = ELF64_R_TYPE(r->r_info);
+            uint32_t sidx;
+            const char *name;
+            uint64_t addr = 0;
+
             if (type != ARCH_RELOC_GLOB_DAT && type != ARCH_RELOC_JUMP_SLOT)
                 continue;
-            uint32_t sidx = ELF64_R_SYM(r->r_info);
-            const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
-            /* Fast filter: both targets start with '_r' */
-            if (name[0] != '_' || name[1] != 'r') continue;
-            uint64_t addr = lookup_fake_object(name);
+            sidx = ELF64_R_SYM(r->r_info);
+            if (sidx >= obj->dynsym_count)
+                continue;
+            name = obj->dynstr + obj->dynsym[sidx].st_name;
+            if (name[0] != '_')
+                continue;
+
+            if (name[1] == 'r')
+                addr = lookup_fake_object(name);
+            else if (name[1] == '_' && name[2] == 'r')
+                addr = lookup_special(name, gnu_hash_calc(name));
+
             if (addr) {
                 *(uint64_t *)(base + r->r_offset) = addr + r->r_addend;
-                found |= (name[12] == '_') ? 2 : 1;  /* _ro vs plain */
-                if (found == 3) break;
+                if (g_debug) {
+                    ldr_msg("GOT preseed: ");
+                    ldr_msg(name);
+                    ldr_msg(" in ");
+                    ldr_msg(obj->name);
+                    ldr_msg("\n");
+                }
             }
         }
     }
@@ -7952,10 +7993,16 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
             g_rseq_offset = (int64_t)glibc_aarch64_pthread_rseq_off() -
                             (int64_t)glibc_aarch64_pthread_size();
         } else {
-            /* Pre-2.34 glibc: no rseq area in struct pthread. */
-            g_rseq_offset = 0;
+            /* No struct pthread rseq area.  Use the padding after tid as
+             * synthetic cpu_id storage for glibc's failure marker. */
+            g_rseq_offset = (int64_t)glibc_aarch64_pthread_tid_off() -
+                            (int64_t)glibc_aarch64_pthread_size();
         }
         g_rseq_size = 0;
+        if (g_debug) {
+            ldr_dbg_hex("[loader] glibc rseq offset=", (uint64_t)g_rseq_offset);
+            ldr_dbg_hex("[loader] glibc rseq size=", (uint64_t)g_rseq_size);
+        }
     }
 #else
     if (!g_is_musl_runtime && min_static_tpoff < 0) {
@@ -8087,6 +8134,7 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
             *(int32_t *)(self + glibc_aarch64_pthread_rseq_cpu_id_off()) =
                 GLIBC_RSEQ_CPU_ID_REGISTRATION_FAILED;
         }
+        glibc_aarch64_disable_rseq_for_thread(tp);
 #else
         *(int32_t *)(tp + TCB_OFF_TID) = (int32_t)syscall(SYS_gettid);
 #endif
@@ -8669,6 +8717,8 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     } else {
         ldr_dbg("[loader] applying relocations...\n");
 
+        build_special_table();
+
         /* Pre-seed _rtld_global/_rtld_global_ro GOT entries so IFUNC
          * resolvers called during GLOB_DAT processing work correctly. */
         for (int i = 0; i < nobj; i++)
@@ -8844,7 +8894,7 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     typedef int (*main_fn_t)(int, char **, char **);
     uint64_t main_addr = resolve_main_address(objs, nobj, idx_map, metas,
                                               entry,
-                                              1);
+                                              0);
 
 #if defined(__aarch64__)
      /* Prefer direct main after __libc_early_init; the bridge can crash on large VFS payloads. */
