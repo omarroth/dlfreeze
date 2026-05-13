@@ -666,7 +666,7 @@ test_python3() {
     if ! command -v python3 &>/dev/null; then skip "python3" "not installed"; return; fi
 
     local pypath out="$BUILD/python3.frozen"
-    pypath=$(readlink -f "$(which python3)")
+    pypath=$(readlink -f "$(command -v python3)")
 
     if ! run_freeze "$DLFREEZE" -v -t -o "$out" -- "$pypath" -c 'import json; print("ok")'; then
         fail "python3" "dlfreeze failed"; return
@@ -817,7 +817,7 @@ test_python3_advanced() {
     if ! command -v python3 &>/dev/null; then skip "python3-adv" "not installed"; return; fi
 
     local pypath out="$BUILD/python3a.frozen"
-    pypath=$(readlink -f "$(which python3)")
+    pypath=$(readlink -f "$(command -v python3)")
 
     # Trace with a broader import set
     if ! run_freeze "$DLFREEZE" -t -o "$out" -- "$pypath" -c \
@@ -1042,7 +1042,7 @@ test_python3_direct() {
     if ! command -v python3 &>/dev/null; then skip "python3-direct" "not installed"; return; fi
 
     local pypath out="$BUILD/python3d.frozen"
-    pypath=$(readlink -f "$(which python3)")
+    pypath=$(readlink -f "$(command -v python3)")
 
     # Freeze with -d (direct) and -t (trace dlopen) to capture C extensions
     if ! run_freeze "$DLFREEZE" -d -t -o "$out" -- "$pypath" -c \
@@ -1155,7 +1155,7 @@ test_ruby_direct_host_run() {
 
     local rubypath out home
     local expect actual rc_e=0 rc_a=0
-    rubypath=$(readlink -f "$(which ruby)")
+    rubypath=$(readlink -f "$(command -v ruby)")
     out="$BUILD/ruby-host.frozen"
     home="$BUILD/ruby-home-missing"
 
