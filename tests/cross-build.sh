@@ -40,6 +40,34 @@ distro_name() {
     fi
 }
 
+path_is_elf() {
+    command -v file >/dev/null 2>&1 && file -b "$1" 2>/dev/null | grep -q 'ELF'
+}
+
+resolve_ruby_elf() {
+    path=$(command -v ruby 2>/dev/null || true)
+    if [ -n "$path" ]; then
+        path=$(readlink -f "$path")
+        if path_is_elf "$path"; then
+            printf '%s\n' "$path"
+            return 0
+        fi
+    fi
+
+    for candidate in ruby-mri ruby3.4 ruby3.3 ruby3.2 ruby3.1 ruby3.0 ruby2.7; do
+        path=$(command -v "$candidate" 2>/dev/null || true)
+        if [ -n "$path" ]; then
+            path=$(readlink -f "$path")
+            if path_is_elf "$path"; then
+                printf '%s\n' "$path"
+                return 0
+            fi
+        fi
+    done
+
+    return 1
+}
+
 # Fetch a modern UPX from GitHub when the distro lacks one (Fedora has
 # no upx in core repos) or ships one too old to compress our binaries
 # (older Debian/Ubuntu).  No-op when a sufficiently new UPX is present.
@@ -236,7 +264,8 @@ fi
 
 # 5. Ruby — freeze a simple deterministic script (best effort)
 if command -v ruby >/dev/null 2>&1; then
-    if run_freeze /work/build/dlfreeze -v -d -t -f '/usr/*' -o "$OUTDIR/ruby.frozen" -- ruby -e 'puts 1+2' 2>/dev/null; then
+    ruby_elf=$(resolve_ruby_elf || true)
+    if [ -n "$ruby_elf" ] && run_freeze /work/build/dlfreeze -v -d -t -f '/usr/*' -o "$OUTDIR/ruby.frozen" -- "$ruby_elf" -e 'puts 1+2' 2>/dev/null; then
         chmod +x "$OUTDIR/ruby.frozen"
         echo "3" > "$OUTDIR/ruby.expected"
         if command -v upx >/dev/null 2>&1; then

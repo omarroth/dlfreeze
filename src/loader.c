@@ -414,11 +414,29 @@ static int64_t dlfreeze_aarch64_tlsdesc_resolve_c(void *arg_in)
 #endif
 
 #if defined(__x86_64__)
+struct x86_64_tlsdesc_arg {
+    uint64_t modid;
+    uint64_t offset;
+};
+
+#define X86_64_TLSDESC_ARGS_PER_PAGE 255
+
 /* x86_64 TLSDESC ABI: caller does `lea desc(%rip), %rax; call *(%rax)`.
  * Resolver may clobber %rax and the flags only; all other registers
  * (including arg registers) must be preserved.  Returns the TP offset
  * (i.e. value to be combined as `%fs:(%rax)`) in %rax. */
 extern uintptr_t dlfreeze_x86_64_tlsdesc_static(void *);
+extern uintptr_t dlfreeze_x86_64_tlsdesc_dynamic(void *);
+static int64_t dlfreeze_x86_64_tlsdesc_resolve_c(void *arg_in);
+
+struct x86_64_tlsdesc_page {
+    struct x86_64_tlsdesc_page *next;
+    size_t used;
+    struct x86_64_tlsdesc_arg args[X86_64_TLSDESC_ARGS_PER_PAGE];
+};
+
+static struct x86_64_tlsdesc_page *g_x86_64_tlsdesc_pages;
+
 __asm__(
     ".text\n"
     ".global dlfreeze_x86_64_tlsdesc_static\n"
@@ -427,7 +445,50 @@ __asm__(
     "dlfreeze_x86_64_tlsdesc_static:\n"
     "\tmovq 8(%rax), %rax\n"
     "\tret\n"
-    ".size dlfreeze_x86_64_tlsdesc_static, .-dlfreeze_x86_64_tlsdesc_static\n");
+    ".size dlfreeze_x86_64_tlsdesc_static, .-dlfreeze_x86_64_tlsdesc_static\n"
+    ".global dlfreeze_x86_64_tlsdesc_dynamic\n"
+    ".hidden dlfreeze_x86_64_tlsdesc_dynamic\n"
+    ".type dlfreeze_x86_64_tlsdesc_dynamic, @function\n"
+    "dlfreeze_x86_64_tlsdesc_dynamic:\n"
+    "\tpushq %rdi\n"
+    "\tpushq %rsi\n"
+    "\tpushq %rdx\n"
+    "\tpushq %rcx\n"
+    "\tpushq %r8\n"
+    "\tpushq %r9\n"
+    "\tpushq %r10\n"
+    "\tpushq %r11\n"
+    "\tpushq %rbx\n"
+    "\tmovq 8(%rax), %rdi\n"
+    "\tcall dlfreeze_x86_64_tlsdesc_resolve_c\n"
+    "\tpopq %rbx\n"
+    "\tpopq %r11\n"
+    "\tpopq %r10\n"
+    "\tpopq %r9\n"
+    "\tpopq %r8\n"
+    "\tpopq %rcx\n"
+    "\tpopq %rdx\n"
+    "\tpopq %rsi\n"
+    "\tpopq %rdi\n"
+    "\tret\n"
+    ".size dlfreeze_x86_64_tlsdesc_dynamic, .-dlfreeze_x86_64_tlsdesc_dynamic\n");
+
+static struct x86_64_tlsdesc_arg *alloc_x86_64_tlsdesc_arg(void)
+{
+    struct x86_64_tlsdesc_page *page = g_x86_64_tlsdesc_pages;
+
+    if (!page || page->used == X86_64_TLSDESC_ARGS_PER_PAGE) {
+        page = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (page == MAP_FAILED)
+            return NULL;
+        memset(page, 0, 4096);
+        page->next = g_x86_64_tlsdesc_pages;
+        g_x86_64_tlsdesc_pages = page;
+    }
+
+    return &page->args[page->used++];
+}
 #endif
 
 #define MUSL_PROGNAME_NEAR_ENVIRON_MAX              0x100
@@ -1124,6 +1185,37 @@ static const struct glibc_ver_offsets glibc_aarch64_2_35 = {
     .gl_make_stack_executable = -1,
 };
 
+/* glibc 2.36 (AArch64): _rtld_global_ro=672B, _rtld_global=4520B
+ * Debian 12 arm64 keeps the 0x740 pthread/rseq layout, but its rtld
+ * structs differ from the 688/4504 AArch64 profile: glro function hooks
+ * and gl stack/TLS fields sit 16 bytes earlier/later respectively. */
+static const struct glibc_ver_offsets glibc_aarch64_2_36_debian = {
+    .pthread_size               = 0x740,
+    .pthread_tid_off            = 0xd0,
+    .pthread_rseq_off           = 0x720,
+    .pthread_rseq_cpu_id_off    = 0x724,
+    .glro_tls_static_size  = 464,   /* 0x1D0 */
+    .glro_tls_static_align = 472,   /* 0x1D8 */
+    .glro_debug_printf     = 568,   /* 0x238 */
+    .glro_mcount           = 576,   /* 0x240 */
+    .glro_open             = 592,   /* 0x250 */
+    .glro_close            = 600,   /* 0x258 */
+    .glro_catch_error      = 608,   /* 0x260 */
+    .glro_error_free       = 616,   /* 0x268 */
+    .glro_find_object      = 640,   /* 0x280 */
+    .gl_tls_static_size    = -1,
+    .gl_tls_static_align   = -1,
+    .gl_nns                = 2688,  /* 0x0A80 */
+    .gl_stack_flags        = 4376,  /* 0x1118 */
+    .gl_tls_generation     = 4432,  /* 0x1150 */
+    .gl_stack_used         = 4448,  /* 0x1160 */
+    .gl_stack_user         = 4464,  /* 0x1170 */
+    .gl_stack_cache        = 4480,  /* 0x1180 */
+    .gl_rtld_lock_recursive   = -1,
+    .gl_rtld_unlock_recursive = -1,
+    .gl_make_stack_executable = -1,
+};
+
 /* glibc 2.41 (AArch64): _rtld_global_ro=704B, _rtld_global=3040B
  * Debian trixie (glibc 2.41-12+deb13u2).  Compared to 2.35–2.39 (688/4504):
  *  - _dl_hwcap3, _dl_hwcap4 added in glro (+16 bytes)
@@ -1160,6 +1252,67 @@ static const struct glibc_ver_offsets glibc_aarch64_2_41 = {
     .gl_make_stack_executable = -1,
 };
 
+/* glibc 2.40 (AArch64): _rtld_global_ro=704B, _rtld_global=4504B
+ * This is a hybrid between the 2.35-2.39 and 2.41 AArch64 layouts:
+ * _rtld_global_ro has the new 704-byte shape, but _rtld_global still has
+ * the older 4504-byte stack/TLS fields. */
+static const struct glibc_ver_offsets glibc_aarch64_2_40_legacy_sized_rtld = {
+    .pthread_size               = 0x740,
+    .pthread_tid_off            = 0xd0,
+    .pthread_rseq_off           = 0x720,
+    .pthread_rseq_cpu_id_off    = 0x724,
+    .glro_tls_static_size  = 472,   /* 0x1D8 */
+    .glro_tls_static_align = 480,   /* 0x1E0 */
+    .glro_debug_printf     = 600,   /* 0x258 */
+    .glro_mcount           = 608,   /* 0x260 */
+    .glro_open             = 624,   /* 0x270 */
+    .glro_close            = 632,   /* 0x278 */
+    .glro_catch_error      = 640,   /* 0x280 */
+    .glro_error_free       = 648,   /* 0x288 */
+    .glro_find_object      = 672,   /* 0x2A0 */
+    .gl_tls_static_size    = -1,
+    .gl_tls_static_align   = -1,
+    .gl_nns                = 2688,  /* 0x0A80 */
+    .gl_stack_flags        = 4360,  /* 0x1108 */
+    .gl_tls_generation     = 4416,  /* 0x1140 */
+    .gl_stack_used         = 4432,  /* 0x1150 */
+    .gl_stack_user         = 4448,  /* 0x1160 */
+    .gl_stack_cache        = 4464,  /* 0x1170 */
+    .gl_rtld_lock_recursive   = -1,
+    .gl_rtld_unlock_recursive = -1,
+    .gl_make_stack_executable = -1,
+};
+
+/* glibc 2.43+ development (AArch64): _rtld_global_ro=400B,
+ * _rtld_global=2272B.  The AArch64 hwcap name table moved out of glro,
+ * making this much more compact than the 2.40/2.41 layouts. */
+static const struct glibc_ver_offsets glibc_aarch64_2_43 = {
+    .pthread_size               = 0x720,
+    .pthread_tid_off            = 0xd0,
+    .pthread_rseq_off           = -1,
+    .pthread_rseq_cpu_id_off    = -1,
+    .glro_tls_static_size  = 160,   /* 0x0A0 */
+    .glro_tls_static_align = 168,   /* 0x0A8 */
+    .glro_debug_printf     = 288,   /* 0x120 */
+    .glro_mcount           = 296,   /* 0x128 */
+    .glro_open             = 312,   /* 0x138 */
+    .glro_close            = 320,   /* 0x140 */
+    .glro_catch_error      = 328,   /* 0x148 */
+    .glro_error_free       = 336,   /* 0x150 */
+    .glro_find_object      = 360,   /* 0x168 */
+    .gl_tls_static_size    = -1,
+    .gl_tls_static_align   = -1,
+    .gl_nns                = 1920,  /* 0x0780 */
+    .gl_stack_flags        = 2128,  /* 0x0850 */
+    .gl_tls_generation     = 2184,  /* 0x0888 */
+    .gl_stack_used         = 2200,  /* 0x0898 */
+    .gl_stack_user         = 2216,  /* 0x08A8 */
+    .gl_stack_cache        = 2232,  /* 0x08B8 */
+    .gl_rtld_lock_recursive   = -1,
+    .gl_rtld_unlock_recursive = -1,
+    .gl_make_stack_executable = -1,
+};
+
 /* glibc 2.34–2.36 (x86-64): _rtld_global_ro=928B, _rtld_global=4304B
  * TLS fields moved to _rtld_global_ro.  Has catch_error/error_free/
  * find_object.  Has stack lists.  Same glro layout as 2.40+ but
@@ -1191,6 +1344,36 @@ static const struct glibc_ver_offsets glibc_2_34 = {
     .gl_make_stack_executable = -1,
 };
 
+/* glibc 2.36 Debian 12 variant (x86-64): _rtld_global_ro=896B,
+ * _rtld_global=4336B.  Similar generation to glibc_2_34, but the fields
+ * used by pthread stack/TLS allocation are shifted by Debian's layout. */
+static const struct glibc_ver_offsets glibc_2_36_debian = {
+    .pthread_size               = -1,
+    .pthread_tid_off            = -1,
+    .pthread_rseq_off           = -1,
+    .pthread_rseq_cpu_id_off    = -1,
+    .glro_tls_static_size  = 672,   /* 0x2A0 */
+    .glro_tls_static_align = 680,   /* 0x2A8 */
+    .glro_debug_printf     = 792,   /* 0x318 */
+    .glro_mcount           = 800,   /* 0x320 */
+    .glro_open             = 816,   /* 0x330 */
+    .glro_close            = 824,   /* 0x338 */
+    .glro_catch_error      = 832,   /* 0x340 */
+    .glro_error_free       = 840,   /* 0x348 */
+    .glro_find_object      = 864,   /* 0x360 */
+    .gl_tls_static_size    = -1,
+    .gl_tls_static_align   = -1,
+    .gl_nns                = 2560,  /* 0x0A00 */
+    .gl_stack_flags        = 4192,  /* 0x1060 */
+    .gl_tls_generation     = 4248,  /* 0x1098 */
+    .gl_stack_used         = 4264,  /* 0x10A8 */
+    .gl_stack_user         = 4280,  /* 0x10B8 */
+    .gl_stack_cache        = 4296,  /* 0x10C8 */
+    .gl_rtld_lock_recursive   = -1,
+    .gl_rtld_unlock_recursive = -1,
+    .gl_make_stack_executable = -1,
+};
+
 /* glibc 2.37–2.39 (x86-64): _rtld_global_ro=952B, _rtld_global=4352B */
 static const struct glibc_ver_offsets glibc_2_37 = {
     .pthread_size               = -1,
@@ -1199,6 +1382,38 @@ static const struct glibc_ver_offsets glibc_2_37 = {
     .pthread_rseq_cpu_id_off    = -1,
     .glro_tls_static_size  = 712,   /* 0x2C8 */
     .glro_tls_static_align = 720,   /* 0x2D0 */
+    .glro_debug_printf     = 848,
+    .glro_mcount           = 856,
+    .glro_open             = 872,
+    .glro_close            = 880,
+    .glro_catch_error      = 888,
+    .glro_error_free       = 896,
+    .glro_find_object      = 920,
+    .gl_tls_static_size    = -1,
+    .gl_tls_static_align   = -1,
+    .gl_nns                = 2560,  /* 0xA00 */
+    .gl_stack_flags        = 4208,  /* 0x1070 */
+    .gl_tls_generation     = 4264,  /* 0x10A8 */
+    .gl_stack_used         = 4280,  /* 0x10B8 */
+    .gl_stack_user         = 4296,  /* 0x10C8 */
+    .gl_stack_cache        = 4312,  /* 0x10D8 */
+    .gl_rtld_lock_recursive   = -1,
+    .gl_rtld_unlock_recursive = -1,
+    .gl_make_stack_executable = -1,
+};
+
+/* glibc 2.40 with the legacy-sized x86-64 rtld structs:
+ * _rtld_global_ro=952B, _rtld_global=4352B.  The public symbol sizes match
+ * glibc 2.37-2.39, but pthread_create reads the TLS static fields one word
+ * earlier in _rtld_global_ro.  Select this profile by the embedded
+ * interpreter's GLIBC_2.40+ symbol-version strings, not by distro name. */
+static const struct glibc_ver_offsets glibc_2_40_legacy_sized_rtld = {
+    .pthread_size               = -1,
+    .pthread_tid_off            = -1,
+    .pthread_rseq_off           = -1,
+    .pthread_rseq_cpu_id_off    = -1,
+    .glro_tls_static_size  = 704,   /* 0x2C0 */
+    .glro_tls_static_align = 712,   /* 0x2C8 */
     .glro_debug_printf     = 848,
     .glro_mcount           = 856,
     .glro_open             = 872,
@@ -1299,8 +1514,12 @@ static size_t g_tls_static_align = 0x40;
 static const struct glibc_ver_offsets *fallback_glibc_offsets_for_minor(int minor)
 {
 #if defined(__aarch64__)
+    if (minor >= 43)
+        return &glibc_aarch64_2_43;
     if (minor >= 41)
         return &glibc_aarch64_2_41;
+    if (minor >= 40)
+        return &glibc_aarch64_2_40_legacy_sized_rtld;
     if (minor >= 35)
         return &glibc_aarch64_2_35;
     if (minor >= 31)
@@ -1677,10 +1896,14 @@ static const struct {
     { EM_X86_64,  536, 3992, &glibc_2_29 },    /* glibc 2.29–2.33 x86-64 (Ubuntu) */
     { EM_X86_64,  544, 4000, &glibc_2_31_debian }, /* glibc 2.31     x86-64 (Debian 11) */
     { EM_AARCH64, 624, 4152, &glibc_aarch64_2_31 }, /* glibc 2.31     AArch64 */
+    { EM_AARCH64, 672, 4520, &glibc_aarch64_2_36_debian }, /* glibc 2.36 AArch64 (Debian 12) */
     { EM_AARCH64, 688, 4504, &glibc_aarch64_2_35 }, /* glibc 2.35–2.39 AArch64 */
+    { EM_AARCH64, 400, 2272, &glibc_aarch64_2_43 }, /* glibc 2.43+    AArch64 */
+    { EM_AARCH64, 704, 4504, &glibc_aarch64_2_40_legacy_sized_rtld }, /* glibc 2.40 AArch64 */
     { EM_AARCH64, 704, 3040, &glibc_aarch64_2_41 }, /* glibc 2.41     AArch64 (Debian/trixie) */
+    { EM_X86_64,  896, 4336, &glibc_2_36_debian }, /* glibc 2.36     x86-64 (Debian 12) */
     { EM_X86_64,  928, 4304, &glibc_2_34 },    /* glibc 2.34–2.36 x86-64 */
-    { EM_X86_64,  952, 4352, &glibc_2_37 },    /* glibc 2.37–2.39 x86-64 */
+    { EM_X86_64,  952, 4352, &glibc_2_37 },    /* glibc 2.37–2.39 x86-64; 2.40+ disambiguated by symbol versions */
     { EM_X86_64,  928, 2120, &glibc_2_40 },    /* glibc 2.40+     x86-64 */
     { EM_X86_64,  952, 2888, &glibc_2_41_debian }, /* glibc 2.41    x86-64 (Debian/trixie) */
 };
@@ -1697,6 +1920,64 @@ static uint64_t elf_vaddr_to_foff(const uint8_t *elf, const Elf64_Ehdr *ehdr,
             return ph[i].p_offset + (vaddr - ph[i].p_vaddr);
     }
     return (uint64_t)-1;
+}
+
+static int scan_glibc_2_minor(const char *buf, size_t len)
+{
+    static const char tag[] = "GLIBC_2.";
+    const size_t tag_len = sizeof(tag) - 1;
+    int max_minor = -1;
+
+    for (size_t i = 0; i + tag_len < len; i++) {
+        int minor = 0;
+        int digits = 0;
+        size_t j;
+
+        if (memcmp(buf + i, tag, tag_len) != 0)
+            continue;
+
+        for (j = i + tag_len; j < len; j++) {
+            unsigned char c = (unsigned char)buf[j];
+            if (c < '0' || c > '9')
+                break;
+            if (minor < 1000)
+                minor = minor * 10 + (int)(c - '0');
+            digits++;
+        }
+        if (digits > 0 && minor > max_minor)
+            max_minor = minor;
+    }
+
+    return max_minor;
+}
+
+static int scan_glibc_release_minor(const char *buf, size_t len)
+{
+    static const char tag[] = "release version 2.";
+    const size_t tag_len = sizeof(tag) - 1;
+    int max_minor = -1;
+
+    for (size_t i = 0; i + tag_len < len; i++) {
+        int minor = 0;
+        int digits = 0;
+        size_t j;
+
+        if (memcmp(buf + i, tag, tag_len) != 0)
+            continue;
+
+        for (j = i + tag_len; j < len; j++) {
+            unsigned char c = (unsigned char)buf[j];
+            if (c < '0' || c > '9')
+                break;
+            if (minor < 1000)
+                minor = minor * 10 + (int)(c - '0');
+            digits++;
+        }
+        if (digits > 0 && minor > max_minor)
+            max_minor = minor;
+    }
+
+    return max_minor;
 }
 
 /*
@@ -1742,10 +2023,12 @@ detect_glibc_offsets_from_interp(const uint8_t *mem, uint64_t mem_foff,
     const Elf64_Dyn *dyn = (const Elf64_Dyn *)(elf + dyn_foff);
     size_t ndyn = dyn_size / sizeof(Elf64_Dyn);
     uint64_t symtab_vaddr = 0, dynstr_vaddr = 0, hash_vaddr = 0;
+    size_t dynstr_size = 0;
     for (size_t i = 0; i < ndyn && dyn[i].d_tag != DT_NULL; i++) {
         switch (dyn[i].d_tag) {
             case DT_SYMTAB: symtab_vaddr = dyn[i].d_un.d_ptr; break;
             case DT_STRTAB: dynstr_vaddr = dyn[i].d_un.d_ptr; break;
+            case DT_STRSZ:  dynstr_size  = dyn[i].d_un.d_val; break;
             case DT_HASH:   hash_vaddr   = dyn[i].d_un.d_ptr; break;
         }
     }
@@ -1770,8 +2053,23 @@ detect_glibc_offsets_from_interp(const uint8_t *mem, uint64_t mem_foff,
     /* Scan .dynsym for _rtld_global_ro and _rtld_global */
     const Elf64_Sym *syms = (const Elf64_Sym *)(elf + symtab_foff);
     const char *str = (const char *)(elf + dynstr_foff);
+    int glibc_minor = -1;
     size_t glro_size = 0, gl_size = 0;
     int found = 0;
+
+    if (dynstr_size > 0 && dynstr_foff < elf_size) {
+        size_t avail = elf_size - dynstr_foff;
+        if (dynstr_size > avail)
+            dynstr_size = avail;
+        glibc_minor = scan_glibc_2_minor(str, dynstr_size);
+    } else {
+        glibc_minor = scan_glibc_2_minor((const char *)elf, elf_size);
+    }
+    {
+        int release_minor = scan_glibc_release_minor((const char *)elf, elf_size);
+        if (release_minor > glibc_minor)
+            glibc_minor = release_minor;
+    }
 
     for (uint32_t i = 0; i < nsyms && found < 2; i++) {
         if (ELF64_ST_TYPE(syms[i].st_info) != STT_OBJECT) continue;
@@ -1805,6 +2103,11 @@ detect_glibc_offsets_from_interp(const uint8_t *mem, uint64_t mem_foff,
         if (glibc_layout_table[i].machine == ehdr->e_machine &&
             glibc_layout_table[i].glro_size == glro_size &&
             glibc_layout_table[i].gl_size == gl_size) {
+            if (ehdr->e_machine == EM_X86_64 && glro_size == 952 &&
+                gl_size == 4352 && glibc_minor >= 40) {
+                ldr_dbg("[loader] detected x86-64 glibc 2.40+ legacy-sized rtld layout\n");
+                return &glibc_2_40_legacy_sized_rtld;
+            }
             ldr_dbg("[loader] detected _rtld_global_ro size from ld-linux.so, matched layout\n");
             return glibc_layout_table[i].offsets;
         }
@@ -2997,6 +3300,45 @@ static int install_glibc_dlopen_tls(struct loaded_obj *obj)
     }
     return 0;
 }
+
+#if defined(__x86_64__)
+static int64_t dlfreeze_x86_64_tlsdesc_resolve_c(void *arg_in) __attribute__((used));
+static int64_t dlfreeze_x86_64_tlsdesc_resolve_c(void *arg_in)
+{
+    struct x86_64_tlsdesc_arg *arg = (struct x86_64_tlsdesc_arg *)arg_in;
+    uintptr_t tp = arch_get_tp();
+
+    if (g_is_musl_runtime) {
+        uintptr_t tls_addr = (uintptr_t)musl_lazy_install_tls(
+            tp, (unsigned long)arg->modid, (unsigned long)arg->offset);
+        return (int64_t)(tls_addr - tp);
+    }
+
+    uintptr_t *dtv = *(uintptr_t **)(tp + TCB_OFF_DTV);
+    uintptr_t tls_block = dtv ? dtv[arg->modid * 2] : 0;
+    if (!tls_block) {
+        for (int obj_index = 0; obj_index < g_nobj; obj_index++) {
+            if (g_all_objs[obj_index].tls.modid == arg->modid &&
+                g_all_objs[obj_index].tls.memsz != 0) {
+                install_glibc_dlopen_tls(&g_all_objs[obj_index]);
+                break;
+            }
+        }
+        dtv = *(uintptr_t **)(tp + TCB_OFF_DTV);
+        tls_block = dtv ? dtv[arg->modid * 2] : 0;
+    }
+
+    if (tls_block)
+        return (int64_t)((tls_block + arg->offset) - tp);
+
+    {
+        struct tls_index ti;
+        ti.ti_module = (unsigned long)arg->modid;
+        ti.ti_offset = (unsigned long)arg->offset;
+        return (int64_t)((uintptr_t)stub_tls_get_addr(&ti) - tp);
+    }
+}
+#endif
 
 /* _dl_allocate_tls_init — copy .tdata for every TLS module into a
  * new thread's TLS block.  Called by glibc's pthread_create. */
@@ -4994,6 +5336,7 @@ static char *vfs_realpath(const char *path, char *resolved)
 {
     if (path && path[0] == '/') {
         const struct vfs_entry *ve = vfs_lookup(path);
+        int path_exists = 0;
 
         if (ve && vfs_is_negative_entry(ve)) {
             set_loader_errno(ENOENT);
@@ -5007,9 +5350,14 @@ static char *vfs_realpath(const char *path, char *resolved)
                 return result;
         }
 
+        if (VFS_SYSCALL(SYS_newfstatat, AT_FDCWD, path,
+                        &(struct stat){0}, 0) == 0)
+            path_exists = 1;
+
         if ((ve && !vfs_is_negative_entry(ve)) ||
             vfs_dir_exists(path) ||
-            frozen_dlopen_elf_size(path) >= 0) {
+            frozen_dlopen_elf_size(path) >= 0 ||
+            path_exists) {
             size_t len = strlen(path) + 1;
 
             if (resolved) {
@@ -5102,10 +5450,8 @@ static ssize_t vfs_readlinkat(int dirfd, const char *path,
         }
     }
     long ret = VFS_SYSCALL(SYS_readlinkat, dirfd, path, buf, bufsiz);
-    if (ret < 0) {
-        set_loader_errno((int)-ret);
+    if (ret < 0)
         return -1;
-    }
     return (ssize_t)ret;
 }
 
@@ -5798,11 +6144,17 @@ static int apply_x86_64_tlsdesc_reloc(struct loaded_obj *obj,
         return 0;
     }
 
-    /* Dynamic (DTV-based) TLSDESC is not yet implemented for x86_64.
-     * Initial-exec / locally-defined TLS variables (the common case for
-     * libpython, libssl, etc.) are covered by the static path above. */
-    ldr_err("dynamic TLSDESC unsupported on x86_64", obj->name);
-    return -1;
+    {
+        struct x86_64_tlsdesc_arg *arg = alloc_x86_64_tlsdesc_arg();
+        if (!arg)
+            return -1;
+        arg->modid = modid;
+        arg->offset = offset;
+        slot[0] = (uint64_t)(uintptr_t)dlfreeze_x86_64_tlsdesc_dynamic;
+        slot[1] = (uint64_t)(uintptr_t)arg;
+    }
+
+    return 0;
 }
 #endif
 #endif /* __aarch64__ || __x86_64__ */
@@ -7070,12 +7422,13 @@ static int file_has_static_tls(const char *path)
         return 0;
     }
 
-    /* Read the dynamic table */
-    Elf64_Dyn *dyn = malloc(dyn_ph->p_filesz);
-    if (!dyn) { close(fd); return 0; }
+    Elf64_Dyn dyn[4096];
+    if (dyn_ph->p_filesz > sizeof(dyn)) {
+        close(fd);
+        return 0;
+    }
     if (pread(fd, dyn, dyn_ph->p_filesz, dyn_ph->p_offset) !=
         (ssize_t)dyn_ph->p_filesz) {
-        free(dyn);
         close(fd);
         return 0;
     }
@@ -7090,7 +7443,6 @@ static int file_has_static_tls(const char *path)
             break;
         }
     }
-    free(dyn);
     return found;
 }
 

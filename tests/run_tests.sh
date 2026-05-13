@@ -78,6 +78,36 @@ capture_output_in_dir() {
     return "$__rc"
 }
 
+path_is_elf() {
+    local path="$1"
+    command -v file &>/dev/null && file -b "$path" 2>/dev/null | grep -q 'ELF'
+}
+
+resolve_ruby_elf() {
+    local path candidate
+
+    if ! command -v ruby &>/dev/null; then
+        return 1
+    fi
+    path=$(readlink -f "$(command -v ruby)")
+    if path_is_elf "$path"; then
+        printf '%s\n' "$path"
+        return 0
+    fi
+
+    for candidate in ruby-mri ruby3.4 ruby3.3 ruby3.2 ruby3.1 ruby3.0 ruby2.7; do
+        if command -v "$candidate" &>/dev/null; then
+            path=$(readlink -f "$(command -v "$candidate")")
+            if path_is_elf "$path"; then
+                printf '%s\n' "$path"
+                return 0
+            fi
+        fi
+    done
+
+    return 1
+}
+
 capture_output_split() {
     local __stdout_var="$1" __stderr_var="$2" __out __err __rc
     shift 2
@@ -1045,8 +1075,8 @@ test_python3_direct() {
     pypath=$(readlink -f "$(command -v python3)")
 
     # Freeze with -d (direct) and -t (trace dlopen) to capture C extensions
-    if ! run_freeze "$DLFREEZE" -d -t -o "$out" -- "$pypath" -c \
-         'import hashlib,sqlite3; print("traced")' 2>/dev/null; then
+        if ! run_freeze "$DLFREEZE" -d -t -o "$out" -- "$pypath" -c \
+            'import hashlib,sqlite3; [getattr(hashlib,n)(b"hello").hexdigest() for n in ("md5","sha1","sha256","sha3_256")]; sqlite3.connect(":memory:").close(); print("traced")' 2>/dev/null; then
         fail "python3-direct" "dlfreeze failed"; return
     fi
 
@@ -1155,7 +1185,10 @@ test_ruby_direct_host_run() {
 
     local rubypath out home
     local expect actual rc_e=0 rc_a=0
-    rubypath=$(readlink -f "$(command -v ruby)")
+    if ! rubypath=$(resolve_ruby_elf); then
+        skip "ruby-direct-host-run" "ruby command is not an ELF and no Ruby ELF interpreter was found"
+        return
+    fi
     out="$BUILD/ruby-host.frozen"
     home="$BUILD/ruby-home-missing"
 
