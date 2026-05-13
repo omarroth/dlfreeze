@@ -108,7 +108,7 @@ echo "========================================================"
 # ── Install build dependencies ─────────────────────────────────────
 if [ -f /etc/alpine-release ]; then
     apk add --no-cache \
-        gcc musl-dev make linux-headers bash python3 file binutils strace
+        gcc g++ musl-dev make linux-headers bash python3 file binutils strace diffutils
     apk add --no-cache upx 2>/dev/null || true
     apk add --no-cache ruby 2>/dev/null || true
     # Alpine's gcc IS musl-gcc; create symlink so tests that check
@@ -124,7 +124,7 @@ elif [ -f /etc/arch-release ]; then
     # readline does not yet provide, breaking /bin/sh for the rest
     # of the script.  Always do a full `-Syu` first.
     pacman -Syu --noconfirm --needed \
-        gcc musl make bash python file binutils strace 2>&1 | tail -3
+        gcc musl make bash python file binutils strace diffutils 2>&1 | tail -3
     pacman -S --noconfirm --needed upx 2>/dev/null || true
     pacman -S --noconfirm --needed ruby 2>/dev/null || true
     # Arch ships musl as a separate package providing /usr/bin/musl-gcc
@@ -135,7 +135,7 @@ elif [ -f /etc/arch-release ]; then
 elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
     PKG=$(command -v dnf || command -v yum)
     "$PKG" install -y -q \
-        gcc make bash python3 file binutils glibc-static 2>&1 | tail -3
+        gcc gcc-c++ make bash python3 file binutils diffutils glibc-static 2>&1 | tail -3
     "$PKG" install -y -q strace 2>/dev/null || true
     "$PKG" install -y -q ruby 2>/dev/null || true
     # Fedora's core repos do not include UPX, so the package install is
@@ -157,7 +157,7 @@ elif [ -f /etc/debian_version ]; then
         sed -i 's|security.ubuntu.com|old-releases.ubuntu.com|g' /etc/apt/sources.list
         apt-get update -qq
     fi
-    apt-get install -y -qq gcc musl-tools make bash file binutils 2>&1 | tail -1
+    apt-get install -y -qq gcc g++ musl-tools make bash file binutils diffutils 2>&1 | tail -1
     apt-get install -y -qq strace 2>/dev/null || true
     apt-get install -y -qq python3 2>/dev/null || true
     apt-get install -y -qq ruby 2>/dev/null || true

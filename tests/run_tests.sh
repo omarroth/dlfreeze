@@ -1075,23 +1075,25 @@ test_python3_direct() {
     pypath=$(readlink -f "$(command -v python3)")
 
     # Freeze with -d (direct) and -t (trace dlopen) to capture C extensions
-        if ! run_freeze "$DLFREEZE" -d -t -o "$out" -- "$pypath" -c \
-            'import hashlib,sqlite3; [getattr(hashlib,n)(b"hello").hexdigest() for n in ("md5","sha1","sha256","sha3_256")]; sqlite3.connect(":memory:").close(); print("traced")' 2>/dev/null; then
+    if ! run_freeze "$DLFREEZE" -d -t -o "$out" -- "$pypath" -c \
+        'import hashlib,sqlite3; [getattr(hashlib,n)(b"hello").hexdigest() for n in ("md5","sha1","sha256","sha3_256")]; sqlite3.connect(":memory:").close(); print("traced")' 2>/dev/null; then
         fail "python3-direct" "dlfreeze failed"; return
     fi
 
     # hashlib — C extension that loads libcrypto.so via DT_NEEDED
-    local expect actual
+    local expect actual rc
     capture_output expect python3 -c 'import hashlib; print(hashlib.sha256(b"hello").hexdigest())'
-    capture_output actual "$out" -c 'import hashlib; print(hashlib.sha256(b"hello").hexdigest())'
-    if [ "$expect" = "$actual" ]; then pass "python3 direct hashlib"; else
-        fail "python3 direct hashlib" "output differs: expected=$expect actual=$actual"; fi
+    rc=0
+    capture_output actual "$out" -c 'import hashlib; print(hashlib.sha256(b"hello").hexdigest())' || rc=$?
+    if [ "$expect" = "$actual" ] && [ "$rc" -eq 0 ]; then pass "python3 direct hashlib"; else
+        fail "python3 direct hashlib" "output or exit code differs (exit 0 vs $rc): expected=$expect actual=$actual"; fi
 
     # sqlite3 — C extension that loads libsqlite3.so
     capture_output expect python3 -c 'import sqlite3; c=sqlite3.connect(":memory:"); c.execute("CREATE TABLE t(x)"); c.execute("INSERT INTO t VALUES(42)"); print(c.execute("SELECT x FROM t").fetchone()[0])'
-    capture_output actual "$out" -c 'import sqlite3; c=sqlite3.connect(":memory:"); c.execute("CREATE TABLE t(x)"); c.execute("INSERT INTO t VALUES(42)"); print(c.execute("SELECT x FROM t").fetchone()[0])'
-    if [ "$expect" = "$actual" ]; then pass "python3 direct sqlite3"; else
-        fail "python3 direct sqlite3" "output differs: expected=$expect actual=$actual"; fi
+    rc=0
+    capture_output actual "$out" -c 'import sqlite3; c=sqlite3.connect(":memory:"); c.execute("CREATE TABLE t(x)"); c.execute("INSERT INTO t VALUES(42)"); print(c.execute("SELECT x FROM t").fetchone()[0])' || rc=$?
+    if [ "$expect" = "$actual" ] && [ "$rc" -eq 0 ]; then pass "python3 direct sqlite3"; else
+        fail "python3 direct sqlite3" "output or exit code differs (exit 0 vs $rc): expected=$expect actual=$actual"; fi
 
     rm -f "$out"
 }
