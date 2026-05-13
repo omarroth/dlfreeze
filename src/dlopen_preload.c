@@ -35,6 +35,11 @@ static int (*real_openat64)(int, const char *, int, ...);
 static FILE *(*real_fopen)(const char *, const char *);
 static FILE *(*real_fopen64)(const char *, const char *);
 static DIR *(*real_opendir)(const char *);
+static int (*real_stat)(const char *, struct stat *);
+static int (*real_lstat)(const char *, struct stat *);
+static int (*real_fstatat)(int, const char *, struct stat *, int);
+static int (*real_access)(const char *, int);
+static int (*real_faccessat)(int, const char *, int, int);
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static __thread int g_trace_depth;
@@ -46,9 +51,15 @@ static int open_needs_mode(int flags)
     return (flags & O_CREAT) || ((flags & O_TMPFILE) == O_TMPFILE);
 }
 
+static int is_absolute_path(const char *path)
+{
+    return path && path[0] == '/';
+}
+
 static void resolve_symbols(void)
 {
-    if (real_dlopen && real_open && real_openat && real_fopen && real_opendir)
+    if (real_dlopen && real_open && real_openat && real_fopen && real_opendir &&
+        real_stat && real_lstat && real_fstatat && real_access && real_faccessat)
         return;
 
     g_trace_depth++;
@@ -68,6 +79,16 @@ static void resolve_symbols(void)
         real_fopen64 = dlsym(RTLD_NEXT, "fopen64");
     if (!real_opendir)
         real_opendir = dlsym(RTLD_NEXT, "opendir");
+    if (!real_stat)
+        real_stat = dlsym(RTLD_NEXT, "stat");
+    if (!real_lstat)
+        real_lstat = dlsym(RTLD_NEXT, "lstat");
+    if (!real_fstatat)
+        real_fstatat = dlsym(RTLD_NEXT, "fstatat");
+    if (!real_access)
+        real_access = dlsym(RTLD_NEXT, "access");
+    if (!real_faccessat)
+        real_faccessat = dlsym(RTLD_NEXT, "faccessat");
     g_trace_depth--;
 }
 
@@ -202,6 +223,41 @@ static void trace_fd_result(int fd, int dirfd, const char *path)
     trace_path_kind(dirfd, path, S_ISDIR(st.st_mode));
 }
 
+static void trace_stat_result(int rc, int dirfd, const char *path,
+                              const struct stat *st)
+{
+    int saved_errno = errno;
+
+    if (rc == 0 && st && S_ISREG(st->st_mode)) {
+        trace_path_kind(dirfd, path, 0);
+    } else if (rc < 0 && (saved_errno == ENOENT || saved_errno == ENOTDIR)) {
+        trace_failed_path(dirfd, path);
+    }
+
+    errno = saved_errno;
+}
+
+static void trace_access_result(int rc, int dirfd, const char *path, int flags)
+{
+    int saved_errno = errno;
+
+    if (rc == 0 && real_fstatat) {
+        struct stat st;
+
+        g_trace_depth++;
+        if (real_fstatat(dirfd, path, &st, flags) == 0 && S_ISREG(st.st_mode)) {
+            g_trace_depth--;
+            trace_path_kind(dirfd, path, 0);
+        } else {
+            g_trace_depth--;
+        }
+    } else if (rc < 0 && (saved_errno == ENOENT || saved_errno == ENOTDIR)) {
+        trace_failed_path(dirfd, path);
+    }
+
+    errno = saved_errno;
+}
+
 __attribute__((constructor))
 static void dlfreeze_trace_init(void)
 {
@@ -275,7 +331,7 @@ int open(const char *path, int flags, ...)
     fd = open_needs_mode(flags) ? real_open(path, flags, mode)
                                 : real_open(path, flags);
     trace_fd_result(fd, AT_FDCWD, path);
-    if (fd < 0 && path[0] == '/')
+    if (fd < 0 && is_absolute_path(path))
         trace_failed_path(AT_FDCWD, path);
     return fd;
 }
@@ -307,7 +363,7 @@ int open64(const char *path, int flags, ...)
                                     : real_open(path, flags);
 
     trace_fd_result(fd, AT_FDCWD, path);
-    if (fd < 0 && path[0] == '/')
+    if (fd < 0 && is_absolute_path(path))
         trace_failed_path(AT_FDCWD, path);
     return fd;
 }
@@ -425,4 +481,80 @@ DIR *opendir(const char *path)
     if (dir)
         trace_path_kind(AT_FDCWD, path, 1);
     return dir;
+}
+
+int stat(const char *path, struct stat *buf)
+{
+    int rc;
+
+    resolve_symbols();
+    if (!real_stat) {
+        errno = ENOSYS;
+        return -1;
+    }
+
+    rc = real_stat(path, buf);
+    trace_stat_result(rc, AT_FDCWD, path, buf);
+    return rc;
+}
+
+int lstat(const char *path, struct stat *buf)
+{
+    int rc;
+
+    resolve_symbols();
+    if (!real_lstat) {
+        errno = ENOSYS;
+        return -1;
+    }
+
+    rc = real_lstat(path, buf);
+    trace_stat_result(rc, AT_FDCWD, path, buf);
+    return rc;
+}
+
+int fstatat(int dirfd, const char *path, struct stat *buf, int flags)
+{
+    int rc;
+
+    resolve_symbols();
+    if (!real_fstatat) {
+        errno = ENOSYS;
+        return -1;
+    }
+
+    rc = real_fstatat(dirfd, path, buf, flags);
+    trace_stat_result(rc, dirfd, path, buf);
+    return rc;
+}
+
+int access(const char *path, int mode)
+{
+    int rc;
+
+    resolve_symbols();
+    if (!real_access) {
+        errno = ENOSYS;
+        return -1;
+    }
+
+    rc = real_access(path, mode);
+    trace_access_result(rc, AT_FDCWD, path, 0);
+    return rc;
+}
+
+int faccessat(int dirfd, const char *path, int mode, int flags)
+{
+    int rc;
+
+    resolve_symbols();
+    if (!real_faccessat) {
+        errno = ENOSYS;
+        return -1;
+    }
+
+    rc = real_faccessat(dirfd, path, mode, flags);
+    trace_access_result(rc, dirfd, path,
+                        (flags & AT_SYMLINK_NOFOLLOW) ? AT_SYMLINK_NOFOLLOW : 0);
+    return rc;
 }

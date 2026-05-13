@@ -1286,9 +1286,38 @@ static const struct glibc_ver_offsets glibc_2_41_debian = {
 
 static uint8_t *g_fake_rtld_global;
 static uint8_t *g_fake_rtld_global_ro;
-static const struct glibc_ver_offsets *g_glibc_off = &glibc_2_40;
+#if defined(__aarch64__)
+#define DEFAULT_GLIBC_OFFSETS (&glibc_aarch64_2_35)
+#else
+#define DEFAULT_GLIBC_OFFSETS (&glibc_2_40)
+#endif
+static const struct glibc_ver_offsets *g_glibc_off = DEFAULT_GLIBC_OFFSETS;
+static int g_glibc_rtld_fixed;
 static size_t g_tls_static_size = 0x1080;
 static size_t g_tls_static_align = 0x40;
+
+static const struct glibc_ver_offsets *fallback_glibc_offsets_for_minor(int minor)
+{
+#if defined(__aarch64__)
+    if (minor >= 41)
+        return &glibc_aarch64_2_41;
+    if (minor >= 35)
+        return &glibc_aarch64_2_35;
+    if (minor >= 31)
+        return &glibc_aarch64_2_31;
+    return &glibc_aarch64_2_27;
+#else
+    if (minor >= 40)
+        return &glibc_2_40;
+    if (minor >= 37)
+        return &glibc_2_37;
+    if (minor >= 34)
+        return &glibc_2_34;
+    if (minor >= 29)
+        return &glibc_2_29;
+    return &glibc_2_17;
+#endif
+}
 
 /* glibc consumers such as Ruby's main-thread stack setup may read
  * __libc_stack_end from ld-linux. Direct-load mode does not map the real
@@ -1627,33 +1656,33 @@ static void fixup_rtld_for_glibc(const struct glibc_ver_offsets *o)
 /*
  * Detect glibc struct layout by parsing the embedded ld-linux.so (INTERP)
  * ELF to extract st_size of _rtld_global_ro and _rtld_global symbols.
- * The sizes uniquely identify the layout version (e.g., 952 bytes for
- * glibc 2.35–2.39 vs 928 bytes for glibc 2.40+).
+ * The ELF machine plus both sizes identify the known layout profile
+ * (e.g. same glibc release ranges can differ by architecture/distro).
  *
- * This approach is fully portable: it reads the actual struct sizes from
- * the binary that was frozen, regardless of which glibc version the build
- * host used.
+ * This reads the actual struct sizes from the frozen interpreter, rather
+ * than relying on the build host's glibc version.
  */
 
 /* Known layout profiles, keyed by _rtld_global_ro AND _rtld_global st_size.
  * Both sizes are needed to disambiguate versions that share a glro_size
  * (e.g. glibc 2.34 and 2.40+ both have glro=928 but different gl sizes). */
 static const struct {
+    uint16_t machine;    /* ELF e_machine of ld-linux.so */
     size_t glro_size;   /* expected st_size of _rtld_global_ro */
     size_t gl_size;     /* expected st_size of _rtld_global    */
     const struct glibc_ver_offsets *offsets;
 } glibc_layout_table[] = {
-    { 440,  3960, &glibc_2_17 },    /* glibc 2.17–2.28 x86-64 */
-    { 520,  4088, &glibc_aarch64_2_27 }, /* glibc 2.27     AArch64 */
-    { 536,  3992, &glibc_2_29 },    /* glibc 2.29–2.33 x86-64 (Ubuntu) */
-    { 544,  4000, &glibc_2_31_debian }, /* glibc 2.31     x86-64 (Debian 11) */
-    { 624,  4152, &glibc_aarch64_2_31 }, /* glibc 2.31     AArch64 */
-    { 688,  4504, &glibc_aarch64_2_35 }, /* glibc 2.35–2.39 AArch64 */
-    { 704,  3040, &glibc_aarch64_2_41 }, /* glibc 2.41     AArch64 (Debian/trixie) */
-    { 928,  4304, &glibc_2_34 },    /* glibc 2.34–2.36 x86-64 */
-    { 952,  4352, &glibc_2_37 },    /* glibc 2.37–2.39 x86-64 */
-    { 928,  2120, &glibc_2_40 },    /* glibc 2.40+     x86-64 */
-    { 952,  2888, &glibc_2_41_debian }, /* glibc 2.41    x86-64 (Debian/trixie) */
+    { EM_X86_64,  440, 3960, &glibc_2_17 },    /* glibc 2.17–2.28 x86-64 */
+    { EM_AARCH64, 520, 4088, &glibc_aarch64_2_27 }, /* glibc 2.27     AArch64 */
+    { EM_X86_64,  536, 3992, &glibc_2_29 },    /* glibc 2.29–2.33 x86-64 (Ubuntu) */
+    { EM_X86_64,  544, 4000, &glibc_2_31_debian }, /* glibc 2.31     x86-64 (Debian 11) */
+    { EM_AARCH64, 624, 4152, &glibc_aarch64_2_31 }, /* glibc 2.31     AArch64 */
+    { EM_AARCH64, 688, 4504, &glibc_aarch64_2_35 }, /* glibc 2.35–2.39 AArch64 */
+    { EM_AARCH64, 704, 3040, &glibc_aarch64_2_41 }, /* glibc 2.41     AArch64 (Debian/trixie) */
+    { EM_X86_64,  928, 4304, &glibc_2_34 },    /* glibc 2.34–2.36 x86-64 */
+    { EM_X86_64,  952, 4352, &glibc_2_37 },    /* glibc 2.37–2.39 x86-64 */
+    { EM_X86_64,  928, 2120, &glibc_2_40 },    /* glibc 2.40+     x86-64 */
+    { EM_X86_64,  952, 2888, &glibc_2_41_debian }, /* glibc 2.41    x86-64 (Debian/trixie) */
 };
 
 /* Convert a virtual address to a file offset using PT_LOAD segments. */
@@ -1773,7 +1802,8 @@ detect_glibc_offsets_from_interp(const uint8_t *mem, uint64_t mem_foff,
 
     /* Match against known layouts (both sizes needed for disambiguation) */
     for (size_t i = 0; i < sizeof(glibc_layout_table)/sizeof(glibc_layout_table[0]); i++) {
-        if (glibc_layout_table[i].glro_size == glro_size &&
+        if (glibc_layout_table[i].machine == ehdr->e_machine &&
+            glibc_layout_table[i].glro_size == glro_size &&
             glibc_layout_table[i].gl_size == gl_size) {
             ldr_dbg("[loader] detected _rtld_global_ro size from ld-linux.so, matched layout\n");
             return glibc_layout_table[i].offsets;
@@ -4246,7 +4276,8 @@ static struct dirent *vfs_readdir(void *dirp)
         /* ---- Phase 0: yield VFS-only child files ----
          * ---- Phase 1: yield VFS-only child subdirs ----
          * ---- Phase 2: yield frozen DLOPEN child .so files ----
-         * Skip entries that already exist on disk (real dir covered them). */
+         * Captured dirs are virtual-only even when fdopendir carries a
+         * placeholder fd for dirfd() compatibility. */
         while (h->phase < 3) {
             if (h->phase == 0) {
                 while (h->scan_pos < (int)VFS_HASH_SIZE) {
@@ -4262,11 +4293,6 @@ static struct dirent *vfs_readdir(void *dirp)
                         && rest[3] == 'r' && rest[4] == '\0') continue;
                     /* Skip negative entries — they represent non-existent files */
                     if (g_vfs_table[si].flags & DLFRZ_FLAG_DATA_NEGATIVE) continue;
-                    /* Skip if real FS already has this file */
-                    if (h->fd_compat >= 0) {
-                        int r = (int)VFS_SYSCALL(SYS_faccessat, AT_FDCWD, fp, 0 /*F_OK*/, 0);
-                        if (r == 0) continue;
-                    }
                     h->result.d_ino = (ino_t)(si + 1);
                     h->result.d_off = ((off_t)1 << 32) |
                                       (uint32_t)h->scan_pos;
@@ -4292,11 +4318,6 @@ static struct dirent *vfs_readdir(void *dirp)
                     if (dp[h->vfs_path_len] != '/') continue;
                     const char *rest = dp + h->vfs_path_len + 1;
                     if (strchr(rest, '/')) continue; /* not direct child */
-                    /* Skip if real FS already has this dir */
-                    if (h->fd_compat >= 0) {
-                        int r = (int)VFS_SYSCALL(SYS_faccessat, AT_FDCWD, dp, 0, 0);
-                        if (r == 0) continue;
-                    }
                     h->result.d_ino = (ino_t)(VFS_HASH_SIZE + si + 1);
                     h->result.d_off = ((off_t)2 << 32) |
                                       (uint32_t)h->scan_pos;
@@ -4330,11 +4351,6 @@ static struct dirent *vfs_readdir(void *dirp)
                         if (fp[h->vfs_path_len] != '/') continue;
                         const char *rest = fp + h->vfs_path_len + 1;
                         if (strchr(rest, '/')) continue; /* not direct child */
-                        if (h->fd_compat >= 0) {
-                            int r = (int)VFS_SYSCALL(SYS_faccessat, AT_FDCWD,
-                                                     fp, 0, 0);
-                            if (r == 0) continue;
-                        }
                         h->result.d_ino = (ino_t)(2 * VFS_HASH_SIZE + si + 1);
                         h->result.d_off = ((off_t)3 << 32) |
                                           (uint32_t)h->scan_pos;
@@ -6887,35 +6903,22 @@ static void init_libc_process_state(struct loaded_obj *objs, int nobj,
      * Primary detection happens earlier via detect_glibc_offsets_from_interp()
      * which parses ld-linux.so's symbol table.  This fallback handles the
      * case where the INTERP entry was missing or unparseable. */
-    if (g_glibc_off == &glibc_2_40) {
-        /* Check if fixup was already applied by the primary detection */
-        int already_fixed = *(size_t *)(g_fake_rtld_global_ro +
-                             g_glibc_off->glro_tls_static_align) != 0;
-        if (!already_fixed) {
-            const struct glibc_ver_offsets *glibc_off = &glibc_2_40;
-            addr = resolve_sym(objs, nobj, "gnu_get_libc_version");
-            if (addr) {
-                const char *ver = ((const char *(*)(void))(uintptr_t)addr)();
-                if (ver && ver[0] == '2' && ver[1] == '.') {
-                    int minor = 0;
-                    for (int i = 2; ver[i] >= '0' && ver[i] <= '9'; i++)
-                        minor = minor * 10 + (ver[i] - '0');
-                    if (minor >= 40)
-                        glibc_off = &glibc_2_40;
-                    else if (minor >= 37)
-                        glibc_off = &glibc_2_37;
-                    else if (minor >= 34)
-                        glibc_off = &glibc_2_34;
-                    else if (minor >= 29)
-                        glibc_off = &glibc_2_29;
-                    else
-                        glibc_off = &glibc_2_17;
-                    ldr_dbg("[loader] fallback: glibc version-based offset selection\n");
-                }
+    if (!g_glibc_rtld_fixed) {
+        const struct glibc_ver_offsets *glibc_off = DEFAULT_GLIBC_OFFSETS;
+        addr = resolve_sym(objs, nobj, "gnu_get_libc_version");
+        if (addr) {
+            const char *ver = ((const char *(*)(void))(uintptr_t)addr)();
+            if (ver && ver[0] == '2' && ver[1] == '.') {
+                int minor = 0;
+                for (int i = 2; ver[i] >= '0' && ver[i] <= '9'; i++)
+                    minor = minor * 10 + (ver[i] - '0');
+                glibc_off = fallback_glibc_offsets_for_minor(minor);
+                ldr_dbg("[loader] fallback: glibc version-based offset selection\n");
             }
-            fixup_rtld_for_glibc(glibc_off);
-            g_glibc_off = glibc_off;
         }
+        fixup_rtld_for_glibc(glibc_off);
+        g_glibc_off = glibc_off;
+        g_glibc_rtld_fixed = 1;
     }
 
     /* Pre-initialize __curbrk in the mapped libc so that sbrk() has
@@ -8448,6 +8451,7 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         if (off) {
             g_glibc_off = off;
             fixup_rtld_for_glibc(off);
+            g_glibc_rtld_fixed = 1;
         }
         /* If detection failed (e.g. musl binary, no INTERP), the
          * version-dependent fields remain unset.  For musl this is fine
@@ -8506,6 +8510,9 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         idx_map[oi] = (int)i;
         oi++;
     }
+
+    if (argc > 0 && argv && objs[0].name && objs[0].name[0])
+        argv[0] = (char *)objs[0].name;
 
     /* 2. Map all objects into memory at pre-assigned addresses.
      *    Reserve the entire VA range in one mmap call first, then
@@ -8894,7 +8901,7 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     typedef int (*main_fn_t)(int, char **, char **);
     uint64_t main_addr = resolve_main_address(objs, nobj, idx_map, metas,
                                               entry,
-                                              0);
+                                              is_musl_runtime);
 
 #if defined(__aarch64__)
      /* Prefer direct main after __libc_early_init; the bridge can crash on large VFS payloads. */

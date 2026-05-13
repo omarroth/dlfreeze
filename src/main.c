@@ -91,6 +91,53 @@ static char *resolve_exe(const char *name)
     return NULL;
 }
 
+/* Preserve the executable identity requested by the user while still letting
+ * resolve_exe() follow symlinks for the file we embed.  Multi-call binaries
+ * such as BusyBox choose behavior from argv[0], so the frozen program should
+ * see /bin/ls rather than /bin/busybox or the frozen output path. */
+static char *resolve_requested_exe_name(const char *name)
+{
+    char full[PATH_MAX];
+
+    if (strchr(name, '/')) {
+        if (name[0] == '/')
+            return strdup(name);
+        if (!getcwd(full, sizeof(full)))
+            return strdup(name);
+        size_t used = strlen(full);
+        int n = snprintf(full + used, sizeof(full) - used, "/%s", name);
+        if (n < 0 || (size_t)n >= sizeof(full) - used)
+            return strdup(name);
+        return strdup(full);
+    }
+
+    const char *pathenv = getenv("PATH");
+    if (!pathenv) return strdup(name);
+
+    char *copy = strdup(pathenv), *save, *tok;
+    if (!copy) return NULL;
+    for (tok = strtok_r(copy, ":", &save); tok; tok = strtok_r(NULL, ":", &save)) {
+        if (tok[0] == '/') {
+            int n = snprintf(full, sizeof(full), "%s/%s", tok, name);
+            if (n < 0 || (size_t)n >= sizeof(full))
+                continue;
+        } else {
+            char cwd[PATH_MAX];
+            if (!getcwd(cwd, sizeof(cwd)))
+                continue;
+            int n = snprintf(full, sizeof(full), "%s/%s/%s", cwd, tok, name);
+            if (n < 0 || (size_t)n >= sizeof(full))
+                continue;
+        }
+        if (access(full, X_OK) == 0) {
+            free(copy);
+            return strdup(full);
+        }
+    }
+    free(copy);
+    return strdup(name);
+}
+
 // Match a path against a glob pattern.  fnmatch's '*' doesn't cross '/',
 // but users expect -f '/usr/lib/*' to match anything under /usr/lib/.
 // If the pattern ends with "/" + "*", we also do a prefix check so that
@@ -807,25 +854,29 @@ int main(int argc, char **argv)
     /* resolve target */
     const char *requested_exe = argv[optind];
     char *exe_path = resolve_exe(argv[optind]);
+    char *exe_name = resolve_requested_exe_name(argv[optind]);
     if (!exe_path) {
         fprintf(stderr, "dlfreeze: cannot find: %s\n", argv[optind]);
+        free(exe_name);
         return 1;
     }
+    if (!exe_name)
+        exe_name = strdup(exe_path);
     if (!elf_check(exe_path)) {
         fprintf(stderr, "dlfreeze: not an ELF: %s\n", exe_path);
-        free(exe_path); return 1;
+        free(exe_name); free(exe_path); return 1;
     }
 
     /* locate our helper binaries */
     char self[PATH_MAX];
     ssize_t slen = readlink("/proc/self/exe", self, sizeof(self)-1);
-    if (slen < 0) { perror("readlink"); free(exe_path); return 1; }
+    if (slen < 0) { perror("readlink"); free(exe_name); free(exe_path); return 1; }
     self[slen] = '\0';
 
     char *bootstrap = find_sibling(self, "dlfreeze-bootstrap");
     if (!bootstrap) {
         fprintf(stderr, "dlfreeze: cannot find dlfreeze-bootstrap\n");
-        free(exe_path); return 1;
+        free(exe_name); free(exe_path); return 1;
     }
 
     if (verbose)
@@ -835,7 +886,7 @@ int main(int argc, char **argv)
     printf("Resolving dependencies for %s …\n", exe_path);
     struct dep_list deps;
     if (dep_resolve(exe_path, &deps) < 0) {
-        free(exe_path); free(bootstrap); return 1;
+        free(exe_name); free(exe_path); free(bootstrap); return 1;
     }
 
     if (verbose) {
@@ -865,6 +916,7 @@ int main(int argc, char **argv)
             if (trace_rc < 0) {
                 data_file_list_free(&data_files);
                 dep_list_free(&deps);
+                free(exe_name);
                 free(exe_path);
                 free(bootstrap);
                 return 1;
@@ -939,7 +991,7 @@ int main(int argc, char **argv)
     printf("Packing %d files into %s …\n", nfiles, out_path);
     struct pack_options po = {
         .exe_path       = exe_path,
-        .exe_name       = exe_path,
+        .exe_name       = exe_name,
         .output_path    = out_path,
         .bootstrap_path = bootstrap,
         .deps           = &deps,
@@ -950,6 +1002,7 @@ int main(int argc, char **argv)
 
     data_file_list_free(&data_files);
     dep_list_free(&deps);
+    free(exe_name);
     free(exe_path);
     free(bootstrap);
     return rc < 0 ? 1 : 0;

@@ -598,6 +598,67 @@ test_cat() {
 }
 
 # ===================================================================
+# Test 4b: direct-load preserves requested executable identity
+# ===================================================================
+test_symlink_exe_identity_direct() {
+    echo "--- symlink executable identity direct-load ---"
+    local src="$BUILD/identity_main.c" bin="$BUILD/identity-target"
+    local alpha="$BUILD/identity-alpha" beta="$BUILD/identity-beta"
+    local out_alpha="$BUILD/identity-alpha.frozen" out_beta="$BUILD/identity-beta.frozen"
+
+    cat > "$src" <<'C'
+#include <stdio.h>
+#include <string.h>
+
+static const char *base_name(const char *path) {
+    const char *slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
+}
+
+int main(int argc, char **argv) {
+    const char *name = base_name(argv[0]);
+    printf("name=%s\n", name);
+    if (strcmp(name, "identity-alpha") == 0) puts("mode=alpha");
+    else if (strcmp(name, "identity-beta") == 0) puts("mode=beta");
+    else puts("mode=unknown");
+    printf("argc=%d\n", argc);
+    return 0;
+}
+C
+    gcc -o "$bin" "$src"
+    ln -sf "$(basename "$bin")" "$alpha"
+    ln -sf "$(basename "$bin")" "$beta"
+
+    if ! run_freeze "$DLFREEZE" -d -o "$out_alpha" "$alpha" >/dev/null 2>&1; then
+        fail "symlink executable identity direct-load" "dlfreeze alpha failed"
+        rm -f "$src" "$bin" "$alpha" "$beta" "$out_alpha" "$out_beta"
+        return
+    fi
+    if ! run_freeze "$DLFREEZE" -d -o "$out_beta" "$beta" >/dev/null 2>&1; then
+        fail "symlink executable identity direct-load" "dlfreeze beta failed"
+        rm -f "$src" "$bin" "$alpha" "$beta" "$out_alpha" "$out_beta"
+        return
+    fi
+
+    local expect_alpha actual_alpha expect_beta actual_beta rc=0
+    capture_output expect_alpha "$alpha" arg1 || rc=$?
+    capture_output actual_alpha "$out_alpha" arg1 || rc=$?
+    capture_output expect_beta "$beta" arg1 arg2 || rc=$?
+    capture_output actual_beta "$out_beta" arg1 arg2 || rc=$?
+    actual_alpha=$(printf '%s\n' "$actual_alpha" | strip_dlfreeze_warnings)
+    actual_beta=$(printf '%s\n' "$actual_beta" | strip_dlfreeze_warnings)
+
+    if [ "$rc" = "0" ] && [ "$expect_alpha" = "$actual_alpha" ] && [ "$expect_beta" = "$actual_beta" ]; then
+        pass "symlink executable identity direct-load"
+    else
+        fail "symlink executable identity direct-load" "argv[0] identity differs"
+        diff -u <(printf '%s\n' "$expect_alpha") <(printf '%s\n' "$actual_alpha") | head -20 || true
+        diff -u <(printf '%s\n' "$expect_beta") <(printf '%s\n' "$actual_beta") | head -20 || true
+    fi
+    rm -f "$src" "$bin" "$alpha" "$beta" "$out_alpha" "$out_beta"
+}
+
+# ===================================================================
 # Test 5: python3 (with dlopen tracing)
 # ===================================================================
 test_python3() {
@@ -1380,7 +1441,17 @@ int main(void) {
     return 0;
 }
 C
-    gcc -o "$bin" "$src" -ldl -lpthread
+    if ! gcc -o "$bin" "$src" -ldl -lpthread 2>"$BUILD/dlv_main.build.err"; then
+        if grep -q 'undefined reference.*dlvsym' "$BUILD/dlv_main.build.err"; then
+            skip "dlvsym direct-load" "host libc does not provide dlvsym"
+        else
+            fail "dlvsym direct-load" "compile failed"
+            head -20 "$BUILD/dlv_main.build.err" || true
+        fi
+        rm -f "$src" "$bin" "$out" "$BUILD/dlv_main.build.err"
+        return
+    fi
+    rm -f "$BUILD/dlv_main.build.err"
 
     if ! run_freeze "$DLFREEZE" -d -o "$out" "$bin" >/dev/null 2>&1; then
         fail "dlvsym direct-load" "dlfreeze failed"
@@ -1414,6 +1485,7 @@ test_glibc_stack_end_direct
 test_exit_code
 test_ls
 test_cat
+test_symlink_exe_identity_direct
 test_dlopen_program
 test_dlopen_fallback
 test_python3

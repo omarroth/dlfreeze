@@ -160,12 +160,12 @@ echo ""
 # ── Run test suite (Docker-dependent tests auto-skip) ──────────────
 echo "--- Test suite ---"
 # The test suite skips tests whose prerequisites are missing (Docker,
-# specific relocation types, etc.).  We run it for coverage but do not
-# gate the build on it — the cross-run job is the hard compatibility gate.
+# specific relocation types, etc.), but real failures must fail the build.
 if run_suite bash tests/run_tests.sh build; then
     echo "Test suite: all passed"
 else
-    echo "WARNING: test suite had failures (may be expected in this environment)"
+    echo "ERROR: test suite failed"
+    exit 1
 fi
 echo ""
 
