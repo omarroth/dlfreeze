@@ -448,8 +448,7 @@ static void process_captured_path(const char *exe_path, const char **patterns,
 
     for (int i = 0; i < npatterns; i++) {
         if (match_glob(patterns[i], rpath)) {
-            if (sb.st_size > 0)
-                data_file_list_add(out, rpath);
+            data_file_list_add(out, rpath);
             /* If the captured file lives inside a __pycache__ directory,
              * schedule a shallow scan of both that __pycache__ and its
              * parent package directory.  Frozen importlib can load

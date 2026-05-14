@@ -20,6 +20,12 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 
+#if defined(__GLIBC__)
+#define DLFREEZE_HAVE_GLIBC_STAT_ALIASES 1
+#else
+#define DLFREEZE_HAVE_GLIBC_STAT_ALIASES 0
+#endif
+
 #ifndef O_TMPFILE
 #define O_TMPFILE 020000000
 #endif
@@ -36,13 +42,29 @@ static FILE *(*real_fopen)(const char *, const char *);
 static FILE *(*real_fopen64)(const char *, const char *);
 static DIR *(*real_opendir)(const char *);
 static int (*real_stat)(const char *, struct stat *);
+#if DLFREEZE_HAVE_GLIBC_STAT_ALIASES
+static int (*real_stat64)(const char *, struct stat64 *);
+#endif
 static int (*real_lstat)(const char *, struct stat *);
+#if DLFREEZE_HAVE_GLIBC_STAT_ALIASES
+static int (*real_lstat64)(const char *, struct stat64 *);
+#endif
 static int (*real_fstatat)(int, const char *, struct stat *, int);
+#if DLFREEZE_HAVE_GLIBC_STAT_ALIASES
+static int (*real_fstatat64)(int, const char *, struct stat64 *, int);
+static int (*real_xstat)(int, const char *, struct stat *);
+static int (*real_xstat64)(int, const char *, struct stat64 *);
+static int (*real_lxstat)(int, const char *, struct stat *);
+static int (*real_lxstat64)(int, const char *, struct stat64 *);
+static int (*real_fxstatat)(int, int, const char *, struct stat *, int);
+static int (*real_fxstatat64)(int, int, const char *, struct stat64 *, int);
+#endif
 static int (*real_access)(const char *, int);
 static int (*real_faccessat)(int, const char *, int, int);
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static __thread int g_trace_depth;
+static int g_symbols_resolved;
 
 #define PRELOAD_TRACE_READY "#DLFREEZE_PRELOAD_TRACE_V1"
 
@@ -58,8 +80,7 @@ static int is_absolute_path(const char *path)
 
 static void resolve_symbols(void)
 {
-    if (real_dlopen && real_open && real_openat && real_fopen && real_opendir &&
-        real_stat && real_lstat && real_fstatat && real_access && real_faccessat)
+    if (g_symbols_resolved)
         return;
 
     g_trace_depth++;
@@ -81,14 +102,39 @@ static void resolve_symbols(void)
         real_opendir = dlsym(RTLD_NEXT, "opendir");
     if (!real_stat)
         real_stat = dlsym(RTLD_NEXT, "stat");
+#if DLFREEZE_HAVE_GLIBC_STAT_ALIASES
+    if (!real_stat64)
+        real_stat64 = dlsym(RTLD_NEXT, "stat64");
+#endif
     if (!real_lstat)
         real_lstat = dlsym(RTLD_NEXT, "lstat");
+#if DLFREEZE_HAVE_GLIBC_STAT_ALIASES
+    if (!real_lstat64)
+        real_lstat64 = dlsym(RTLD_NEXT, "lstat64");
+#endif
     if (!real_fstatat)
         real_fstatat = dlsym(RTLD_NEXT, "fstatat");
+#if DLFREEZE_HAVE_GLIBC_STAT_ALIASES
+    if (!real_fstatat64)
+        real_fstatat64 = dlsym(RTLD_NEXT, "fstatat64");
+    if (!real_xstat)
+        real_xstat = dlsym(RTLD_NEXT, "__xstat");
+    if (!real_xstat64)
+        real_xstat64 = dlsym(RTLD_NEXT, "__xstat64");
+    if (!real_lxstat)
+        real_lxstat = dlsym(RTLD_NEXT, "__lxstat");
+    if (!real_lxstat64)
+        real_lxstat64 = dlsym(RTLD_NEXT, "__lxstat64");
+    if (!real_fxstatat)
+        real_fxstatat = dlsym(RTLD_NEXT, "__fxstatat");
+    if (!real_fxstatat64)
+        real_fxstatat64 = dlsym(RTLD_NEXT, "__fxstatat64");
+#endif
     if (!real_access)
         real_access = dlsym(RTLD_NEXT, "access");
     if (!real_faccessat)
         real_faccessat = dlsym(RTLD_NEXT, "faccessat");
+    g_symbols_resolved = 1;
     g_trace_depth--;
 }
 
@@ -236,6 +282,22 @@ static void trace_stat_result(int rc, int dirfd, const char *path,
 
     errno = saved_errno;
 }
+
+#if DLFREEZE_HAVE_GLIBC_STAT_ALIASES
+static void trace_stat64_result(int rc, int dirfd, const char *path,
+                                const struct stat64 *st)
+{
+    int saved_errno = errno;
+
+    if (rc == 0 && st && S_ISREG(st->st_mode)) {
+        trace_path_kind(dirfd, path, 0);
+    } else if (rc < 0 && (saved_errno == ENOENT || saved_errno == ENOTDIR)) {
+        trace_failed_path(dirfd, path);
+    }
+
+    errno = saved_errno;
+}
+#endif
 
 static void trace_access_result(int rc, int dirfd, const char *path, int flags)
 {
@@ -498,6 +560,23 @@ int stat(const char *path, struct stat *buf)
     return rc;
 }
 
+#if DLFREEZE_HAVE_GLIBC_STAT_ALIASES
+int stat64(const char *path, struct stat64 *buf)
+{
+    int rc;
+
+    resolve_symbols();
+    if (!real_stat64) {
+        errno = ENOSYS;
+        return -1;
+    }
+
+    rc = real_stat64(path, buf);
+    trace_stat64_result(rc, AT_FDCWD, path, buf);
+    return rc;
+}
+#endif
+
 int lstat(const char *path, struct stat *buf)
 {
     int rc;
@@ -513,6 +592,23 @@ int lstat(const char *path, struct stat *buf)
     return rc;
 }
 
+#if DLFREEZE_HAVE_GLIBC_STAT_ALIASES
+int lstat64(const char *path, struct stat64 *buf)
+{
+    int rc;
+
+    resolve_symbols();
+    if (!real_lstat64) {
+        errno = ENOSYS;
+        return -1;
+    }
+
+    rc = real_lstat64(path, buf);
+    trace_stat64_result(rc, AT_FDCWD, path, buf);
+    return rc;
+}
+#endif
+
 int fstatat(int dirfd, const char *path, struct stat *buf, int flags)
 {
     int rc;
@@ -527,6 +623,115 @@ int fstatat(int dirfd, const char *path, struct stat *buf, int flags)
     trace_stat_result(rc, dirfd, path, buf);
     return rc;
 }
+
+#if DLFREEZE_HAVE_GLIBC_STAT_ALIASES
+int fstatat64(int dirfd, const char *path, struct stat64 *buf, int flags)
+{
+    int rc;
+
+    resolve_symbols();
+    if (!real_fstatat64) {
+        errno = ENOSYS;
+        return -1;
+    }
+
+    rc = real_fstatat64(dirfd, path, buf, flags);
+    trace_stat64_result(rc, dirfd, path, buf);
+    return rc;
+}
+
+int __xstat(int version, const char *path, struct stat *buf)
+{
+    int rc;
+
+    resolve_symbols();
+    if (!real_xstat) {
+        errno = ENOSYS;
+        return -1;
+    }
+
+    rc = real_xstat(version, path, buf);
+    trace_stat_result(rc, AT_FDCWD, path, buf);
+    return rc;
+}
+
+int __xstat64(int version, const char *path, struct stat64 *buf)
+{
+    int rc;
+
+    resolve_symbols();
+    if (!real_xstat64) {
+        errno = ENOSYS;
+        return -1;
+    }
+
+    rc = real_xstat64(version, path, buf);
+    trace_stat64_result(rc, AT_FDCWD, path, buf);
+    return rc;
+}
+
+int __lxstat(int version, const char *path, struct stat *buf)
+{
+    int rc;
+
+    resolve_symbols();
+    if (!real_lxstat) {
+        errno = ENOSYS;
+        return -1;
+    }
+
+    rc = real_lxstat(version, path, buf);
+    trace_stat_result(rc, AT_FDCWD, path, buf);
+    return rc;
+}
+
+int __lxstat64(int version, const char *path, struct stat64 *buf)
+{
+    int rc;
+
+    resolve_symbols();
+    if (!real_lxstat64) {
+        errno = ENOSYS;
+        return -1;
+    }
+
+    rc = real_lxstat64(version, path, buf);
+    trace_stat64_result(rc, AT_FDCWD, path, buf);
+    return rc;
+}
+
+int __fxstatat(int version, int dirfd, const char *path,
+               struct stat *buf, int flags)
+{
+    int rc;
+
+    resolve_symbols();
+    if (!real_fxstatat) {
+        errno = ENOSYS;
+        return -1;
+    }
+
+    rc = real_fxstatat(version, dirfd, path, buf, flags);
+    trace_stat_result(rc, dirfd, path, buf);
+    return rc;
+}
+
+int __fxstatat64(int version, int dirfd, const char *path,
+                 struct stat64 *buf, int flags)
+{
+    int rc;
+
+    resolve_symbols();
+    if (!real_fxstatat64) {
+        errno = ENOSYS;
+        return -1;
+    }
+
+    rc = real_fxstatat64(version, dirfd, path, buf, flags);
+    trace_stat64_result(rc, dirfd, path, buf);
+    return rc;
+}
+#endif
 
 int access(const char *path, int mode)
 {
