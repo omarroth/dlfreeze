@@ -156,147 +156,6 @@ static int match_glob(const char *pattern, const char *path)
 }
 
 /* ------------------------------------------------------------------ */
-/* Add all regular non-ELF files in a single directory (non-recursive) */
-/* to the data-file list, skipping files already in deps.              */
-/* ------------------------------------------------------------------ */
-static void scan_dir_shallow(const char *dirpath,
-                             struct data_file_list *out,
-                             const struct dep_list *deps,
-                             const char *exe_path)
-{
-    DIR *d = opendir(dirpath);
-    if (!d) return;
-    struct dirent *e;
-    while ((e = readdir(d))) {
-        if (e->d_name[0] == '.' &&
-            (e->d_name[1] == '\0' ||
-             (e->d_name[1] == '.' && e->d_name[2] == '\0')))
-            continue;
-        char child[PATH_MAX];
-        snprintf(child, sizeof(child), "%s/%s", dirpath, e->d_name);
-
-        /* Use lstat first so we can detect symlinks before following.
-         * scan_dir_shallow is meant to pick up sibling files inside an
-         * already-captured directory; following a symlink that points
-         * *outside* the captured tree (e.g. _pcbnew.so -> /usr/bin/...)
-         * pulls in unrelated megabytes the program never used.  Only
-         * follow links whose realpath stays under the captured dir. */
-        struct stat lsb;
-        if (lstat(child, &lsb) != 0) continue;
-
-        char rpath[PATH_MAX];
-        if (S_ISLNK(lsb.st_mode)) {
-            if (!realpath(child, rpath)) continue;
-            size_t dlen = strlen(dirpath);
-            if (strncmp(rpath, dirpath, dlen) != 0 ||
-                (rpath[dlen] != '/' && rpath[dlen] != '\0'))
-                continue;  /* link target escapes captured dir */
-        } else {
-            if (!realpath(child, rpath)) continue;
-        }
-
-        struct stat sb;
-        if (stat(rpath, &sb) != 0) continue;
-
-        /* Subdirectory: by default skip.  Adding a .dir marker for
-         * an empty subdir would make vfs_dir_exists() report it as
-         * present and Python's import machinery then treats it as a
-         * namespace package shadowing the real module
-         * (e.g. /usr/lib/python3.14/re).
-         *
-         * Exception: when a subdir holds ELF binary extensions
-         * (e.g. /usr/lib/pythonX.Y/lib-dynload) we MUST report it as
-         * present even when the trace didn't dlopen any of them.
-         * Python's getpath walks the filesystem looking for
-         * lib-dynload to compute sys.exec_prefix; if it can't find
-         * the directory it prints "Could not find platform dependent
-         * libraries <exec_prefix>" on stderr.  Such a dir contains
-         * only ELF .so files (no __init__.py), so namespace-pkg
-         * shadowing of a sibling .py module is not a concern.  Add a
-         * .dir marker for it so vfs_dir_exists() succeeds. */
-        if (S_ISDIR(sb.st_mode)) {
-            DIR *sd = opendir(rpath);
-            if (sd) {
-                int has_elf = 0, has_py_init = 0;
-                struct dirent *se;
-                while ((se = readdir(sd))) {
-                    if (se->d_name[0] == '.') continue;
-                    /* __init__.py marks a pure-Python package; skip
-                     * such dirs to avoid namespace-pkg shadowing. */
-                    if (strcmp(se->d_name, "__init__.py") == 0) {
-                        has_py_init = 1;
-                        break;
-                    }
-                    size_t nl = strlen(se->d_name);
-                    if (nl < 4) continue;
-                    /* Quick filename heuristic: .so / .so.* extension */
-                    if (strcmp(se->d_name + nl - 3, ".so") == 0 ||
-                        strstr(se->d_name, ".so.") != NULL) {
-                        char ec[PATH_MAX];
-                        snprintf(ec, sizeof(ec), "%s/%s", rpath, se->d_name);
-                        if (elf_check(ec)) { has_elf = 1; }
-                    }
-                }
-                closedir(sd);
-                if (has_elf && !has_py_init) {
-                    char marker[PATH_MAX];
-                    snprintf(marker, sizeof(marker), "%s/.dir", rpath);
-                    data_file_list_add_virtual(out, marker);
-                }
-            }
-            continue;
-        }
-
-        if (!S_ISREG(sb.st_mode)) continue;
-
-        /* Check if this file is a known dep (exe, interp, or resolved
-         * shared lib / dlopen lib).  Known-dep ELF files are served at
-         * runtime via frozen_dlopen_serve_memfd; add them as virtual
-         * placeholders so VFS directory listings include them without
-         * duplicating the payload.  ELF files that are NOT known deps
-         * and non-ELF files are embedded as real data. */
-        int skip = 0;
-        if (!skip && strcmp(rpath, exe_path) == 0) skip = 1;
-        if (!skip && deps->interp_path &&
-            strcmp(rpath, deps->interp_path) == 0) skip = 1;
-        for (int i = 0; !skip && i < deps->count; i++) {
-            char dpath[PATH_MAX];
-            if (realpath(deps->libs[i].path, dpath) &&
-                strcmp(rpath, dpath) == 0)
-                skip = 1;
-        }
-
-        if (skip) {
-            data_file_list_add_virtual(out, rpath);
-        } else {
-            /* Sibling ELF files that aren't known deps were never
-             * dlopen'd or executed by the traced program.  Bundling
-             * them as real payload bloats the frozen binary by tens
-             * of MB (e.g. cv2.so, libtorrent.so in site-packages).
-             * If the program later tries to load one at runtime it
-             * will get ENOENT — same as if -f had not matched it. */
-            if (elf_check(rpath))
-                continue;
-            /* .pth files in site-packages execute Python code at
-             * interpreter startup (site.addpackage).  Many of them
-             * (e.g. *-nspkg.pth) call importlib to load namespace
-             * packages we didn't capture, which raises and forces
-             * Python to load `traceback` -> `re` etc. that the trace
-             * never opened.  Skip them — site.py tolerates an empty
-             * site-packages just fine. */
-            const char *base = strrchr(rpath, '/');
-            if (base) {
-                size_t blen = strlen(base);
-                if (blen >= 4 && strcmp(base + blen - 4, ".pth") == 0)
-                    continue;
-            }
-            data_file_list_add(out, rpath);
-        }
-    }
-    closedir(d);
-}
-
-/* ------------------------------------------------------------------ */
 /* Capture data files opened during a traced run. Prefer the bundled   */
 /* LD_PRELOAD tracer and fall back to strace if that helper is absent. */
 /* ------------------------------------------------------------------ */
@@ -353,25 +212,20 @@ static int path_is_known_dep(const char *rpath, const char *exe_path,
     return 0;
 }
 
-static void add_capture_dir(char ***cap_dirs, int *ncap_dirs, int *cap_dirs_cap,
-                            const char *rpath)
+static void data_file_list_add_dir_marker(struct data_file_list *out,
+                                          const char *rpath)
 {
-    for (int i = 0; i < *ncap_dirs; i++)
-        if (strcmp((*cap_dirs)[i], rpath) == 0)
-            return;
+    char marker[PATH_MAX];
 
-    if (*ncap_dirs >= *cap_dirs_cap) {
-        *cap_dirs_cap = *cap_dirs_cap ? *cap_dirs_cap * 2 : 64;
-        *cap_dirs = realloc(*cap_dirs, *cap_dirs_cap * sizeof(char *));
-    }
-    (*cap_dirs)[(*ncap_dirs)++] = strdup(rpath);
+    if (snprintf(marker, sizeof(marker), "%s/.dir", rpath) >= (int)sizeof(marker))
+        return;
+    data_file_list_add_virtual(out, marker);
 }
 
 static void process_captured_path(const char *exe_path, const char **patterns,
                                   int npatterns, struct data_file_list *out,
                                   struct dep_list *deps, const char *rpath,
-                                  int is_dir, char ***cap_dirs,
-                                  int *ncap_dirs, int *cap_dirs_cap)
+                                  int is_dir)
 {
     struct stat sb;
 
@@ -381,40 +235,9 @@ static void process_captured_path(const char *exe_path, const char **patterns,
         if (!dir_matches_patterns(rpath, patterns, npatterns))
             return;
 
-        /* Only auto-shallow-scan __pycache__ dirs (and their parent
-         * package dir).  Frozen importlib loads sibling .py/.pyc
-         * files for these without going through our open() hook, so
-         * we must proactively pull them in.
-         *
-         * For other opendir'd dirs (site-packages, encodings, etc.)
-         * the program will open() any file it actually needs and
-         * those F records carry the file in.  Adding the entire dir
-         * to cap_dirs would bulk-pull every untouched sibling — .pth
-         * files, large stand-alone .py modules (pcbnew.py, etc.),
-         * inflating the frozen binary by tens of MB.  Just record a
-         * .dir VFS marker so directory listings still see the dir. */
-        const char *slash = strrchr(rpath, '/');
-        int is_pycache = slash && slash > rpath &&
-                         strcmp(slash + 1, "__pycache__") == 0;
-        if (is_pycache) {
-            add_capture_dir(cap_dirs, ncap_dirs, cap_dirs_cap, rpath);
-            char parent[PATH_MAX];
-            size_t plen = (size_t)(slash - rpath);
-            if (plen < sizeof(parent)) {
-                memcpy(parent, rpath, plen);
-                parent[plen] = '\0';
-                if (dir_matches_patterns(parent, patterns, npatterns))
-                    add_capture_dir(cap_dirs, ncap_dirs,
-                                    cap_dirs_cap, parent);
-            }
-        }
-        /* For non-__pycache__ dirs we do nothing.  Adding a .dir
-         * marker here would make the VFS report the dir as present
-         * (and empty) even when no contents were captured, which
-         * causes Python's import machinery to treat it as a
-         * namespace package shadowing the real module.  The dir will
-         * still appear in vfs_dir_exists() automatically once any
-         * file inside it is captured (via its parent registration). */
+        /* Preserve successful directory probes without bulk-pulling contents;
+         * traced file probes carry per-child existence semantics. */
+        data_file_list_add_dir_marker(out, rpath);
         return;
     }
 
@@ -431,55 +254,9 @@ static void process_captured_path(const char *exe_path, const char **patterns,
     if (path_is_known_dep(rpath, exe_path, deps))
         return;
 
-    /* Skip site-packages .pth files.  Python's site.addpackage() execs
-     * each .pth's contents at interpreter startup; namespace-package
-     * .pth files (e.g. *-nspkg.pth) try to importlib-load packages
-     * we never captured, raising and forcing the traceback module to
-     * load `re` etc. that the trace never opened either.  Dropping
-     * them keeps site.py happy with an effectively empty site-pkgs. */
-    {
-        const char *base = strrchr(rpath, '/');
-        if (base) {
-            size_t blen = strlen(base);
-            if (blen >= 4 && strcmp(base + blen - 4, ".pth") == 0)
-                return;
-        }
-    }
-
     for (int i = 0; i < npatterns; i++) {
         if (match_glob(patterns[i], rpath)) {
             data_file_list_add(out, rpath);
-            /* If the captured file lives inside a __pycache__ directory,
-             * schedule a shallow scan of both that __pycache__ and its
-             * parent package directory.  Frozen importlib can load
-             * sibling submodules (e.g. importlib._bootstrap) without
-             * the trace ever opening the package dir, so we need to
-             * proactively pick up the .py/.pyc siblings. */
-            const char *slash = strrchr(rpath, '/');
-            if (slash && slash > rpath) {
-                char parent[PATH_MAX];
-                size_t plen = (size_t)(slash - rpath);
-                if (plen < sizeof(parent)) {
-                    memcpy(parent, rpath, plen);
-                    parent[plen] = '\0';
-                    const char *pslash = strrchr(parent, '/');
-                    if (pslash && strcmp(pslash + 1, "__pycache__") == 0) {
-                        if (dir_matches_patterns(parent, patterns, npatterns))
-                            add_capture_dir(cap_dirs, ncap_dirs,
-                                            cap_dirs_cap, parent);
-                        char gparent[PATH_MAX];
-                        size_t gplen = (size_t)(pslash - parent);
-                        if (gplen > 0 && gplen < sizeof(gparent)) {
-                            memcpy(gparent, parent, gplen);
-                            gparent[gplen] = '\0';
-                            if (dir_matches_patterns(gparent, patterns,
-                                                     npatterns))
-                                add_capture_dir(cap_dirs, ncap_dirs,
-                                                cap_dirs_cap, gparent);
-                        }
-                    }
-                }
-            }
             return;
         }
     }
@@ -508,22 +285,8 @@ static void process_captured_negative_path(const char **patterns, int npatterns,
     }
 }
 
-static void finish_captured_paths(const char *exe_path, struct data_file_list *out,
-                                  struct dep_list *deps, int verbose,
-                                  char **cap_dirs, int ncap_dirs)
+static void finish_captured_paths(struct data_file_list *out, int verbose)
 {
-    if (ncap_dirs > 0 && verbose) {
-        printf("  captured dirs: %d\n", ncap_dirs);
-        for (int i = 0; i < ncap_dirs; i++)
-            printf("    %s\n", cap_dirs[i]);
-    }
-
-    for (int i = 0; i < ncap_dirs; i++) {
-        scan_dir_shallow(cap_dirs[i], out, deps, exe_path);
-        free(cap_dirs[i]);
-    }
-    free(cap_dirs);
-
     if (verbose || out->count > 0) {
         printf("  data files : %d matched\n", out->count);
         if (verbose) {
@@ -559,8 +322,6 @@ static int parse_preload_file_trace(const char *tracef, const char *exe_path,
                                     struct dep_list *deps, int verbose)
 {
     FILE *tf = fopen(tracef, "r");
-    char **cap_dirs = NULL;
-    int ncap_dirs = 0, cap_dirs_cap = 0;
     char line[4096];
 
     if (!tf)
@@ -583,12 +344,11 @@ static int parse_preload_file_trace(const char *tracef, const char *exe_path,
             continue;
         }
         process_captured_path(exe_path, patterns, npatterns, out, deps,
-                              line + 2, line[0] == 'D',
-                              &cap_dirs, &ncap_dirs, &cap_dirs_cap);
+                              line + 2, line[0] == 'D');
     }
 
     fclose(tf);
-    finish_captured_paths(exe_path, out, deps, verbose, cap_dirs, ncap_dirs);
+    finish_captured_paths(out, verbose);
     return 0;
 }
 
@@ -600,8 +360,6 @@ static int parse_strace_file_trace(const char *tracef, const char *exe_path,
 {
     FILE *tf = fopen(tracef, "r");
     FILE *elf_tf = elf_tracef ? fopen(elf_tracef, "a") : NULL;
-    char **cap_dirs = NULL;
-    int ncap_dirs = 0, cap_dirs_cap = 0;
     char line[4096];
 
     if (!tf)
@@ -648,15 +406,14 @@ static int parse_strace_file_trace(const char *tracef, const char *exe_path,
             }
 
             process_captured_path(exe_path, patterns, npatterns, out, deps,
-                                  rpath, is_dir,
-                                  &cap_dirs, &ncap_dirs, &cap_dirs_cap);
+                                  rpath, is_dir);
         }
     }
 
     fclose(tf);
     if (elf_tf)
         fclose(elf_tf);
-    finish_captured_paths(exe_path, out, deps, verbose, cap_dirs, ncap_dirs);
+    finish_captured_paths(out, verbose);
     return 0;
 }
 

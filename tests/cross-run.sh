@@ -186,7 +186,8 @@ for src_dir in $FROZEN_GLOB; do
     if [ -f "$frozen_py" ] && [ -f "$expected_py" ]; then
         chmod +x "$frozen_py" 2>/dev/null || true
         rc=0
-        actual=$(run_capture_stdout "$frozen_py" -c 'print(1+2)') || rc=$?
+        actual=$(run_capture_stdout env DLFREEZE_NO_FORK=1 \
+            "$frozen_py" -c 'print(1+2)') || rc=$?
         exp=$(cat "$expected_py")
         if [ "$actual" = "$exp" ] && [ "$rc" -eq 0 ]; then
             pass "$src_env/python3.frozen"
@@ -202,7 +203,8 @@ for src_dir in $FROZEN_GLOB; do
     if [ -f "$frozen_py_upx" ] && [ -f "$expected_py" ]; then
         chmod +x "$frozen_py_upx" 2>/dev/null || true
         rc=0
-        actual=$(run_capture_stdout "$frozen_py_upx" -c 'print(1+2)') || rc=$?
+        actual=$(run_capture_stdout env DLFREEZE_NO_FORK=1 \
+            "$frozen_py_upx" -c 'print(1+2)') || rc=$?
         exp=$(cat "$expected_py")
         if [ "$actual" = "$exp" ] && [ "$rc" -eq 0 ]; then
             pass "$src_env/python3.upx.frozen"
@@ -219,7 +221,8 @@ for src_dir in $FROZEN_GLOB; do
     if [ -f "$frozen_rb" ] && [ -f "$expected_rb" ]; then
         chmod +x "$frozen_rb" 2>/dev/null || true
         rc=0
-        actual=$(run_capture "$frozen_rb" -e 'puts 1+2') || rc=$?
+        actual=$(run_capture env DLFREEZE_NO_FORK=1 \
+            "$frozen_rb" -e 'puts 1+2') || rc=$?
         exp=$(cat "$expected_rb")
         if [ "$actual" = "$exp" ] && [ "$rc" -eq 0 ]; then
             pass "$src_env/ruby.frozen"
@@ -235,7 +238,8 @@ for src_dir in $FROZEN_GLOB; do
     if [ -f "$frozen_rb_upx" ] && [ -f "$expected_rb" ]; then
         chmod +x "$frozen_rb_upx" 2>/dev/null || true
         rc=0
-        actual=$(run_capture "$frozen_rb_upx" -e 'puts 1+2') || rc=$?
+        actual=$(run_capture env DLFREEZE_NO_FORK=1 \
+            "$frozen_rb_upx" -e 'puts 1+2') || rc=$?
         exp=$(cat "$expected_rb")
         if [ "$actual" = "$exp" ] && [ "$rc" -eq 0 ]; then
             pass "$src_env/ruby.upx.frozen"

@@ -109,20 +109,6 @@ static int bs_is_musl_interp_path(const char *path)
     return strncmp(base, "ld-musl", 7) == 0;
 }
 
-static int bs_is_python_exe(const char *path)
-{
-    const char *base = bs_basename(path);
-
-    return strncmp(base, "python", 6) == 0;
-}
-
-static int bs_is_ruby_exe(const char *path)
-{
-    const char *base = bs_basename(path);
-
-    return strcmp(base, "ruby") == 0 || strncmp(base, "ruby", 4) == 0;
-}
-
 static int bs_debug_enabled(void)
 {
     const char *dbg = getenv("DLFREEZE_DEBUG");
@@ -385,20 +371,14 @@ int main(int argc, char **argv)
     /* 7. extract all files */
     char exe_path[PATH_MAX + 256]    = {0};
     char interp_path[PATH_MAX + 256] = {0};
-    int has_python_stdlib_data = 0;
 
     for (uint32_t i = 0; i < ft.num_entries; i++) {
         const char *name = strtab + ent[i].name_offset;
-        if ((ent[i].flags & DLFRZ_FLAG_DATA) != 0 && name[0] == '/') {
-            if (strncmp(name, "/usr/lib/python", 15) == 0 ||
-                strncmp(name, "/usr/local/lib/python", 21) == 0)
-                has_python_stdlib_data = 1;
-        }
         if ((ent[i].flags & (DLFRZ_FLAG_DATA_VIRTUAL | DLFRZ_FLAG_DATA_NEGATIVE)) != 0)
             continue;
         char dst[PATH_MAX + 256];
-        /* Extract DATA entries and DLOPEN'd python extension modules at
-         * their full original path so importlib finds them; system
+        /* Extract DATA entries and DLOPEN entries at
+         * their full original path so path-based loaders find them; system
          * shared libraries (DT_NEEDED-style soname lookup) go flat into
          * g_tmpdir (used as LD_LIBRARY_PATH). */
         int use_full_path = (name[0] == '/') &&
@@ -528,19 +508,6 @@ int main(int argc, char **argv)
     setenv("LD_LIBRARY_PATH", lp, 1);
     setenv("DLFREEZE_TMPDIR", g_tmpdir, 1);
     setenv("DLFREEZE_EXTRACT_ROOT", g_tmpdir, 1);
-
-    if (bs_is_python_exe(exe_path) && has_python_stdlib_data) {
-        char pyhome[PATH_MAX + 256];
-        snprintf(pyhome, sizeof(pyhome), "%s/usr", g_tmpdir);
-        setenv("PYTHONHOME", pyhome, 1);
-        setenv("PYTHONNOUSERSITE", "1", 1);
-    }
-
-    if (bs_is_ruby_exe(exe_path)) {
-        /* Keep extracted cross-distro runs deterministic and avoid host gem
-         * prelude requirements for optional default gems/extensions. */
-        setenv("RUBYOPT", "--disable-gems", 1);
-    }
 
     /* 10. fork→exec, parent waits + cleans up */
     g_child = fork();

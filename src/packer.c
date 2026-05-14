@@ -1970,13 +1970,10 @@ int pack_frozen(const struct pack_options *opts)
          * name like libQt6Core.so.6.11.0, but we need the soname for
          * basename matching against DT_NEEDED entries at runtime.
          *
-         * Exception: dlopen'd python extension modules (e.g.
-         *   /usr/lib/python3/dist-packages/cryptography/hazmat/bindings/_rust.abi3.so)
-         * are loaded by python's import system using the full file
-         * path, not by DT_NEEDED-style soname lookup, and the soname
-         * (e.g. "libcryptography_rust.so") usually doesn't match the
-         * file basename — so the extraction-fallback path needs the
-         * original full path preserved. */
+         * Direct dlopen captures use the probed absolute path, not
+         * DT_NEEDED-style soname lookup.  When the soname does not match
+         * the file basename, the extraction fallback must preserve the
+         * original full path so path-based loaders find the same file. */
         {
             const char *rpath = opts->deps->libs[i].path;
             const char *sname = opts->deps->libs[i].name;
@@ -1986,8 +1983,7 @@ int pack_frozen(const struct pack_options *opts)
             const char *rbase = last_slash ? last_slash + 1 : rpath;
             int soname_matches = (strcmp(rbase, sname) == 0);
             if (is_dlopen && is_dlopen_direct && !soname_matches) {
-                /* Use full original path so extraction places the file
-                 * exactly where python's importlib expects it. */
+                /* Use the full original path for path-based dlopen probes. */
                 strcpy(strtab + stroff, rpath);
                 stroff += strlen(rpath) + 1;
             } else if (last_slash) {

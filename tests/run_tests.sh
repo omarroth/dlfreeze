@@ -1477,7 +1477,7 @@ int main(void) {
 }
 C
     if ! gcc -o "$bin" "$src" -ldl -lpthread 2>"$BUILD/dlv_main.build.err"; then
-        if grep -q 'undefined reference.*dlvsym' "$BUILD/dlv_main.build.err"; then
+        if grep -Eq 'undefined reference.*dlvsym|implicit declaration of function .dlvsym.' "$BUILD/dlv_main.build.err"; then
             skip "dlvsym direct-load" "host libc does not provide dlvsym"
         else
             fail "dlvsym direct-load" "compile failed"

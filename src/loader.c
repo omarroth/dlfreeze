@@ -3718,7 +3718,6 @@ static uint32_t vfs_hash(const char *s)
 }
 
 static void vfs_init_dirs(void);
-static void vfs_init_pyc_aliases(void);
 static int vfs_dir_exists(const char *path);
 static const struct vfs_entry *vfs_lookup(const char *path);
 static int frozen_dlopen_find(const char *path);
@@ -3794,7 +3793,6 @@ static void vfs_init(const uint8_t *mem, uint64_t mem_foff,
     }
     if (g_vfs_count > 0) {
         vfs_init_dirs();
-        vfs_init_pyc_aliases();
     }
 }
 
@@ -3841,9 +3839,9 @@ static void vfs_dbg_op(const char *op, const char *path, const char *detail)
 /* ---- VFS directory table --------------------------------------------- */
 /*
  * Derived from embedded file paths at init time.  For each file like
- * /usr/lib/python3.14/json/__init__.py we record all parent directories:
- *   /usr/lib/python3.14/json
- *   /usr/lib/python3.14
+ * /usr/lib/app/data/config.json we record all parent directories:
+ *   /usr/lib/app/data
+ *   /usr/lib/app
  *   /usr/lib
  *   /usr
  * This lets stat() report them as directories and opendir() list them.
@@ -3945,11 +3943,10 @@ static void vfs_init_dirs(void)
         }
     }
     /* Also derive parent directories from frozen DLOPEN entries so that
-     * directories whose only contents are dlopen-served .so files
-     * (e.g. /usr/lib/python3.14/lib-dynload, /usr/lib/ossl-modules)
-     * report as existing.  Otherwise vfs_path_is_sealed_miss seals
-     * them as ENOENT, hiding the lib-dynload directory from Python's
-     * importer and breaking C-extension imports. */
+    * directories whose only contents are dlopen-served .so files
+    * report as existing.  Otherwise vfs_path_is_sealed_miss can make
+    * extension/plugin directories look missing before the loader gets a
+    * chance to serve their captured shared objects. */
     if (g_frozen_metas && g_frozen_entries && g_frozen_strtab) {
         for (uint32_t i = 0; i < g_frozen_num_entries; i++) {
             if (!(g_frozen_metas[i].flags & LDR_FLAG_DLOPEN)) continue;
@@ -3969,86 +3966,6 @@ static void vfs_init_dirs(void)
     if (g_debug && g_vfs_dir_count > 0) {
         ldr_dbg_hex("[loader] vfs: 0x", g_vfs_dir_count);
         ldr_msg(" directories derived\n");
-    }
-}
-
-/*
- * vfs_init_pyc_aliases — create synthetic <name>.pyc entries for every
- * __pycache__/<name>.cpython-XY.pyc file where the corresponding
- * <name>.py is missing from VFS.
- *
- * Python's SourceFileLoader needs <name>.py to exist on disk to find a
- * module.  When only the .pyc from __pycache__/ was captured (Python
- * loaded it without opening the .py source), SourceFileLoader fails.
- * SourcelessFileLoader looks for <name>.pyc (without version tag) in
- * the parent directory.  By creating these aliases we enable it to
- * find and load the bytecode.
- */
-static void vfs_init_pyc_aliases(void)
-{
-    static char pyc_strbuf[65536];
-    int strpos = 0;
-    int alias_count = 0;
-
-    for (int i = 0; i < (int)VFS_HASH_SIZE; i++) {
-        if (!g_vfs_table[i].path) continue;
-        const char *path = g_vfs_table[i].path;
-
-        /* Match __pycache__/<name>.cpython-<digits>.pyc */
-        const char *pc = strstr(path, "/__pycache__/");
-        if (!pc) continue;
-
-        const char *fname = pc + 13; /* past "/__pycache__/" */
-        const char *cp = strstr(fname, ".cpython-");
-        if (!cp) continue;
-        const char *ext = cp + 9; /* past ".cpython-" */
-        while (*ext >= '0' && *ext <= '9') ext++;
-        if (ext[0] != '.' || ext[1] != 'p' || ext[2] != 'y' ||
-            ext[3] != 'c' || ext[4] != '\0')
-            continue;
-
-        int parent_len = (int)(pc - path);
-        int name_len   = (int)(cp - fname);
-
-        /* Build <parent>/<name>.py and <parent>/<name>.pyc in a check buf */
-        char buf[512];
-        int base = parent_len + 1 + name_len;
-        if (base + 5 > (int)sizeof(buf)) continue; /* .pyc\0 */
-        memcpy(buf, path, parent_len);
-        buf[parent_len] = '/';
-        memcpy(buf + parent_len + 1, fname, name_len);
-
-                /* Skip if .py already exists as a real embedded file.
-                 * Virtual placeholders should not suppress the sourceless alias. */
-        memcpy(buf + base, ".py", 4);
-        { const struct vfs_entry *py_ve = vfs_lookup(buf);
-                    if (py_ve && !vfs_is_virtual_entry(py_ve)) continue; }
-
-        /* Skip if .pyc already exists */
-        memcpy(buf + base, ".pyc", 5);
-        if (vfs_lookup(buf)) continue;
-
-        /* Store the new path string */
-        int need = base + 4 + 1; /* .pyc\0 */
-        if (strpos + need > (int)sizeof(pyc_strbuf)) break;
-        char *dest = pyc_strbuf + strpos;
-        memcpy(dest, buf, need);
-        strpos += need;
-
-        /* Insert into the hash table */
-        uint32_t idx = vfs_hash(dest) & (VFS_HASH_SIZE - 1);
-        while (g_vfs_table[idx].path)
-            idx = (idx + 1) & (VFS_HASH_SIZE - 1);
-        g_vfs_table[idx].path = dest;
-        g_vfs_table[idx].data = g_vfs_table[i].data;
-        g_vfs_table[idx].size = g_vfs_table[i].size;
-        g_vfs_count++;
-        alias_count++;
-    }
-
-    if (g_debug && alias_count > 0) {
-        ldr_dbg_hex("[loader] vfs: 0x", alias_count);
-        ldr_msg(" pyc aliases created\n");
     }
 }
 
@@ -4356,8 +4273,8 @@ static char **vfs_prepare_child_env(char **envp)
 
 /* ---- VFS opendir/readdir/closedir ------------------------------------ */
 /*
- * We replace libc's opendir/readdir/closedir so Python's os.listdir()
- * sees embedded files even when the real directories don't exist.
+ * We replace libc's opendir/readdir/closedir so directory enumeration sees
+ * embedded files even when the real directories don't exist.
  *
  * For our fake DIR handles we use a magic sentinel at the start.
  * glibc's real DIR struct starts with an int fd (small positive number),
@@ -4675,9 +4592,9 @@ static struct dirent *vfs_readdir(void *dirp)
                 h->scan_pos = 0;
             }
             if (h->phase == 2) {
-                /* Frozen DLOPEN entries (e.g. lib-dynload .so files
-                 * served via memfd) are not in g_vfs_table; enumerate
-                 * them here so Python's FileFinder can discover them. */
+                /* Frozen DLOPEN entries served via memfd are not in
+                 * g_vfs_table; enumerate them here so directory scanners
+                 * can discover them. */
                 if (g_frozen_metas && g_frozen_entries && g_frozen_strtab) {
                     while (h->scan_pos < (int)g_frozen_num_entries) {
                         uint32_t si = (uint32_t)h->scan_pos++;
@@ -4894,9 +4811,9 @@ static int vfs_open(const char *path, int flags, int mode)
     /* For absolute paths inside the captured tree, intercept all
      * accesses (read or write) so we never touch the host filesystem.
      * Writes to captured paths are refused (EROFS) since the frozen
-     * image is read-only; this prevents Python's .pyc bytecode cache
-     * (and similar tools) from silently writing to the original
-     * /usr/lib/... locations on the host. */
+    * image is read-only; this prevents caches, locks, and generated files
+    * from silently writing to the original /usr/lib/... locations on the
+    * host. */
     if (path && path[0] == '/') {
         int is_write = (flags & 3) != 0 /* O_WRONLY or O_RDWR */;
         /* Directory path captured in VFS: serve virtually (no FS touch). */
@@ -4929,9 +4846,9 @@ static int vfs_open(const char *path, int flags, int mode)
             if (fd >= 0) return fd;
         }
         /* Sealed mount: refuse host fall-through for paths that match a
-         * frozen-mount glob but were not captured.  Applies to writes
-         * too — otherwise Python's .pyc cache, dpkg's lock files, etc.
-         * would silently write to the host's /usr tree. */
+         * frozen-mount glob but were not captured.  Applies to writes too,
+         * otherwise cache and lock files could silently land in the host's
+         * /usr tree. */
         if (vfs_path_is_sealed_miss(path)) {
             vfs_seal_log("open", path);
             set_loader_errno(is_write ? EROFS : ENOENT);
@@ -4940,8 +4857,7 @@ static int vfs_open(const char *path, int flags, int mode)
         if (!is_write) {
             int ret = (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, path, flags, mode);
             if (ret >= 0) return ret;
-            /* Probe-open for a DLOPEN ELF (e.g. Ruby's require checking
-             * .so exists) */
+            /* Probe-open for a DLOPEN ELF before dlopen is reached. */
             int fd = frozen_dlopen_serve_memfd(path);
             if (fd >= 0) {
                 vfs_dbg_op("open", path, "dlopen-elf");
@@ -5060,10 +4976,9 @@ static void *vfs_fopen(const char *path, const char *mode)
 
 /*
  * Helpers to make VFS stat/open/access wrappers aware of DLOPEN-captured ELFs.
- * When a frozen binary (e.g. Ubuntu 20.04 Ruby) is run on a different distro,
- * the original file paths (e.g. /usr/lib/x86_64-linux-gnu/ruby/2.7.0/monitor.so)
- * don't exist on the host.  Without these helpers, Ruby's openat/stat probes
- * return ENOENT → LoadError before dlopen is ever reached.
+ * When a frozen binary is run on a different distro, the original absolute
+ * paths for extension modules/plugins may not exist on the host.  Without
+ * these helpers, openat/stat probes return ENOENT before dlopen is reached.
  */
 
 /* Return the frozen ELF index for path, or -1 if not found. */
@@ -5089,8 +5004,8 @@ static int64_t frozen_dlopen_elf_size(const char *path)
     return (int64_t)g_frozen_entries[idx].data_size;
 }
 
-/* Open a frozen DLOPEN ELF as a memfd so probe-opens (e.g. Ruby's require)
- * succeed even when the original path doesn't exist on the host filesystem. */
+/* Open a frozen DLOPEN ELF as a memfd so probe-opens succeed even when the
+ * original path doesn't exist on the host filesystem. */
 static int frozen_dlopen_serve_memfd(const char *path)
 {
     int idx = frozen_dlopen_find(path);
@@ -5118,15 +5033,14 @@ static int frozen_dlopen_serve_memfd(const char *path)
 }
 
 /*
- * vfs_stat / vfs_fstatat — intercept stat calls for embedded files.
- * Python's import system checks if files exist via stat() before opening.
- * We fabricate a regular-file stat result for embedded VFS entries.
+ * vfs_stat / vfs_fstatat — intercept stat calls for embedded files and
+ * fabricate a regular-file stat result for embedded VFS entries.
  */
 static int vfs_stat(const char *path, struct stat *buf)
 {
     if (path && path[0] == '/') {
         /* Report real files and non-directory virtual placeholders so
-         * importlib/plugin scanners can discover embedded ELF names.
+         * directory/plugin scanners can discover embedded ELF names.
          * Directory markers stay synthetic-only. */
         const struct vfs_entry *ve = vfs_lookup(path);
         if (ve && vfs_is_negative_entry(ve)) {
@@ -5246,7 +5160,7 @@ vfs_fstatat_fallthrough:;
     return (int)VFS_SYSCALL(SYS_newfstatat, dirfd, path, buf, flag);
 }
 
-/* vfs_access / vfs_faccessat — Python calls os.access() / os.path.exists() */
+/* vfs_access / vfs_faccessat — keep existence probes inside the frozen image. */
 static int vfs_access(const char *path, int amode)
 {
     if (path && path[0] == '/') {

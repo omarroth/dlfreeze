@@ -274,8 +274,8 @@ static void trace_stat_result(int rc, int dirfd, const char *path,
 {
     int saved_errno = errno;
 
-    if (rc == 0 && st && S_ISREG(st->st_mode)) {
-        trace_path_kind(dirfd, path, 0);
+    if (rc == 0 && st && (S_ISREG(st->st_mode) || S_ISDIR(st->st_mode))) {
+        trace_path_kind(dirfd, path, S_ISDIR(st->st_mode));
     } else if (rc < 0 && (saved_errno == ENOENT || saved_errno == ENOTDIR)) {
         trace_failed_path(dirfd, path);
     }
@@ -289,8 +289,8 @@ static void trace_stat64_result(int rc, int dirfd, const char *path,
 {
     int saved_errno = errno;
 
-    if (rc == 0 && st && S_ISREG(st->st_mode)) {
-        trace_path_kind(dirfd, path, 0);
+    if (rc == 0 && st && (S_ISREG(st->st_mode) || S_ISDIR(st->st_mode))) {
+        trace_path_kind(dirfd, path, S_ISDIR(st->st_mode));
     } else if (rc < 0 && (saved_errno == ENOENT || saved_errno == ENOTDIR)) {
         trace_failed_path(dirfd, path);
     }
@@ -307,9 +307,10 @@ static void trace_access_result(int rc, int dirfd, const char *path, int flags)
         struct stat st;
 
         g_trace_depth++;
-        if (real_fstatat(dirfd, path, &st, flags) == 0 && S_ISREG(st.st_mode)) {
+        if (real_fstatat(dirfd, path, &st, flags) == 0 &&
+            (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode))) {
             g_trace_depth--;
-            trace_path_kind(dirfd, path, 0);
+            trace_path_kind(dirfd, path, S_ISDIR(st.st_mode));
         } else {
             g_trace_depth--;
         }
