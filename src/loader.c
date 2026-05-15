@@ -927,11 +927,10 @@ static signal_handler_t vfs_signal(int signum, signal_handler_t handler)
  * significantly in glibc 2.40 (cpu_features restructured, hwcap_flags
  * and platforms arrays removed, tlsdesc fields added).
  *
- * We detect the correct layout at runtime by parsing the embedded
- * ld-linux.so's .dynsym for the _rtld_global_ro and _rtld_global
- * OBJECT symbols — their st_size uniquely identifies the struct layout.
- * This avoids hardcoding against any particular glibc version and keeps
- * dlfreeze portable as a static musl binary.
+ * We detect the layout at runtime by parsing the embedded ld-linux.so's
+ * .dynsym for the _rtld_global_ro and _rtld_global OBJECT symbols.  Exact
+ * known size pairs use validated profiles; unknown modern pairs are derived
+ * from struct sizes, release metadata, and stable tail-field placement.
  *
  * To add a new glibc layout profile, use:
  *   gdb -batch -ex 'start' -ex 'ptype /o struct rtld_global_ro' /bin/true
@@ -1507,6 +1506,7 @@ static uint8_t *g_fake_rtld_global_ro;
 #define DEFAULT_GLIBC_OFFSETS (&glibc_2_40)
 #endif
 static const struct glibc_ver_offsets *g_glibc_off = DEFAULT_GLIBC_OFFSETS;
+static struct glibc_ver_offsets g_glibc_derived_offsets;
 static int g_glibc_rtld_fixed;
 static size_t g_tls_static_size = 0x1080;
 static size_t g_tls_static_align = 0x40;
@@ -1875,8 +1875,9 @@ static void fixup_rtld_for_glibc(const struct glibc_ver_offsets *o)
 /*
  * Detect glibc struct layout by parsing the embedded ld-linux.so (INTERP)
  * ELF to extract st_size of _rtld_global_ro and _rtld_global symbols.
- * The ELF machine plus both sizes identify the known layout profile
- * (e.g. same glibc release ranges can differ by architecture/distro).
+ * The ELF machine plus both sizes identify known layout profiles when a
+ * validated row exists.  Otherwise modern glibc layouts can be derived from
+ * the same size/version data without requiring a new distro-specific row.
  *
  * This reads the actual struct sizes from the frozen interpreter, rather
  * than relying on the build host's glibc version.
@@ -1920,6 +1921,216 @@ static uint64_t elf_vaddr_to_foff(const uint8_t *elf, const Elf64_Ehdr *ehdr,
             return ph[i].p_offset + (vaddr - ph[i].p_vaddr);
     }
     return (uint64_t)-1;
+}
+
+static void glibc_offsets_mark_absent(struct glibc_ver_offsets *o)
+{
+    o->glro_tls_static_size = -1;
+    o->glro_tls_static_align = -1;
+    o->glro_debug_printf = -1;
+    o->glro_mcount = -1;
+    o->glro_open = -1;
+    o->glro_close = -1;
+    o->glro_catch_error = -1;
+    o->glro_error_free = -1;
+    o->glro_find_object = -1;
+    o->gl_tls_static_size = -1;
+    o->gl_tls_static_align = -1;
+    o->gl_nns = -1;
+    o->gl_stack_flags = -1;
+    o->gl_tls_generation = -1;
+    o->gl_stack_used = -1;
+    o->gl_stack_user = -1;
+    o->gl_stack_cache = -1;
+    o->gl_rtld_lock_recursive = -1;
+    o->gl_rtld_unlock_recursive = -1;
+    o->gl_make_stack_executable = -1;
+    o->pthread_size = -1;
+    o->pthread_tid_off = -1;
+    o->pthread_rseq_off = -1;
+    o->pthread_rseq_cpu_id_off = -1;
+}
+
+static int glibc_set_offset(int *field, size_t off)
+{
+    if (off > (size_t)INT_MAX)
+        return 0;
+    *field = (int)off;
+    return 1;
+}
+
+static int glibc_assign_modern_glro_hooks(struct glibc_ver_offsets *o,
+                                          uint16_t machine,
+                                          size_t glro_size,
+                                          int effective_minor)
+{
+    size_t debug;
+    int compact_tail = 0;
+
+    if (effective_minor < 34 || glro_size < 128 || glro_size > GLRO_SIZE)
+        return 0;
+
+    if (machine == EM_X86_64)
+        compact_tail = glro_size == 928 ||
+                       (effective_minor >= 40 && glro_size < 952);
+    else if (machine == EM_AARCH64)
+        compact_tail = glro_size <= 512;
+    else
+        return 0;
+
+    debug = compact_tail ? glro_size - 112 : glro_size - 104;
+    if ((debug & (sizeof(uintptr_t) - 1)) != 0 || debug + 80 > glro_size)
+        return 0;
+
+    glibc_set_offset(&o->glro_debug_printf, debug);
+    glibc_set_offset(&o->glro_mcount, debug + 8);
+    glibc_set_offset(&o->glro_open, debug + 24);
+    glibc_set_offset(&o->glro_close, debug + 32);
+    glibc_set_offset(&o->glro_catch_error, debug + 40);
+    glibc_set_offset(&o->glro_error_free, debug + 48);
+    glibc_set_offset(&o->glro_find_object, debug + 72);
+    return 1;
+}
+
+static int glibc_effective_minor(uint16_t machine, size_t gl_size, int minor)
+{
+    if (minor >= 0)
+        return minor;
+
+    if (machine == EM_AARCH64) {
+        if (gl_size < 2600)
+            return 43;
+        if (gl_size < 3600)
+            return 41;
+        return 35;
+    }
+    if (gl_size < 2600)
+        return 40;
+    if (gl_size < 3200)
+        return 41;
+    return 37;
+}
+
+static int glibc_infer_modern_glro_tls(struct glibc_ver_offsets *o,
+                                       uint16_t machine,
+                                       size_t glro_size,
+                                       int effective_minor)
+{
+    int delta;
+    size_t tls_size_off;
+
+    if (o->glro_debug_printf < 0 || effective_minor < 34)
+        return 0;
+
+    if (machine == EM_AARCH64) {
+        if (effective_minor >= 40)
+            delta = 128;
+        else if (glro_size <= 672)
+            delta = 104;
+        else
+            delta = 120;
+    } else if (machine == EM_X86_64) {
+        if (effective_minor >= 40)
+            delta = 144;
+        else if (glro_size <= 896)
+            delta = 120;
+        else
+            delta = 136;
+    } else {
+        return 0;
+    }
+
+    if (o->glro_debug_printf < delta)
+        return 0;
+    tls_size_off = (size_t)(o->glro_debug_printf - delta);
+    if ((tls_size_off & (sizeof(size_t) - 1)) != 0 ||
+        tls_size_off + 2 * sizeof(size_t) > glro_size)
+        return 0;
+
+    glibc_set_offset(&o->glro_tls_static_size, tls_size_off);
+    glibc_set_offset(&o->glro_tls_static_align, tls_size_off + sizeof(size_t));
+    return 1;
+}
+
+static int glibc_infer_modern_global(struct glibc_ver_offsets *o,
+                                     uint16_t machine,
+                                     size_t gl_size)
+{
+    size_t nns;
+
+    if (gl_size < 512 || gl_size > GL_SIZE)
+        return 0;
+    if (machine == EM_AARCH64)
+        nns = gl_size < 2600 ? 1920 : 2688;
+    else if (machine == EM_X86_64)
+        nns = gl_size < 2600 ? 1792 : 2560;
+    else
+        return 0;
+
+    if (nns + sizeof(size_t) <= gl_size)
+        glibc_set_offset(&o->gl_nns, nns);
+    if (gl_size < 144)
+        return 0;
+
+    glibc_set_offset(&o->gl_stack_flags, gl_size - 144);
+    glibc_set_offset(&o->gl_tls_generation, gl_size - 88);
+    glibc_set_offset(&o->gl_stack_used, gl_size - 72);
+    glibc_set_offset(&o->gl_stack_user, gl_size - 56);
+    glibc_set_offset(&o->gl_stack_cache, gl_size - 40);
+    return 1;
+}
+
+static void glibc_infer_aarch64_pthread(struct glibc_ver_offsets *o,
+                                        uint16_t machine,
+                                        int effective_minor)
+{
+    if (machine != EM_AARCH64)
+        return;
+
+    o->pthread_tid_off = 0xd0;
+    if (effective_minor >= 41) {
+        o->pthread_size = 0x720;
+        o->pthread_rseq_off = -1;
+        o->pthread_rseq_cpu_id_off = -1;
+    } else if (effective_minor >= 35) {
+        o->pthread_size = 0x740;
+        o->pthread_rseq_off = 0x720;
+        o->pthread_rseq_cpu_id_off = 0x724;
+    } else if (effective_minor >= 31) {
+        o->pthread_size = 0x720;
+        o->pthread_rseq_off = -1;
+        o->pthread_rseq_cpu_id_off = -1;
+    } else {
+        o->pthread_size = 0x710;
+        o->pthread_rseq_off = -1;
+        o->pthread_rseq_cpu_id_off = -1;
+    }
+}
+
+static const struct glibc_ver_offsets *derive_glibc_offsets_from_layout(
+    uint16_t machine,
+    size_t glro_size,
+    size_t gl_size,
+    int glibc_minor)
+{
+    int effective_minor;
+    struct glibc_ver_offsets *o = &g_glibc_derived_offsets;
+
+    if (!glro_size || !gl_size || glro_size > GLRO_SIZE || gl_size > GL_SIZE)
+        return NULL;
+
+    glibc_offsets_mark_absent(o);
+    effective_minor = glibc_effective_minor(machine, gl_size, glibc_minor);
+
+    if (!glibc_assign_modern_glro_hooks(o, machine, glro_size, effective_minor))
+        return NULL;
+    if (!glibc_infer_modern_glro_tls(o, machine, glro_size, effective_minor))
+        return NULL;
+    if (!glibc_infer_modern_global(o, machine, gl_size))
+        return NULL;
+    glibc_infer_aarch64_pthread(o, machine, effective_minor);
+
+    return o;
 }
 
 static int scan_glibc_2_minor(const char *buf, size_t len)
@@ -2110,6 +2321,16 @@ detect_glibc_offsets_from_interp(const uint8_t *mem, uint64_t mem_foff,
             }
             ldr_dbg("[loader] detected _rtld_global_ro size from ld-linux.so, matched layout\n");
             return glibc_layout_table[i].offsets;
+        }
+    }
+
+    {
+        const struct glibc_ver_offsets *derived =
+            derive_glibc_offsets_from_layout(ehdr->e_machine, glro_size,
+                                             gl_size, glibc_minor);
+        if (derived) {
+            ldr_dbg("[loader] derived glibc rtld layout from symbol sizes\n");
+            return derived;
         }
     }
 
