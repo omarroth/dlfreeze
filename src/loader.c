@@ -1680,11 +1680,10 @@ static int init_fake_rtld(void)
 
 #if defined(__x86_64__)
     /*
-     * Populate _dl_x86_cpu_features from CPUID so that IFUNC resolvers
-     * (memcpy, memset, strcmp, etc.) pick CPU-appropriate implementations.
-     * Without this, resolvers see all-zero features and fall back to
-     * a generic SSE2 variant that prefetches 12 KiB ahead, causing
-     * SIGSEGV on buffer boundaries.
+    * Populate _dl_x86_cpu_features from CPUID so that IFUNC resolvers
+    * (memcpy, memset, strcmp, etc.) see a coherent baseline feature set.
+    * Without this, resolvers see all-zero features and can choose unsafe
+    * fallback paths for the zero-filled threshold/preference fields.
      *
      * struct cpu_features layout (stable across glibc 2.35–2.43):
      *   +0x70  _dl_x86_cpu_features
@@ -1700,6 +1699,36 @@ static int init_fake_rtld(void)
 #define CPUF_PREFERRED  (CPUF_BASE + 340)
     {
         uint32_t eax, ebx, ecx, edx;
+        uint32_t x86_usable_ecx_mask = 0xffffffffu;
+        uint32_t x86_usable7_ebx_mask = 0xffffffffu;
+        uint32_t x86_usable7_ecx_mask = 0xffffffffu;
+        uint32_t x86_usable7_edx_mask = 0xffffffffu;
+
+        /* Keep glibc IFUNC selection on conservative SSE/ERMS paths.  The
+         * AVX-family resolvers consult more of struct cpu_features than the
+         * small subset we synthesize here, and CI hosts can expose wider
+         * vector support than local development machines. */
+        x86_usable_ecx_mask &= ~((1u << 12) |  /* FMA */
+                                 (1u << 28) |  /* AVX */
+                                 (1u << 29));  /* F16C */
+        x86_usable7_ebx_mask &= ~((1u << 5)  |  /* AVX2 */
+                                  (1u << 16) |  /* AVX512F */
+                                  (1u << 17) |  /* AVX512DQ */
+                                  (1u << 21) |  /* AVX512IFMA */
+                                  (1u << 26) |  /* AVX512PF */
+                                  (1u << 27) |  /* AVX512ER */
+                                  (1u << 28) |  /* AVX512CD */
+                                  (1u << 30) |  /* AVX512BW */
+                                  (1u << 31));  /* AVX512VL */
+        x86_usable7_ecx_mask &= ~((1u << 1)  |  /* AVX512VBMI */
+                                  (1u << 6)  |  /* AVX512VBMI2 */
+                                  (1u << 11) |  /* AVX512VNNI */
+                                  (1u << 12) |  /* AVX512BITALG */
+                                  (1u << 14));  /* AVX512VPOPCNTDQ */
+        x86_usable7_edx_mask &= ~((1u << 2)  |  /* AVX512_4VNNIW */
+                                  (1u << 3)  |  /* AVX512_4FMAPS */
+                                  (1u << 8)  |  /* AVX512VP2INTERSECT */
+                                  (1u << 23));  /* AVX512FP16 */
 
         /* CPUID(0) — max leaf & vendor */
         __asm__ volatile("cpuid" : "=a"(eax),"=b"(ebx),"=c"(ecx),"=d"(edx)
@@ -1730,9 +1759,8 @@ static int init_fake_rtld(void)
             *(uint32_t *)(f0 + 4)  = ebx;
             *(uint32_t *)(f0 + 8)  = ecx;
             *(uint32_t *)(f0 + 12) = edx;
-            /* features[0].usable — copy cpuid results.
-             * For AVX: only mark usable if OS supports XSAVE (ECX bit 27). */
-            uint32_t usable_ecx = ecx;
+            /* features[0].usable — conservative subset of CPUID(1). */
+            uint32_t usable_ecx = ecx & x86_usable_ecx_mask;
             uint32_t usable_edx = edx;
             if (!(ecx & (1u << 27)))   /* OSXSAVE not set by OS */
                 usable_ecx &= ~(1u << 28);  /* clear AVX */
@@ -1751,11 +1779,11 @@ static int init_fake_rtld(void)
             *(uint32_t *)(f1 + 4)  = ebx;
             *(uint32_t *)(f1 + 8)  = ecx;
             *(uint32_t *)(f1 + 12) = edx;
-            /* usable = same as cpuid for leaf 7 features */
+            /* usable = conservative subset of cpuid for leaf 7 features */
             *(uint32_t *)(f1 + 16) = eax;
-            *(uint32_t *)(f1 + 20) = ebx;
-            *(uint32_t *)(f1 + 24) = ecx;
-            *(uint32_t *)(f1 + 28) = edx;
+            *(uint32_t *)(f1 + 20) = ebx & x86_usable7_ebx_mask;
+            *(uint32_t *)(f1 + 24) = ecx & x86_usable7_ecx_mask;
+            *(uint32_t *)(f1 + 28) = edx & x86_usable7_edx_mask;
         }
 
         /* preferred[0] = 0 — let resolvers use raw feature checks
