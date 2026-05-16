@@ -56,6 +56,46 @@ run_quiet() {
     run_with_timeout "$@"
 }
 
+artifact_info() {
+    path="$1"
+
+    echo "  artifact: $path"
+    if command -v stat >/dev/null 2>&1; then
+        stat -c '  stat: mode=%a size=%s mtime=%y' "$path" 2>/dev/null || true
+    fi
+    if command -v file >/dev/null 2>&1; then
+        file "$path" 2>/dev/null | sed 's/^/  file: /' || true
+    fi
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$path" 2>/dev/null | sed 's/^/  sha256: /' || true
+    fi
+}
+
+diagnose_failure() {
+    artifact="$1"
+    expected="$2"
+    actual="$3"
+    shift 3
+
+    artifact_info "$artifact"
+    echo "  expected: $(printf '%s\n' "$expected" | head -3)"
+    if [ -n "$actual" ]; then
+        echo "  actual:"
+        printf '%s\n' "$actual" | sed -n '1,20p' | sed 's/^/    /'
+    else
+        echo "  actual: <empty>"
+    fi
+
+    tmp=$(mktemp)
+    set +e
+    run_with_timeout "$@" >"$tmp" 2>&1
+    dbg_rc=$?
+    set -e
+    echo "  debug retry rc=$dbg_rc (first 120 lines):"
+    sed -n '1,120p' "$tmp" | sed 's/^/    /'
+    rm -f "$tmp"
+}
+
 distro_name() {
     if [ -f /etc/os-release ]; then
         . /etc/os-release
@@ -193,6 +233,9 @@ for src_dir in $FROZEN_GLOB; do
             pass "$src_env/python3.frozen"
         else
             fail "$src_env/python3.frozen" "output differs or rc=$rc"
+            diagnose_failure "$frozen_py" "$exp" "$actual" \
+                env DLFREEZE_DEBUG=1 DLFREEZE_NO_FORK=1 \
+                "$frozen_py" -c 'print(1+2)'
         fi
     else
         skip "$src_env/python3.frozen" "artifact not found"
@@ -210,6 +253,9 @@ for src_dir in $FROZEN_GLOB; do
             pass "$src_env/python3.upx.frozen"
         else
             fail "$src_env/python3.upx.frozen" "output differs or rc=$rc"
+            diagnose_failure "$frozen_py_upx" "$exp" "$actual" \
+                env DLFREEZE_DEBUG=1 DLFREEZE_NO_FORK=1 \
+                "$frozen_py_upx" -c 'print(1+2)'
         fi
     else
         skip "$src_env/python3.upx.frozen" "artifact or expectation not found"
@@ -228,6 +274,9 @@ for src_dir in $FROZEN_GLOB; do
             pass "$src_env/ruby.frozen"
         else
             fail "$src_env/ruby.frozen" "output differs or rc=$rc"
+            diagnose_failure "$frozen_rb" "$exp" "$actual" \
+                env DLFREEZE_DEBUG=1 DLFREEZE_NO_FORK=1 \
+                "$frozen_rb" -e 'puts 1+2'
         fi
     else
         skip "$src_env/ruby.frozen" "artifact not found"
@@ -245,6 +294,9 @@ for src_dir in $FROZEN_GLOB; do
             pass "$src_env/ruby.upx.frozen"
         else
             fail "$src_env/ruby.upx.frozen" "output differs or rc=$rc"
+            diagnose_failure "$frozen_rb_upx" "$exp" "$actual" \
+                env DLFREEZE_DEBUG=1 DLFREEZE_NO_FORK=1 \
+                "$frozen_rb_upx" -e 'puts 1+2'
         fi
     else
         skip "$src_env/ruby.upx.frozen" "artifact or expectation not found"
