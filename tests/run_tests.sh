@@ -26,6 +26,44 @@ skip() { echo "${YLW}SKIP${RST}: $1 — $2"; ((SKIP++)) || true; }
 TEST_RUN_TIMEOUT="${TEST_RUN_TIMEOUT:-30}"
 TEST_FREEZE_TIMEOUT="${TEST_FREEZE_TIMEOUT:-180}"
 TEST_TIMEOUT_KILL_AFTER="${TEST_TIMEOUT_KILL_AFTER:-5}"
+TEST_CC_RETRIES="${TEST_CC_RETRIES:-2}"
+TEST_REAL_GCC="${TEST_REAL_GCC:-$(command -v gcc || true)}"
+
+gcc() {
+    local attempt=0 tmp rc
+
+    if [ -z "$TEST_REAL_GCC" ]; then
+        echo "gcc: command not found" >&2
+        return 127
+    fi
+
+    while :; do
+        tmp=$(mktemp)
+        set +e
+        "$TEST_REAL_GCC" "$@" 2>"$tmp"
+        rc=$?
+        set -e
+
+        if [ "$rc" -eq 0 ]; then
+            cat "$tmp" >&2
+            rm -f "$tmp"
+            return 0
+        fi
+
+        if [ "$attempt" -lt "$TEST_CC_RETRIES" ] &&
+           grep -Eqi 'internal compiler error|segmentation fault signal terminated program (cc1|collect2)|fatal error: killed signal terminated program (cc1|collect2)' "$tmp"; then
+            attempt=$((attempt + 1))
+            echo "warning: gcc crashed while compiling test fixture; retrying ($attempt/$TEST_CC_RETRIES)" >&2
+            cat "$tmp" >&2
+            rm -f "$tmp"
+            continue
+        fi
+
+        cat "$tmp" >&2
+        rm -f "$tmp"
+        return "$rc"
+    done
+}
 
 run_with_timeout_seconds() {
     local limit="$1"

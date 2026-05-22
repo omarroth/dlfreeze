@@ -8,7 +8,10 @@ BUILD_ARCH := $(shell uname -m)
 BUILD_TRIPLE := $(shell $(CC) -dumpmachine 2>/dev/null || uname -m)
 BUILD_OS := $(shell if [ -r /etc/os-release ]; then . /etc/os-release; fi; printf '%s:%s' "$${ID:-unknown}" "$${VERSION_ID:-unknown}")
 BUILD_LIBC := $(shell ldd --version 2>&1 | head -n 1 || true)
-BUILD_STAMP := $(BUILD_ARCH)|$(BUILD_TRIPLE)|$(BUILD_OS)|$(BUILD_LIBC)
+BUILD_SOURCE_HASH := $(shell find src include -type f \( -name '*.c' -o -name '*.h' \) -print 2>/dev/null | sort | xargs sha256sum 2>/dev/null | sha256sum 2>/dev/null | awk '{print $$1}')
+STATIC_CC := $(shell command -v musl-gcc 2>/dev/null || echo $(CC))
+STATIC_CC_STAMP := $(shell printf '%s:%s' '$(STATIC_CC)' "$$('$(STATIC_CC)' -dumpmachine 2>/dev/null || true)")
+BUILD_STAMP := $(BUILD_ARCH)|$(BUILD_TRIPLE)|$(BUILD_OS)|$(BUILD_LIBC)|cc:$(STATIC_CC_STAMP)|src:$(BUILD_SOURCE_HASH)
 
 # ── sources for the main dlfreeze tool ──────────────────────────────
 TOOL_SRCS = $(SRC)/main.c $(SRC)/elf_parser.c $(SRC)/dep_resolver.c $(SRC)/packer.c
@@ -20,7 +23,7 @@ BOOTSTRAP = $(BUILD)/dlfreeze-bootstrap
 PRELOAD   = $(BUILD)/dlfreeze-preload.so
 
 # Use musl-gcc for static tools when available; fall back to system gcc.
-TOOL_CC := $(shell command -v musl-gcc 2>/dev/null || echo $(CC))
+TOOL_CC := $(STATIC_CC)
 
 # Some toolchains (gcc >= 16) inject -latomic_asneeded into the link line,
 # but musl-gcc.specs only adds -L/usr/lib/musl/lib so the system copy
@@ -67,7 +70,7 @@ $(DLFREEZE): $(TOOL_OBJS)
 # Fall back to system gcc if musl-gcc isn't available.
 # -fno-stack-protector: the loader changes FS register (TLS) which
 # invalidates the stack canary, so SSP must be disabled.
-BOOTSTRAP_CC := $(shell command -v musl-gcc 2>/dev/null || echo $(CC))
+BOOTSTRAP_CC := $(STATIC_CC)
 INC      = include
 
 $(BOOTSTRAP): $(SRC)/bootstrap.c $(SRC)/loader.c $(INC)/common.h $(INC)/loader.h | prepare-build

@@ -371,18 +371,59 @@ int main(int argc, char **argv)
     /* 7. extract all files */
     char exe_path[PATH_MAX + 256]    = {0};
     char interp_path[PATH_MAX + 256] = {0};
+    int has_data_entries = 0;
+
+    for (uint32_t i = 0; i < ft.num_entries; i++) {
+        if ((ent[i].flags & DLFRZ_FLAG_DATA) != 0) {
+            has_data_entries = 1;
+            break;
+        }
+    }
 
     for (uint32_t i = 0; i < ft.num_entries; i++) {
         const char *name = strtab + ent[i].name_offset;
-        if ((ent[i].flags & (DLFRZ_FLAG_DATA_VIRTUAL | DLFRZ_FLAG_DATA_NEGATIVE)) != 0)
+        if ((ent[i].flags & DLFRZ_FLAG_DATA_NEGATIVE) != 0)
             continue;
+
+        if ((ent[i].flags & DLFRZ_FLAG_DATA_VIRTUAL) != 0) {
+            const char marker[] = "/.dir";
+            size_t name_len = strlen(name);
+            size_t marker_len = sizeof(marker) - 1;
+
+            if (name_len > marker_len &&
+                strcmp(name + name_len - marker_len, marker) == 0) {
+                char dst[PATH_MAX + 256];
+                int n;
+
+                if (name[0] == '/')
+                    n = snprintf(dst, sizeof(dst), "%s%.*s", g_tmpdir,
+                                 (int)(name_len - marker_len), name);
+                else
+                    n = snprintf(dst, sizeof(dst), "%s/%.*s", g_tmpdir,
+                                 (int)(name_len - marker_len), name);
+                if (n < 0 || n >= (int)sizeof(dst) ||
+                    ensure_parent_dirs(dst) < 0 ||
+                    (mkdir(dst, 0755) < 0 && errno != EEXIST)) {
+                    fprintf(stderr, "dlfreeze-bootstrap: mkdir failed: %s\n", dst);
+                    rmtree(g_tmpdir);
+                    close(sfd); return 127;
+                }
+            }
+            continue;
+        }
+
         char dst[PATH_MAX + 256];
-        /* Extract DATA entries and DLOPEN entries at
-         * their full original path so path-based loaders find them; system
-         * shared libraries (DT_NEEDED-style soname lookup) go flat into
-         * g_tmpdir (used as LD_LIBRARY_PATH). */
+        /* Extract DATA entries and DLOPEN entries at their full original
+         * path so path-based loaders find them.  When data files are present,
+         * also keep an absolute main executable under that same tree so
+         * resource discovery (e.g. Python sys.prefix) sees a coherent root.
+         * Without data entries, keep the main executable flat so runtimes can
+         * continue to use the target system's resource tree.  System shared
+         * libraries (DT_NEEDED-style soname lookup) go flat into g_tmpdir
+         * (used as LD_LIBRARY_PATH). */
         int use_full_path = (name[0] == '/') &&
-            (((ent[i].flags & DLFRZ_FLAG_DATA) != 0) ||
+            ((has_data_entries && (ent[i].flags & DLFRZ_FLAG_MAIN_EXE) != 0) ||
+             ((ent[i].flags & DLFRZ_FLAG_DATA) != 0) ||
              ((ent[i].flags & DLFRZ_FLAG_DLOPEN) != 0));
         if (use_full_path)
             snprintf(dst, sizeof(dst), "%s%s", g_tmpdir, name);
@@ -460,43 +501,64 @@ int main(int argc, char **argv)
      *    by the kernel.  Use the bundled interpreter for musl on aarch64 too.
      *    Self-reexec binaries like clang are uncommon in cross-run scenarios
      *    and are not covered by the cross-run test matrix. */
-    int nac; char **nav;
     int is_musl_interp = interp_path[0] && bs_is_musl_interp_path(interp_path);
-    int use_interp_launcher = interp_path[0] && !is_musl_interp;
+    int launcher_available = interp_path[0] && !is_musl_interp;
+    int use_interp_launcher = launcher_available;
+    int direct_available = 1;
 #if defined(__aarch64__)
-    /* On aarch64, always use the bundled interpreter for both musl and glibc
-     * binaries.  For glibc: the bundled ld-linux.so and libc.so.6 must be the
-     * same version; using the system ld-linux with an older or newer bundled
-     * libc causes undefined-symbol errors or SIGILL from mismatched internal
-     * glibc data structures.  For musl: system ld-musl-aarch64.so.1 is absent
-     * on glibc-only targets so the bundled copy is required. */
-    use_interp_launcher = interp_path[0] != '\0';
+    /* On aarch64, the bundled interpreter must always be available as a
+     * launcher for both musl and glibc binaries.  For musl: the system
+     * ld-musl-aarch64.so.1 is absent on glibc-only targets, so the bundled
+     * copy is required.  For glibc: when the bundled ld-linux.so and
+     * libc.so.6 differ from the system glibc, only the bundled launcher
+     * avoids version-skew crashes (e.g. `symbol lookup error: libc.so.6:
+     * undefined symbol: __tunable_is_initialized` when the system ld-linux
+     * is older than the bundled libc; `SIGILL` or undefined
+     * `_dl_audit_symbind_alt` when newer).
+     *
+     * Prefer the launcher on aarch64.  Some environments (e.g. qemu-user
+     * emulating Debian Trixie's ld-linux.so launching python3.13) segfault
+     * when the dynamic loader is invoked explicitly as a launcher even
+     * though the kernel can exec the same binary via PT_INTERP just fine.
+     * On a crashing signal exit from the launcher, fall back to direct
+     * exec.  This handles both cross-distro version skew (launcher works)
+     * and qemu launcher SEGV (direct fallback works). */
+    launcher_available = interp_path[0] != '\0';
+    use_interp_launcher = launcher_available;
 #endif
-    if (use_interp_launcher) {
+
+    /* Build both argv variants up front so we can switch at fallback time. */
+    int direct_nac = argc;
+    char **direct_nav = calloc(direct_nac + 1, sizeof(char *));
+    direct_nav[0] = exe_path;
+    for (int i = 1; i < argc; i++)
+        direct_nav[i] = argv[i];
+
+    int launcher_nac = 0;
+    char **launcher_nav = NULL;
+    if (launcher_available) {
         if (is_musl_interp) {
-            nac = argc + 1;
-            nav = calloc(nac + 1, sizeof(char *));
-            nav[0] = interp_path;
-            nav[1] = exe_path;
+            launcher_nac = argc + 1;
+            launcher_nav = calloc(launcher_nac + 1, sizeof(char *));
+            launcher_nav[0] = interp_path;
+            launcher_nav[1] = exe_path;
             for (int i = 1; i < argc; i++)
-                nav[i + 1] = argv[i];
+                launcher_nav[i + 1] = argv[i];
         } else {
-            nac = argc + 3;
-            nav = calloc(nac + 1, sizeof(char *));
-            nav[0] = interp_path;
-            nav[1] = (char *)"--library-path";
-            nav[2] = g_tmpdir;
-            nav[3] = exe_path;
+            launcher_nac = argc + 3;
+            launcher_nav = calloc(launcher_nac + 1, sizeof(char *));
+            launcher_nav[0] = interp_path;
+            launcher_nav[1] = (char *)"--library-path";
+            launcher_nav[2] = g_tmpdir;
+            launcher_nav[3] = exe_path;
             for (int i = 1; i < argc; i++)
-                nav[i + 3] = argv[i];
+                launcher_nav[i + 3] = argv[i];
         }
-    } else {
-        nac = argc;
-        nav = calloc(nac + 1, sizeof(char *));
-        nav[0] = exe_path;
-        for (int i = 1; i < argc; i++)
-            nav[i] = argv[i];
     }
+
+    int nac = use_interp_launcher ? launcher_nac : direct_nac;
+    char **nav = use_interp_launcher ? launcher_nav : direct_nav;
+    (void)nac;
 
     /* 9. set LD_LIBRARY_PATH */
     const char *oldlp = getenv("LD_LIBRARY_PATH");
@@ -509,23 +571,7 @@ int main(int argc, char **argv)
     setenv("DLFREEZE_TMPDIR", g_tmpdir, 1);
     setenv("DLFREEZE_EXTRACT_ROOT", g_tmpdir, 1);
 
-    /* 10. fork→exec, parent waits + cleans up */
-    g_child = fork();
-    if (g_child < 0) {
-        perror("fork"); rmtree(g_tmpdir); return 127;
-    }
-
-    if (g_child == 0) {
-        /* child ── become the real program */
-        if (use_interp_launcher)
-            execve(interp_path, nav, environ);
-        else
-            execve(exe_path, nav, environ);
-        perror("execve");
-        _exit(127);
-    }
-
-    /* parent ── forward signals & wait */
+    /* 10. fork→exec, parent waits + cleans up. */
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = fwd_signal;
@@ -535,12 +581,49 @@ int main(int argc, char **argv)
                    SIGPIPE, SIGALRM, SIGCONT, SIGTSTP, SIGTTIN, SIGTTOU, 0 };
     for (int i = 0; sigs[i]; i++) sigaction(sigs[i], &sa, NULL);
 
-    int status;
-    while (waitpid(g_child, &status, 0) < 0)
-        if (errno != EINTR) break;
+    int status = 0;
+    int attempts = 0;
+    for (;;) {
+        attempts++;
+        g_child = fork();
+        if (g_child < 0) {
+            perror("fork"); rmtree(g_tmpdir);
+            free(direct_nav); free(launcher_nav);
+            return 127;
+        }
+
+        if (g_child == 0) {
+            if (use_interp_launcher)
+                execve(interp_path, nav, environ);
+            else
+                execve(exe_path, nav, environ);
+            perror("execve");
+            _exit(127);
+        }
+
+        while (waitpid(g_child, &status, 0) < 0)
+            if (errno != EINTR) break;
+
+        /* On crashing-signal exit from the launcher path, fall back to
+         * direct exec once.  This handles e.g. qemu-user environments where
+         * the explicit ld-linux launcher segfaults but kernel PT_INTERP
+         * exec of the same binary works. */
+        if (attempts == 1 && use_interp_launcher && direct_available &&
+            WIFSIGNALED(status)) {
+            int sig = WTERMSIG(status);
+            if (sig == SIGSEGV || sig == SIGILL || sig == SIGBUS ||
+                sig == SIGABRT) {
+                use_interp_launcher = 0;
+                nav = direct_nav;
+                continue;
+            }
+        }
+        break;
+    }
 
     rmtree(g_tmpdir);
-    free(nav);
+    free(direct_nav);
+    free(launcher_nav);
 
     if (WIFEXITED(status))
         return WEXITSTATUS(status);

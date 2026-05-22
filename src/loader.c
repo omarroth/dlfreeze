@@ -1150,8 +1150,39 @@ static const struct glibc_ver_offsets glibc_aarch64_2_31 = {
     .gl_make_stack_executable = 0xfd0,
 };
 
-/* glibc 2.35–2.39 (AArch64): _rtld_global_ro=688B, _rtld_global=4504B
- * Ubuntu 22.04 arm64 (glibc 2.35) through Ubuntu 24.04 arm64 (glibc 2.39).
+/* glibc 2.35 (AArch64): _rtld_global_ro=704B, _rtld_global=4488B
+ * Ubuntu 22.04 arm64.  Its struct pthread is larger than later 2.36–2.40
+ * layouts; pthread_self() subtracts 0x7c0, and rseq_area remains 0x20
+ * bytes before TP. */
+static const struct glibc_ver_offsets glibc_aarch64_2_35_large_pthread = {
+    .pthread_size               = 0x7c0,
+    .pthread_tid_off            = 0xd0,
+    .pthread_rseq_off           = 0x7a0,
+    .pthread_rseq_cpu_id_off    = 0x7a4,
+    .glro_tls_static_size  = 472,   /* 0x1D8 */
+    .glro_tls_static_align = 480,   /* 0x1E0 */
+    .glro_debug_printf     = 592,   /* 0x250 */
+    .glro_mcount           = 600,   /* 0x258 */
+    .glro_open             = 616,   /* 0x268 */
+    .glro_close            = 624,   /* 0x270 */
+    .glro_catch_error      = 632,   /* 0x278 */
+    .glro_error_free       = 640,   /* 0x280 */
+    .glro_find_object      = 664,   /* 0x298 */
+    .gl_tls_static_size    = -1,
+    .gl_tls_static_align   = -1,
+    .gl_nns                = 2688,  /* 0x0A80 */
+    .gl_stack_flags        = 4344,  /* 0x10F8 */
+    .gl_tls_generation     = 4400,  /* 0x1130 */
+    .gl_stack_used         = 4416,  /* 0x1140 */
+    .gl_stack_user         = 4432,  /* 0x1150 */
+    .gl_stack_cache        = 4448,  /* 0x1160 */
+    .gl_rtld_lock_recursive   = -1,
+    .gl_rtld_unlock_recursive = -1,
+    .gl_make_stack_executable = -1,
+};
+
+/* glibc 2.36–2.39 (AArch64): _rtld_global_ro=688B, _rtld_global=4504B
+ * Ubuntu 24.04 arm64 (glibc 2.39) and similarly sized modern profiles.
  * Lock callbacks removed (same as x86-64 2.34+).
  * TLS static size/align fields now in _rtld_global_ro.
  * Offsets verified from Ubuntu 24.04 arm64 glibc 2.39 debug layout. */
@@ -1508,6 +1539,7 @@ static uint8_t *g_fake_rtld_global_ro;
 static const struct glibc_ver_offsets *g_glibc_off = DEFAULT_GLIBC_OFFSETS;
 static struct glibc_ver_offsets g_glibc_derived_offsets;
 static int g_glibc_rtld_fixed;
+static int g_glibc_minor = -1;
 static size_t g_tls_static_size = 0x1080;
 static size_t g_tls_static_align = 0x40;
 
@@ -1520,8 +1552,10 @@ static const struct glibc_ver_offsets *fallback_glibc_offsets_for_minor(int mino
         return &glibc_aarch64_2_41;
     if (minor >= 40)
         return &glibc_aarch64_2_40_legacy_sized_rtld;
-    if (minor >= 35)
+    if (minor >= 36)
         return &glibc_aarch64_2_35;
+    if (minor >= 35)
+        return &glibc_aarch64_2_35_large_pthread;
     if (minor >= 31)
         return &glibc_aarch64_2_31;
     return &glibc_aarch64_2_27;
@@ -1536,6 +1570,89 @@ static const struct glibc_ver_offsets *fallback_glibc_offsets_for_minor(int mino
         return &glibc_2_29;
     return &glibc_2_17;
 #endif
+}
+
+static const struct glibc_ver_offsets *
+fallback_glibc_offsets_for_machine(uint16_t machine, int minor,
+                                   size_t glro_size, size_t gl_size)
+{
+    if (machine == EM_AARCH64) {
+        if (gl_size > 0) {
+            if (gl_size < 2600)
+                return &glibc_aarch64_2_43;
+            if (gl_size < 3600)
+                return &glibc_aarch64_2_41;
+            if (gl_size >= 4512 && gl_size < 4600)
+                return &glibc_aarch64_2_36_debian;
+            if (gl_size >= 4480 && gl_size < 4512) {
+                if (gl_size < 4496 || minor == 35)
+                    return &glibc_aarch64_2_35_large_pthread;
+                return (minor >= 40 || glro_size >= 704) ?
+                    &glibc_aarch64_2_40_legacy_sized_rtld :
+                    &glibc_aarch64_2_35;
+            }
+            if (gl_size >= 4120 && gl_size < 4180)
+                return &glibc_aarch64_2_31;
+            if (gl_size >= 4060 && gl_size < 4120)
+                return &glibc_aarch64_2_27;
+        }
+        if (minor >= 43)
+            return &glibc_aarch64_2_43;
+        if (minor >= 41)
+            return &glibc_aarch64_2_41;
+        if (minor == 35)
+            return &glibc_aarch64_2_35_large_pthread;
+        if (minor >= 40 || glro_size >= 704)
+            return &glibc_aarch64_2_40_legacy_sized_rtld;
+        if (minor >= 36 || glro_size >= 672)
+            return &glibc_aarch64_2_35;
+        if (minor >= 35)
+            return &glibc_aarch64_2_35_large_pthread;
+        if (minor >= 31 || glro_size >= 624)
+            return &glibc_aarch64_2_31;
+        return &glibc_aarch64_2_27;
+    }
+
+    if (machine == EM_X86_64) {
+        if (gl_size > 0) {
+            if (gl_size < 2600)
+                return &glibc_2_40;
+            if (gl_size < 3200)
+                return &glibc_2_41_debian;
+            if (gl_size >= 4320) {
+                if (minor >= 40)
+                    return &glibc_2_40_legacy_sized_rtld;
+                if (minor >= 37)
+                    return &glibc_2_37;
+                return &glibc_2_36_debian;
+            }
+            if (gl_size >= 4280)
+                return &glibc_2_34;
+            if (gl_size >= 3996)
+                return &glibc_2_31_debian;
+            if (gl_size >= 3980)
+                return &glibc_2_29;
+            if (gl_size >= 3940)
+                return &glibc_2_17;
+        }
+        if (minor >= 40) {
+            if (glro_size >= 952)
+                return &glibc_2_41_debian;
+            return &glibc_2_40;
+        }
+        if (minor >= 37 || glro_size >= 952)
+            return &glibc_2_37;
+        if (minor >= 34 || glro_size >= 896) {
+            if (glro_size > 0 && glro_size <= 896)
+                return &glibc_2_36_debian;
+            return &glibc_2_34;
+        }
+        if (minor >= 29 || glro_size >= 536)
+            return &glibc_2_29;
+        return &glibc_2_17;
+    }
+
+    return NULL;
 }
 
 /* glibc consumers such as Ruby's main-thread stack setup may read
@@ -1652,6 +1769,571 @@ static void init_empty_list(uint8_t *base, size_t off)
     *(uintptr_t *)(base + off + 8) = addr;  /* prev */
 }
 
+#if defined(__x86_64__)
+#define X86_CPUF_BASE              0x70
+#define X86_CPUF_BASIC_KIND        0
+#define X86_CPUF_BASIC_MAX_CPUID   4
+#define X86_CPUF_BASIC_FAMILY      8
+#define X86_CPUF_BASIC_MODEL       12
+#define X86_CPUF_BASIC_STEPPING    16
+#define X86_CPUF_FEATURES          20
+#define X86_CPUF_FEATURE_SIZE      32
+#define X86_CPUF_MAX_FEATURES      10
+
+#define X86_CPUID_INDEX_1          0
+#define X86_CPUID_INDEX_7          1
+#define X86_CPUID_INDEX_80000001   2
+#define X86_CPUID_INDEX_D_ECX_1    3
+#define X86_CPUID_INDEX_80000007   4
+#define X86_CPUID_INDEX_80000008   5
+#define X86_CPUID_INDEX_7_ECX_1    6
+#define X86_CPUID_INDEX_19         7
+#define X86_CPUID_INDEX_14_ECX_0   8
+#define X86_CPUID_INDEX_24_ECX_0   9
+
+struct x86_cpu_features_layout {
+    int feature_count;
+    int preferred;
+    int isa_1;
+    int xsave_state_size;
+    int xsave_state_full_size;
+    int data_cache_size;
+    int shared_cache_size;
+    int non_temporal_threshold;
+    int memset_non_temporal_threshold;
+    int rep_movsb_threshold;
+    int rep_movsb_stop_threshold;
+    int rep_stosb_threshold;
+};
+
+struct x86_cpuid_feature_regs {
+    uint32_t cpuid_eax;
+    uint32_t cpuid_ebx;
+    uint32_t cpuid_ecx;
+    uint32_t cpuid_edx;
+    uint32_t active_eax;
+    uint32_t active_ebx;
+    uint32_t active_ecx;
+    uint32_t active_edx;
+};
+
+static const struct x86_cpu_features_layout x86_cpuf_initial_layout = {
+    .feature_count = 2,
+    .preferred = -1,
+    .isa_1 = -1,
+    .xsave_state_size = -1,
+    .xsave_state_full_size = -1,
+    .data_cache_size = -1,
+    .shared_cache_size = -1,
+    .non_temporal_threshold = -1,
+    .memset_non_temporal_threshold = -1,
+    .rep_movsb_threshold = -1,
+    .rep_movsb_stop_threshold = -1,
+    .rep_stosb_threshold = -1,
+};
+
+static const struct x86_cpu_features_layout x86_cpuf_layout_2_34_2_38 = {
+    .feature_count = 9,
+    .preferred = 308,
+    .isa_1 = 312,
+    .xsave_state_size = 320,
+    .xsave_state_full_size = 328,
+    .data_cache_size = 336,
+    .shared_cache_size = 344,
+    .non_temporal_threshold = 352,
+    .memset_non_temporal_threshold = -1,
+    .rep_movsb_threshold = 360,
+    .rep_movsb_stop_threshold = 368,
+    .rep_stosb_threshold = 376,
+};
+
+static const struct x86_cpu_features_layout x86_cpuf_layout_2_39_plus = {
+    .feature_count = 10,
+    .preferred = 340,
+    .isa_1 = 344,
+    .xsave_state_size = 352,
+    .xsave_state_full_size = 360,
+    .data_cache_size = 368,
+    .shared_cache_size = 376,
+    .non_temporal_threshold = 384,
+    .memset_non_temporal_threshold = 392,
+    .rep_movsb_threshold = 400,
+    .rep_movsb_stop_threshold = 408,
+    .rep_stosb_threshold = 416,
+};
+
+static void x86_cpuid_count(uint32_t leaf, uint32_t subleaf,
+                            uint32_t *cpuid_eax, uint32_t *cpuid_ebx,
+                            uint32_t *cpuid_ecx, uint32_t *cpuid_edx)
+{
+    __asm__ volatile("cpuid"
+                     : "=a"(*cpuid_eax), "=b"(*cpuid_ebx),
+                       "=c"(*cpuid_ecx), "=d"(*cpuid_edx)
+                     : "a"(leaf), "c"(subleaf));
+}
+
+static uint64_t x86_xgetbv0(void)
+{
+    uint32_t xcr0_low;
+    uint32_t xcr0_high;
+
+    __asm__ volatile(".byte 0x0f, 0x01, 0xd0"
+                     : "=a"(xcr0_low), "=d"(xcr0_high)
+                     : "c"(0));
+    return ((uint64_t)xcr0_high << 32) | xcr0_low;
+}
+
+static int x86_cpuf_offset_ok(int offset, size_t width)
+{
+    return offset >= 0 && (size_t)offset + width <= GLRO_SIZE - X86_CPUF_BASE;
+}
+
+static void x86_cpuf_store_u32(int offset, uint32_t value)
+{
+    if (x86_cpuf_offset_ok(offset, sizeof(uint32_t)))
+        *(uint32_t *)(g_fake_rtld_global_ro + X86_CPUF_BASE + offset) = value;
+}
+
+static void x86_cpuf_store_size(int offset, size_t value)
+{
+    if (x86_cpuf_offset_ok(offset, sizeof(size_t)))
+        *(size_t *)(g_fake_rtld_global_ro + X86_CPUF_BASE + offset) = value;
+}
+
+static void x86_cpuf_store_feature(
+    const struct x86_cpu_features_layout *layout,
+    int feature_index,
+    const struct x86_cpuid_feature_regs *feature)
+{
+    uint8_t *slot;
+
+    if (feature_index < 0 || feature_index >= layout->feature_count)
+        return;
+    if (!x86_cpuf_offset_ok(X86_CPUF_FEATURES +
+                            feature_index * X86_CPUF_FEATURE_SIZE,
+                            X86_CPUF_FEATURE_SIZE))
+        return;
+
+    slot = g_fake_rtld_global_ro + X86_CPUF_BASE + X86_CPUF_FEATURES +
+           feature_index * X86_CPUF_FEATURE_SIZE;
+    *(uint32_t *)(slot + 0)  = feature->cpuid_eax;
+    *(uint32_t *)(slot + 4)  = feature->cpuid_ebx;
+    *(uint32_t *)(slot + 8)  = feature->cpuid_ecx;
+    *(uint32_t *)(slot + 12) = feature->cpuid_edx;
+    *(uint32_t *)(slot + 16) = feature->active_eax;
+    *(uint32_t *)(slot + 20) = feature->active_ebx;
+    *(uint32_t *)(slot + 24) = feature->active_ecx;
+    *(uint32_t *)(slot + 28) = feature->active_edx;
+}
+
+static const struct x86_cpu_features_layout *
+x86_cpu_features_layout_for_glibc(const struct glibc_ver_offsets *glibc_offsets)
+{
+    if (g_glibc_minor >= 39 ||
+        glibc_offsets == &glibc_2_40 ||
+        glibc_offsets == &glibc_2_40_legacy_sized_rtld ||
+        glibc_offsets == &glibc_2_41_debian)
+        return &x86_cpuf_layout_2_39_plus;
+    return &x86_cpuf_layout_2_34_2_38;
+}
+
+static uint32_t x86_cpu_kind_from_vendor(uint32_t vendor_ebx,
+                                         uint32_t vendor_edx,
+                                         uint32_t vendor_ecx)
+{
+    if (vendor_ebx == 0x756e6547u && vendor_edx == 0x49656e69u &&
+        vendor_ecx == 0x6c65746eu)
+        return 1;  /* arch_kind_intel */
+    if (vendor_ebx == 0x68747541u && vendor_edx == 0x69746e65u &&
+        vendor_ecx == 0x444d4163u)
+        return 2;  /* arch_kind_amd */
+    if (vendor_ebx == 0x746e6543u && vendor_edx == 0x48727561u &&
+        vendor_ecx == 0x736c7561u)
+        return 3;  /* arch_kind_zhaoxin */
+    if (vendor_ebx == 0x6f677948u && vendor_edx == 0x6e65476eu &&
+        vendor_ecx == 0x656e6975u)
+        return 4;  /* arch_kind_hygon */
+    return 5;      /* arch_kind_other */
+}
+
+static void x86_cpuf_record_leaf(struct x86_cpuid_feature_regs *feature,
+                                 uint32_t cpuid_eax, uint32_t cpuid_ebx,
+                                 uint32_t cpuid_ecx, uint32_t cpuid_edx)
+{
+    feature->cpuid_eax = cpuid_eax;
+    feature->cpuid_ebx = cpuid_ebx;
+    feature->cpuid_ecx = cpuid_ecx;
+    feature->cpuid_edx = cpuid_edx;
+    feature->active_eax = cpuid_eax;
+    feature->active_ebx = cpuid_ebx;
+    feature->active_ecx = cpuid_ecx;
+    feature->active_edx = cpuid_edx;
+}
+
+static void x86_detect_cache_sizes(uint32_t max_leaf, uint32_t max_ext_leaf,
+                                   size_t *data_cache_size,
+                                   size_t *shared_cache_size)
+{
+    uint64_t detected_l1_data = 32u * 1024u;
+    uint64_t detected_shared = 2u * 1024u * 1024u;
+
+    if (max_leaf >= 4) {
+        for (uint32_t cache_index = 0; cache_index < 32; cache_index++) {
+            uint32_t cpuid_eax;
+            uint32_t cpuid_ebx;
+            uint32_t cpuid_ecx;
+            uint32_t cpuid_edx;
+            uint32_t cache_type;
+            uint32_t cache_level;
+            uint64_t line_size;
+            uint64_t partitions;
+            uint64_t ways;
+            uint64_t sets;
+            uint64_t cache_size;
+
+            x86_cpuid_count(4, cache_index, &cpuid_eax, &cpuid_ebx,
+                            &cpuid_ecx, &cpuid_edx);
+            (void)cpuid_edx;
+            cache_type = cpuid_eax & 0x1fu;
+            if (cache_type == 0)
+                break;
+            cache_level = (cpuid_eax >> 5) & 0x7u;
+            line_size = (cpuid_ebx & 0xfffu) + 1u;
+            partitions = ((cpuid_ebx >> 12) & 0x3ffu) + 1u;
+            ways = ((cpuid_ebx >> 22) & 0x3ffu) + 1u;
+            sets = (uint64_t)cpuid_ecx + 1u;
+            cache_size = line_size * partitions * ways * sets;
+
+            if (cache_type == 1 && cache_level == 1 && cache_size > 0)
+                detected_l1_data = cache_size;
+            if (cache_level >= 2 && cache_size > detected_shared)
+                detected_shared = cache_size;
+        }
+    }
+
+    if (max_ext_leaf >= 0x8000001du) {
+        for (uint32_t cache_index = 0; cache_index < 32; cache_index++) {
+            uint32_t cpuid_eax;
+            uint32_t cpuid_ebx;
+            uint32_t cpuid_ecx;
+            uint32_t cpuid_edx;
+            uint32_t cache_type;
+            uint32_t cache_level;
+            uint64_t line_size;
+            uint64_t partitions;
+            uint64_t ways;
+            uint64_t sets;
+            uint64_t cache_size;
+
+            x86_cpuid_count(0x8000001du, cache_index, &cpuid_eax,
+                            &cpuid_ebx, &cpuid_ecx, &cpuid_edx);
+            (void)cpuid_edx;
+            cache_type = cpuid_eax & 0x1fu;
+            if (cache_type == 0)
+                break;
+            cache_level = (cpuid_eax >> 5) & 0x7u;
+            line_size = (cpuid_ebx & 0xfffu) + 1u;
+            partitions = ((cpuid_ebx >> 12) & 0x3ffu) + 1u;
+            ways = ((cpuid_ebx >> 22) & 0x3ffu) + 1u;
+            sets = (uint64_t)cpuid_ecx + 1u;
+            cache_size = line_size * partitions * ways * sets;
+
+            if (cache_type == 1 && cache_level == 1 && cache_size > 0)
+                detected_l1_data = cache_size;
+            if (cache_level >= 2 && cache_size > detected_shared)
+                detected_shared = cache_size;
+        }
+    } else if (max_ext_leaf >= 0x80000006u) {
+        uint32_t cpuid_eax;
+        uint32_t cpuid_ebx;
+        uint32_t cpuid_ecx;
+        uint32_t cpuid_edx;
+        uint64_t l2_size;
+        uint64_t l3_size;
+
+        x86_cpuid_count(0x80000006u, 0, &cpuid_eax, &cpuid_ebx,
+                        &cpuid_ecx, &cpuid_edx);
+        (void)cpuid_eax;
+        (void)cpuid_ebx;
+        l2_size = ((uint64_t)(cpuid_ecx >> 16) & 0xffffu) * 1024u;
+        l3_size = ((uint64_t)(cpuid_edx >> 18) & 0x3fffu) * 512u * 1024u;
+        if (l2_size > detected_shared)
+            detected_shared = l2_size;
+        if (l3_size > detected_shared)
+            detected_shared = l3_size;
+    }
+
+    *data_cache_size = (size_t)detected_l1_data;
+    *shared_cache_size = (size_t)detected_shared;
+}
+
+static uint32_t x86_compute_isa_1(
+    const struct x86_cpuid_feature_regs features[X86_CPUF_MAX_FEATURES])
+{
+    const uint32_t leaf1_ecx = features[X86_CPUID_INDEX_1].active_ecx;
+    const uint32_t leaf1_edx = features[X86_CPUID_INDEX_1].active_edx;
+    const uint32_t leaf7_ebx = features[X86_CPUID_INDEX_7].active_ebx;
+    const uint32_t ext1_ecx = features[X86_CPUID_INDEX_80000001].active_ecx;
+    uint32_t isa_1 = 0;
+    const uint32_t baseline_edx = (1u << 0) | (1u << 8) | (1u << 15) |
+                                  (1u << 23) | (1u << 24) | (1u << 25) |
+                                  (1u << 26);
+    const uint32_t v2_ecx = (1u << 0) | (1u << 9) | (1u << 13) |
+                            (1u << 19) | (1u << 20) | (1u << 23);
+    const uint32_t v3_ecx = (1u << 12) | (1u << 22) | (1u << 28) |
+                            (1u << 29);
+    const uint32_t v3_ebx = (1u << 3) | (1u << 5) | (1u << 8);
+    const uint32_t v4_ebx = (1u << 16) | (1u << 17) | (1u << 28) |
+                            (1u << 30) | (1u << 31);
+
+    if ((leaf1_edx & baseline_edx) == baseline_edx)
+        isa_1 |= 1u << 0;
+    if ((isa_1 & (1u << 0)) && (leaf1_ecx & v2_ecx) == v2_ecx &&
+        (ext1_ecx & (1u << 0)))
+        isa_1 |= 1u << 1;
+    if ((isa_1 & (1u << 1)) && (leaf1_ecx & v3_ecx) == v3_ecx &&
+        (leaf7_ebx & v3_ebx) == v3_ebx && (ext1_ecx & (1u << 5)))
+        isa_1 |= 1u << 2;
+    if ((isa_1 & (1u << 2)) && (leaf7_ebx & v4_ebx) == v4_ebx)
+        isa_1 |= 1u << 3;
+    return isa_1;
+}
+
+static void init_x86_cpu_features(const struct glibc_ver_offsets *glibc_offsets,
+                                  int layout_known)
+{
+    const struct x86_cpu_features_layout *layout = layout_known
+        ? x86_cpu_features_layout_for_glibc(glibc_offsets)
+        : &x86_cpuf_initial_layout;
+    struct x86_cpuid_feature_regs features[X86_CPUF_MAX_FEATURES];
+    uint32_t cpuid_eax;
+    uint32_t cpuid_ebx;
+    uint32_t cpuid_ecx;
+    uint32_t cpuid_edx;
+    uint32_t max_leaf;
+    uint32_t max_ext_leaf = 0;
+    uint32_t leaf7_max_subleaf = 0;
+    uint64_t xcr0 = 0;
+    int has_osxsave = 0;
+    int has_avx_state = 0;
+    int has_avx512_state = 0;
+    int has_amx_state = 0;
+    size_t data_cache_size = 32u * 1024u;
+    size_t shared_cache_size = 2u * 1024u * 1024u;
+    size_t non_temporal_threshold;
+    size_t rep_movsb_stop_threshold;
+    uint32_t xsave_state_size = 512;
+    uint32_t xsave_state_full_size = 512;
+
+    memset(features, 0, sizeof(features));
+    memset(g_fake_rtld_global_ro + X86_CPUF_BASE, 0, 640);
+
+    x86_cpuid_count(0, 0, &cpuid_eax, &cpuid_ebx, &cpuid_ecx, &cpuid_edx);
+    max_leaf = cpuid_eax;
+    x86_cpuf_store_u32(X86_CPUF_BASIC_KIND,
+                       x86_cpu_kind_from_vendor(cpuid_ebx, cpuid_edx,
+                                                cpuid_ecx));
+    x86_cpuf_store_u32(X86_CPUF_BASIC_MAX_CPUID, max_leaf);
+
+    x86_cpuid_count(0x80000000u, 0, &cpuid_eax, &cpuid_ebx,
+                    &cpuid_ecx, &cpuid_edx);
+    if (cpuid_eax >= 0x80000000u)
+        max_ext_leaf = cpuid_eax;
+
+    if (max_leaf >= 1) {
+        uint32_t family;
+        uint32_t model;
+
+        x86_cpuid_count(1, 0, &cpuid_eax, &cpuid_ebx, &cpuid_ecx,
+                        &cpuid_edx);
+        x86_cpuf_record_leaf(&features[X86_CPUID_INDEX_1], cpuid_eax,
+                             cpuid_ebx, cpuid_ecx, cpuid_edx);
+        family = (cpuid_eax >> 8) & 0xfu;
+        model = (cpuid_eax >> 4) & 0xfu;
+        if (family == 6 || family == 15)
+            model += ((cpuid_eax >> 16) & 0xfu) << 4;
+        if (family == 15)
+            family += (cpuid_eax >> 20) & 0xffu;
+        x86_cpuf_store_u32(X86_CPUF_BASIC_FAMILY, family);
+        x86_cpuf_store_u32(X86_CPUF_BASIC_MODEL, model);
+        x86_cpuf_store_u32(X86_CPUF_BASIC_STEPPING, cpuid_eax & 0xfu);
+
+        has_osxsave = (cpuid_ecx & ((1u << 26) | (1u << 27))) ==
+                      ((1u << 26) | (1u << 27));
+        if (has_osxsave)
+            xcr0 = x86_xgetbv0();
+        has_avx_state = layout_known && has_osxsave && ((xcr0 & 0x7u) == 0x7u);
+        has_avx512_state = has_avx_state && ((xcr0 & 0xe0u) == 0xe0u);
+        has_amx_state = layout_known && has_osxsave &&
+                        ((xcr0 & ((1ull << 17) | (1ull << 18))) ==
+                         ((1ull << 17) | (1ull << 18)));
+
+        if (!has_osxsave)
+            features[X86_CPUID_INDEX_1].active_ecx &=
+                ~((1u << 26) | (1u << 27));
+        if (!has_avx_state)
+            features[X86_CPUID_INDEX_1].active_ecx &=
+                ~((1u << 12) | (1u << 28) | (1u << 29));
+    }
+
+    if (max_leaf >= 7) {
+        const uint32_t leaf7_ebx_avx512 = (1u << 16) | (1u << 17) |
+                                          (1u << 21) | (1u << 26) |
+                                          (1u << 27) | (1u << 28) |
+                                          (1u << 30) | (1u << 31);
+        const uint32_t leaf7_ecx_avx512 = (1u << 1) | (1u << 6) |
+                                          (1u << 11) | (1u << 12) |
+                                          (1u << 14);
+        const uint32_t leaf7_edx_avx512 = (1u << 2) | (1u << 3) |
+                                          (1u << 8) | (1u << 23);
+
+        x86_cpuid_count(7, 0, &cpuid_eax, &cpuid_ebx, &cpuid_ecx,
+                        &cpuid_edx);
+        leaf7_max_subleaf = cpuid_eax;
+        x86_cpuf_record_leaf(&features[X86_CPUID_INDEX_7], cpuid_eax,
+                             cpuid_ebx, cpuid_ecx, cpuid_edx);
+        if (!has_avx_state) {
+            features[X86_CPUID_INDEX_7].active_ebx &= ~(1u << 5);
+            features[X86_CPUID_INDEX_7].active_ecx &= ~((1u << 9) |
+                                                        (1u << 10));
+        }
+        if (!has_avx512_state) {
+            features[X86_CPUID_INDEX_7].active_ebx &= ~leaf7_ebx_avx512;
+            features[X86_CPUID_INDEX_7].active_ecx &= ~leaf7_ecx_avx512;
+            features[X86_CPUID_INDEX_7].active_edx &= ~leaf7_edx_avx512;
+        }
+        if (!has_amx_state)
+            features[X86_CPUID_INDEX_7].active_edx &=
+                ~((1u << 22) | (1u << 24) | (1u << 25));
+    }
+
+    if (max_ext_leaf >= 0x80000001u) {
+        x86_cpuid_count(0x80000001u, 0, &cpuid_eax, &cpuid_ebx,
+                        &cpuid_ecx, &cpuid_edx);
+        x86_cpuf_record_leaf(&features[X86_CPUID_INDEX_80000001], cpuid_eax,
+                             cpuid_ebx, cpuid_ecx, cpuid_edx);
+        if (!has_avx_state)
+            features[X86_CPUID_INDEX_80000001].active_ecx &=
+                ~((1u << 11) | (1u << 16));
+    }
+
+    if (max_leaf >= 0xdu &&
+        (features[X86_CPUID_INDEX_1].cpuid_ecx & (1u << 26))) {
+        x86_cpuid_count(0xdu, 0, &cpuid_eax, &cpuid_ebx,
+                        &cpuid_ecx, &cpuid_edx);
+        if (has_osxsave) {
+            xsave_state_size = cpuid_ebx ? cpuid_ebx : 512;
+            xsave_state_full_size = cpuid_ecx ? cpuid_ecx : xsave_state_size;
+        }
+        x86_cpuid_count(0xdu, 1, &cpuid_eax, &cpuid_ebx,
+                        &cpuid_ecx, &cpuid_edx);
+        x86_cpuf_record_leaf(&features[X86_CPUID_INDEX_D_ECX_1], cpuid_eax,
+                             cpuid_ebx, cpuid_ecx, cpuid_edx);
+        if (!has_osxsave) {
+            features[X86_CPUID_INDEX_D_ECX_1].active_eax = 0;
+            features[X86_CPUID_INDEX_D_ECX_1].active_ebx = 0;
+            features[X86_CPUID_INDEX_D_ECX_1].active_ecx = 0;
+            features[X86_CPUID_INDEX_D_ECX_1].active_edx = 0;
+        }
+    }
+
+    if (max_ext_leaf >= 0x80000007u) {
+        x86_cpuid_count(0x80000007u, 0, &cpuid_eax, &cpuid_ebx,
+                        &cpuid_ecx, &cpuid_edx);
+        x86_cpuf_record_leaf(&features[X86_CPUID_INDEX_80000007], cpuid_eax,
+                             cpuid_ebx, cpuid_ecx, cpuid_edx);
+    }
+
+    if (max_ext_leaf >= 0x80000008u) {
+        x86_cpuid_count(0x80000008u, 0, &cpuid_eax, &cpuid_ebx,
+                        &cpuid_ecx, &cpuid_edx);
+        x86_cpuf_record_leaf(&features[X86_CPUID_INDEX_80000008], cpuid_eax,
+                             cpuid_ebx, cpuid_ecx, cpuid_edx);
+    }
+
+    if (max_leaf >= 7 && leaf7_max_subleaf >= 1) {
+        x86_cpuid_count(7, 1, &cpuid_eax, &cpuid_ebx, &cpuid_ecx,
+                        &cpuid_edx);
+        x86_cpuf_record_leaf(&features[X86_CPUID_INDEX_7_ECX_1], cpuid_eax,
+                             cpuid_ebx, cpuid_ecx, cpuid_edx);
+        if (!has_avx_state) {
+            features[X86_CPUID_INDEX_7_ECX_1].active_eax &=
+                ~((1u << 4) | (1u << 23));
+            features[X86_CPUID_INDEX_7_ECX_1].active_edx &=
+                ~((1u << 4) | (1u << 5) | (1u << 19));
+        }
+        if (!has_avx512_state)
+            features[X86_CPUID_INDEX_7_ECX_1].active_eax &= ~(1u << 5);
+        if (!has_amx_state) {
+            features[X86_CPUID_INDEX_7_ECX_1].active_eax &= ~(1u << 21);
+            features[X86_CPUID_INDEX_7_ECX_1].active_edx &= ~(1u << 8);
+        }
+    }
+
+    if (max_leaf >= 0x19u) {
+        x86_cpuid_count(0x19u, 0, &cpuid_eax, &cpuid_ebx,
+                        &cpuid_ecx, &cpuid_edx);
+        x86_cpuf_record_leaf(&features[X86_CPUID_INDEX_19], cpuid_eax,
+                             cpuid_ebx, cpuid_ecx, cpuid_edx);
+    }
+
+    if (max_leaf >= 0x14u) {
+        x86_cpuid_count(0x14u, 0, &cpuid_eax, &cpuid_ebx,
+                        &cpuid_ecx, &cpuid_edx);
+        x86_cpuf_record_leaf(&features[X86_CPUID_INDEX_14_ECX_0], cpuid_eax,
+                             cpuid_ebx, cpuid_ecx, cpuid_edx);
+    }
+
+    if (layout->feature_count > X86_CPUID_INDEX_24_ECX_0 &&
+        max_leaf >= 0x24u) {
+        x86_cpuid_count(0x24u, 0, &cpuid_eax, &cpuid_ebx,
+                        &cpuid_ecx, &cpuid_edx);
+        x86_cpuf_record_leaf(&features[X86_CPUID_INDEX_24_ECX_0], cpuid_eax,
+                             cpuid_ebx, cpuid_ecx, cpuid_edx);
+        if (!has_avx_state)
+            features[X86_CPUID_INDEX_24_ECX_0].active_ebx &=
+                ~((1u << 16) | (1u << 17) | (1u << 18));
+        else if (!has_avx512_state)
+            features[X86_CPUID_INDEX_24_ECX_0].active_ebx &= ~(1u << 18);
+    }
+
+    for (int feature_index = 0; feature_index < layout->feature_count &&
+         feature_index < X86_CPUF_MAX_FEATURES; feature_index++)
+        x86_cpuf_store_feature(layout, feature_index,
+                               &features[feature_index]);
+
+    if (!layout_known)
+        return;
+
+    x86_detect_cache_sizes(max_leaf, max_ext_leaf, &data_cache_size,
+                           &shared_cache_size);
+    if (shared_cache_size < data_cache_size)
+        shared_cache_size = data_cache_size;
+    non_temporal_threshold = shared_cache_size * 3u / 4u;
+    if (non_temporal_threshold < 1024u * 1024u)
+        non_temporal_threshold = 1024u * 1024u;
+    rep_movsb_stop_threshold = shared_cache_size * 4u;
+    if (rep_movsb_stop_threshold < 4u * 1024u * 1024u)
+        rep_movsb_stop_threshold = 4u * 1024u * 1024u;
+
+    x86_cpuf_store_u32(layout->preferred, 0);
+    x86_cpuf_store_u32(layout->isa_1, x86_compute_isa_1(features));
+    x86_cpuf_store_size(layout->xsave_state_size, xsave_state_size);
+    x86_cpuf_store_u32(layout->xsave_state_full_size,
+                       xsave_state_full_size);
+    x86_cpuf_store_size(layout->data_cache_size, data_cache_size);
+    x86_cpuf_store_size(layout->shared_cache_size, shared_cache_size);
+    x86_cpuf_store_size(layout->non_temporal_threshold,
+                        non_temporal_threshold);
+    x86_cpuf_store_size(layout->memset_non_temporal_threshold,
+                        non_temporal_threshold);
+    x86_cpuf_store_size(layout->rep_movsb_threshold, 2048);
+    x86_cpuf_store_size(layout->rep_movsb_stop_threshold,
+                        rep_movsb_stop_threshold);
+    x86_cpuf_store_size(layout->rep_stosb_threshold, 2048);
+}
+#endif /* __x86_64__ */
+
 static int init_fake_rtld(void)
 {
     g_fake_rtld_global_ro = (uint8_t *)mmap(NULL, GLRO_SIZE,
@@ -1679,149 +2361,7 @@ static int init_fake_rtld(void)
 #endif
 
 #if defined(__x86_64__)
-    /*
-    * Populate _dl_x86_cpu_features from CPUID so that IFUNC resolvers
-    * (memcpy, memset, strcmp, etc.) see a coherent baseline feature set.
-    * Without this, resolvers see all-zero features and can choose unsafe
-    * fallback paths for the zero-filled threshold/preference fields.
-     *
-     * struct cpu_features layout (stable across glibc 2.35–2.43):
-     *   +0x70  _dl_x86_cpu_features
-     *     +0   cpu_features_basic (20 bytes: kind, max_cpuid, family, model, stepping)
-     *     +20  cpuid_feature_internal features[10] (32 bytes each: cpuid + usable)
-     *     +340 preferred[1]
-     *     +344 isa_1
-     *     ...
-     */
-#define CPUF_BASE       0x70   /* _dl_x86_cpu_features in _rtld_global_ro */
-#define CPUF_BASIC      (CPUF_BASE + 0)
-#define CPUF_FEATURES(i) (CPUF_BASE + 20 + 32*(i))
-#define CPUF_PREFERRED  (CPUF_BASE + 340)
-    {
-        uint32_t eax, ebx, ecx, edx;
-        uint32_t x86_usable_ecx_mask = 0xffffffffu;
-        uint32_t x86_usable7_ebx_mask = 0xffffffffu;
-        uint32_t x86_usable7_ecx_mask = 0xffffffffu;
-        uint32_t x86_usable7_edx_mask = 0xffffffffu;
-
-        /* Keep glibc IFUNC selection on conservative SSE/ERMS paths.  The
-         * AVX-family resolvers consult more of struct cpu_features than the
-         * small subset we synthesize here, and CI hosts can expose wider
-         * vector support than local development machines. */
-        x86_usable_ecx_mask &= ~((1u << 12) |  /* FMA */
-                                 (1u << 28) |  /* AVX */
-                                 (1u << 29));  /* F16C */
-        x86_usable7_ebx_mask &= ~((1u << 5)  |  /* AVX2 */
-                                  (1u << 16) |  /* AVX512F */
-                                  (1u << 17) |  /* AVX512DQ */
-                                  (1u << 21) |  /* AVX512IFMA */
-                                  (1u << 26) |  /* AVX512PF */
-                                  (1u << 27) |  /* AVX512ER */
-                                  (1u << 28) |  /* AVX512CD */
-                                  (1u << 30) |  /* AVX512BW */
-                                  (1u << 31));  /* AVX512VL */
-        x86_usable7_ecx_mask &= ~((1u << 1)  |  /* AVX512VBMI */
-                                  (1u << 6)  |  /* AVX512VBMI2 */
-                                  (1u << 11) |  /* AVX512VNNI */
-                                  (1u << 12) |  /* AVX512BITALG */
-                                  (1u << 14));  /* AVX512VPOPCNTDQ */
-        x86_usable7_edx_mask &= ~((1u << 2)  |  /* AVX512_4VNNIW */
-                                  (1u << 3)  |  /* AVX512_4FMAPS */
-                                  (1u << 8)  |  /* AVX512VP2INTERSECT */
-                                  (1u << 23));  /* AVX512FP16 */
-
-        /* CPUID(0) — max leaf & vendor */
-        __asm__ volatile("cpuid" : "=a"(eax),"=b"(ebx),"=c"(ecx),"=d"(edx)
-                         : "a"(0), "c"(0));
-        uint32_t max_leaf = eax;
-        /* basic.kind = 1 (x86-64 arch), basic.max_cpuid = max_leaf */
-        *(uint32_t *)(g_fake_rtld_global_ro + CPUF_BASIC + 0)  = 1;
-        *(uint32_t *)(g_fake_rtld_global_ro + CPUF_BASIC + 4)  = max_leaf;
-
-        /* CPUID(1) — family/model/stepping + feature flags */
-        if (max_leaf >= 1) {
-            __asm__ volatile("cpuid" : "=a"(eax),"=b"(ebx),"=c"(ecx),"=d"(edx)
-                             : "a"(1), "c"(0));
-            /* Decode family/model/stepping */
-            uint32_t family = (eax >> 8) & 0xf;
-            uint32_t model  = (eax >> 4) & 0xf;
-            if (family == 6 || family == 15)
-                model += ((eax >> 16) & 0xf) << 4;
-            if (family == 15)
-                family += (eax >> 20) & 0xff;
-            *(uint32_t *)(g_fake_rtld_global_ro + CPUF_BASIC + 8)  = family;
-            *(uint32_t *)(g_fake_rtld_global_ro + CPUF_BASIC + 12) = model;
-            *(uint32_t *)(g_fake_rtld_global_ro + CPUF_BASIC + 16) = eax & 0xf;
-
-            /* features[0].cpuid = raw CPUID(1) output */
-            uint8_t *f0 = g_fake_rtld_global_ro + CPUF_FEATURES(0);
-            *(uint32_t *)(f0 + 0)  = eax;
-            *(uint32_t *)(f0 + 4)  = ebx;
-            *(uint32_t *)(f0 + 8)  = ecx;
-            *(uint32_t *)(f0 + 12) = edx;
-            /* features[0].usable — conservative subset of CPUID(1). */
-            uint32_t usable_ecx = ecx & x86_usable_ecx_mask;
-            uint32_t usable_edx = edx;
-            if (!(ecx & (1u << 27)))   /* OSXSAVE not set by OS */
-                usable_ecx &= ~(1u << 28);  /* clear AVX */
-            *(uint32_t *)(f0 + 16) = eax;
-            *(uint32_t *)(f0 + 20) = ebx;
-            *(uint32_t *)(f0 + 24) = usable_ecx;
-            *(uint32_t *)(f0 + 28) = usable_edx;
-        }
-
-        /* CPUID(7,0) — extended features (ERMS, AVX2, AVX512, etc.) */
-        if (max_leaf >= 7) {
-            __asm__ volatile("cpuid" : "=a"(eax),"=b"(ebx),"=c"(ecx),"=d"(edx)
-                             : "a"(7), "c"(0));
-            uint8_t *f1 = g_fake_rtld_global_ro + CPUF_FEATURES(1);
-            *(uint32_t *)(f1 + 0)  = eax;
-            *(uint32_t *)(f1 + 4)  = ebx;
-            *(uint32_t *)(f1 + 8)  = ecx;
-            *(uint32_t *)(f1 + 12) = edx;
-            /* usable = conservative subset of cpuid for leaf 7 features */
-            *(uint32_t *)(f1 + 16) = eax;
-            *(uint32_t *)(f1 + 20) = ebx & x86_usable7_ebx_mask;
-            *(uint32_t *)(f1 + 24) = ecx & x86_usable7_ecx_mask;
-            *(uint32_t *)(f1 + 28) = edx & x86_usable7_edx_mask;
-        }
-
-        /* preferred[0] = 0 — let resolvers use raw feature checks
-         * rather than model-specific tuning preferences. */
-
-        /*
-         * Non-temporal thresholds: glibc's optimised memcpy/memset use
-         * non-temporal (streaming) stores for copies larger than
-         * non_temporal_threshold.  Non-temporal stores bypass the cache
-         * and write in large aligned chunks (e.g. 96 bytes per iteration
-         * with MOVNTPS).  When the threshold is 0 (our default from the
-         * zero-filled mmap), the condition "size >= 0" is always true,
-         * so EVERY copy — even 67 bytes — takes the non-temporal path.
-         * Those large-chunk writes overrun the destination buffer and
-         * corrupt adjacent allocations (pymalloc pool headers, etc.).
-         *
-         * Set thresholds to SIZE_MAX to disable non-temporal stores
-         * entirely.  This matches normal behaviour for most workloads
-         * (non-temporal copies are only beneficial for multi-MB buffers).
-         *
-         * cpu_features layout (stable offset for non_temporal_threshold):
-         *   +384  non_temporal_threshold         (8 bytes)
-         * Following offsets shifted by +8 in glibc 2.40+ (added
-         * memset_non_temporal_threshold), but all are set to SIZE_MAX
-         * so the shift is harmless — the extra write lands on an adjacent
-         * threshold or cache-size field which tolerates SIZE_MAX.
-         */
-#define CPUF_NON_TEMPORAL_THRESHOLD  (CPUF_BASE + 384)
-#define CPUF_MEMSET_NT_THRESHOLD     (CPUF_BASE + 392)
-#define CPUF_REP_MOVSB_THRESHOLD     (CPUF_BASE + 400)
-#define CPUF_REP_MOVSB_STOP          (CPUF_BASE + 408)
-#define CPUF_REP_STOSB_THRESHOLD     (CPUF_BASE + 416)
-        *(size_t *)(g_fake_rtld_global_ro + CPUF_NON_TEMPORAL_THRESHOLD) = (size_t)-1;
-        *(size_t *)(g_fake_rtld_global_ro + CPUF_MEMSET_NT_THRESHOLD)    = (size_t)-1;
-        *(size_t *)(g_fake_rtld_global_ro + CPUF_REP_MOVSB_THRESHOLD)    = (size_t)-1;
-        *(size_t *)(g_fake_rtld_global_ro + CPUF_REP_MOVSB_STOP)         = (size_t)-1;
-        *(size_t *)(g_fake_rtld_global_ro + CPUF_REP_STOSB_THRESHOLD)    = (size_t)-1;
-    }
+    init_x86_cpu_features(NULL, 0);
 #endif /* __x86_64__ */
 
     /* _dl_ns[0]._ns_loaded — pointer to the head link_map.  Used by
@@ -1845,6 +2385,10 @@ static int init_fake_rtld(void)
  */
 static void fixup_rtld_for_glibc(const struct glibc_ver_offsets *o)
 {
+#if defined(__x86_64__)
+    init_x86_cpu_features(o, 1);
+#endif
+
     /* _rtld_global_ro: TLS static fields needed by __libc_early_init →
      * thread stack guard computation.  Without these, __libc_early_init
      * divides by zero (SIGFPE).
@@ -1925,6 +2469,7 @@ static const struct {
     { EM_X86_64,  536, 3992, &glibc_2_29 },    /* glibc 2.29–2.33 x86-64 (Ubuntu) */
     { EM_X86_64,  544, 4000, &glibc_2_31_debian }, /* glibc 2.31     x86-64 (Debian 11) */
     { EM_AARCH64, 624, 4152, &glibc_aarch64_2_31 }, /* glibc 2.31     AArch64 */
+    { EM_AARCH64, 704, 4488, &glibc_aarch64_2_35_large_pthread }, /* glibc 2.35 AArch64 */
     { EM_AARCH64, 672, 4520, &glibc_aarch64_2_36_debian }, /* glibc 2.36 AArch64 (Debian 12) */
     { EM_AARCH64, 688, 4504, &glibc_aarch64_2_35 }, /* glibc 2.35–2.39 AArch64 */
     { EM_AARCH64, 400, 2272, &glibc_aarch64_2_43 }, /* glibc 2.43+    AArch64 */
@@ -1949,6 +2494,88 @@ static uint64_t elf_vaddr_to_foff(const uint8_t *elf, const Elf64_Ehdr *ehdr,
             return ph[i].p_offset + (vaddr - ph[i].p_vaddr);
     }
     return (uint64_t)-1;
+}
+
+static int elf_section_name_matches(const char *strtab, size_t strtab_size,
+                                    uint32_t name_offset, const char *expect)
+{
+    size_t i = 0;
+
+    if ((size_t)name_offset >= strtab_size)
+        return 0;
+    while (expect[i]) {
+        if ((size_t)name_offset + i >= strtab_size ||
+            strtab[name_offset + i] != expect[i])
+            return 0;
+        i++;
+    }
+    return (size_t)name_offset + i < strtab_size &&
+           strtab[name_offset + i] == '\0';
+}
+
+static size_t elf_section_size_by_name(const uint8_t *elf,
+                                       const Elf64_Ehdr *ehdr,
+                                       size_t elf_size,
+                                       const char *name)
+{
+    const uint8_t *shbase;
+    const Elf64_Shdr *shstr;
+    const char *shstrtab;
+    size_t shdr_bytes;
+
+    if (ehdr->e_shoff == 0 || ehdr->e_shnum == 0 ||
+        ehdr->e_shstrndx == SHN_UNDEF || ehdr->e_shstrndx >= ehdr->e_shnum ||
+        ehdr->e_shentsize < sizeof(Elf64_Shdr))
+        return 0;
+    if (ehdr->e_shoff > elf_size)
+        return 0;
+    shdr_bytes = (size_t)ehdr->e_shnum * (size_t)ehdr->e_shentsize;
+    if ((size_t)ehdr->e_shnum != 0 &&
+        shdr_bytes / (size_t)ehdr->e_shnum != (size_t)ehdr->e_shentsize)
+        return 0;
+    if (shdr_bytes > elf_size - (size_t)ehdr->e_shoff)
+        return 0;
+
+    shbase = elf + ehdr->e_shoff;
+    shstr = (const Elf64_Shdr *)(shbase +
+        (size_t)ehdr->e_shstrndx * ehdr->e_shentsize);
+    if (shstr->sh_offset > elf_size ||
+        shstr->sh_size > elf_size - shstr->sh_offset)
+        return 0;
+    shstrtab = (const char *)(elf + shstr->sh_offset);
+
+    for (uint16_t i = 0; i < ehdr->e_shnum; i++) {
+        const Elf64_Shdr *sh = (const Elf64_Shdr *)(shbase +
+            (size_t)i * ehdr->e_shentsize);
+
+        if (!elf_section_name_matches(shstrtab, shstr->sh_size,
+                                      sh->sh_name, name))
+            continue;
+        if (sh->sh_type != SHT_PROGBITS || !(sh->sh_flags & SHF_ALLOC) ||
+            !(sh->sh_flags & SHF_WRITE))
+            return 0;
+        return sh->sh_size;
+    }
+
+    return 0;
+}
+
+static size_t infer_glibc_global_size_from_data_section(const uint8_t *elf,
+                                                        const Elf64_Ehdr *ehdr,
+                                                        size_t elf_size)
+{
+    size_t data_size = elf_section_size_by_name(elf, ehdr, elf_size, ".data");
+    size_t gl_size = data_size;
+
+    if (gl_size < 512 || gl_size > GL_SIZE + sizeof(uint32_t))
+        return 0;
+    if ((gl_size & (sizeof(uintptr_t) - 1)) == sizeof(uint32_t))
+        gl_size -= sizeof(uint32_t);
+    if ((gl_size & (sizeof(uintptr_t) - 1)) != 0)
+        gl_size &= ~(sizeof(uintptr_t) - 1);
+    if (gl_size < 512 || gl_size > GL_SIZE)
+        return 0;
+    return gl_size;
 }
 
 static void glibc_offsets_mark_absent(struct glibc_ver_offsets *o)
@@ -1987,6 +2614,75 @@ static int glibc_set_offset(int *field, size_t off)
     return 1;
 }
 
+static int glibc_offset_fits(int off, size_t width, size_t size)
+{
+    return off < 0 || ((size_t)off <= size && width <= size - (size_t)off);
+}
+
+static void glibc_copy_glro_offsets(struct glibc_ver_offsets *dst,
+                                    const struct glibc_ver_offsets *src,
+                                    size_t glro_size)
+{
+    if (!src)
+        return;
+    if (glibc_offset_fits(src->glro_tls_static_size, sizeof(size_t), glro_size) &&
+        glibc_offset_fits(src->glro_tls_static_align, sizeof(size_t), glro_size)) {
+        dst->glro_tls_static_size = src->glro_tls_static_size;
+        dst->glro_tls_static_align = src->glro_tls_static_align;
+    }
+    if (glibc_offset_fits(src->glro_debug_printf, sizeof(void *), glro_size))
+        dst->glro_debug_printf = src->glro_debug_printf;
+    if (glibc_offset_fits(src->glro_mcount, sizeof(void *), glro_size))
+        dst->glro_mcount = src->glro_mcount;
+    if (glibc_offset_fits(src->glro_open, sizeof(void *), glro_size))
+        dst->glro_open = src->glro_open;
+    if (glibc_offset_fits(src->glro_close, sizeof(void *), glro_size))
+        dst->glro_close = src->glro_close;
+    if (glibc_offset_fits(src->glro_catch_error, sizeof(void *), glro_size))
+        dst->glro_catch_error = src->glro_catch_error;
+    if (glibc_offset_fits(src->glro_error_free, sizeof(void *), glro_size))
+        dst->glro_error_free = src->glro_error_free;
+    if (glibc_offset_fits(src->glro_find_object, sizeof(void *), glro_size))
+        dst->glro_find_object = src->glro_find_object;
+}
+
+static void glibc_copy_global_offsets(struct glibc_ver_offsets *dst,
+                                      const struct glibc_ver_offsets *src,
+                                      size_t gl_size)
+{
+    if (!src)
+        return;
+    if (glibc_offset_fits(src->gl_tls_static_size, sizeof(size_t), gl_size) &&
+        glibc_offset_fits(src->gl_tls_static_align, sizeof(size_t), gl_size)) {
+        dst->gl_tls_static_size = src->gl_tls_static_size;
+        dst->gl_tls_static_align = src->gl_tls_static_align;
+    }
+    if (glibc_offset_fits(src->gl_nns, sizeof(size_t), gl_size))
+        dst->gl_nns = src->gl_nns;
+    if (glibc_offset_fits(src->gl_stack_flags, sizeof(int), gl_size))
+        dst->gl_stack_flags = src->gl_stack_flags;
+    if (glibc_offset_fits(src->gl_tls_generation, sizeof(size_t), gl_size))
+        dst->gl_tls_generation = src->gl_tls_generation;
+    if (glibc_offset_fits(src->gl_stack_used, 2 * sizeof(uintptr_t), gl_size))
+        dst->gl_stack_used = src->gl_stack_used;
+    if (glibc_offset_fits(src->gl_stack_user, 2 * sizeof(uintptr_t), gl_size))
+        dst->gl_stack_user = src->gl_stack_user;
+    if (glibc_offset_fits(src->gl_stack_cache, 2 * sizeof(uintptr_t), gl_size))
+        dst->gl_stack_cache = src->gl_stack_cache;
+    if (glibc_offset_fits(src->gl_rtld_lock_recursive, sizeof(void *), gl_size))
+        dst->gl_rtld_lock_recursive = src->gl_rtld_lock_recursive;
+    if (glibc_offset_fits(src->gl_rtld_unlock_recursive, sizeof(void *), gl_size))
+        dst->gl_rtld_unlock_recursive = src->gl_rtld_unlock_recursive;
+    if (glibc_offset_fits(src->gl_make_stack_executable, sizeof(void *), gl_size))
+        dst->gl_make_stack_executable = src->gl_make_stack_executable;
+}
+
+static int glibc_offsets_have_required_tls(const struct glibc_ver_offsets *o)
+{
+    return (o->glro_tls_static_size >= 0 && o->glro_tls_static_align >= 0) ||
+           (o->gl_tls_static_size >= 0 && o->gl_tls_static_align >= 0);
+}
+
 static int glibc_assign_modern_glro_hooks(struct glibc_ver_offsets *o,
                                           uint16_t machine,
                                           size_t glro_size,
@@ -2002,7 +2698,8 @@ static int glibc_assign_modern_glro_hooks(struct glibc_ver_offsets *o,
         compact_tail = glro_size == 928 ||
                        (effective_minor >= 40 && glro_size < 952);
     else if (machine == EM_AARCH64)
-        compact_tail = glro_size <= 512;
+        compact_tail = glro_size <= 512 ||
+                       (effective_minor < 40 && glro_size == 704);
     else
         return 0;
 
@@ -2030,12 +2727,24 @@ static int glibc_effective_minor(uint16_t machine, size_t gl_size, int minor)
             return 43;
         if (gl_size < 3600)
             return 41;
+        if (gl_size >= 4480)
+            return 35;
+        if (gl_size >= 4120)
+            return 31;
+        if (gl_size >= 4060)
+            return 27;
         return 35;
     }
     if (gl_size < 2600)
         return 40;
     if (gl_size < 3200)
         return 41;
+    if (gl_size >= 4280)
+        return 37;
+    if (gl_size >= 3980)
+        return 31;
+    if (gl_size >= 3940)
+        return 27;
     return 37;
 }
 
@@ -2088,12 +2797,25 @@ static int glibc_infer_modern_global(struct glibc_ver_offsets *o,
 
     if (gl_size < 512 || gl_size > GL_SIZE)
         return 0;
-    if (machine == EM_AARCH64)
-        nns = gl_size < 2600 ? 1920 : 2688;
-    else if (machine == EM_X86_64)
-        nns = gl_size < 2600 ? 1792 : 2560;
-    else
+    if (machine == EM_AARCH64) {
+        if (gl_size < 3600) {
+            if (gl_size < 352 + sizeof(size_t))
+                return 0;
+            nns = gl_size - 352;
+        } else {
+            nns = 2688;
+        }
+    } else if (machine == EM_X86_64) {
+        if (gl_size < 3200) {
+            if (gl_size < 328 + sizeof(size_t))
+                return 0;
+            nns = gl_size - 328;
+        } else {
+            nns = 2560;
+        }
+    } else {
         return 0;
+    }
 
     if (nns + sizeof(size_t) <= gl_size)
         glibc_set_offset(&o->gl_nns, nns);
@@ -2110,7 +2832,9 @@ static int glibc_infer_modern_global(struct glibc_ver_offsets *o,
 
 static void glibc_infer_aarch64_pthread(struct glibc_ver_offsets *o,
                                         uint16_t machine,
-                                        int effective_minor)
+                                        int effective_minor,
+                                        size_t glro_size,
+                                        size_t gl_size)
 {
     if (machine != EM_AARCH64)
         return;
@@ -2120,6 +2844,11 @@ static void glibc_infer_aarch64_pthread(struct glibc_ver_offsets *o,
         o->pthread_size = 0x720;
         o->pthread_rseq_off = -1;
         o->pthread_rseq_cpu_id_off = -1;
+    } else if (effective_minor == 35 ||
+               (gl_size >= 4480 && gl_size < 4496 && glro_size >= 704)) {
+        o->pthread_size = 0x7c0;
+        o->pthread_rseq_off = 0x7a0;
+        o->pthread_rseq_cpu_id_off = 0x7a4;
     } else if (effective_minor >= 35) {
         o->pthread_size = 0x740;
         o->pthread_rseq_off = 0x720;
@@ -2135,6 +2864,49 @@ static void glibc_infer_aarch64_pthread(struct glibc_ver_offsets *o,
     }
 }
 
+static void ldr_dbg_offset(const char *prefix, int off)
+{
+    if (!g_debug)
+        return;
+    if (off >= 0) {
+        ldr_hex(prefix, (uint64_t)(unsigned)off);
+    } else {
+        ldr_msg(prefix);
+        ldr_msg("absent\n");
+    }
+}
+
+static void debug_dump_glibc_offsets(const char *source,
+                                     uint16_t machine,
+                                     int minor,
+                                     size_t glro_size,
+                                     size_t gl_size,
+                                     const struct glibc_ver_offsets *o)
+{
+    if (!g_debug || !o)
+        return;
+
+    ldr_msg("[loader] glibc rtld layout source: ");
+    ldr_msg(source ? source : "unknown");
+    ldr_msg("\n");
+    ldr_dbg_hex("[loader]   machine=0x", machine);
+    ldr_dbg_hex("[loader]   glibc minor=0x", minor >= 0 ? (uint64_t)minor : 0);
+    ldr_dbg_hex("[loader]   _rtld_global_ro size=0x", glro_size);
+    ldr_dbg_hex("[loader]   _rtld_global size=0x", gl_size);
+    ldr_dbg_offset("[loader]   glro_tls_static_size=0x", o->glro_tls_static_size);
+    ldr_dbg_offset("[loader]   glro_tls_static_align=0x", o->glro_tls_static_align);
+    ldr_dbg_offset("[loader]   glro_open=0x", o->glro_open);
+    ldr_dbg_offset("[loader]   glro_find_object=0x", o->glro_find_object);
+    ldr_dbg_offset("[loader]   gl_nns=0x", o->gl_nns);
+    ldr_dbg_offset("[loader]   gl_stack_flags=0x", o->gl_stack_flags);
+    ldr_dbg_offset("[loader]   gl_tls_generation=0x", o->gl_tls_generation);
+    ldr_dbg_offset("[loader]   gl_stack_used=0x", o->gl_stack_used);
+#if defined(__aarch64__)
+    ldr_dbg_offset("[loader]   pthread_size=0x", o->pthread_size);
+    ldr_dbg_offset("[loader]   pthread_rseq_off=0x", o->pthread_rseq_off);
+#endif
+}
+
 static const struct glibc_ver_offsets *derive_glibc_offsets_from_layout(
     uint16_t machine,
     size_t glro_size,
@@ -2142,21 +2914,58 @@ static const struct glibc_ver_offsets *derive_glibc_offsets_from_layout(
     int glibc_minor)
 {
     int effective_minor;
+    int have_any = 0;
+    const struct glibc_ver_offsets *fallback;
     struct glibc_ver_offsets *o = &g_glibc_derived_offsets;
 
-    if (!glro_size || !gl_size || glro_size > GLRO_SIZE || gl_size > GL_SIZE)
+    if ((!glro_size && !gl_size) || glro_size > GLRO_SIZE || gl_size > GL_SIZE)
         return NULL;
 
     glibc_offsets_mark_absent(o);
     effective_minor = glibc_effective_minor(machine, gl_size, glibc_minor);
+    fallback = fallback_glibc_offsets_for_machine(machine, effective_minor,
+                                                  glro_size, gl_size);
 
-    if (!glibc_assign_modern_glro_hooks(o, machine, glro_size, effective_minor))
+    if (glro_size > 0) {
+        int glro_ok = glibc_assign_modern_glro_hooks(o, machine, glro_size,
+                                                     effective_minor) &&
+                      glibc_infer_modern_glro_tls(o, machine, glro_size,
+                                                  effective_minor);
+        if (!glro_ok)
+            glibc_copy_glro_offsets(o, fallback, glro_size);
+        have_any = have_any || glro_ok || o->glro_debug_printf >= 0 ||
+                   o->glro_tls_static_size >= 0;
+    } else {
+        *o = fallback ? *fallback : *o;
+        have_any = fallback != NULL;
+    }
+
+    if (gl_size > 0) {
+        int global_ok = effective_minor >= 34 &&
+                        glibc_infer_modern_global(o, machine, gl_size);
+        if (!global_ok)
+            glibc_copy_global_offsets(o, fallback, gl_size);
+        have_any = have_any || global_ok || o->gl_nns >= 0 ||
+                   o->gl_stack_flags >= 0;
+    } else if (fallback) {
+        o->gl_tls_static_size = fallback->gl_tls_static_size;
+        o->gl_tls_static_align = fallback->gl_tls_static_align;
+        o->gl_nns = fallback->gl_nns;
+        o->gl_stack_flags = fallback->gl_stack_flags;
+        o->gl_tls_generation = fallback->gl_tls_generation;
+        o->gl_stack_used = fallback->gl_stack_used;
+        o->gl_stack_user = fallback->gl_stack_user;
+        o->gl_stack_cache = fallback->gl_stack_cache;
+        o->gl_rtld_lock_recursive = fallback->gl_rtld_lock_recursive;
+        o->gl_rtld_unlock_recursive = fallback->gl_rtld_unlock_recursive;
+        o->gl_make_stack_executable = fallback->gl_make_stack_executable;
+        have_any = 1;
+    }
+
+    if (!have_any || !glibc_offsets_have_required_tls(o))
         return NULL;
-    if (!glibc_infer_modern_glro_tls(o, machine, glro_size, effective_minor))
-        return NULL;
-    if (!glibc_infer_modern_global(o, machine, gl_size))
-        return NULL;
-    glibc_infer_aarch64_pthread(o, machine, effective_minor);
+    glibc_infer_aarch64_pthread(o, machine, effective_minor,
+                                glro_size, gl_size);
 
     return o;
 }
@@ -2219,6 +3028,188 @@ static int scan_glibc_release_minor(const char *buf, size_t len)
     return max_minor;
 }
 
+static uint32_t elf_gnu_hash_symbol_count(const uint8_t *elf,
+                                          const Elf64_Ehdr *ehdr,
+                                          size_t elf_size,
+                                          uint64_t gnu_hash_vaddr)
+{
+    uint64_t hash_foff = elf_vaddr_to_foff(elf, ehdr, gnu_hash_vaddr);
+    const uint32_t *header;
+    const uint32_t *buckets;
+    const uint32_t *chains;
+    size_t buckets_off;
+    size_t chains_off;
+    uint32_t nbuckets;
+    uint32_t symoffset;
+    uint32_t bloom_size;
+    uint32_t max_sym = 0;
+
+    if (hash_foff == (uint64_t)-1 || hash_foff + 16 > elf_size)
+        return 0;
+    header = (const uint32_t *)(elf + hash_foff);
+    nbuckets = header[0];
+    symoffset = header[1];
+    bloom_size = header[2];
+    if (nbuckets == 0)
+        return 0;
+
+    buckets_off = (size_t)hash_foff + 16 +
+                  (size_t)bloom_size * sizeof(Elf64_Addr);
+    if (buckets_off > elf_size ||
+        (size_t)nbuckets > (elf_size - buckets_off) / sizeof(uint32_t))
+        return 0;
+    chains_off = buckets_off + (size_t)nbuckets * sizeof(uint32_t);
+    if (chains_off > elf_size)
+        return 0;
+
+    buckets = (const uint32_t *)(elf + buckets_off);
+    chains = (const uint32_t *)(elf + chains_off);
+    for (uint32_t bucket_index = 0; bucket_index < nbuckets; bucket_index++) {
+        uint32_t sym = buckets[bucket_index];
+        size_t chain_index;
+        size_t max_chain_words;
+
+        if (sym < symoffset)
+            continue;
+        chain_index = (size_t)(sym - symoffset);
+        max_chain_words = (elf_size - chains_off) / sizeof(uint32_t);
+        if (chain_index >= max_chain_words)
+            continue;
+
+        for (size_t i = chain_index; i < max_chain_words; i++, sym++) {
+            uint32_t hash = chains[i];
+
+            if (sym > max_sym)
+                max_sym = sym;
+            if (hash & 1u)
+                break;
+        }
+    }
+
+    return max_sym ? max_sym + 1 : 0;
+}
+
+static uint32_t elf_fallback_symbol_count(size_t symtab_foff,
+                                          size_t dynstr_foff,
+                                          size_t elf_size)
+{
+    size_t max_syms;
+
+    if (symtab_foff >= elf_size)
+        return 0;
+    if (dynstr_foff > symtab_foff)
+        max_syms = (dynstr_foff - symtab_foff) / sizeof(Elf64_Sym);
+    else
+        max_syms = (elf_size - symtab_foff) / sizeof(Elf64_Sym);
+    if (max_syms > 16384)
+        max_syms = 16384;
+    return (uint32_t)max_syms;
+}
+
+static int dynstr_name_matches(const char *str, size_t dynstr_size,
+                               uint32_t name_offset, const char *expect)
+{
+    size_t i = 0;
+
+    if ((size_t)name_offset >= dynstr_size)
+        return 0;
+    while (expect[i]) {
+        if ((size_t)name_offset + i >= dynstr_size ||
+            str[name_offset + i] != expect[i])
+            return 0;
+        i++;
+    }
+    if ((size_t)name_offset + i >= dynstr_size)
+        return 0;
+    return str[name_offset + i] == '\0' || str[name_offset + i] == '@';
+}
+
+static void scan_rtld_global_symbols(const Elf64_Sym *syms,
+                                     size_t symbol_count,
+                                     const char *strtab,
+                                     size_t strtab_size,
+                                     size_t *glro_size,
+                                     size_t *gl_size,
+                                     int *found)
+{
+    for (size_t i = 0; i < symbol_count && *found < 2; i++) {
+        uint32_t name_offset;
+
+        if (ELF64_ST_TYPE(syms[i].st_info) != STT_OBJECT)
+            continue;
+        if (syms[i].st_size == 0)
+            continue;
+        name_offset = syms[i].st_name;
+        if (!*glro_size && dynstr_name_matches(strtab, strtab_size,
+                                               name_offset,
+                                               "_rtld_global_ro")) {
+            *glro_size = syms[i].st_size;
+            (*found)++;
+        } else if (!*gl_size && dynstr_name_matches(strtab, strtab_size,
+                                                    name_offset,
+                                                    "_rtld_global")) {
+            *gl_size = syms[i].st_size;
+            (*found)++;
+        }
+    }
+}
+
+static void scan_section_rtld_global_symbols(const uint8_t *elf,
+                                             const Elf64_Ehdr *ehdr,
+                                             size_t elf_size,
+                                             size_t *glro_size,
+                                             size_t *gl_size,
+                                             int *found)
+{
+    const uint8_t *shbase;
+    size_t shdr_bytes;
+
+    if (*found >= 2 || ehdr->e_shoff == 0 || ehdr->e_shnum == 0 ||
+        ehdr->e_shentsize < sizeof(Elf64_Shdr))
+        return;
+    if (ehdr->e_shoff > elf_size)
+        return;
+    shdr_bytes = (size_t)ehdr->e_shnum * (size_t)ehdr->e_shentsize;
+    if ((size_t)ehdr->e_shnum != 0 &&
+        shdr_bytes / (size_t)ehdr->e_shnum != (size_t)ehdr->e_shentsize)
+        return;
+    if (shdr_bytes > elf_size - (size_t)ehdr->e_shoff)
+        return;
+    shbase = elf + ehdr->e_shoff;
+
+    for (uint16_t i = 0; i < ehdr->e_shnum && *found < 2; i++) {
+        const Elf64_Shdr *sh = (const Elf64_Shdr *)(shbase +
+            (size_t)i * ehdr->e_shentsize);
+        const Elf64_Shdr *strsh;
+        const Elf64_Sym *syms;
+        const char *strtab;
+        size_t symbol_count;
+        size_t entsize;
+
+        if (sh->sh_type != SHT_SYMTAB && sh->sh_type != SHT_DYNSYM)
+            continue;
+        if (sh->sh_link >= ehdr->e_shnum)
+            continue;
+        entsize = sh->sh_entsize ? sh->sh_entsize : sizeof(Elf64_Sym);
+        if (entsize != sizeof(Elf64_Sym) || sh->sh_offset > elf_size ||
+            sh->sh_size > elf_size - sh->sh_offset)
+            continue;
+
+        strsh = (const Elf64_Shdr *)(shbase +
+            (size_t)sh->sh_link * ehdr->e_shentsize);
+        if (strsh->sh_offset > elf_size ||
+            strsh->sh_size > elf_size - strsh->sh_offset)
+            continue;
+
+        syms = (const Elf64_Sym *)(elf + sh->sh_offset);
+        strtab = (const char *)(elf + strsh->sh_offset);
+        symbol_count = sh->sh_size / sizeof(Elf64_Sym);
+        scan_rtld_global_symbols(syms, symbol_count, strtab,
+                                 strsh->sh_size, glro_size, gl_size,
+                                 found);
+    }
+}
+
 /*
  * Detect glibc offsets from the embedded ld-linux.so's .dynsym.
  * Returns a pointer to the matching offset profile, or NULL on failure.
@@ -2245,109 +3236,132 @@ detect_glibc_offsets_from_interp(const uint8_t *mem, uint64_t mem_foff,
         ehdr->e_ident[EI_MAG2] != 'L'  || ehdr->e_ident[EI_MAG3] != 'F')
         return NULL;
 
-    /* Find PT_DYNAMIC to locate .dynsym and .dynstr */
-    const Elf64_Phdr *phdrs = (const Elf64_Phdr *)(elf + ehdr->e_phoff);
-    uint64_t dyn_foff = 0;
-    size_t dyn_size = 0;
-    for (int i = 0; i < ehdr->e_phnum; i++) {
-        if (phdrs[i].p_type == PT_DYNAMIC) {
-            dyn_foff = phdrs[i].p_offset;
-            dyn_size = phdrs[i].p_filesz;
-            break;
-        }
-    }
-    if (!dyn_foff || dyn_foff + dyn_size > elf_size) return NULL;
-
-    /* Extract DT_SYMTAB, DT_STRTAB, DT_HASH from dynamic section */
-    const Elf64_Dyn *dyn = (const Elf64_Dyn *)(elf + dyn_foff);
-    size_t ndyn = dyn_size / sizeof(Elf64_Dyn);
-    uint64_t symtab_vaddr = 0, dynstr_vaddr = 0, hash_vaddr = 0;
-    size_t dynstr_size = 0;
-    for (size_t i = 0; i < ndyn && dyn[i].d_tag != DT_NULL; i++) {
-        switch (dyn[i].d_tag) {
-            case DT_SYMTAB: symtab_vaddr = dyn[i].d_un.d_ptr; break;
-            case DT_STRTAB: dynstr_vaddr = dyn[i].d_un.d_ptr; break;
-            case DT_STRSZ:  dynstr_size  = dyn[i].d_un.d_val; break;
-            case DT_HASH:   hash_vaddr   = dyn[i].d_un.d_ptr; break;
-        }
-    }
-    if (!symtab_vaddr || !dynstr_vaddr) return NULL;
-
-    /* Convert virtual addresses to file offsets */
-    uint64_t symtab_foff = elf_vaddr_to_foff(elf, ehdr, symtab_vaddr);
-    uint64_t dynstr_foff = elf_vaddr_to_foff(elf, ehdr, dynstr_vaddr);
-    if (symtab_foff == (uint64_t)-1 || dynstr_foff == (uint64_t)-1) return NULL;
-
-    /* Get symbol count from DT_HASH (nchain field) */
-    uint32_t nsyms = 0;
-    if (hash_vaddr) {
-        uint64_t hash_foff = elf_vaddr_to_foff(elf, ehdr, hash_vaddr);
-        if (hash_foff != (uint64_t)-1 && hash_foff + 8 <= elf_size) {
-            const uint32_t *hashtab = (const uint32_t *)(elf + hash_foff);
-            nsyms = hashtab[1];  /* nchain = number of symbols */
-        }
-    }
-    if (nsyms == 0) nsyms = 4096;  /* fallback upper bound */
-
-    /* Scan .dynsym for _rtld_global_ro and _rtld_global */
-    const Elf64_Sym *syms = (const Elf64_Sym *)(elf + symtab_foff);
-    const char *str = (const char *)(elf + dynstr_foff);
     int glibc_minor = -1;
     size_t glro_size = 0, gl_size = 0;
     int found = 0;
+    const char *str = NULL;
+    size_t dynstr_size = 0;
 
-    if (dynstr_size > 0 && dynstr_foff < elf_size) {
-        size_t avail = elf_size - dynstr_foff;
-        if (dynstr_size > avail)
-            dynstr_size = avail;
-        glibc_minor = scan_glibc_2_minor(str, dynstr_size);
-    } else {
-        glibc_minor = scan_glibc_2_minor((const char *)elf, elf_size);
+    if (ehdr->e_phoff <= elf_size && ehdr->e_phentsize >= sizeof(Elf64_Phdr) &&
+        ehdr->e_phnum <= (elf_size - (size_t)ehdr->e_phoff) / ehdr->e_phentsize) {
+        const Elf64_Phdr *phdrs = (const Elf64_Phdr *)(elf + ehdr->e_phoff);
+        uint64_t dyn_foff = 0;
+        size_t dyn_size = 0;
+
+        for (int i = 0; i < ehdr->e_phnum; i++) {
+            const Elf64_Phdr *ph = (const Elf64_Phdr *)((const uint8_t *)phdrs +
+                (size_t)i * ehdr->e_phentsize);
+
+            if (ph->p_type == PT_DYNAMIC) {
+                dyn_foff = ph->p_offset;
+                dyn_size = ph->p_filesz;
+                break;
+            }
+        }
+
+        if (dyn_foff && dyn_foff <= elf_size && dyn_size <= elf_size - dyn_foff) {
+            const Elf64_Dyn *dyn = (const Elf64_Dyn *)(elf + dyn_foff);
+            size_t ndyn = dyn_size / sizeof(Elf64_Dyn);
+            uint64_t symtab_vaddr = 0, dynstr_vaddr = 0, hash_vaddr = 0;
+            uint64_t gnu_hash_vaddr = 0;
+            uint64_t symtab_foff = (uint64_t)-1;
+            uint64_t dynstr_foff = (uint64_t)-1;
+
+            for (size_t i = 0; i < ndyn && dyn[i].d_tag != DT_NULL; i++) {
+                switch (dyn[i].d_tag) {
+                    case DT_SYMTAB: symtab_vaddr = dyn[i].d_un.d_ptr; break;
+                    case DT_STRTAB: dynstr_vaddr = dyn[i].d_un.d_ptr; break;
+                    case DT_STRSZ:  dynstr_size  = dyn[i].d_un.d_val; break;
+                    case DT_HASH:   hash_vaddr   = dyn[i].d_un.d_ptr; break;
+                    case DT_GNU_HASH: gnu_hash_vaddr = dyn[i].d_un.d_ptr; break;
+                }
+            }
+
+            if (dynstr_vaddr) {
+                dynstr_foff = elf_vaddr_to_foff(elf, ehdr, dynstr_vaddr);
+                if (dynstr_foff != (uint64_t)-1 && dynstr_foff < elf_size) {
+                    size_t avail = elf_size - (size_t)dynstr_foff;
+                    if (dynstr_size == 0 || dynstr_size > avail)
+                        dynstr_size = avail;
+                    str = (const char *)(elf + dynstr_foff);
+                    glibc_minor = scan_glibc_2_minor(str, dynstr_size);
+                }
+            }
+
+            if (symtab_vaddr && str && dynstr_size > 0) {
+                uint32_t nsyms = 0;
+
+                symtab_foff = elf_vaddr_to_foff(elf, ehdr, symtab_vaddr);
+                if (symtab_foff != (uint64_t)-1 && symtab_foff < elf_size) {
+                    if (hash_vaddr) {
+                        uint64_t hash_foff = elf_vaddr_to_foff(elf, ehdr, hash_vaddr);
+                        if (hash_foff != (uint64_t)-1 && hash_foff + 8 <= elf_size) {
+                            const uint32_t *hashtab = (const uint32_t *)(elf + hash_foff);
+                            nsyms = hashtab[1];
+                        }
+                    }
+                    if (nsyms == 0 && gnu_hash_vaddr)
+                        nsyms = elf_gnu_hash_symbol_count(elf, ehdr, elf_size,
+                                                          gnu_hash_vaddr);
+                    if (nsyms == 0)
+                        nsyms = elf_fallback_symbol_count((size_t)symtab_foff,
+                                                          (size_t)(str - (const char *)elf),
+                                                          elf_size);
+                    if ((size_t)nsyms > (elf_size - (size_t)symtab_foff) /
+                            sizeof(Elf64_Sym))
+                        nsyms = (uint32_t)((elf_size - (size_t)symtab_foff) /
+                                           sizeof(Elf64_Sym));
+                    if (nsyms > 0) {
+                        const Elf64_Sym *syms = (const Elf64_Sym *)(elf + symtab_foff);
+                        scan_rtld_global_symbols(syms, nsyms, str, dynstr_size,
+                                                 &glro_size, &gl_size, &found);
+                    }
+                }
+            }
+        }
     }
+
+    if (glibc_minor < 0)
+        glibc_minor = scan_glibc_2_minor((const char *)elf, elf_size);
     {
         int release_minor = scan_glibc_release_minor((const char *)elf, elf_size);
         if (release_minor > glibc_minor)
             glibc_minor = release_minor;
     }
 
-    for (uint32_t i = 0; i < nsyms && found < 2; i++) {
-        if (ELF64_ST_TYPE(syms[i].st_info) != STT_OBJECT) continue;
-        if (syms[i].st_size == 0) continue;
-        uint32_t noff = syms[i].st_name;
-        const char *name = str + noff;
-        /* Compare names — _rtld_global_ro first (longer) to avoid false match */
-        if (name[0] == '_' && name[1] == 'r') {
-            int j = 0;
-            const char *expect_ro = "_rtld_global_ro";
-            const char *expect_gl = "_rtld_global";
-            while (expect_ro[j] && name[j] == expect_ro[j]) j++;
-            if (expect_ro[j] == '\0' && (name[j] == '\0' || name[j] == '@')) {
-                glro_size = syms[i].st_size;
-                found++;
-            } else {
-                j = 0;
-                while (expect_gl[j] && name[j] == expect_gl[j]) j++;
-                if (expect_gl[j] == '\0' && (name[j] == '\0' || name[j] == '@')) {
-                    gl_size = syms[i].st_size;
-                    found++;
-                }
-            }
+    scan_section_rtld_global_symbols(elf, ehdr, elf_size, &glro_size,
+                                     &gl_size, &found);
+
+    if (!gl_size) {
+        gl_size = infer_glibc_global_size_from_data_section(elf, ehdr, elf_size);
+        if (gl_size) {
+            ldr_dbg("[loader] inferred _rtld_global size from ld-linux .data section\n");
+            ldr_dbg_hex("[loader]   _rtld_global size=0x", gl_size);
         }
     }
 
-    if (!glro_size) return NULL;  /* symbol not found */
+    if (!glro_size && !gl_size) return NULL;  /* no usable layout signal */
 
     /* Match against known layouts (both sizes needed for disambiguation) */
     for (size_t i = 0; i < sizeof(glibc_layout_table)/sizeof(glibc_layout_table[0]); i++) {
         if (glibc_layout_table[i].machine == ehdr->e_machine &&
             glibc_layout_table[i].glro_size == glro_size &&
             glibc_layout_table[i].gl_size == gl_size) {
+            if (glibc_minor >= 0)
+                g_glibc_minor = glibc_minor;
             if (ehdr->e_machine == EM_X86_64 && glro_size == 952 &&
                 gl_size == 4352 && glibc_minor >= 40) {
                 ldr_dbg("[loader] detected x86-64 glibc 2.40+ legacy-sized rtld layout\n");
+                debug_dump_glibc_offsets("exact-symbols-legacy-sized",
+                                         ehdr->e_machine, glibc_minor,
+                                         glro_size, gl_size,
+                                         &glibc_2_40_legacy_sized_rtld);
                 return &glibc_2_40_legacy_sized_rtld;
             }
             ldr_dbg("[loader] detected _rtld_global_ro size from ld-linux.so, matched layout\n");
+            debug_dump_glibc_offsets("exact-symbols", ehdr->e_machine,
+                                     glibc_minor, glro_size, gl_size,
+                                     glibc_layout_table[i].offsets);
             return glibc_layout_table[i].offsets;
         }
     }
@@ -2357,13 +3371,22 @@ detect_glibc_offsets_from_interp(const uint8_t *mem, uint64_t mem_foff,
             derive_glibc_offsets_from_layout(ehdr->e_machine, glro_size,
                                              gl_size, glibc_minor);
         if (derived) {
-            ldr_dbg("[loader] derived glibc rtld layout from symbol sizes\n");
+            g_glibc_minor = glibc_effective_minor(ehdr->e_machine, gl_size,
+                                                  glibc_minor);
+            ldr_dbg("[loader] derived glibc rtld layout from interpreter layout data\n");
+            ldr_dbg_hex("[loader]   _rtld_global_ro size=0x", glro_size);
+            ldr_dbg_hex("[loader]   _rtld_global size=0x", gl_size);
+            debug_dump_glibc_offsets("derived", ehdr->e_machine,
+                                     g_glibc_minor, glro_size, gl_size,
+                                     derived);
             return derived;
         }
     }
 
     /* Unknown struct size — log and return NULL for fallback */
     ldr_dbg("[loader] unknown _rtld_global_ro size, falling back\n");
+    ldr_dbg_hex("[loader]   _rtld_global_ro size=0x", glro_size);
+    ldr_dbg_hex("[loader]   _rtld_global size=0x", gl_size);
     return NULL;
 }
 
@@ -2462,6 +3485,10 @@ static int stub_dl_rtld_di_serinfo(void) { return -1; }
 #define GLIBC_AARCH64_PTHREAD_RSEQ_OFF_DEFAULT   0x720
 #define GLIBC_AARCH64_PTHREAD_RSEQ_CPU_ID_OFF_DEFAULT 0x724
 #define GLIBC_AARCH64_PTHREAD_CANCELHANDLING_OFF_DEFAULT 0x108
+#define GLIBC_AARCH64_PTHREAD_STACKBLOCK_OFF     0x490
+#define GLIBC_AARCH64_PTHREAD_STACKBLOCK_SIZE_OFF 0x498
+#define GLIBC_AARCH64_PTHREAD_GUARDSIZE_OFF      0x4a0
+#define GLIBC_AARCH64_PTHREAD_REPORTED_GUARDSIZE_OFF 0x4a8
 #define GLIBC_RSEQ_REGISTERED_BIT 0x80
 #define GLIBC_RSEQ_CPU_ID_REGISTRATION_FAILED (-2)
 
@@ -2607,16 +3634,12 @@ static inline uint64_t static_tls_first_tpoff(void)
     return 0;
 }
 
+#if defined(__aarch64__)
 static inline uintptr_t glibc_aarch64_pthread_self_from_tp(uintptr_t tp)
 {
-#if defined(__aarch64__)
     return tp - glibc_aarch64_pthread_size();
-#else
-    return tp;
-#endif
 }
 
-#if defined(__aarch64__)
 static void glibc_aarch64_disable_rseq_for_thread(uintptr_t tp)
 {
     if (g_is_musl_runtime || g_rseq_size != 0)
@@ -2629,6 +3652,19 @@ static void glibc_aarch64_disable_rseq_for_thread(uintptr_t tp)
 
     *cancelhandling &= ~GLIBC_RSEQ_REGISTERED_BIT;
     *(int32_t *)(rseq_base + 4) = GLIBC_RSEQ_CPU_ID_REGISTRATION_FAILED;
+}
+
+static void glibc_aarch64_set_main_stack(uintptr_t stack_base,
+                                         size_t stack_size)
+{
+    if (g_is_musl_runtime || !stack_base || !stack_size)
+        return;
+
+    uintptr_t self = glibc_aarch64_pthread_self_from_tp(arch_get_tp());
+    *(uintptr_t *)(self + GLIBC_AARCH64_PTHREAD_STACKBLOCK_OFF) = stack_base;
+    *(size_t *)(self + GLIBC_AARCH64_PTHREAD_STACKBLOCK_SIZE_OFF) = stack_size;
+    *(size_t *)(self + GLIBC_AARCH64_PTHREAD_GUARDSIZE_OFF) = 0;
+    *(size_t *)(self + GLIBC_AARCH64_PTHREAD_REPORTED_GUARDSIZE_OFF) = 0;
 }
 #endif
 
@@ -7427,11 +8463,14 @@ static void init_libc_process_state(struct loaded_obj *objs, int nobj,
                 int minor = 0;
                 for (int i = 2; ver[i] >= '0' && ver[i] <= '9'; i++)
                     minor = minor * 10 + (ver[i] - '0');
+                g_glibc_minor = minor;
                 glibc_off = fallback_glibc_offsets_for_minor(minor);
                 ldr_dbg("[loader] fallback: glibc version-based offset selection\n");
             }
         }
         fixup_rtld_for_glibc(glibc_off);
+        debug_dump_glibc_offsets("gnu_get_libc_version-fallback", 0,
+                                 g_glibc_minor, 0, 0, glibc_off);
         g_glibc_off = glibc_off;
         g_glibc_rtld_fixed = 1;
     }
@@ -7498,6 +8537,19 @@ static int dl_name_matches(const char *path, const char *name)
 
     n = strlen(name);
     return n > 0 && strncmp(base, name, n) == 0 && base[n] == '.';
+}
+
+static int dl_is_virtual_runtime_object(const char *name)
+{
+    const char *base;
+
+    if (!name || !name[0])
+        return 0;
+    base = dl_basename(name);
+    return strncmp(base, "linux-vdso", 10) == 0 ||
+           strncmp(base, "linux-gate", 10) == 0 ||
+           strncmp(base, "ld-linux", 8) == 0 ||
+           strncmp(base, "ld-musl", 7) == 0;
 }
 
 static const char *dl_store_name(const char *s)
@@ -7627,6 +8679,8 @@ static struct loaded_obj *load_needed_from_filesystem(const char *needed)
 
     if (!needed || !needed[0])
         return NULL;
+    if (dl_is_virtual_runtime_object(needed))
+        return NULL;
 
     if (needed[0] == '/') {
         int fd = open(needed, O_RDONLY);
@@ -7677,6 +8731,9 @@ static void dl_load_needed(struct loaded_obj *obj,
     for (size_t i = 0; i < dyn_count && dyn[i].d_tag != DT_NULL; i++) {
         if (dyn[i].d_tag != DT_NEEDED) continue;
         const char *needed = obj->dynstr + dyn[i].d_un.d_val;
+
+        if (dl_is_virtual_runtime_object(needed))
+            continue;
 
         /* Skip if already loaded (basename match) */
         int found = 0;
@@ -7989,6 +9046,10 @@ static struct loaded_obj *load_embedded_object(uint32_t mi)
             for (size_t di = 0; di < dc && dyn[di].d_tag != DT_NULL; di++) {
                 if (dyn[di].d_tag != DT_NEEDED) continue;
                 const char *needed = obj->dynstr + dyn[di].d_un.d_val;
+
+                if (dl_is_virtual_runtime_object(needed))
+                    continue;
+
                 /* Skip if already loaded */
                 int found = 0;
                 for (int j = 0; j < g_nobj; j++) {
@@ -8095,6 +9156,9 @@ static void *my_dlopen(const char *path, int flags)
 
     /* Check if already loaded (basename match) */
     const char *bn = dl_basename(path);
+
+    if (dl_is_virtual_runtime_object(bn))
+        return DL_GLOBAL_HANDLE;
 
     for (int i = 0; i < g_nobj; i++) {
         if (!g_all_objs[i].name) continue;
@@ -8835,6 +9899,11 @@ static void transfer_to_entry(uintptr_t entry, int argc, char **argv,
      * Let's recompute to ensure. */
     if (((uintptr_t)sp & 0xF) != 0)
         sp--;
+
+#if defined(__aarch64__)
+    if (!is_musl_runtime)
+        glibc_aarch64_set_main_stack((uintptr_t)stack_mem, stack_size);
+#endif
 
     int p = 0;
     sp[p++] = (uintptr_t)argc;
