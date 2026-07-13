@@ -23,6 +23,8 @@ struct dlfrz_entry;
  *   entries:      manifest entry array (num_entries elements)
  *   strtab:       string table
  *   num_entries:  number of entries
+ *   handoff_fd:    optional pipe written immediately before constructors;
+ *                  -1 disables the parent notification
  *   argc, argv, envp: passed to the loaded program's entry point
  *
  * On success this function does NOT return — it transfers control to the
@@ -35,6 +37,7 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
                uint32_t num_entries,
                const uint32_t *runtime_fixups,
                uint32_t runtime_fixup_count,
+               int handoff_fd,
                int argc, char **argv, char **envp);
 
 #endif /* DLFREEZE_LOADER_H */

@@ -356,14 +356,9 @@ void *dlopen(const char *filename, int flags)
             canonicalize_path(resolved, sizeof(resolved));
             if (g_dlopen_trace_fd >= 0)
                 write_trace_line(g_dlopen_trace_fd, "", resolved);
-            /* Also record in the file-trace.  Inside glibc, dlopen()
-             * uses an internal openat() that bypasses our open() hook,
-             * so .so files loaded via dlopen (e.g. Python's lib-dynload
-             * extension modules like _struct.so) never appear as F
-             * records via the open path.  Without an explicit F record
-             * here the packer wouldn't know to embed them, breaking
-             * imports that depend on dynamically-loaded extension
-             * modules. */
+            /* Also record in the file trace.  Some libcs open dlopen()
+             * targets internally and bypass the interposed open() family,
+             * so the successful link-map path is the authoritative record. */
             if (g_file_trace_fd >= 0 && resolved[0] == '/')
                 write_trace_line(g_file_trace_fd, "F ", resolved);
         }

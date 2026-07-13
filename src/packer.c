@@ -10,6 +10,8 @@
 #include <stdint.h>
 #include <elf.h>
 #include <errno.h>
+#include <limits.h>
+#include <fcntl.h>
 
 #ifndef DLFRZ_FLAG_DATA_VIRTUAL
 #define DLFRZ_FLAG_DATA_VIRTUAL 0x100
@@ -91,6 +93,14 @@ typedef Elf64_Xword Elf64_Relr;
 
 /* Starting base address for direct-loaded objects (above bootstrap VA) */
 #define DIRECT_LOAD_BASE  0x200000000ULL
+
+/* A frozen AArch64 payload must remain mmap-able on 4, 16, and 64 KiB
+ * kernels.  Align embedded ELF starts to the largest supported page size. */
+#if defined(__aarch64__)
+#define PAYLOAD_ALIGN 65536ULL
+#else
+#define PAYLOAD_ALIGN 4096ULL
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Data file list helpers                                              */
@@ -415,53 +425,96 @@ static int needs_runtime_reloc_scan(FILE *f, const Elf64_Ehdr *ehdr)
     return needs_scan;
 }
 
-/*
- * Extract `main` address from _start for stripped PIE binaries.
- * Scans the entry point code for `lea disp32(%rip), %rdi` (48 8d 3d XX XX XX XX)
- * which loads the `main` pointer before calling __libc_start_main.
- */
+/* Return bytes starting at a virtual address in a file-backed PT_LOAD.
+ * required_flags is normally PF_X for instruction reads and zero for data. */
+static size_t read_elf_va(FILE *f, const Elf64_Ehdr *ehdr,
+                          const uint8_t *phdrs, uint64_t va,
+                          void *buf, size_t size, uint32_t required_flags)
+{
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        const Elf64_Phdr *ph = (const Elf64_Phdr *)(
+            phdrs + (size_t)i * ehdr->e_phentsize);
+        uint64_t delta;
+        uint64_t file_off;
+        size_t available;
+
+        if (ph->p_type != PT_LOAD ||
+            (ph->p_flags & required_flags) != required_flags ||
+            va < ph->p_vaddr)
+            continue;
+        delta = va - ph->p_vaddr;
+        if (delta >= ph->p_filesz || ph->p_offset > UINT64_MAX - delta)
+            continue;
+        file_off = ph->p_offset + delta;
+        if (file_off > (uint64_t)LONG_MAX)
+            return 0;
+        available = (size_t)(ph->p_filesz - delta);
+        if (available > size)
+            available = size;
+        if (fseek(f, (long)file_off, SEEK_SET) != 0)
+            return 0;
+        return fread(buf, 1, available, f);
+    }
+    return 0;
+}
+
+static int elf_va_is_executable(const Elf64_Ehdr *ehdr,
+                                const uint8_t *phdrs, uint64_t va)
+{
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        const Elf64_Phdr *ph = (const Elf64_Phdr *)(
+            phdrs + (size_t)i * ehdr->e_phentsize);
+
+        if (ph->p_type == PT_LOAD && (ph->p_flags & PF_X) != 0 &&
+            va >= ph->p_vaddr && va - ph->p_vaddr < ph->p_filesz)
+            return 1;
+    }
+    return 0;
+}
+
+#if defined(__x86_64__)
+/* Extract main from the x86-64 glibc CRT sequence in stripped executables:
+ *   lea disp32(%rip), %rdi  (PIE), or mov $imm32, %rdi (ET_EXEC).
+ * The result is accepted only when it names file-backed executable code. */
 static uint64_t find_main_from_entry(FILE *f, const Elf64_Ehdr *ehdr,
                                      const uint8_t *phdrs)
 {
     uint64_t entry_va = ehdr->e_entry;
-
-    /* Map entry VA to file offset */
-    uint64_t entry_foff = 0;
-    int found_seg = 0;
-    for (int i = 0; i < ehdr->e_phnum; i++) {
-        Elf64_Phdr *ph = (Elf64_Phdr *)(phdrs + i * ehdr->e_phentsize);
-        if (ph->p_type != PT_LOAD) continue;
-        if (entry_va >= ph->p_vaddr &&
-            entry_va < ph->p_vaddr + ph->p_filesz) {
-            entry_foff = ph->p_offset + (entry_va - ph->p_vaddr);
-            found_seg = 1;
-            break;
-        }
-    }
-    if (!found_seg) return 0;
-
-    /* Read 64 bytes at entry point */
     uint8_t code[64];
-    if (fseek(f, entry_foff, SEEK_SET) != 0) return 0;
-    size_t nr = fread(code, 1, sizeof(code), f);
-    if (nr < 16) return 0;
+    size_t nr = read_elf_va(f, ehdr, phdrs, entry_va, code, sizeof(code), PF_X);
 
-    /* Scan for: 48 8d 3d XX XX XX XX  (lea disp32(%rip), %rdi)  — PIE
-     *     or:   48 c7 c7 XX XX XX XX  (mov $imm32, %rdi)        — non-PIE */
+    if (nr < 16)
+        return 0;
+
     for (size_t i = 0; i + 7 <= nr; i++) {
-        if (code[i] == 0x48 && code[i+1] == 0x8d && code[i+2] == 0x3d) {
+        uint64_t main_va = 0;
+
+        if (code[i] == 0x48 && code[i + 1] == 0x8d &&
+            code[i + 2] == 0x3d) {
             int32_t disp;
-            memcpy(&disp, &code[i+3], 4);
-            /* RIP at time of lea = entry_va + i + 7 */
-            uint64_t main_va = entry_va + i + 7 + (int64_t)disp;
-            fprintf(stderr, "dlfreeze: extracted main=0x%lx from _start\n",
-                    (unsigned long)main_va);
-            return main_va;
+            uint64_t next_rip;
+
+            memcpy(&disp, &code[i + 3], sizeof(disp));
+            if (entry_va > UINT64_MAX - i - 7)
+                continue;
+            next_rip = entry_va + i + 7;
+            if (disp < 0) {
+                uint64_t magnitude = (uint64_t)(-(int64_t)disp);
+                if (next_rip < magnitude)
+                    continue;
+                main_va = next_rip - magnitude;
+            } else if (next_rip <= UINT64_MAX - (uint32_t)disp) {
+                main_va = next_rip + (uint32_t)disp;
+            }
+        } else if (code[i] == 0x48 && code[i + 1] == 0xc7 &&
+                   code[i + 2] == 0xc7) {
+            int32_t imm;
+
+            memcpy(&imm, &code[i + 3], sizeof(imm));
+            main_va = (uint64_t)(int64_t)imm;
         }
-        if (code[i] == 0x48 && code[i+1] == 0xc7 && code[i+2] == 0xc7) {
-            uint32_t imm;
-            memcpy(&imm, &code[i+3], 4);
-            uint64_t main_va = (uint64_t)imm;
+
+        if (main_va && elf_va_is_executable(ehdr, phdrs, main_va)) {
             fprintf(stderr, "dlfreeze: extracted main=0x%lx from _start\n",
                     (unsigned long)main_va);
             return main_va;
@@ -469,6 +522,164 @@ static uint64_t find_main_from_entry(FILE *f, const Elf64_Ehdr *ehdr,
     }
     return 0;
 }
+#elif defined(__aarch64__)
+static int64_t aarch64_sign_extend(uint64_t value, unsigned int bits)
+{
+    uint64_t sign = 1ULL << (bits - 1);
+    return (int64_t)((value ^ sign) - sign);
+}
+
+static int aarch64_add_signed(uint64_t base, int64_t delta, uint64_t *result)
+{
+    if (delta < 0) {
+        uint64_t magnitude = (uint64_t)(-(delta + 1)) + 1;
+        if (base < magnitude)
+            return 0;
+        *result = base - magnitude;
+    } else {
+        if (base > UINT64_MAX - (uint64_t)delta)
+            return 0;
+        *result = base + (uint64_t)delta;
+    }
+    return 1;
+}
+
+static int aarch64_is_b_imm(uint32_t insn)
+{
+    return (insn & 0xfc000000u) == 0x14000000u;
+}
+
+static int aarch64_is_adrp(uint32_t insn)
+{
+    return (insn & 0x9f000000u) == 0x90000000u;
+}
+
+static int aarch64_is_adr(uint32_t insn)
+{
+    return (insn & 0x9f000000u) == 0x10000000u;
+}
+
+static int aarch64_is_add_imm64(uint32_t insn)
+{
+    return (insn & 0xff000000u) == 0x91000000u;
+}
+
+static int aarch64_is_ldr_uimm64(uint32_t insn)
+{
+    return (insn & 0xffc00000u) == 0xf9400000u;
+}
+
+static int aarch64_decode_pc_rel(uint64_t pc, uint32_t insn, int adrp,
+                                 uint64_t *result)
+{
+    uint64_t immhi = (insn >> 5) & 0x7ffffu;
+    uint64_t immlo = (insn >> 29) & 0x3u;
+    int64_t imm = aarch64_sign_extend((immhi << 2) | immlo, 21);
+    uint64_t base = pc;
+
+    if (adrp) {
+        base &= ~0xfffULL;
+        imm *= 4096;
+    }
+    return aarch64_add_signed(base, imm, result);
+}
+
+static uint64_t aarch64_find_main_block(FILE *f, const Elf64_Ehdr *ehdr,
+                                        const uint8_t *phdrs,
+                                        uint64_t block_va, int depth)
+{
+    if (depth <= 0)
+        return 0;
+
+    for (unsigned int i = 0; i < 16; i++) {
+        uint64_t pc;
+        uint32_t insn;
+        uint32_t rd;
+
+        if (block_va > UINT64_MAX - (uint64_t)i * sizeof(insn))
+            return 0;
+        pc = block_va + (uint64_t)i * sizeof(insn);
+        if (read_elf_va(f, ehdr, phdrs, pc, &insn, sizeof(insn), PF_X) !=
+            sizeof(insn))
+            return 0;
+
+        if (aarch64_is_b_imm(insn)) {
+            int64_t delta = aarch64_sign_extend(insn & 0x03ffffffu, 26) * 4;
+            uint64_t target;
+
+            if (aarch64_add_signed(pc, delta, &target) && target != pc)
+                return aarch64_find_main_block(f, ehdr, phdrs, target,
+                                                depth - 1);
+            continue;
+        }
+
+        rd = insn & 31u;
+        if (rd != 0)
+            continue;
+
+        if (aarch64_is_adr(insn)) {
+            uint64_t target;
+            return aarch64_decode_pc_rel(pc, insn, 0, &target) ? target : 0;
+        }
+
+        if (aarch64_is_adrp(insn)) {
+            uint64_t base;
+            uint64_t next_pc;
+            uint32_t next;
+            uint32_t next_rd;
+            uint32_t next_rn;
+
+            if (!aarch64_decode_pc_rel(pc, insn, 1, &base) ||
+                pc > UINT64_MAX - sizeof(next))
+                continue;
+            next_pc = pc + sizeof(next);
+            if (read_elf_va(f, ehdr, phdrs, next_pc, &next, sizeof(next),
+                            PF_X) != sizeof(next))
+                continue;
+            next_rd = next & 31u;
+            next_rn = (next >> 5) & 31u;
+
+            if (aarch64_is_add_imm64(next) && next_rd == 0 && next_rn == 0) {
+                uint64_t imm = (next >> 10) & 0xfffu;
+                if ((next >> 22) & 1u)
+                    imm <<= 12;
+                return base <= UINT64_MAX - imm ? base + imm : 0;
+            }
+
+            if (aarch64_is_ldr_uimm64(next) && next_rd == 0 && next_rn == 0) {
+                uint64_t offset = ((next >> 10) & 0xfffu) << 3;
+                uint64_t slot;
+                uint64_t target;
+
+                if (base > UINT64_MAX - offset)
+                    return 0;
+                slot = base + offset;
+                if (read_elf_va(f, ehdr, phdrs, slot, &target,
+                                sizeof(target), 0) != sizeof(target))
+                    return 0;
+                return target;
+            }
+        }
+    }
+    return 0;
+}
+
+/* AArch64 CRTs pass main in x0 using ADR, ADRP+ADD, or ADRP+LDR.  Some
+ * toolchains put that sequence behind an unconditional B veneer. */
+static uint64_t find_main_from_entry(FILE *f, const Elf64_Ehdr *ehdr,
+                                     const uint8_t *phdrs)
+{
+    uint64_t main_va = aarch64_find_main_block(f, ehdr, phdrs,
+                                                ehdr->e_entry, 3);
+
+    if (main_va && elf_va_is_executable(ehdr, phdrs, main_va)) {
+        fprintf(stderr, "dlfreeze: extracted main=0x%lx from _start\n",
+                (unsigned long)main_va);
+        return main_va;
+    }
+    return 0;
+}
+#endif
 
 /* ---- compute per-library metadata for direct loading ------------- */
 static int compute_lib_meta(const char *path, uint64_t base, uint32_t flags,
@@ -482,8 +693,21 @@ static int compute_lib_meta(const char *path, uint64_t base, uint32_t flags,
         fclose(f); return -1;
     }
     if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0 ||
-        ehdr.e_ident[EI_CLASS] != ELFCLASS64) {
-        fprintf(stderr, "dlfreeze: %s: not a 64-bit ELF\n", path);
+        ehdr.e_ident[EI_CLASS] != ELFCLASS64 ||
+        ehdr.e_ident[EI_DATA] != ELFDATA2LSB ||
+        ehdr.e_phentsize != sizeof(Elf64_Phdr)) {
+        fprintf(stderr, "dlfreeze: %s: unsupported or malformed ELF\n", path);
+        fclose(f); return -1;
+    }
+#if defined(__x86_64__)
+    if (ehdr.e_machine != EM_X86_64) {
+#elif defined(__aarch64__)
+    if (ehdr.e_machine != EM_AARCH64) {
+#else
+    if (1) {
+#endif
+        fprintf(stderr, "dlfreeze: %s: ELF machine does not match dlfreeze\n",
+                path);
         fclose(f); return -1;
     }
 
@@ -505,7 +729,12 @@ static int compute_lib_meta(const char *path, uint64_t base, uint32_t flags,
         meta->flags |= DLFRZ_FLAG_RUNTIME_SCAN;
 
     /* Read program headers to get VA span */
-    size_t phsz = ehdr.e_phnum * ehdr.e_phentsize;
+    if (ehdr.e_phnum == 0 ||
+        (uint64_t)ehdr.e_phoff +
+            (uint64_t)ehdr.e_phnum * sizeof(Elf64_Phdr) > (uint64_t)LONG_MAX) {
+        fclose(f); return -1;
+    }
+    size_t phsz = (size_t)ehdr.e_phnum * sizeof(Elf64_Phdr);
     uint8_t *phdrs = malloc(phsz);
     if (!phdrs) { fclose(f); return -1; }
     fseek(f, ehdr.e_phoff, SEEK_SET);
@@ -513,17 +742,32 @@ static int compute_lib_meta(const char *path, uint64_t base, uint32_t flags,
         free(phdrs); fclose(f); return -1;
     }
 
-    uint64_t lo = UINT64_MAX, hi = 0;
+    uint64_t lo = UINT64_MAX, hi = 0, phdr_vaddr = UINT64_MAX;
+    uint64_t phdr_file_end = ehdr.e_phoff + phsz;
     for (int i = 0; i < ehdr.e_phnum; i++) {
         Elf64_Phdr *ph = (Elf64_Phdr *)(phdrs + i * ehdr.e_phentsize);
         if (ph->p_type != PT_LOAD) continue;
         if (ph->p_vaddr < lo) lo = ph->p_vaddr;
+        if (ph->p_memsz > UINT64_MAX - ph->p_vaddr) {
+            free(phdrs); fclose(f); return -1;
+        }
         uint64_t end = ph->p_vaddr + ph->p_memsz;
         if (end > hi) hi = end;
+        if (ehdr.e_phoff >= ph->p_offset &&
+            phdr_file_end >= ehdr.e_phoff &&
+            phdr_file_end - ph->p_offset <= ph->p_filesz)
+            phdr_vaddr = ph->p_vaddr + (ehdr.e_phoff - ph->p_offset);
     }
 
     if (flags & DLFRZ_FLAG_MAIN_EXE) {
         meta->main_sym = find_named_symbol(f, &ehdr, "main");
+        if (meta->main_sym &&
+            !elf_va_is_executable(&ehdr, phdrs, meta->main_sym)) {
+            fprintf(stderr,
+                    "dlfreeze: ignoring main symbol outside executable "
+                    "PT_LOAD in %s\n", path);
+            meta->main_sym = 0;
+        }
         if (!meta->main_sym)
             meta->main_sym = find_main_from_entry(f, &ehdr, phdrs);
     }
@@ -531,14 +775,13 @@ static int compute_lib_meta(const char *path, uint64_t base, uint32_t flags,
     free(phdrs);
     fclose(f);
 
-    if (lo > hi) { lo = hi = 0; }
+    if (lo > hi || phdr_vaddr == UINT64_MAX || phdr_vaddr > UINT32_MAX) {
+        fprintf(stderr, "dlfreeze: %s: program headers are not loadable\n", path);
+        return -1;
+    }
     meta->vaddr_lo = lo;
     meta->vaddr_hi = hi;
-
-    /* Convert phdr_off from file offset to virtual address.  The phdr
-     * table lives in the first PT_LOAD segment whose p_offset is always 0
-     * for standard ELFs, so: phdr_vaddr = e_phoff + first_load_vaddr. */
-    meta->phdr_off = (uint32_t)(ehdr.e_phoff + lo);
+    meta->phdr_off = (uint32_t)phdr_vaddr;
     return 0;
 }
 
@@ -560,6 +803,7 @@ struct prelink_obj {
     const char       *dynstr;
     uint32_t          dynsym_count;
     const uint32_t   *gnu_hash;
+    const uint32_t   *sysv_hash;
     const uint16_t   *versym;
 
     const Elf64_Rela *rela;
@@ -583,12 +827,30 @@ static uint32_t pl_gnu_hash(const char *name)
     return h;
 }
 
+static uint32_t pl_sysv_hash(const char *name)
+{
+    uint32_t h = 0;
+
+    for (const uint8_t *p = (const uint8_t *)name; *p; p++) {
+        uint32_t high;
+
+        h = (h << 4) + *p;
+        high = h & 0xf0000000U;
+        if (high)
+            h ^= high >> 24;
+        h &= ~high;
+    }
+    return h;
+}
+
 static const Elf64_Sym *pl_lookup_gnu(const struct prelink_obj *obj,
                                        const char *name, uint32_t gh)
 {
     const uint32_t *ht = obj->gnu_hash;
     if (!ht) return NULL;
     uint32_t nbuckets = ht[0], symoffset = ht[1], bloom_size = ht[2], bloom_shift = ht[3];
+    if (nbuckets == 0 || bloom_size == 0 || bloom_shift >= 32)
+        return NULL;
     const uint64_t *bloom = (const uint64_t *)&ht[4];
     const uint32_t *buckets = (const uint32_t *)(bloom + bloom_size);
     const uint32_t *chain = &buckets[nbuckets];
@@ -598,10 +860,10 @@ static const Elf64_Sym *pl_lookup_gnu(const struct prelink_obj *obj,
     if ((word & mask) != mask) return NULL;
 
     uint32_t idx = buckets[gh % nbuckets];
-    if (idx < symoffset) return NULL;
+    if (idx < symoffset || idx >= obj->dynsym_count) return NULL;
 
     const Elf64_Sym *fallback = NULL;
-    for (;;) {
+    while (idx < obj->dynsym_count) {
         uint32_t hv = chain[idx - symoffset];
         if ((hv | 1) == (gh | 1)) {
             const Elf64_Sym *s = &obj->dynsym[idx];
@@ -632,6 +894,46 @@ static const Elf64_Sym *pl_lookup_linear(const struct prelink_obj *obj,
             if (!fallback)
                 fallback = s;
         }
+    }
+    return fallback;
+}
+
+static const Elf64_Sym *pl_lookup_sysv(const struct prelink_obj *obj,
+                                        const char *name)
+{
+    const uint32_t *ht = obj->sysv_hash;
+    uint32_t nbuckets;
+    uint32_t nchain;
+    const uint32_t *buckets;
+    const uint32_t *chains;
+    uint32_t idx;
+    const Elf64_Sym *fallback = NULL;
+
+    if (!ht)
+        return NULL;
+    nbuckets = ht[0];
+    nchain = ht[1];
+    if (nbuckets == 0 || nchain == 0)
+        return NULL;
+    buckets = &ht[2];
+    chains = &buckets[nbuckets];
+    idx = buckets[pl_sysv_hash(name) % nbuckets];
+
+    for (uint32_t steps = 0; idx != STN_UNDEF && steps < nchain; steps++) {
+        const Elf64_Sym *sym;
+
+        if (idx >= nchain || idx >= obj->dynsym_count)
+            return NULL;
+        sym = &obj->dynsym[idx];
+        if (sym->st_shndx != SHN_UNDEF &&
+            ELF64_ST_BIND(sym->st_info) != STB_LOCAL &&
+            strcmp(obj->dynstr + sym->st_name, name) == 0) {
+            if (!obj->versym || !(obj->versym[idx] & 0x8000))
+                return sym;
+            if (!fallback)
+                fallback = sym;
+        }
+        idx = chains[idx];
     }
     return fallback;
 }
@@ -670,7 +972,9 @@ static uint64_t pl_resolve_sym(struct prelink_obj *objs, int nobj,
     for (int i = 0; i < nobj; i++) {
         const Elf64_Sym *sym = objs[i].gnu_hash
             ? pl_lookup_gnu(&objs[i], name, gh)
-            : pl_lookup_linear(&objs[i], name);
+            : (objs[i].sysv_hash
+                ? pl_lookup_sysv(&objs[i], name)
+                : pl_lookup_linear(&objs[i], name));
         if (sym) {
             if (ELF64_ST_TYPE(sym->st_info) == STT_GNU_IFUNC) {
                 result = 0;
@@ -715,7 +1019,7 @@ static void pl_parse_dynamic(struct prelink_obj *obj, uint64_t base,
     uint64_t v_rela = 0, rela_sz = 0;
     uint64_t jmprel = 0, pltrelsz = 0;
     uint64_t v_relr = 0, relr_sz = 0;
-    uint64_t hash_addr = 0;
+    uint64_t gnu_hash_addr = 0, sysv_hash_addr = 0;
     uint64_t versym_addr = 0;
 
     for (size_t i = 0; i < dyn_count && dyn[i].d_tag != DT_NULL; i++) {
@@ -727,7 +1031,8 @@ static void pl_parse_dynamic(struct prelink_obj *obj, uint64_t base,
         case DT_RELASZ:       rela_sz = dyn[i].d_un.d_val;      break;
         case DT_JMPREL:       jmprel = dyn[i].d_un.d_ptr;       break;
         case DT_PLTRELSZ:     pltrelsz = dyn[i].d_un.d_val;     break;
-        case DT_GNU_HASH:     hash_addr = dyn[i].d_un.d_ptr;    break;
+        case DT_GNU_HASH:     gnu_hash_addr = dyn[i].d_un.d_ptr; break;
+        case DT_HASH:         sysv_hash_addr = dyn[i].d_un.d_ptr; break;
         case DT_VERSYM:       versym_addr = dyn[i].d_un.d_ptr;  break;
         case 36: /* DT_RELR */   v_relr = dyn[i].d_un.d_ptr;    break;
         case 35: /* DT_RELRSZ */ relr_sz = dyn[i].d_un.d_val;   break;
@@ -736,26 +1041,46 @@ static void pl_parse_dynamic(struct prelink_obj *obj, uint64_t base,
 
     if (symtab)      obj->dynsym   = (const Elf64_Sym *)(base + symtab);
     if (strtab)      obj->dynstr   = (const char *)(base + strtab);
-    if (hash_addr)   obj->gnu_hash = (const uint32_t *)(base + hash_addr);
+    if (gnu_hash_addr)
+        obj->gnu_hash = (const uint32_t *)(base + gnu_hash_addr);
+    if (sysv_hash_addr)
+        obj->sysv_hash = (const uint32_t *)(base + sysv_hash_addr);
     if (versym_addr) obj->versym   = (const uint16_t *)(base + versym_addr);
 
+    if (strsz > 0 && strtab > symtab) {
+        uint64_t span = (strtab - symtab) / sizeof(Elf64_Sym);
+        obj->dynsym_count = span > UINT32_MAX
+            ? UINT32_MAX : (uint32_t)span;
+    }
+    if (obj->sysv_hash && obj->sysv_hash[0] != 0 &&
+        obj->sysv_hash[1] > obj->dynsym_count)
+        obj->dynsym_count = obj->sysv_hash[1];
     if (obj->gnu_hash) {
         const uint32_t *ht = obj->gnu_hash;
         uint32_t nb = ht[0], so = ht[1], bs = ht[2];
-        const uint32_t *bk = (const uint32_t *)((const uint64_t *)&ht[4] + bs);
-        const uint32_t *ch = &bk[nb];
-        uint32_t mx = so;
-        for (uint32_t b = 0; b < nb; b++)
-            if (bk[b] > mx) mx = bk[b];
-        if (mx >= so)
-            while (!(ch[mx - so] & 1)) mx++;
-        obj->dynsym_count = mx + 1;
-    }
-    if (strsz > 0 && strtab > symtab) {
-        uint32_t span_count = (uint32_t)((strtab - symtab) / sizeof(Elf64_Sym));
-
-        if (span_count > obj->dynsym_count)
-            obj->dynsym_count = span_count;
+        if (nb != 0 && bs != 0 && ht[3] < 32) {
+            const uint32_t *bk =
+                (const uint32_t *)((const uint64_t *)&ht[4] + bs);
+            const uint32_t *ch = &bk[nb];
+            uint32_t mx = 0;
+            int have_symbol = 0;
+            for (uint32_t b = 0; b < nb; b++) {
+                if (bk[b] == STN_UNDEF)
+                    continue;
+                if (!have_symbol || bk[b] > mx)
+                    mx = bk[b];
+                have_symbol = 1;
+            }
+            if (have_symbol && mx >= so) {
+                uint32_t limit = obj->dynsym_count
+                    ? obj->dynsym_count : UINT32_MAX;
+                while (mx < limit && !(ch[mx - so] & 1))
+                    mx++;
+                if (mx < limit && mx != UINT32_MAX &&
+                    mx + 1 > obj->dynsym_count)
+                    obj->dynsym_count = mx + 1;
+            }
+        }
     }
 
     if (v_rela)     obj->rela       = (const Elf64_Rela *)(base + v_rela);
@@ -821,6 +1146,9 @@ static int pl_apply_rela(struct prelink_obj *obj,
         if (pass != 0) continue;
 
         switch (type) {
+        case 0: /* R_X86_64_NONE / R_AARCH64_NONE */
+            break;
+
         case ARCH_RELOC_RELATIVE:
             *slot = base + r->r_addend;
             break;
@@ -858,7 +1186,10 @@ static int pl_apply_rela(struct prelink_obj *obj,
             break;
 
         default:
-            break;
+            fprintf(stderr,
+                    "dlfreeze: unsupported relocation type %u during pre-link\n",
+                    type);
+            return -1;
         }
     }
     return 0;
@@ -903,9 +1234,12 @@ static int prelink_obj_collect_runtime_fixups(const struct prelink_obj *obj,
                         const Elf64_Sym *sym = &obj->dynsym[sidx];
                         const char *name = obj->dynstr + sym->st_name;
                         uint64_t slot = *(const uint64_t *)(obj->base + rel->r_offset);
+                        int versioned = obj->versym &&
+                            (obj->versym[sidx] & 0x7fff) > 1;
 
                         if (slot == 0 || runtime_reloc_name_match(name) ||
-                            ELF64_ST_BIND(sym->st_info) != STB_WEAK) {
+                            ELF64_ST_BIND(sym->st_info) != STB_WEAK ||
+                            versioned) {
                             needs_fixup = 1;
                         }
                     }
@@ -923,7 +1257,9 @@ static int prelink_obj_collect_runtime_fixups(const struct prelink_obj *obj,
                     needs_fixup = 1;
                 } else if (sidx != 0 && sidx < obj->dynsym_count) {
                     const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
-                    if (runtime_reloc_name_match(name))
+                    if (runtime_reloc_name_match(name) ||
+                        (obj->versym &&
+                         (obj->versym[sidx] & 0x7fff) > 1))
                         needs_fixup = 1;
                 }
             }
@@ -1007,9 +1343,9 @@ static int prelink_objects(const char *output_path,
             /* Skip embedded data files — not ELFs */
             if (m->flags & DLFRZ_FLAG_DATA) continue;
 
-        uint64_t lo   = m->vaddr_lo & ~0xFFFULL;
-        uint64_t hi   = ALIGN_UP(m->vaddr_hi, 4096);
-        uint64_t span = hi - lo + 4 * 4096;
+            uint64_t lo   = m->vaddr_lo & ~(PAYLOAD_ALIGN - 1);
+            uint64_t hi   = ALIGN_UP(m->vaddr_hi, PAYLOAD_ALIGN);
+            uint64_t span = hi - lo + 4 * PAYLOAD_ALIGN;
 
         void *mapped = mmap((void *)(base + lo), span,
                             PROT_READ | PROT_WRITE | PROT_EXEC,
@@ -1021,7 +1357,12 @@ static int prelink_objects(const char *output_path,
         size_t phsz = m->phdr_num * m->phdr_entsz;
         uint8_t *phdr_buf = malloc(phsz);
         if (!phdr_buf) _exit(1);
-        fseek(outf, entries[i].data_offset + m->phdr_off - m->vaddr_lo, SEEK_SET);
+        Elf64_Ehdr embedded_ehdr;
+        fseek(outf, entries[i].data_offset, SEEK_SET);
+        if (fread(&embedded_ehdr, 1, sizeof(embedded_ehdr), outf) !=
+            sizeof(embedded_ehdr))
+            _exit(1);
+        fseek(outf, entries[i].data_offset + embedded_ehdr.e_phoff, SEEK_SET);
         if (fread(phdr_buf, 1, phsz, outf) != phsz) _exit(1);
 
         /* Load each PT_LOAD segment */
@@ -1080,36 +1421,42 @@ static int prelink_objects(const char *output_path,
             if (metas[i].flags & DLFRZ_FLAG_DLOPEN) continue;
             if (metas[i].flags & DLFRZ_FLAG_DATA) continue;
         pl_apply_relr(&objs[i]);
-        if (objs[i].rela_count > 0)
+        if (objs[i].rela_count > 0 &&
             pl_apply_rela(&objs[i], objs[i].rela, objs[i].rela_count,
-                          objs, nobj, 0);
-        if (objs[i].jmprel_count > 0)
+                          objs, nobj, 0) < 0)
+            _exit(1);
+        if (objs[i].jmprel_count > 0 &&
             pl_apply_rela(&objs[i], objs[i].jmprel, objs[i].jmprel_count,
-                          objs, nobj, 0);
+                          objs, nobj, 0) < 0)
+            _exit(1);
     }
     /* Pass 1: IRELATIVE (resolvers can read populated GOTs) */
     for (int i = 0; i < nobj; i++) {
             if (metas[i].flags & DLFRZ_FLAG_INTERP) continue;
             if (metas[i].flags & DLFRZ_FLAG_DLOPEN) continue;
             if (metas[i].flags & DLFRZ_FLAG_DATA) continue;
-        if (objs[i].rela_count > 0)
+        if (objs[i].rela_count > 0 &&
             pl_apply_rela(&objs[i], objs[i].rela, objs[i].rela_count,
-                          objs, nobj, 1);
-        if (objs[i].jmprel_count > 0)
+                          objs, nobj, 1) < 0)
+            _exit(1);
+        if (objs[i].jmprel_count > 0 &&
             pl_apply_rela(&objs[i], objs[i].jmprel, objs[i].jmprel_count,
-                          objs, nobj, 1);
+                          objs, nobj, 1) < 0)
+            _exit(1);
     }
     /* Pass 2: COPY after source DSOs have already been fully relocated. */
     for (int i = 0; i < nobj; i++) {
             if (metas[i].flags & DLFRZ_FLAG_INTERP) continue;
             if (metas[i].flags & DLFRZ_FLAG_DLOPEN) continue;
             if (metas[i].flags & DLFRZ_FLAG_DATA) continue;
-        if (objs[i].rela_count > 0)
+        if (objs[i].rela_count > 0 &&
             pl_apply_rela(&objs[i], objs[i].rela, objs[i].rela_count,
-                          objs, nobj, 2);
-        if (objs[i].jmprel_count > 0)
+                          objs, nobj, 2) < 0)
+            _exit(1);
+        if (objs[i].jmprel_count > 0 &&
             pl_apply_rela(&objs[i], objs[i].jmprel, objs[i].jmprel_count,
-                          objs, nobj, 2);
+                          objs, nobj, 2) < 0)
+            _exit(1);
     }
 
     for (int i = 0; i < nobj; i++) {
@@ -1222,10 +1569,10 @@ static int prelink_objects(const char *output_path,
  *     and size.  This survives UPX decompression because it lives in a
  *     PT_LOAD segment.
  *
- *  2. A spare program-header entry (PT_GNU_STACK) is converted into a
- *     PT_LOAD that maps the payload region.  UPX compresses all PT_LOAD
- *     segments and decompresses them back at runtime, so the payload
- *     becomes accessible in virtual memory even after UPX.
+ *  2. A non-runtime PT_NOTE entry is converted into a PT_LOAD that maps the
+ *     payload region.  PT_GNU_STACK is deliberately preserved so the frozen
+ *     executable retains the bootstrap's non-executable-stack policy.  UPX
+ *     compresses all PT_LOAD segments and restores them at runtime.
  *
  *  3. Section-header metadata is zeroed out (UPX strips it anyway).
  */
@@ -1256,14 +1603,14 @@ static int patch_elf_for_upx(const char *path, size_t bootstrap_sz,
     }
 
     /* Payload VA: next page-aligned address after the last PT_LOAD */
-    uint64_t payload_vaddr = ALIGN_UP(max_va, 4096);
+    uint64_t payload_vaddr = ALIGN_UP(max_va, PAYLOAD_ALIGN);
     size_t payload_filesz = total_sz - payload_off;
 
-    /* --- Find and repurpose PT_GNU_STACK → PT_LOAD for payload --- */
-    int found_stack = 0;
+    /* --- Find and repurpose a non-runtime PT_NOTE for the payload. --- */
+    int found_payload_slot = 0;
     for (int i = 0; i < ehdr->e_phnum; i++) {
         Elf64_Phdr *ph = (Elf64_Phdr *)(hdr + ehdr->e_phoff + i * ehdr->e_phentsize);
-        if (ph->p_type == PT_GNU_STACK) {
+        if (ph->p_type == PT_NOTE) {
             ph->p_type   = PT_LOAD;
             ph->p_flags  = PF_R;
             ph->p_offset = payload_off;
@@ -1271,14 +1618,16 @@ static int patch_elf_for_upx(const char *path, size_t bootstrap_sz,
             ph->p_paddr  = payload_vaddr;
             ph->p_filesz = payload_filesz;
             ph->p_memsz  = payload_filesz;
-            ph->p_align  = 4096;
-            found_stack = 1;
+            ph->p_align  = PAYLOAD_ALIGN;
+            found_payload_slot = 1;
             break;
         }
     }
-    if (!found_stack) {
-        fprintf(stderr, "dlfreeze: warning: no PT_GNU_STACK to repurpose\n");
-        /* Continue anyway — file-based path will still work */
+    if (!found_payload_slot) {
+        fprintf(stderr,
+                "dlfreeze: warning: no spare PT_NOTE; UPX compatibility "
+                "is disabled for this output\n");
+        /* Normal EOF-based payload discovery remains fully functional. */
     }
 
     /* --- Zero section-header table if not already set by symtab --- */
@@ -1299,10 +1648,15 @@ static int patch_elf_for_upx(const char *path, size_t bootstrap_sz,
             memcpy(&v2, hdr + i + 16, 8);
             memcpy(&v3, hdr + i + 24, 8);
             if (v1 == 0 && v2 == 0 && v3 == 0) {
-                /* Patch with real values */
+                /* Patch with real values.  Without a safe spare program
+                 * header, leave the in-memory location disabled. */
                 uint64_t foff = payload_off;
-                memcpy(hdr + i + 8, &payload_vaddr, 8);
-                memcpy(hdr + i + 16, &payload_filesz, 8);
+                uint64_t mapped_vaddr =
+                    found_payload_slot ? payload_vaddr : 0;
+                uint64_t mapped_filesz =
+                    found_payload_slot ? payload_filesz : 0;
+                memcpy(hdr + i + 8, &mapped_vaddr, 8);
+                memcpy(hdr + i + 16, &mapped_filesz, 8);
                 memcpy(hdr + i + 24, &foff, 8);
                 patched = 1;
                 break;
@@ -1890,6 +2244,71 @@ static int append_combined_symtab(const char *path,
 }
 
 /* ------------------------------------------------------------------ */
+static int elf_defines_symbol(const char *path, const char *name)
+{
+    FILE *file = fopen(path, "rb");
+    Elf64_Ehdr ehdr;
+    int found = 0;
+
+    if (!file)
+        return 0;
+    if (fread(&ehdr, 1, sizeof(ehdr), file) == sizeof(ehdr) &&
+        memcmp(ehdr.e_ident, ELFMAG, SELFMAG) == 0 &&
+        ehdr.e_ident[EI_CLASS] == ELFCLASS64)
+        found = find_named_symbol(file, &ehdr, name) != 0;
+    fclose(file);
+    return found;
+}
+
+static int file_contains_string(const char *path, const char *needle)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    struct stat st;
+    void *map;
+    int found = 0;
+
+    if (fd < 0)
+        return 0;
+    if (fstat(fd, &st) < 0 || st.st_size <= 0)
+        goto out;
+    map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (map == MAP_FAILED)
+        goto out;
+    found = memmem(map, (size_t)st.st_size, needle, strlen(needle)) != NULL;
+    munmap(map, (size_t)st.st_size);
+
+out:
+    close(fd);
+    return found;
+}
+
+static int direct_runtime_supported(const struct pack_options *opts)
+{
+    const char *interp_path = opts->deps->interp_path;
+    const char *base;
+
+    if (!interp_path)
+        return 0;
+    base = strrchr(interp_path, '/');
+    base = base ? base + 1 : interp_path;
+    if (strncmp(base, "ld-musl", 7) == 0)
+        return file_contains_string(interp_path, "musl libc (");
+    if (strncmp(base, "ld-linux", 8) != 0 ||
+        !elf_defines_symbol(interp_path, "_rtld_global") ||
+        !elf_defines_symbol(interp_path, "_rtld_global_ro"))
+        return 0;
+
+    for (int i = 0; i < opts->deps->count; i++) {
+        if (strcmp(opts->deps->libs[i].name, "libc.so.6") == 0 &&
+            elf_defines_symbol(opts->deps->libs[i].path,
+                               "gnu_get_libc_version") &&
+            elf_defines_symbol(opts->deps->libs[i].path,
+                               "__libc_early_init"))
+            return 1;
+    }
+    return 0;
+}
+
 int pack_frozen(const struct pack_options *opts)
 {
     FILE *out = fopen(opts->output_path, "wb");
@@ -1914,9 +2333,8 @@ int pack_frozen(const struct pack_options *opts)
     /* Store directory-qualified sonames (dirname(path)/soname) so that:
      *   - dl_basename() still matches DT_NEEDED sonames at runtime
      *   - profilers and dl_iterate_phdr get paths that exist on disk
-     * Note: realpath() may resolve symlinks to versioned names like
-     * libQt6Core.so.6.11.0, but DT_NEEDED uses soname "libQt6Core.so.6",
-     * so we use dirname(resolved_path)/soname for libraries. */
+     * Note: realpath() may resolve a soname symlink to a fully versioned
+     * filename, so use dirname(resolved_path)/soname for libraries. */
     size_t strsz = 0;
     const char *main_name = opts->exe_name ? opts->exe_name : opts->exe_path;
 
@@ -1933,7 +2351,7 @@ int pack_frozen(const struct pack_options *opts)
     int eidx = 0;
 
     /* 2. main executable ------------------------------------------- */
-    write_pad(out, off, 4096); off = ALIGN_UP(off, 4096);
+    write_pad(out, off, PAYLOAD_ALIGN); off = ALIGN_UP(off, PAYLOAD_ALIGN);
     size_t payload_off = off;   /* start of the payload region */
     entries[eidx].data_offset = off;
     entries[eidx].flags       = DLFRZ_FLAG_MAIN_EXE;
@@ -1946,7 +2364,7 @@ int pack_frozen(const struct pack_options *opts)
 
     /* 3. interpreter ----------------------------------------------- */
     if (opts->deps->interp_path) {
-        write_pad(out, off, 4096); off = ALIGN_UP(off, 4096);
+        write_pad(out, off, PAYLOAD_ALIGN); off = ALIGN_UP(off, PAYLOAD_ALIGN);
         entries[eidx].data_offset = off;
         entries[eidx].flags       = DLFRZ_FLAG_INTERP;
         entries[eidx].name_offset = stroff;
@@ -1959,16 +2377,14 @@ int pack_frozen(const struct pack_options *opts)
 
     /* 4. shared libraries ------------------------------------------ */
     for (int i = 0; i < opts->deps->count; i++) {
-        write_pad(out, off, 4096); off = ALIGN_UP(off, 4096);
+        write_pad(out, off, PAYLOAD_ALIGN); off = ALIGN_UP(off, PAYLOAD_ALIGN);
         entries[eidx].data_offset = off;
         entries[eidx].flags       = DLFRZ_FLAG_SHLIB;
         if (opts->deps->libs[i].from_dlopen)
             entries[eidx].flags |= DLFRZ_FLAG_DLOPEN;
         entries[eidx].name_offset = stroff;
-        /* Build dirname(path)/soname — e.g. "/usr/lib/libQt6Core.so.6"
-         * The path may have been resolved via realpath() to a versioned
-         * name like libQt6Core.so.6.11.0, but we need the soname for
-         * basename matching against DT_NEEDED entries at runtime.
+        /* Build dirname(path)/soname.  The resolved path may use a fully
+         * versioned filename, but runtime DT_NEEDED matching needs the soname.
          *
          * Direct dlopen captures use the probed absolute path, not
          * DT_NEEDED-style soname lookup.  When the soname does not match
@@ -2044,7 +2460,12 @@ int pack_frozen(const struct pack_options *opts)
 
     /* 6b. loader metadata (direct-load mode) ----------------------- */
     size_t meta_off = 0;
-    if (opts->direct_load) {
+    if (opts->direct_load && !direct_runtime_supported(opts)) {
+        fprintf(stderr,
+                "dlfreeze: warning: direct-load is unavailable for runtime %s; "
+                "creating an extraction-mode binary\n",
+                opts->deps->interp_path ? opts->deps->interp_path : "(none)");
+    } else if (opts->direct_load) {
         metas = calloc(eidx, sizeof(*metas));
         if (!metas) goto fail2;
 
@@ -2055,8 +2476,18 @@ int pack_frozen(const struct pack_options *opts)
                 continue;
             }
             if (compute_lib_meta(src_paths[i], base, entries[i].flags,
-                                  &metas[i]) < 0) {
+                                 &metas[i]) < 0) {
                 goto fail2;
+            }
+            if ((entries[i].flags & DLFRZ_FLAG_MAIN_EXE) &&
+                metas[i].main_sym == 0) {
+                fprintf(stderr,
+                        "dlfreeze: warning: cannot establish main address "
+                        "for %s; creating an extraction-mode binary\n",
+                        src_paths[i]);
+                free(metas);
+                metas = NULL;
+                break;
             }
 
             /* Non-PIE executables (ET_EXEC) have absolute addresses
@@ -2067,16 +2498,30 @@ int pack_frozen(const struct pack_options *opts)
                 metas[i].vaddr_lo != 0) {
                 metas[i].base_addr = 0;
                 /* Verify the exe doesn't overlap with either the
-                 * bootstrap (at 0x40000000) or the DSO region. */
-                if (metas[i].vaddr_hi > 0x40000000ULL) {
+                 * bootstrap (at 0x40000000) or its trailing guard pages. */
+                if (metas[i].vaddr_hi > UINT64_MAX - 5 * PAYLOAD_ALIGN ||
+                    ALIGN_UP(metas[i].vaddr_hi, PAYLOAD_ALIGN) +
+                        4 * PAYLOAD_ALIGN > 0x40000000ULL) {
                     fprintf(stderr,
-                            "dlfreeze: non-PIE executable VA range extends "
-                            "past 0x40000000; direct-load not supported\n");
+                            "dlfreeze: non-PIE executable VA range or guards "
+                            "overlap the bootstrap; direct-load not supported\n");
                     free(metas); metas = NULL;
                     break;
                 }
             } else {
-                base += ALIGN_UP(metas[i].vaddr_hi, 0x200000);
+                /* Leave room for the loader's trailing guard pages even when
+                 * an object's high VA is exactly on a 2 MiB boundary. */
+                if (metas[i].vaddr_hi > UINT64_MAX - 4 * PAYLOAD_ALIGN) {
+                    free(metas); metas = NULL;
+                    break;
+                }
+                uint64_t step = ALIGN_UP(
+                    metas[i].vaddr_hi + 4 * PAYLOAD_ALIGN, 0x200000);
+                if (base > UINT64_MAX - step) {
+                    free(metas); metas = NULL;
+                    break;
+                }
+                base += step;
             }
         }
 

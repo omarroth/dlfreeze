@@ -7,6 +7,24 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 
+static int range_in_file(uint64_t offset, uint64_t length, size_t size)
+{
+    return offset <= size && length <= size - offset;
+}
+
+static const char *dynamic_string(const char *strtab, size_t strtab_size,
+                                  uint64_t offset)
+{
+    const char *value;
+
+    if (offset >= strtab_size)
+        return NULL;
+    value = strtab + offset;
+    if (!memchr(value, '\0', strtab_size - offset))
+        return NULL;
+    return value;
+}
+
 int elf_check(const char *path)
 {
     unsigned char hdr[4];
@@ -26,12 +44,21 @@ static int parse_elf64(const uint8_t *data, size_t size, struct elf_info *info)
     if (size < sizeof(Elf64_Ehdr)) return -1;
     const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *)data;
 
+    if (ehdr->e_ident[EI_DATA] != ELFDATA2LSB ||
+        ehdr->e_ident[EI_VERSION] != EV_CURRENT ||
+        ehdr->e_version != EV_CURRENT ||
+        ehdr->e_ehsize != sizeof(*ehdr) ||
+        ehdr->e_phentsize != sizeof(Elf64_Phdr))
+        return -1;
+
     info->ei_class  = ELFCLASS64;
     info->e_machine = ehdr->e_machine;
     info->is_pie    = (ehdr->e_type == ET_DYN);
 
     if (ehdr->e_phoff == 0 || ehdr->e_phnum == 0) return -1;
-    if (ehdr->e_phoff + (uint64_t)ehdr->e_phnum * ehdr->e_phentsize > size) return -1;
+    if (!range_in_file(ehdr->e_phoff,
+                       (uint64_t)ehdr->e_phnum * sizeof(Elf64_Phdr), size))
+        return -1;
 
     const Elf64_Phdr *phdr = (const Elf64_Phdr *)(data + ehdr->e_phoff);
 
@@ -41,22 +68,27 @@ static int parse_elf64(const uint8_t *data, size_t size, struct elf_info *info)
     /* First pass: PT_INTERP + PT_DYNAMIC */
     for (int i = 0; i < ehdr->e_phnum; i++) {
         if (phdr[i].p_type == PT_INTERP) {
-            if (phdr[i].p_offset + phdr[i].p_filesz <= size) {
-                size_t len = phdr[i].p_filesz;
-                if (len >= sizeof(info->interp)) len = sizeof(info->interp) - 1;
-                memcpy(info->interp, data + phdr[i].p_offset, len);
-                info->interp[len] = '\0';
-                /* strip trailing NUL already embedded in the segment */
-                size_t slen = strlen(info->interp);
-                if (slen > 0 && info->interp[slen-1] == '\n') info->interp[--slen] = '\0';
-            }
+            const uint8_t *value;
+            size_t len;
+
+            if (phdr[i].p_filesz == 0 ||
+                !range_in_file(phdr[i].p_offset, phdr[i].p_filesz, size))
+                return -1;
+            value = data + phdr[i].p_offset;
+            if (!memchr(value, '\0', phdr[i].p_filesz))
+                return -1;
+            len = strnlen((const char *)value, phdr[i].p_filesz);
+            if (len >= sizeof(info->interp))
+                return -1;
+            memcpy(info->interp, value, len + 1);
         }
         if (phdr[i].p_type == PT_DYNAMIC) {
             info->is_dynamic = 1;
-            if (phdr[i].p_offset + phdr[i].p_filesz <= size) {
-                dyn_section = (const Elf64_Dyn *)(data + phdr[i].p_offset);
-                dyn_count   = phdr[i].p_filesz / sizeof(Elf64_Dyn);
-            }
+            if (phdr[i].p_filesz % sizeof(Elf64_Dyn) != 0 ||
+                !range_in_file(phdr[i].p_offset, phdr[i].p_filesz, size))
+                return -1;
+            dyn_section = (const Elf64_Dyn *)(data + phdr[i].p_offset);
+            dyn_count   = phdr[i].p_filesz / sizeof(Elf64_Dyn);
         }
     }
 
@@ -64,24 +96,35 @@ static int parse_elf64(const uint8_t *data, size_t size, struct elf_info *info)
 
     /* Find the dynamic string table */
     uint64_t strtab_addr = 0;
+    uint64_t declared_strtab_size = 0;
     for (size_t i = 0; i < dyn_count; i++) {
-        if (dyn_section[i].d_tag == DT_STRTAB) {
+        if (dyn_section[i].d_tag == DT_STRTAB)
             strtab_addr = dyn_section[i].d_un.d_ptr;
-            break;
-        }
+        else if (dyn_section[i].d_tag == DT_STRSZ)
+            declared_strtab_size = dyn_section[i].d_un.d_val;
         if (dyn_section[i].d_tag == DT_NULL) break;
     }
     if (strtab_addr == 0) return 0;
 
     /* Convert VA → file offset */
     const char *dyn_strtab = NULL;
+    size_t dyn_strtab_size = 0;
     for (int i = 0; i < ehdr->e_phnum; i++) {
         if (phdr[i].p_type == PT_LOAD &&
             strtab_addr >= phdr[i].p_vaddr &&
-            strtab_addr <  phdr[i].p_vaddr + phdr[i].p_filesz)
+            strtab_addr - phdr[i].p_vaddr < phdr[i].p_filesz)
         {
             uint64_t off = phdr[i].p_offset + (strtab_addr - phdr[i].p_vaddr);
-            if (off < size) dyn_strtab = (const char *)(data + off);
+            uint64_t available = phdr[i].p_filesz -
+                                 (strtab_addr - phdr[i].p_vaddr);
+
+            if (!range_in_file(off, available, size))
+                return -1;
+            if (declared_strtab_size > available)
+                return -1;
+            dyn_strtab = (const char *)(data + off);
+            dyn_strtab_size = declared_strtab_size
+                ? (size_t)declared_strtab_size : (size_t)available;
             break;
         }
     }
@@ -104,20 +147,32 @@ static int parse_elf64(const uint8_t *data, size_t size, struct elf_info *info)
         const char *s;
         switch (dyn_section[i].d_tag) {
         case DT_NEEDED:
-            s = dyn_strtab + dyn_section[i].d_un.d_val;
-            info->needed[idx++] = strdup(s);
+            s = dynamic_string(dyn_strtab, dyn_strtab_size,
+                               dyn_section[i].d_un.d_val);
+            if (!s || !(info->needed[idx] = strdup(s)))
+                return -1;
+            idx++;
             break;
         case DT_RPATH:
-            s = dyn_strtab + dyn_section[i].d_un.d_val;
-            strncpy(info->rpath, s, sizeof(info->rpath) - 1);
+            s = dynamic_string(dyn_strtab, dyn_strtab_size,
+                               dyn_section[i].d_un.d_val);
+            if (!s || strlen(s) >= sizeof(info->rpath))
+                return -1;
+            strcpy(info->rpath, s);
             break;
         case DT_RUNPATH:
-            s = dyn_strtab + dyn_section[i].d_un.d_val;
-            strncpy(info->runpath, s, sizeof(info->runpath) - 1);
+            s = dynamic_string(dyn_strtab, dyn_strtab_size,
+                               dyn_section[i].d_un.d_val);
+            if (!s || strlen(s) >= sizeof(info->runpath))
+                return -1;
+            strcpy(info->runpath, s);
             break;
         case DT_SONAME:
-            s = dyn_strtab + dyn_section[i].d_un.d_val;
-            strncpy(info->soname, s, sizeof(info->soname) - 1);
+            s = dynamic_string(dyn_strtab, dyn_strtab_size,
+                               dyn_section[i].d_un.d_val);
+            if (!s || strlen(s) >= sizeof(info->soname))
+                return -1;
+            strcpy(info->soname, s);
             break;
         }
     }
@@ -151,6 +206,8 @@ int elf_parse(const char *path, struct elf_info *info)
 
 out:
     munmap(data, st.st_size);
+    if (ret < 0)
+        elf_info_free(info);
     return ret;
 }
 

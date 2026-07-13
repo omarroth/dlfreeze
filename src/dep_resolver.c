@@ -43,18 +43,50 @@ static int is_musl_interpreter(const char *path)
     return strncmp(base, "ld-musl", 7) == 0;
 }
 
-static char *resolve_from_musl_interp_dir(const char *name,
-                                          const char *interp_path)
+static int elf_matches_target(const char *path, const struct dep_list *deps)
+{
+    struct elf_info info;
+    int matches;
+
+    if (elf_parse(path, &info) < 0)
+        return 0;
+    matches = info.is_dynamic &&
+              info.ei_class == deps->target_ei_class &&
+              info.e_machine == deps->target_e_machine;
+    elf_info_free(&info);
+    return matches;
+}
+
+static char *validated_candidate(const char *path,
+                                 const struct dep_list *deps)
+{
+    struct stat st;
+    char *real;
+
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode))
+        return NULL;
+
+    real = realpath(path, NULL);
+    if (!real)
+        return NULL;
+    if (!elf_matches_target(real, deps)) {
+        free(real);
+        return NULL;
+    }
+    return real;
+}
+
+static char *resolve_from_interp_dir(const char *name,
+                                     const struct dep_list *deps)
 {
     char *interp_real;
     char *interp_copy;
     char *interp_dir;
     char path[PATH_MAX];
-    struct stat st;
 
-    if (!is_musl_interpreter(interp_path)) return NULL;
+    if (!deps->interp_path || !deps->interp_path[0]) return NULL;
 
-    interp_real = realpath(interp_path, NULL);
+    interp_real = realpath(deps->interp_path, NULL);
     if (!interp_real) return NULL;
 
     interp_copy = strdup(interp_real);
@@ -62,25 +94,41 @@ static char *resolve_from_musl_interp_dir(const char *name,
     if (!interp_copy) return NULL;
 
     interp_dir = dirname(interp_copy);
-    snprintf(path, sizeof(path), "%s/%s", interp_dir, name);
+    if (snprintf(path, sizeof(path), "%s/%s", interp_dir, name) >=
+        (int)sizeof(path)) {
+        free(interp_copy);
+        return NULL;
+    }
     free(interp_copy);
 
-    if (stat(path, &st) != 0) return NULL;
-
-    {
-        char *rp = realpath(path, NULL);
-        return rp ? rp : strdup(path);
-    }
+    return validated_candidate(path, deps);
 }
 
-/* Common glibc runtime libs loaded via dlopen (NSS, resolv …) */
-static const char *glibc_runtime_libs[] = {
-    "libnss_files.so.2",
-    "libnss_dns.so.2",
-    "libresolv.so.2",
-    "libnss_myhostname.so.2",
-    NULL
-};
+static int musl_arch_from_interp(const char *interp_path, char *arch,
+                                 size_t arch_size)
+{
+    static const char prefix[] = "ld-musl-";
+    const char *base;
+    const char *suffix;
+    size_t len;
+
+    if (!is_musl_interpreter(interp_path) || arch_size == 0)
+        return -1;
+    base = strrchr(interp_path, '/');
+    base = base ? base + 1 : interp_path;
+    if (strncmp(base, prefix, sizeof(prefix) - 1) != 0)
+        return -1;
+    base += sizeof(prefix) - 1;
+    suffix = strstr(base, ".so");
+    if (!suffix || suffix == base)
+        return -1;
+    len = (size_t)(suffix - base);
+    if (len >= arch_size)
+        return -1;
+    memcpy(arch, base, len);
+    arch[len] = '\0';
+    return 0;
+}
 
 /* ------------------------------------------------------------------ */
 /*  ldconfig -p cache                                                 */
@@ -103,6 +151,10 @@ static void load_ldconfig_cache(void)
 
     int cap = 256;
     ldc_cache = calloc(cap, sizeof(*ldc_cache));
+    if (!ldc_cache) {
+        pclose(f);
+        return;
+    }
 
     while (fgets(line, sizeof(line), f)) {
         char *p = line;
@@ -119,23 +171,38 @@ static void load_ldconfig_cache(void)
         if (nl) *nl = '\0';
 
         if (ldc_count >= cap) {
-            cap *= 2;
-            ldc_cache = realloc(ldc_cache, cap * sizeof(*ldc_cache));
+            int new_cap = cap * 2;
+            void *new_cache = realloc(ldc_cache,
+                                      (size_t)new_cap * sizeof(*ldc_cache));
+            if (!new_cache)
+                break;
+            ldc_cache = new_cache;
+            cap = new_cap;
         }
-        ldc_cache[ldc_count].name = strdup(p);
-        ldc_cache[ldc_count].path = strdup(path);
+        char *cache_name = strdup(p);
+        char *cache_path = strdup(path);
+        if (!cache_name || !cache_path) {
+            free(cache_name);
+            free(cache_path);
+            continue;
+        }
+        ldc_cache[ldc_count].name = cache_name;
+        ldc_cache[ldc_count].path = cache_path;
         ldc_count++;
     }
     pclose(f);
 }
 
-static char *resolve_from_ldconfig(const char *name)
+static char *resolve_from_ldconfig(const char *name,
+                                   const struct dep_list *deps)
 {
     load_ldconfig_cache();
     for (int i = 0; i < ldc_count; i++)
         if (strcmp(ldc_cache[i].name, name) == 0) {
-            char *rp = realpath(ldc_cache[i].path, NULL);
-            return rp ? rp : strdup(ldc_cache[i].path);
+            char *candidate = validated_candidate(ldc_cache[i].path, deps);
+
+            if (candidate)
+                return candidate;
         }
     return NULL;
 }
@@ -183,8 +250,15 @@ static int dep_list_add(struct dep_list *deps, const char *name,
         deps->libs = nl;
         deps->capacity = nc;
     }
-    deps->libs[deps->count].name        = strdup(name);
-    deps->libs[deps->count].path        = strdup(path);
+    char *new_name = strdup(name);
+    char *new_path = strdup(path);
+    if (!new_name || !new_path) {
+        free(new_name);
+        free(new_path);
+        return -1;
+    }
+    deps->libs[deps->count].name        = new_name;
+    deps->libs[deps->count].path        = new_path;
     deps->libs[deps->count].from_dlopen = from_dlopen;
     deps->libs[deps->count].dlopen_direct = dlopen_direct;
     deps->count++;
@@ -194,6 +268,11 @@ static int dep_list_add(struct dep_list *deps, const char *name,
 /* ------------------------------------------------------------------ */
 /*  $ORIGIN expansion                                                 */
 /* ------------------------------------------------------------------ */
+static int token_boundary(char value)
+{
+    return value == '/' || value == ':' || value == '\0';
+}
+
 static char *expand_origin(const char *tmpl, const char *origin)
 {
     char *buf = malloc(PATH_MAX);
@@ -201,17 +280,28 @@ static char *expand_origin(const char *tmpl, const char *origin)
     char *d = buf, *end = buf + PATH_MAX - 1;
     const char *s = tmpl;
     while (*s && d < end) {
+        const char *replacement = NULL;
+        size_t consumed = 0;
+
         if (strncmp(s, "${ORIGIN}", 9) == 0) {
-            size_t l = strlen(origin);
-            if (d + l >= end) break;
-            memcpy(d, origin, l); d += l; s += 9;
-        } else if (strncmp(s, "$ORIGIN", 7) == 0 &&
-                   (s[7] == '/' || s[7] == ':' || s[7] == '\0')) {
-            size_t l = strlen(origin);
-            if (d + l >= end) break;
-            memcpy(d, origin, l); d += l; s += 7;
-        } else {
+            replacement = origin;
+            consumed = 9;
+        } else if (strncmp(s, "$ORIGIN", 7) == 0 && token_boundary(s[7])) {
+            replacement = origin;
+            consumed = 7;
+        }
+
+        if (replacement) {
+            size_t l = strlen(replacement);
+            if (d + l >= end) { free(buf); return NULL; }
+            memcpy(d, replacement, l);
+            d += l;
+            s += consumed;
+        } else if (d < end) {
             *d++ = *s++;
+        } else {
+            free(buf);
+            return NULL;
         }
     }
     *d = '\0';
@@ -221,77 +311,120 @@ static char *expand_origin(const char *tmpl, const char *origin)
 /* ------------------------------------------------------------------ */
 /*  Library search (RPATH → LD_LIBRARY_PATH → RUNPATH → defaults)     */
 /* ------------------------------------------------------------------ */
-static char *search_dirs(const char *name, const char *dirs, const char *origin)
+static char *search_dirs(const char *name, const char *dirs, const char *origin,
+                         const struct dep_list *deps)
 {
     if (!dirs || !dirs[0]) return NULL;
-    char *copy = strdup(dirs);
-    if (!copy) return NULL;
-    char *save, *tok;
+    const char *start = dirs;
     char path[PATH_MAX];
-    struct stat st;
 
-    for (tok = strtok_r(copy, ":", &save); tok; tok = strtok_r(NULL, ":", &save)) {
-        char *expanded = expand_origin(tok, origin);
-        snprintf(path, sizeof(path), "%s/%s", expanded, name);
-        free(expanded);
-        if (stat(path, &st) == 0) {
-            free(copy);
-            char *rp = realpath(path, NULL);
-            return rp ? rp : strdup(path);
+    for (;;) {
+        const char *separator = strchr(start, ':');
+        size_t length = separator ? (size_t)(separator - start) : strlen(start);
+        char *tok = length ? strndup(start, length) : strdup(".");
+        char *expanded = tok ? expand_origin(tok, origin) : NULL;
+        char *candidate;
+
+        free(tok);
+        if (!expanded)
+            goto next;
+        if (snprintf(path, sizeof(path), "%s/%s", expanded, name) >=
+            (int)sizeof(path)) {
+            free(expanded);
+            goto next;
         }
+        free(expanded);
+        candidate = validated_candidate(path, deps);
+        if (candidate)
+            return candidate;
+
+next:
+        if (!separator)
+            break;
+        start = separator + 1;
     }
-    free(copy);
     return NULL;
+}
+
+static char *resolve_from_musl_path_file(const char *name, const char *origin,
+                                         const struct dep_list *deps)
+{
+    char arch[64];
+    char config_path[PATH_MAX];
+    char dirs[4096];
+    FILE *f;
+    size_t len;
+
+    if (musl_arch_from_interp(deps->interp_path, arch, sizeof(arch)) < 0)
+        return NULL;
+    if (snprintf(config_path, sizeof(config_path), "/etc/ld-musl-%s.path",
+                 arch) >= (int)sizeof(config_path))
+        return NULL;
+
+    f = fopen(config_path, "r");
+    if (!f)
+        return NULL;
+    len = fread(dirs, 1, sizeof(dirs) - 1, f);
+    fclose(f);
+    if (len == 0)
+        return NULL;
+    dirs[len] = '\0';
+    for (size_t i = 0; i < len; i++)
+        if (dirs[i] == '\n' || dirs[i] == '\r')
+            dirs[i] = ':';
+
+    return search_dirs(name, dirs, origin, deps);
 }
 
 static char *find_library(const char *name,
                           const char *rpath, const char *runpath,
-                          const char *origin, const char *interp_path)
+                          const char *origin, const struct dep_list *deps)
 {
     char *p;
-    struct stat st;
 
-    /* absolute path → use directly */
-    if (name[0] == '/') {
-        if (stat(name, &st) == 0) return realpath(name, NULL);
-        return NULL;
-    }
+    /* A DT_NEEDED name containing a slash is a pathname, not a soname. */
+    if (strchr(name, '/'))
+        return validated_candidate(name, deps);
 
     /* 1. RPATH (only when RUNPATH absent) */
     if (rpath && rpath[0] && (!runpath || !runpath[0])) {
-        p = search_dirs(name, rpath, origin);
+        p = search_dirs(name, rpath, origin, deps);
         if (p) return p;
     }
 
     /* 2. LD_LIBRARY_PATH */
     const char *ldp = getenv("LD_LIBRARY_PATH");
     if (ldp && ldp[0]) {
-        p = search_dirs(name, ldp, origin);
+        p = search_dirs(name, ldp, origin, deps);
         if (p) return p;
     }
 
     /* 3. RUNPATH */
     if (runpath && runpath[0]) {
-        p = search_dirs(name, runpath, origin);
+        p = search_dirs(name, runpath, origin, deps);
         if (p) return p;
     }
 
-    /* musl keeps its real runtime DSOs next to the interpreter */
-    p = resolve_from_musl_interp_dir(name, interp_path);
+    /* Several libc families keep their runtime DSOs beside the interpreter. */
+    p = resolve_from_interp_dir(name, deps);
+    if (p) return p;
+
+    /* musl's configured default search path */
+    p = resolve_from_musl_path_file(name, origin, deps);
     if (p) return p;
 
     /* 4. ldconfig cache */
-    p = resolve_from_ldconfig(name);
+    p = resolve_from_ldconfig(name, deps);
     if (p) return p;
 
     /* 5. Default paths */
     char path[PATH_MAX];
     for (int i = 0; default_paths[i]; i++) {
-        snprintf(path, sizeof(path), "%s/%s", default_paths[i], name);
-        if (stat(path, &st) == 0) {
-            char *rp = realpath(path, NULL);
-            return rp ? rp : strdup(path);
-        }
+        if (snprintf(path, sizeof(path), "%s/%s", default_paths[i], name) >=
+            (int)sizeof(path))
+            continue;
+        p = validated_candidate(path, deps);
+        if (p) return p;
     }
 
     return NULL;
@@ -305,20 +438,30 @@ struct bfs_queue {
     int    head, tail, cap;
 };
 
-static void bfs_init(struct bfs_queue *q)
+static int bfs_init(struct bfs_queue *q)
 {
     q->cap   = 256;
     q->items = calloc(q->cap, sizeof(char *));
     q->head  = q->tail = 0;
+    return q->items ? 0 : -1;
 }
 
-static void bfs_push(struct bfs_queue *q, const char *s)
+static int bfs_push(struct bfs_queue *q, const char *s)
 {
     if (q->tail >= q->cap) {
-        q->cap *= 2;
-        q->items = realloc(q->items, q->cap * sizeof(char *));
+        int new_cap = q->cap * 2;
+        char **new_items = realloc(q->items,
+                                   (size_t)new_cap * sizeof(char *));
+        if (!new_items)
+            return -1;
+        q->items = new_items;
+        q->cap = new_cap;
     }
-    q->items[q->tail++] = strdup(s);
+    q->items[q->tail] = strdup(s);
+    if (!q->items[q->tail])
+        return -1;
+    q->tail++;
+    return 0;
 }
 
 static char *bfs_pop(struct bfs_queue *q)
@@ -336,24 +479,32 @@ static void bfs_free(struct bfs_queue *q)
 /* ------------------------------------------------------------------ */
 /*  Resolve all transitive deps of one ELF into deps                  */
 /* ------------------------------------------------------------------ */
-static void resolve_needed(struct elf_info *info, const char *origin,
-                           struct dep_list *deps, struct bfs_queue *q,
-                           int dlopen_flag)
+static int resolve_needed(struct elf_info *info, const char *origin,
+                          struct dep_list *deps, struct bfs_queue *q,
+                          int dlopen_flag)
 {
     for (int i = 0; i < info->needed_count; i++) {
         const char *name = info->needed[i];
         if (is_virtual_lib(name)) continue;
 
         char *path = find_library(name, info->rpath, info->runpath, origin,
-                                  deps->interp_path);
+                                  deps);
         if (!path) {
-            fprintf(stderr, "dlfreeze: warning: library not found: %s\n", name);
-            continue;
+            fprintf(stderr,
+                    "dlfreeze: required library not found or incompatible: %s\n",
+                    name);
+            return -1;
         }
         int added = dep_list_add(deps, name, path, dlopen_flag, 0);
-        if (added > 0) bfs_push(q, path);
+        if (added > 0 && bfs_push(q, path) < 0) {
+            free(path);
+            return -1;
+        }
         free(path);
+        if (added < 0)
+            return -1;
     }
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -367,8 +518,9 @@ int dep_resolve(const char *exe_path, struct dep_list *deps)
     if (!real) { perror(exe_path); return -1; }
 
     char *dir_tmp = strdup(real);
-    char *origin  = strdup(dirname(dir_tmp));
+    char *origin  = dir_tmp ? strdup(dirname(dir_tmp)) : NULL;
     free(dir_tmp);
+    if (!origin) { free(real); return -1; }
 
     struct elf_info info;
     if (elf_parse(real, &info) < 0) {
@@ -384,63 +536,77 @@ int dep_resolve(const char *exe_path, struct dep_list *deps)
         return -1;
     }
 
-    if (info.interp[0])
+    deps->target_ei_class = info.ei_class;
+    deps->target_e_machine = info.e_machine;
+
+    if (info.interp[0]) {
+        if (!elf_matches_target(info.interp, deps)) {
+            fprintf(stderr,
+                    "dlfreeze: interpreter is missing, invalid, or incompatible: %s\n",
+                    info.interp);
+            elf_info_free(&info);
+            free(origin); free(real);
+            return -1;
+        }
         deps->interp_path = strdup(info.interp);
+        if (!deps->interp_path) {
+            elf_info_free(&info);
+            free(origin); free(real);
+            return -1;
+        }
+    }
 
     struct bfs_queue q;
-    bfs_init(&q);
+    if (bfs_init(&q) < 0) {
+        elf_info_free(&info);
+        free(origin); free(real);
+        dep_list_free(deps);
+        return -1;
+    }
 
-    resolve_needed(&info, origin, deps, &q, 0);
+    if (resolve_needed(&info, origin, deps, &q, 0) < 0) {
+        elf_info_free(&info);
+        bfs_free(&q);
+        free(origin); free(real);
+        dep_list_free(deps);
+        return -1;
+    }
     elf_info_free(&info);
 
     /* BFS: process transitive deps */
     char *lib_path;
     while ((lib_path = bfs_pop(&q))) {
         struct elf_info li;
-        if (elf_parse(lib_path, &li) < 0) { free(lib_path); continue; }
+        if (elf_parse(lib_path, &li) < 0 || !li.is_dynamic ||
+            li.ei_class != deps->target_ei_class ||
+            li.e_machine != deps->target_e_machine) {
+            fprintf(stderr,
+                    "dlfreeze: resolved library became invalid or incompatible: %s\n",
+                    lib_path);
+            elf_info_free(&li);
+            free(lib_path);
+            bfs_free(&q);
+            free(origin); free(real);
+            dep_list_free(deps);
+            return -1;
+        }
 
         char *dt = strdup(lib_path);
-        char *lo = strdup(dirname(dt));
-        resolve_needed(&li, lo, deps, &q, 0);
+        char *lo = dt ? strdup(dirname(dt)) : NULL;
+        if (!dt || !lo || resolve_needed(&li, lo, deps, &q, 0) < 0) {
+            free(lo); free(dt);
+            elf_info_free(&li);
+            free(lib_path);
+            bfs_free(&q);
+            free(origin); free(real);
+            dep_list_free(deps);
+            return -1;
+        }
         free(lo); free(dt);
         elf_info_free(&li);
         free(lib_path);
     }
     bfs_free(&q);
-
-    /* Auto-add common glibc NSS libraries when libc.so.6 is present */
-    int has_glibc = 0;
-    for (int i = 0; i < deps->count; i++)
-        if (strcmp(deps->libs[i].name, "libc.so.6") == 0) { has_glibc = 1; break; }
-
-    if (has_glibc) {
-        struct bfs_queue q2;
-        bfs_init(&q2);
-
-        for (int i = 0; glibc_runtime_libs[i]; i++) {
-            char *p = find_library(glibc_runtime_libs[i], NULL, NULL, origin,
-                                   deps->interp_path);
-            if (p) {
-                int added = dep_list_add(deps, glibc_runtime_libs[i], p, 0, 0);
-                if (added > 0) bfs_push(&q2, p);
-                free(p);
-            }
-        }
-
-        /* resolve their deps too */
-        while ((lib_path = bfs_pop(&q2))) {
-            struct elf_info li;
-            if (elf_parse(lib_path, &li) == 0) {
-                char *dt = strdup(lib_path);
-                char *lo = strdup(dirname(dt));
-                resolve_needed(&li, lo, deps, &q2, 0);
-                free(lo); free(dt);
-                elf_info_free(&li);
-            }
-            free(lib_path);
-        }
-        bfs_free(&q2);
-    }
 
     free(origin);
     free(real);
@@ -456,7 +622,10 @@ int dep_add_dlopen_libs(struct dep_list *deps, const char *trace_file)
     if (!f) return -1;
 
     struct bfs_queue q;
-    bfs_init(&q);
+    if (bfs_init(&q) < 0) {
+        fclose(f);
+        return -1;
+    }
 
     char line[PATH_MAX];
     while (fgets(line, sizeof(line), f)) {
@@ -476,16 +645,30 @@ int dep_add_dlopen_libs(struct dep_list *deps, const char *trace_file)
         base = base ? base + 1 : rp;
         if (is_virtual_lib(base)) { free(rp); continue; }
 
-        name = base;
-        if (elf_parse(rp, &info) == 0) {
-            if (info.soname[0])
-                name = info.soname;
+        if (elf_parse(rp, &info) < 0 || !info.is_dynamic ||
+            info.ei_class != deps->target_ei_class ||
+            info.e_machine != deps->target_e_machine) {
             elf_info_free(&info);
+            free(rp);
+            continue;
         }
+        name = info.soname[0] ? info.soname : base;
 
         int added = dep_list_add(deps, name, rp, 1, 1);
-        if (added > 0) bfs_push(&q, rp);
+        if (added > 0 && bfs_push(&q, rp) < 0) {
+            elf_info_free(&info);
+            free(rp);
+            fclose(f);
+            bfs_free(&q);
+            return -1;
+        }
+        elf_info_free(&info);
         free(rp);
+        if (added < 0) {
+            fclose(f);
+            bfs_free(&q);
+            return -1;
+        }
     }
     fclose(f);
 
@@ -493,13 +676,26 @@ int dep_add_dlopen_libs(struct dep_list *deps, const char *trace_file)
     char *lib_path;
     while ((lib_path = bfs_pop(&q))) {
         struct elf_info li;
-        if (elf_parse(lib_path, &li) == 0) {
-            char *dt = strdup(lib_path);
-            char *lo = strdup(dirname(dt));
-            resolve_needed(&li, lo, deps, &q, 1);
+        if (elf_parse(lib_path, &li) < 0 || !li.is_dynamic ||
+            li.ei_class != deps->target_ei_class ||
+            li.e_machine != deps->target_e_machine) {
+            elf_info_free(&li);
+            free(lib_path);
+            bfs_free(&q);
+            return -1;
+        }
+
+        char *dt = strdup(lib_path);
+        char *lo = dt ? strdup(dirname(dt)) : NULL;
+        if (!dt || !lo || resolve_needed(&li, lo, deps, &q, 1) < 0) {
             free(lo); free(dt);
             elf_info_free(&li);
+            free(lib_path);
+            bfs_free(&q);
+            return -1;
         }
+        free(lo); free(dt);
+        elf_info_free(&li);
         free(lib_path);
     }
     bfs_free(&q);

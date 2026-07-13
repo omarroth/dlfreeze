@@ -1,6 +1,8 @@
 #ifndef DLFREEZE_DEP_RESOLVER_H
 #define DLFREEZE_DEP_RESOLVER_H
 
+#include <stdint.h>
+
 struct resolved_lib {
     char *name;          /* soname (e.g. "libc.so.6") */
     char *path;          /* resolved absolute path     */
@@ -13,6 +15,8 @@ struct dep_list {
     int    count;
     int    capacity;
     char  *interp_path;  /* dynamic linker (PT_INTERP) */
+    int       target_ei_class;  /* required ELF class for dependencies */
+    uint16_t  target_e_machine; /* required ELF machine for dependencies */
 };
 
 /* Resolve all shared-library dependencies of an ELF binary (BFS). */

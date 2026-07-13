@@ -33,6 +33,28 @@
 
 extern char **environ;
 
+static int prepend_ld_preload(const char *preload)
+{
+    const char *old = getenv("LD_PRELOAD");
+    size_t preload_len = strlen(preload);
+    size_t old_len = old && old[0] ? strlen(old) : 0;
+    char *value = malloc(preload_len + (old_len ? old_len + 2 : 1));
+    int rc;
+
+    if (!value)
+        return -1;
+    memcpy(value, preload, preload_len);
+    if (old_len) {
+        value[preload_len] = ':';
+        memcpy(value + preload_len + 1, old, old_len + 1);
+    } else {
+        value[preload_len] = '\0';
+    }
+    rc = setenv("LD_PRELOAD", value, 1);
+    free(value);
+    return rc;
+}
+
 static void usage(const char *prog)
 {
     fprintf(stderr,
@@ -47,8 +69,8 @@ static void usage(const char *prog)
         "Examples:\n"
         "  %s /bin/ls\n"
         "  %s -o frozen_ls /bin/ls\n"
-        "  %s -t -o frozen_py -- python3 -c 'import json'\n"
-        "  %s -d -t -f '/usr/lib/python*' -- python3 -c 'import json'\n",
+        "  %s -t -o frozen_app -- myapp --load-plugins\n"
+        "  %s -d -t -f '/usr/share/myapp/*' -- myapp --self-test\n",
         prog, prog, prog, prog, prog);
 }
 
@@ -467,7 +489,8 @@ static int capture_data_files(const char *exe_path, int argc, char **argv,
             int nargs = 1 + (argc - tstart);
             char **tav;
 
-            setenv("LD_PRELOAD", preload_path, 1);
+            if (prepend_ld_preload(preload_path) < 0)
+                _exit(127);
             setenv("DLFREEZE_TRACE_FILE", dlopen_tracef, 1);
             setenv("DLFREEZE_FILE_TRACE_FILE", tracef, 1);
 
@@ -539,7 +562,11 @@ static int capture_data_files(const char *exe_path, int argc, char **argv,
                 fclose(dtf);
             }
         }
-        dep_add_dlopen_libs(deps, dlopen_tracef);
+        if (dep_add_dlopen_libs(deps, dlopen_tracef) < 0) {
+            unlink(dlopen_tracef);
+            unlink(tracef);
+            return -1;
+        }
         if (verbose) {
             printf("libraries after trace: %d\n", deps->count);
             for (int i = 0; i < deps->count; i++)
@@ -558,7 +585,8 @@ static int capture_data_files(const char *exe_path, int argc, char **argv,
                                       out, deps, verbose, elf_tracef);
 
         if (!have_preload && rc == 0) {
-            dep_add_dlopen_libs(deps, elf_tracef);
+            if (dep_add_dlopen_libs(deps, elf_tracef) < 0)
+                rc = -1;
             if (verbose) {
                 printf("libraries after strace fallback: %d\n", deps->count);
                 for (int i = 0; i < deps->count; i++)
@@ -657,6 +685,7 @@ int main(int argc, char **argv)
     struct data_file_list data_files;
     data_file_list_init(&data_files);
     if (do_trace) {
+        int trace_failed = 0;
         char *preload = find_sibling(self, "dlfreeze-preload.so");
         if (!preload)
             fprintf(stderr, "dlfreeze: warning: dlfreeze-preload.so not found, "
@@ -689,7 +718,8 @@ int main(int argc, char **argv)
                 pid_t pid = fork();
                 if (pid == 0) {
                     setpgid(0, 0);
-                    setenv("LD_PRELOAD", preload, 1);
+                    if (prepend_ld_preload(preload) < 0)
+                        _exit(127);
                     setenv("DLFREEZE_TRACE_FILE", tracef, 1);
 
                     int tstart = optind + 1;  /* args after the executable */
@@ -718,7 +748,13 @@ int main(int argc, char **argv)
                             fclose(tf);
                         }
                     }
-                    dep_add_dlopen_libs(&deps, tracef);
+                    if (!preload_trace_ready(tracef)) {
+                        fprintf(stderr, "dlfreeze: trace helper is incompatible "
+                                "with the target runtime\n");
+                        trace_failed = 1;
+                    } else if (dep_add_dlopen_libs(&deps, tracef) < 0) {
+                        trace_failed = 1;
+                    }
                     if (verbose) {
                         printf("libraries after trace: %d\n", deps.count);
                         for (int i = 0; i < deps.count; i++)
@@ -731,6 +767,14 @@ int main(int argc, char **argv)
             }
         }
         free(preload);
+        if (trace_failed) {
+            data_file_list_free(&data_files);
+            dep_list_free(&deps);
+            free(exe_name);
+            free(exe_path);
+            free(bootstrap);
+            return 1;
+        }
     }
 
     /* output path */
