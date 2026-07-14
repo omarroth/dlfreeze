@@ -25,6 +25,76 @@ static const char *dynamic_string(const char *strtab, size_t strtab_size,
     return value;
 }
 
+static const void *elf64_vaddr_file(const uint8_t *data, size_t size,
+                                    const Elf64_Phdr *phdr, uint16_t phnum,
+                                    uint64_t vaddr, uint64_t length)
+{
+    for (uint16_t i = 0; i < phnum; i++) {
+        uint64_t delta;
+        uint64_t offset;
+
+        if (phdr[i].p_type != PT_LOAD || vaddr < phdr[i].p_vaddr)
+            continue;
+        delta = vaddr - phdr[i].p_vaddr;
+        if (delta > phdr[i].p_filesz ||
+            length > phdr[i].p_filesz - delta ||
+            phdr[i].p_offset > UINT64_MAX - delta)
+            continue;
+        offset = phdr[i].p_offset + delta;
+        if (!range_in_file(offset, length, size))
+            return NULL;
+        return data + offset;
+    }
+    return NULL;
+}
+
+static int elf64_tpoff_relocation(uint16_t machine, uint32_t type)
+{
+#ifdef R_X86_64_TPOFF64
+    if (machine == EM_X86_64 && type == R_X86_64_TPOFF64)
+        return 1;
+#endif
+#ifdef R_AARCH64_TLS_TPREL
+    if (machine == EM_AARCH64 && type == R_AARCH64_TLS_TPREL)
+        return 1;
+#endif
+    return 0;
+}
+
+static int elf64_rela_has_tpoff(const uint8_t *data, size_t size,
+                                const Elf64_Ehdr *ehdr,
+                                const Elf64_Phdr *phdr,
+                                uint64_t address, uint64_t bytes,
+                                uint64_t entsz, int *found_out)
+{
+    const uint8_t *rela;
+    size_t count;
+
+    if (bytes == 0)
+        return 0;
+    if (address == 0 || entsz != sizeof(Elf64_Rela) ||
+        bytes % sizeof(Elf64_Rela) != 0 || bytes > SIZE_MAX)
+        return -1;
+    rela = elf64_vaddr_file(data, size, phdr, ehdr->e_phnum,
+                           address, bytes);
+    if (!rela)
+        return -1;
+    count = (size_t)(bytes / sizeof(Elf64_Rela));
+    for (size_t i = 0; i < count; i++) {
+        Elf64_Xword r_info;
+
+        memcpy(&r_info,
+               rela + i * sizeof(Elf64_Rela) + offsetof(Elf64_Rela, r_info),
+               sizeof(r_info));
+        if (elf64_tpoff_relocation(ehdr->e_machine,
+                                   ELF64_R_TYPE(r_info))) {
+            *found_out = 1;
+            break;
+        }
+    }
+    return 0;
+}
+
 int elf_check(const char *path)
 {
     unsigned char hdr[4];
@@ -64,6 +134,7 @@ static int parse_elf64(const uint8_t *data, size_t size, struct elf_info *info)
 
     const Elf64_Dyn *dyn_section = NULL;
     size_t dyn_count = 0;
+    unsigned int tls_count = 0;
 
     /* First pass: PT_INTERP + PT_DYNAMIC */
     for (int i = 0; i < ehdr->e_phnum; i++) {
@@ -90,6 +161,11 @@ static int parse_elf64(const uint8_t *data, size_t size, struct elf_info *info)
             dyn_section = (const Elf64_Dyn *)(data + phdr[i].p_offset);
             dyn_count   = phdr[i].p_filesz / sizeof(Elf64_Dyn);
         }
+        if (phdr[i].p_type == PT_TLS) {
+            if (++tls_count != 1 || phdr[i].p_filesz > phdr[i].p_memsz)
+                return -1;
+            info->tls_memsz = phdr[i].p_memsz;
+        }
     }
 
     if (!dyn_section) return 0;  /* static binary */
@@ -97,36 +173,76 @@ static int parse_elf64(const uint8_t *data, size_t size, struct elf_info *info)
     /* Find the dynamic string table */
     uint64_t strtab_addr = 0;
     uint64_t declared_strtab_size = 0;
+    uint64_t rela_addr = 0;
+    uint64_t rela_size = 0;
+    uint64_t rela_ent = sizeof(Elf64_Rela);
+    uint64_t jmprel_addr = 0;
+    uint64_t pltrel_size = 0;
+    uint64_t pltrel_kind = DT_RELA;
+    int has_df_static_tls = 0;
+    int has_tpoff = 0;
     for (size_t i = 0; i < dyn_count; i++) {
         if (dyn_section[i].d_tag == DT_STRTAB)
             strtab_addr = dyn_section[i].d_un.d_ptr;
         else if (dyn_section[i].d_tag == DT_STRSZ)
             declared_strtab_size = dyn_section[i].d_un.d_val;
+        else if (dyn_section[i].d_tag == DT_RELA)
+            rela_addr = dyn_section[i].d_un.d_ptr;
+        else if (dyn_section[i].d_tag == DT_RELASZ)
+            rela_size = dyn_section[i].d_un.d_val;
+        else if (dyn_section[i].d_tag == DT_RELAENT)
+            rela_ent = dyn_section[i].d_un.d_val;
+        else if (dyn_section[i].d_tag == DT_JMPREL)
+            jmprel_addr = dyn_section[i].d_un.d_ptr;
+        else if (dyn_section[i].d_tag == DT_PLTRELSZ)
+            pltrel_size = dyn_section[i].d_un.d_val;
+        else if (dyn_section[i].d_tag == DT_PLTREL)
+            pltrel_kind = dyn_section[i].d_un.d_val;
+        else if (dyn_section[i].d_tag == DT_FLAGS &&
+                 (dyn_section[i].d_un.d_val & DF_STATIC_TLS) != 0)
+            has_df_static_tls = 1;
         if (dyn_section[i].d_tag == DT_NULL) break;
     }
+    if (elf64_rela_has_tpoff(data, size, ehdr, phdr, rela_addr, rela_size,
+                             rela_ent, &has_tpoff) < 0)
+        return -1;
+    if (pltrel_size != 0 &&
+        (pltrel_kind != DT_RELA ||
+         elf64_rela_has_tpoff(data, size, ehdr, phdr, jmprel_addr,
+                              pltrel_size, sizeof(Elf64_Rela),
+                              &has_tpoff) < 0))
+        return -1;
+    /* A TPOFF relocation constrains the defining TLS module, not
+     * necessarily the object that contains the relocation.  A requester
+     * with no PT_TLS of its own can therefore force a dependency's TLS into
+     * the static layout.  DF_STATIC_TLS by itself only describes a useful
+     * constraint when this object has a non-empty TLS template. */
+    info->has_static_tls = has_tpoff ||
+                           (info->tls_memsz != 0 && has_df_static_tls);
     if (strtab_addr == 0) return 0;
 
     /* Convert VA → file offset */
     const char *dyn_strtab = NULL;
     size_t dyn_strtab_size = 0;
     for (int i = 0; i < ehdr->e_phnum; i++) {
-        if (phdr[i].p_type == PT_LOAD &&
-            strtab_addr >= phdr[i].p_vaddr &&
-            strtab_addr - phdr[i].p_vaddr < phdr[i].p_filesz)
-        {
-            uint64_t off = phdr[i].p_offset + (strtab_addr - phdr[i].p_vaddr);
-            uint64_t available = phdr[i].p_filesz -
-                                 (strtab_addr - phdr[i].p_vaddr);
+        uint64_t available;
 
-            if (!range_in_file(off, available, size))
-                return -1;
-            if (declared_strtab_size > available)
-                return -1;
-            dyn_strtab = (const char *)(data + off);
-            dyn_strtab_size = declared_strtab_size
-                ? (size_t)declared_strtab_size : (size_t)available;
-            break;
-        }
+        if (phdr[i].p_type != PT_LOAD ||
+            strtab_addr < phdr[i].p_vaddr ||
+            strtab_addr - phdr[i].p_vaddr >= phdr[i].p_filesz)
+            continue;
+        available = phdr[i].p_filesz -
+                    (strtab_addr - phdr[i].p_vaddr);
+        if (declared_strtab_size > available)
+            return -1;
+        dyn_strtab = elf64_vaddr_file(
+            data, size, phdr, ehdr->e_phnum, strtab_addr,
+            declared_strtab_size ? declared_strtab_size : available);
+        if (!dyn_strtab)
+            return -1;
+        dyn_strtab_size = declared_strtab_size
+            ? (size_t)declared_strtab_size : (size_t)available;
+        break;
     }
     if (!dyn_strtab) return 0;
 

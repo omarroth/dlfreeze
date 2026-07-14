@@ -8,6 +8,7 @@ struct resolved_lib {
     char *path;          /* resolved absolute path     */
     int   from_dlopen;   /* found via dlopen tracing   */
     int   dlopen_direct; /* path appeared in trace file */
+    int   dlopen_early;  /* closure must be mapped before static TLS setup */
 };
 
 struct dep_list {
@@ -24,6 +25,9 @@ int dep_resolve(const char *exe_path, struct dep_list *deps);
 
 /* Merge dlopen-traced libraries (one path per line in trace_file). */
 int dep_add_dlopen_libs(struct dep_list *deps, const char *trace_file);
+
+/* Mark traced dlopen closures that require startup static-TLS placement. */
+int dep_mark_dlopen_early_closures(struct dep_list *deps);
 
 /* Free all resources in a dep_list. */
 void dep_list_free(struct dep_list *deps);

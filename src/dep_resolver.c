@@ -261,6 +261,7 @@ static int dep_list_add(struct dep_list *deps, const char *name,
     deps->libs[deps->count].path        = new_path;
     deps->libs[deps->count].from_dlopen = from_dlopen;
     deps->libs[deps->count].dlopen_direct = dlopen_direct;
+    deps->libs[deps->count].dlopen_early = 0;
     deps->count++;
     return 1; /* added */
 }
@@ -699,6 +700,133 @@ int dep_add_dlopen_libs(struct dep_list *deps, const char *trace_file)
         free(lib_path);
     }
     bfs_free(&q);
+    return 0;
+}
+
+static int dependency_path_index(const struct dep_list *deps,
+                                 const char *resolved_path)
+{
+    int found = -1;
+
+    if (!resolved_path || !resolved_path[0])
+        return -1;
+    for (int i = 0; i < deps->count; i++) {
+        if (strcmp(deps->libs[i].path, resolved_path) != 0)
+            continue;
+        if (found >= 0)
+            return -2;
+        found = i;
+    }
+    return found;
+}
+
+int dep_mark_dlopen_early_closures(struct dep_list *deps)
+{
+    unsigned char *closure;
+    int *queue;
+
+    if (!deps || deps->count < 0)
+        return -1;
+    if (deps->count == 0)
+        return 0;
+    closure = calloc((size_t)deps->count, sizeof(*closure));
+    queue = malloc((size_t)deps->count * sizeof(*queue));
+    if (!closure || !queue) {
+        free(closure);
+        free(queue);
+        return -1;
+    }
+
+    for (int root = 0; root < deps->count; root++) {
+        int head = 0;
+        int tail = 0;
+        int needs_early = 0;
+
+        if (!deps->libs[root].from_dlopen ||
+            !deps->libs[root].dlopen_direct)
+            continue;
+        memset(closure, 0, (size_t)deps->count);
+        closure[root] = 1;
+        queue[tail++] = root;
+
+        while (head < tail) {
+            int index = queue[head++];
+            struct elf_info info;
+            char *path_copy;
+            char *origin;
+
+            if (elf_parse(deps->libs[index].path, &info) < 0) {
+                free(closure);
+                free(queue);
+                return -1;
+            }
+            path_copy = strdup(deps->libs[index].path);
+            origin = path_copy ? strdup(dirname(path_copy)) : NULL;
+            if (!path_copy || !origin) {
+                free(origin);
+                free(path_copy);
+                elf_info_free(&info);
+                free(closure);
+                free(queue);
+                return -1;
+            }
+            if (deps->libs[index].from_dlopen && info.has_static_tls)
+                needs_early = 1;
+            for (int n = 0; n < info.needed_count; n++) {
+                char *resolved;
+                int dependency;
+
+                if (is_virtual_lib(info.needed[n]))
+                    continue;
+                resolved = find_library(info.needed[n], info.rpath,
+                                        info.runpath, origin, deps);
+                if (!resolved) {
+                    free(origin);
+                    free(path_copy);
+                    elf_info_free(&info);
+                    free(closure);
+                    free(queue);
+                    return -1;
+                }
+                dependency = dependency_path_index(deps, resolved);
+                free(resolved);
+                if (dependency == -2) {
+                    free(origin);
+                    free(path_copy);
+                    elf_info_free(&info);
+                    free(closure);
+                    free(queue);
+                    return -1;
+                }
+
+                if (dependency < 0) {
+                    free(origin);
+                    free(path_copy);
+                    elf_info_free(&info);
+                    free(closure);
+                    free(queue);
+                    return -1;
+                }
+                if (!deps->libs[dependency].from_dlopen ||
+                    closure[dependency])
+                    continue;
+                closure[dependency] = 1;
+                queue[tail++] = dependency;
+            }
+            free(origin);
+            free(path_copy);
+            elf_info_free(&info);
+        }
+
+        if (needs_early) {
+            for (int i = 0; i < deps->count; i++)
+                if (closure[i] && deps->libs[i].from_dlopen)
+                    deps->libs[i].dlopen_early = 1;
+        }
+    }
+
+    free(closure);
+    free(queue);
     return 0;
 }
 

@@ -13,7 +13,7 @@ run_with_timeout_seconds() {
     shift
 
     if command -v timeout >/dev/null 2>&1; then
-        if timeout --help 2>&1 | grep -q -- '--kill-after'; then
+        if timeout --help 2>&1 | grep -- '--kill-after' >/dev/null; then
             timeout --kill-after="$TEST_TIMEOUT_KILL_AFTER" "$limit" "$@"
         else
             timeout "$limit" "$@"
@@ -33,6 +33,7 @@ run_suite() {
 
 distro_name() {
     if [ -f /etc/os-release ]; then
+        # shellcheck source=/dev/null
         . /etc/os-release
         echo "$PRETTY_NAME"
     else
@@ -41,7 +42,99 @@ distro_name() {
 }
 
 path_is_elf() {
-    command -v file >/dev/null 2>&1 && file -b "$1" 2>/dev/null | grep -q 'ELF'
+    command -v file >/dev/null 2>&1 &&
+        file -b "$1" 2>/dev/null | grep 'ELF' >/dev/null
+}
+
+# Return 0 when at least one distinct, dynamic host runtime is admitted for
+# direct loading, 1 when every available runtime cleanly falls back to
+# extraction, and 2 for a compiler/packer failure.  CI coverage should depend
+# on the capability being exercised, not on distro names (rolling and
+# prerelease images frequently change their PRETTY_NAME).
+probe_direct_runtime_admission() {
+    probe_dir=/tmp/dlfreeze-direct-admission
+    probe_src="$probe_dir/probe.c"
+    probe_seen=
+    probe_index=0
+
+    rm -rf "$probe_dir"
+    mkdir -p "$probe_dir"
+    if ! command -v readelf >/dev/null 2>&1; then
+        echo "ERROR: readelf is required for the direct-runtime capability probe" >&2
+        rm -rf "$probe_dir"
+        return 2
+    fi
+    cat > "$probe_src" <<'EOF'
+int main(void) { return 0; }
+EOF
+
+    for probe_cc in gcc musl-gcc; do
+        probe_cc_path=$(command -v "$probe_cc" 2>/dev/null || true)
+        [ -n "$probe_cc_path" ] || continue
+        probe_cc_path=$(readlink -f "$probe_cc_path")
+        case " $probe_seen " in
+            *" $probe_cc_path "*) continue ;;
+        esac
+        probe_seen="$probe_seen $probe_cc_path"
+        probe_index=$((probe_index + 1))
+        probe_bin="$probe_dir/probe-$probe_index"
+        probe_out="$probe_dir/probe-$probe_index.frozen"
+        probe_log="$probe_dir/probe-$probe_index.log"
+        probe_compile_log="$probe_dir/probe-$probe_index.compile.log"
+
+        if ! "$probe_cc" -o "$probe_bin" "$probe_src" \
+                >"$probe_compile_log" 2>&1; then
+            echo "ERROR: direct-runtime probe compilation failed with $probe_cc" >&2
+            cat "$probe_compile_log" >&2
+            rm -rf "$probe_dir"
+            return 2
+        fi
+        if ! readelf -W -l "$probe_bin" 2>/dev/null |
+                grep 'Requesting program interpreter:' >/dev/null; then
+            continue
+        fi
+        if ! run_freeze ./build/dlfreeze -d -o "$probe_out" "$probe_bin" \
+                >"$probe_log" 2>&1; then
+            echo "ERROR: dlfreeze failed during direct-runtime capability probe ($probe_cc)" >&2
+            cat "$probe_log" >&2
+            rm -rf "$probe_dir"
+            return 2
+        fi
+        if [ ! -x "$probe_out" ]; then
+            echo "ERROR: direct-runtime probe produced no executable ($probe_cc)" >&2
+            cat "$probe_log" >&2
+            rm -rf "$probe_dir"
+            return 2
+        fi
+
+        if grep -Eq \
+                '^[[:space:]]*mode[[:space:]]*:[[:space:]]*direct-load \(in-process loader\)[[:space:]]*$' \
+                "$probe_log"; then
+            if grep -Eq \
+                    'direct-load is unavailable for runtime .*creating an extraction-mode binary' \
+                    "$probe_log"; then
+                echo "ERROR: contradictory direct-runtime probe result ($probe_cc)" >&2
+                cat "$probe_log" >&2
+                rm -rf "$probe_dir"
+                return 2
+            fi
+            rm -rf "$probe_dir"
+            return 0
+        fi
+        if grep -Eq \
+                'direct-load is unavailable for runtime .*creating an extraction-mode binary' \
+                "$probe_log"; then
+            continue
+        fi
+
+        echo "ERROR: unrecognized direct-runtime probe result ($probe_cc)" >&2
+        cat "$probe_log" >&2
+        rm -rf "$probe_dir"
+        return 2
+    done
+
+    rm -rf "$probe_dir"
+    return 1
 }
 
 resolve_ruby_elf() {
@@ -140,7 +233,7 @@ elif [ -f /etc/arch-release ]; then
     # syscalls may be unavailable when the container runs through qemu-user;
     # use pacman's supported opt-out in this already-isolated CI container.
     pacman_sandbox_opt=
-    if pacman -S --help 2>&1 | grep -q -- '--disable-sandbox'; then
+    if pacman -S --help 2>&1 | grep -- '--disable-sandbox' >/dev/null; then
         pacman_sandbox_opt=--disable-sandbox
     fi
     pacman_log=/tmp/dlfreeze-pacman.log
@@ -230,14 +323,26 @@ echo ""
 echo "--- Test suite ---"
 # The test suite skips tests whose prerequisites are missing (Docker,
 # specific relocation types, etc.), but real failures must fail the build.
-# Development-snapshot libc jobs intentionally exercise the extraction
-# admission path.  Every stable matrix image must prove that at least one
-# fixture actually contained and executed direct-load metadata.
-case "$(distro_name)" in
-    *Rawhide*|*rawhide*) DLFREEZE_REQUIRE_DIRECT=0 ;;
-    *)                   DLFREEZE_REQUIRE_DIRECT=1 ;;
-esac
+# Require direct-loader coverage exactly when this image has an admitted host
+# runtime.  A clean extraction fallback is a capability result; compiler,
+# packer, and ambiguous-output failures from the probe remain fatal.
+# Arch GCC 16 may inject -latomic_asneeded outside musl-gcc's private search
+# path.  Match the test-suite workaround so the capability probe measures the
+# runtime rather than that wrapper/toolchain quirk.
+if [ -e /usr/lib/libatomic_asneeded.a ]; then
+    export LIBRARY_PATH="${LIBRARY_PATH:+$LIBRARY_PATH:}/usr/lib"
+fi
+if probe_direct_runtime_admission; then
+    DLFREEZE_REQUIRE_DIRECT=1
+else
+    probe_rc=$?
+    if [ "$probe_rc" -ne 1 ]; then
+        exit 1
+    fi
+    DLFREEZE_REQUIRE_DIRECT=0
+fi
 export DLFREEZE_REQUIRE_DIRECT
+echo "direct coverage required: $DLFREEZE_REQUIRE_DIRECT"
 if run_suite bash tests/run_tests.sh build; then
     echo "Test suite: all passed"
 else

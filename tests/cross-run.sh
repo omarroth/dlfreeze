@@ -20,7 +20,7 @@ RUN_TIMEOUT_KILL_AFTER="${RUN_TIMEOUT_KILL_AFTER:-5}"
 
 run_with_timeout() {
     if command -v timeout >/dev/null 2>&1; then
-        if timeout --help 2>&1 | grep -q -- '--kill-after'; then
+        if timeout --help 2>&1 | grep -- '--kill-after' >/dev/null; then
             timeout --kill-after="$RUN_TIMEOUT_KILL_AFTER" "$RUN_TIMEOUT" "$@"
         else
             timeout "$RUN_TIMEOUT" "$@"
@@ -98,6 +98,7 @@ diagnose_failure() {
 
 distro_name() {
     if [ -f /etc/os-release ]; then
+        # shellcheck source=/dev/null
         . /etc/os-release
         echo "$PRETTY_NAME"
     else
@@ -112,10 +113,6 @@ echo ""
 
 FROZEN_DIR="${FROZEN_DIR:-/work/frozen-all}"
 FROZEN_GLOB="${FROZEN_GLOB:-$FROZEN_DIR/frozen-*}"
-IS_ALPINE_TARGET=0
-if [ -f /etc/alpine-release ]; then
-    IS_ALPINE_TARGET=1
-fi
 
 if [ ! -d "$FROZEN_DIR" ]; then
     echo "ERROR: $FROZEN_DIR not found"

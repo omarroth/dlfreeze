@@ -42,6 +42,8 @@
 #define LDR_FLAG_NEEDS_RTLD  0x20
 #define LDR_FLAG_DATA        0x40
 #define LDR_FLAG_RUNTIME_SCAN 0x80
+#define LDR_FLAG_DLOPEN_EARLY 0x400
+#define LDR_FLAG_DLOPEN_ROOT  0x800
 
 #define LDR_PRELINK_FIXUP_JMPREL 0x80000000u
 
@@ -3523,6 +3525,14 @@ struct loaded_obj {
     uint16_t          relocation_scope_root;
     uint8_t           lookup_scope_valid;
     uint8_t           relocation_scope_root_valid;
+    uint8_t           visible;
+    /* Promoted static-TLS closures need ordinary relocations before the
+     * initial TLS image is copied, but target IFUNC/IRELATIVE resolvers must
+     * retain native dlopen timing.  The phase is the next resolver pass to
+     * run (zero once both are complete), so a retry never repeats an already
+     * completed graph-wide phase.  RELRO is finalized separately afterward. */
+    uint8_t           deferred_relocation_phase;
+    uint8_t           final_protections_pending;
 
     /* TLS */
     struct obj_tls    tls;
@@ -4244,8 +4254,278 @@ static int decode_aarch64_musl_tid_offset(const uint8_t *code, size_t len,
     return 0;
 }
 
+/* Return the GPRs definitely written by an instruction used in the admitted
+ * pthread_detach streams.  Unknown instructions fail closed in the data-flow
+ * checks below rather than being assumed harmless. */
+static int aarch64_musl_gpr_writes(uint32_t insn, uint32_t *writes_out)
+{
+    uint32_t writes = 0;
+
+#define RECORD_WRITE(reg_)                                                  \
+    do {                                                                    \
+        unsigned int record_reg = (reg_);                                   \
+        if (record_reg != 31)                                               \
+            writes |= 1u << record_reg;                                     \
+    } while (0)
+
+    /* Direct and conditional branches, compare-and-branch, and barriers. */
+    if ((insn & 0xfc000000u) == 0x14000000u ||
+        (insn & 0xff000010u) == 0x54000000u ||
+        (insn & 0x7e000000u) == 0x34000000u ||
+        (insn & 0x7e000000u) == 0x36000000u ||
+        (insn & 0xfffffc1fu) == 0xd65f0000u ||
+        insn == 0xd503201fu || insn == 0xd5033bbfu) {
+        *writes_out = 0;
+        return 1;
+    }
+
+    /* ADR/ADRP, add/subtract immediate, logical register aliases (including
+     * MOV), and MOVN/MOVZ/MOVK all write Rd. */
+    if ((insn & 0x1f000000u) == 0x10000000u ||
+        (insn & 0x1f000000u) == 0x11000000u ||
+        (insn & 0x1f000000u) == 0x0a000000u ||
+        (insn & 0x1f800000u) == 0x12800000u) {
+        RECORD_WRITE(insn & 0x1f);
+        *writes_out = writes;
+        return 1;
+    }
+
+    /* Exclusive load/store.  STLXR writes its status register Rs; LDAXR
+     * writes Rt. */
+    if ((insn & 0xfffffc00u) == 0x885ffc00u) {
+        RECORD_WRITE(insn & 0x1f);
+        *writes_out = writes;
+        return 1;
+    }
+    if ((insn & 0xffe0fc00u) == 0x8800fc00u) {
+        RECORD_WRITE((insn >> 16) & 0x1f);
+        *writes_out = writes;
+        return 1;
+    }
+
+    /* Unsigned-offset and unscaled single-register loads/stores. */
+    if ((insn & 0x3b000000u) == 0x39000000u) {
+        if (insn & (1u << 22))
+            RECORD_WRITE(insn & 0x1f);
+        *writes_out = writes;
+        return 1;
+    }
+    if ((insn & 0x3b000000u) == 0x38000000u) {
+        if (insn & (1u << 22))
+            RECORD_WRITE(insn & 0x1f);
+        /* Treat every indexed form conservatively as base writeback. */
+        if (((insn >> 10) & 3) != 0)
+            RECORD_WRITE((insn >> 5) & 0x1f);
+        *writes_out = writes;
+        return 1;
+    }
+
+    /* Load/store pair.  Offset mode (bits 24:23 == 2) has no writeback. */
+    if ((insn & 0x3a000000u) == 0x28000000u) {
+        if (insn & (1u << 22)) {
+            RECORD_WRITE(insn & 0x1f);
+            RECORD_WRITE((insn >> 10) & 0x1f);
+        }
+        if ((insn & 0x01800000u) != 0x01000000u)
+            RECORD_WRITE((insn >> 5) & 0x1f);
+        *writes_out = writes;
+        return 1;
+    }
+
+    /* A system-register read writes Rt. */
+    if ((insn & 0xfff00000u) == 0xd5300000u) {
+        RECORD_WRITE(insn & 0x1f);
+        *writes_out = writes;
+        return 1;
+    }
+
+#undef RECORD_WRITE
+    return 0;
+}
+
+static int aarch64_musl_registers_preserved(const uint8_t *code,
+                                             size_t begin, size_t end,
+                                             uint32_t protected)
+{
+    if ((begin & 3) != 0 || (end & 3) != 0 || begin > end)
+        return 0;
+    for (size_t i = begin; i < end; i += 4) {
+        uint32_t writes;
+
+        if (!aarch64_musl_gpr_writes(read_u32_le(code + i), &writes) ||
+            (writes & protected) != 0)
+            return 0;
+    }
+    return 1;
+}
+
+static int aarch64_musl_is_control_flow(uint32_t insn)
+{
+    return (insn & 0xfc000000u) == 0x14000000u ||
+           (insn & 0xfc000000u) == 0x94000000u ||
+           (insn & 0xff000010u) == 0x54000000u ||
+           (insn & 0x7e000000u) == 0x34000000u ||
+           (insn & 0x7e000000u) == 0x36000000u ||
+           (insn & 0xfffffc1fu) == 0xd61f0000u ||
+           (insn & 0xfffffc1fu) == 0xd63f0000u ||
+           (insn & 0xfffffc1fu) == 0xd65f0000u;
+}
+
+static int aarch64_musl_no_control_flow(const uint8_t *code,
+                                         size_t begin, size_t end)
+{
+    if ((begin & 3) != 0 || (end & 3) != 0 || begin > end)
+        return 0;
+    for (size_t i = begin; i < end; i += 4)
+        if (aarch64_musl_is_control_flow(read_u32_le(code + i)))
+            return 0;
+    return 1;
+}
+
+static int aarch64_unconditional_branch(size_t pos, uint32_t insn,
+                                         int64_t *target_out)
+{
+    int64_t imm;
+
+    if ((insn & 0xfc000000u) != 0x14000000u)
+        return 0;
+    imm = insn & 0x03ffffffu;
+    if (imm & (1 << 25))
+        imm -= 1 << 26;
+    *target_out = (int64_t)pos + imm * 4;
+    return 1;
+}
+
+/* Prove that source still contains pthread_detach's original X0 argument at
+ * the exact use site.  Only direct copies to ABI callee-saved X19-X28 are
+ * carried forward, and any later write invalidates that provenance. */
+static int aarch64_musl_arg0_at(const uint8_t *code, size_t use,
+                                unsigned int source)
+{
+    uint32_t valid = 1u;
+
+    if ((use & 3) != 0 || source == 31 ||
+        (source != 0 && (source < 19 || source > 28)))
+        return 0;
+    for (size_t i = 0; i < use; i += 4) {
+        uint32_t insn = read_u32_le(code + i);
+        uint32_t writes;
+        unsigned int copy_destination = 31;
+
+        /* Prologue provenance is deliberately linear.  The admitted copies
+         * precede control flow; proving that a branch reaches a later copy
+         * would require a full CFG and is not private-layout evidence. */
+        if (aarch64_musl_is_control_flow(insn))
+            return 0;
+        if ((insn & 0xffffffe0u) == 0xaa0003e0u &&
+            (valid & 1u) != 0) {
+            unsigned int destination = insn & 0x1f;
+
+            if (destination >= 19 && destination <= 28)
+                copy_destination = destination;
+        }
+        if (!aarch64_musl_gpr_writes(insn, &writes))
+            return 0;
+        valid &= ~writes;
+        if (copy_destination != 31)
+            valid |= 1u << copy_destination;
+    }
+    return (valid & (1u << source)) != 0;
+}
+
+static int aarch64_is_movz_value(uint32_t insn, unsigned int reg,
+                                  unsigned int value)
+{
+    return reg != 31 && (insn & 0x7f800000u) == 0x52800000u &&
+           ((insn >> 21) & 3) == 0 &&
+           ((insn >> 5) & 0xffff) == value && (insn & 0x1f) == reg;
+}
+
+static int aarch64_musl_constant_at(const uint8_t *code, size_t use,
+                                    unsigned int reg, unsigned int value)
+{
+    size_t begin = use > 64 ? use - 64 : 0;
+
+    if (reg == 31)
+        return 0;
+    for (size_t i = begin; i < use; i += 4) {
+        if (aarch64_is_movz_value(read_u32_le(code + i), reg, value) &&
+            aarch64_musl_no_control_flow(code, 0, i) &&
+            aarch64_musl_no_control_flow(code, i + 4, use) &&
+            aarch64_musl_registers_preserved(
+                code, i + 4, use, 1u << reg))
+            return 1;
+    }
+    return 0;
+}
+
+static int aarch64_cond_branch(size_t pos, uint32_t insn,
+                               unsigned int *cond_out, int64_t *target_out)
+{
+    int64_t imm;
+
+    if ((insn & 0xff000010u) != 0x54000000u)
+        return 0;
+    imm = (insn >> 5) & 0x7ffff;
+    if (imm & (1 << 18))
+        imm -= 1 << 19;
+    *cond_out = insn & 0xf;
+    *target_out = (int64_t)pos + imm * 4;
+    return 1;
+}
+
+static int aarch64_cbz_branch(size_t pos, uint32_t insn,
+                              unsigned int expected_reg,
+                              int64_t *target_out)
+{
+    int64_t imm;
+
+    /* Accept W/X CBZ, but not CBNZ. */
+    if ((insn & 0x7f000000u) != 0x34000000u ||
+        (insn & 0x1f) != expected_reg)
+        return 0;
+    imm = (insn >> 5) & 0x7ffff;
+    if (imm & (1 << 18))
+        imm -= 1 << 19;
+    *target_out = (int64_t)pos + imm * 4;
+    return 1;
+}
+
+static int aarch64_musl_forward_value(const uint8_t *code, size_t load,
+                                      size_t branch, unsigned int value_reg)
+{
+    for (size_t i = 0; i < load; i += 4) {
+        if (aarch64_is_movz_value(read_u32_le(code + i), value_reg, 3) &&
+            aarch64_musl_no_control_flow(code, 0, i) &&
+            aarch64_musl_no_control_flow(code, i + 4, branch) &&
+            aarch64_musl_registers_preserved(
+                code, i + 4, branch, 1u << value_reg))
+            return 1;
+    }
+    return 0;
+}
+
+static int aarch64_musl_loop_value(const uint8_t *code,
+                                   size_t initial_branch, size_t load,
+                                   size_t compare_branch,
+                                   unsigned int value_reg)
+{
+    for (size_t i = 0; i < initial_branch; i += 4) {
+        if (aarch64_is_movz_value(read_u32_le(code + i), value_reg, 3) &&
+            aarch64_musl_no_control_flow(code, 0, i) &&
+            aarch64_musl_no_control_flow(code, i + 4, initial_branch) &&
+            aarch64_musl_registers_preserved(
+                code, i + 4, initial_branch, 1u << value_reg) &&
+            aarch64_musl_registers_preserved(
+                code, load, compare_branch, 1u << value_reg))
+            return 1;
+    }
+    return 0;
+}
+
 /* As on x86-64, old pthread_detach directly stores a detached marker while
  * modern implementations use an exclusive state transition. */
+
 static int decode_aarch64_musl_detach_offset(const uint8_t *code, size_t len,
                                              size_t *off_out,
                                              int *initial_out)
@@ -4254,17 +4534,18 @@ static int decode_aarch64_musl_detach_offset(const uint8_t *code, size_t len,
         uint32_t mov = read_u32_le(code + i);
         unsigned int value_reg;
 
-        if ((mov & 0x7f800000u) != 0x52800000u ||
-            ((mov >> 5) & 0xffff) != 2)
-            continue;
         value_reg = mov & 0x1f;
+        if (!aarch64_is_movz_value(mov, value_reg, 2))
+            continue;
         for (size_t j = i + 4; j + 4 <= len && j <= i + 16; j += 4) {
             uint32_t store = read_u32_le(code + j);
+            unsigned int base_reg = (store >> 5) & 0x1f;
             size_t off;
 
             if ((store & 0xffc00000u) != 0xb9000000u ||
-                ((store >> 5) & 0x1f) != 0 ||
-                (store & 0x1f) != value_reg)
+                base_reg == 31 || (store & 0x1f) != value_reg ||
+                !aarch64_musl_arg0_at(code, j, base_reg) ||
+                !aarch64_musl_constant_at(code, j, value_reg, 2))
                 continue;
             off = ((store >> 10) & 0xfff) * sizeof(uint32_t);
             if (off < MUSL_THREAD_PROBE_LIMIT) {
@@ -4277,13 +4558,17 @@ static int decode_aarch64_musl_detach_offset(const uint8_t *code, size_t len,
 
     for (size_t i = 0; i + 8 <= len; i += 4) {
         uint32_t add = read_u32_le(code + i);
+        unsigned int source_reg;
         unsigned int address_reg;
         uint64_t off;
 
-        if ((add & 0xff000000u) != 0x91000000u ||
-            ((add >> 5) & 0x1f) != 0)
+        if ((add & 0xff000000u) != 0x91000000u)
             continue;
+        source_reg = (add >> 5) & 0x1f;
         address_reg = add & 0x1f;
+        if (address_reg == 31 ||
+            !aarch64_musl_arg0_at(code, i, source_reg))
+            continue;
         off = (add >> 10) & 0xfff;
         if ((add >> 22) & 1)
             off <<= 12;
@@ -4296,56 +4581,91 @@ static int decode_aarch64_musl_detach_offset(const uint8_t *code, size_t len,
         for (size_t j = i + 4; j + 4 <= len && j <= i + 80; j += 4) {
             uint32_t load = read_u32_le(code + j);
             unsigned int loaded_reg;
-            int has_joinable_compare = 0;
-            int has_detached_store = 0;
 
             if ((load & 0xfffffc00u) != 0x885ffc00u ||
                 ((load >> 5) & 0x1f) != address_reg)
                 continue;
             loaded_reg = load & 0x1f;
+            if (loaded_reg == 31 || loaded_reg == address_reg)
+                continue;
 
             for (size_t k = j + 4; k + 4 <= len && k <= j + 16; k += 4) {
                 uint32_t compare = read_u32_le(code + k);
+                size_t branch_pos = k + 4;
+                unsigned int condition;
+                int64_t branch_target;
 
-                if ((compare & 0xff00001fu) == 0x7100001fu &&
-                    ((compare >> 5) & 0x1f) == loaded_reg &&
-                    ((compare >> 10) & 0xfff) == 2 &&
-                    ((compare >> 22) & 1) == 0) {
-                    has_joinable_compare = 1;
-                    break;
-                }
-            }
-            if (!has_joinable_compare)
-                continue;
-
-            size_t store_begin = j > i + 16 ? j - 16 : i + 4;
-            for (size_t k = store_begin;
-                 k + 4 <= len && k <= j + 24; k += 4) {
-                uint32_t store = read_u32_le(code + k);
-                unsigned int value_reg;
-
-                if ((store & 0xffe0fc00u) != 0x8800fc00u ||
-                    ((store >> 5) & 0x1f) != address_reg)
+                if (k != j + 4 ||
+                    (compare & 0xff00001fu) != 0x7100001fu ||
+                    ((compare >> 5) & 0x1f) != loaded_reg ||
+                    ((compare >> 10) & 0xfff) != 2 ||
+                    ((compare >> 22) & 1) != 0 ||
+                    branch_pos + 4 > len ||
+                    !aarch64_cond_branch(
+                        branch_pos, read_u32_le(code + branch_pos),
+                        &condition, &branch_target) ||
+                    (condition != 0 && condition != 1))
                     continue;
-                value_reg = store & 0x1f;
-                for (size_t m = i + 4; m <= k; m += 4) {
-                    uint32_t mov = read_u32_le(code + m);
 
-                    if ((mov & 0x7f800000u) == 0x52800000u &&
-                        ((mov >> 5) & 0xffff) == 3 &&
-                        ((mov >> 21) & 3) == 0 &&
-                        (mov & 0x1f) == value_reg) {
-                        has_detached_store = 1;
-                        break;
+                for (size_t m = i + 4;
+                     m + 4 <= len && m <= j + 24; m += 4) {
+                    uint32_t store = read_u32_le(code + m);
+                    unsigned int status_reg;
+                    unsigned int value_reg;
+
+                    if ((store & 0xffe0fc00u) != 0x8800fc00u ||
+                        ((store >> 5) & 0x1f) != address_reg)
+                        continue;
+                    status_reg = (store >> 16) & 0x1f;
+                    value_reg = store & 0x1f;
+                    if (status_reg == 31 || value_reg == 31 ||
+                        status_reg == address_reg ||
+                        status_reg == value_reg)
+                        continue;
+
+                    /* B.NE skips a following store when the state is not
+                     * JOINABLE.  B.EQ loops back to a preceding store. */
+                    if (condition == 1) {
+                        if (m != branch_pos + 4 ||
+                            branch_target <= (int64_t)m ||
+                            !aarch64_musl_no_control_flow(
+                                code, i + 4, j) ||
+                            !aarch64_musl_registers_preserved(
+                                code, i + 4, j, 1u << address_reg) ||
+                            !aarch64_musl_forward_value(
+                                code, j, branch_pos, value_reg))
+                            continue;
+                    } else {
+                        int64_t initial_target;
+                        int64_t cbz_target;
+
+                        if (m < 4 || m + 8 != j ||
+                            branch_target != (int64_t)m ||
+                            loaded_reg == value_reg ||
+                            !aarch64_unconditional_branch(
+                                m - 4, read_u32_le(code + m - 4),
+                                &initial_target) ||
+                            initial_target != (int64_t)j ||
+                            !aarch64_cbz_branch(
+                                m + 4, read_u32_le(code + m + 4),
+                                status_reg, &cbz_target) ||
+                            cbz_target <= (int64_t)j ||
+                            !aarch64_musl_no_control_flow(
+                                code, i + 4, m - 4) ||
+                            !aarch64_musl_registers_preserved(
+                                code, i + 4, m - 4,
+                                1u << address_reg) ||
+                            !aarch64_musl_registers_preserved(
+                                code, m, j, 1u << address_reg) ||
+                            !aarch64_musl_loop_value(
+                                code, m - 4, j, branch_pos, value_reg))
+                            continue;
                     }
+
+                    *off_out = (size_t)off;
+                    *initial_out = 2;
+                    return 1;
                 }
-                if (has_detached_store)
-                    break;
-            }
-            if (has_detached_store) {
-                *off_out = (size_t)off;
-                *initial_out = 2;
-                return 1;
             }
         }
     }
@@ -4354,6 +4674,229 @@ static int decode_aarch64_musl_detach_offset(const uint8_t *code, size_t len,
 #endif
 
 #if defined(__x86_64__)
+static int x86_64_modrm_end(const uint8_t *code, size_t len,
+                            size_t modrm_pos, size_t *end_out)
+{
+    uint8_t modrm;
+    unsigned int mod;
+    unsigned int rm;
+    size_t end;
+
+    if (modrm_pos >= len)
+        return 0;
+    modrm = code[modrm_pos];
+    mod = modrm >> 6;
+    rm = modrm & 7;
+    end = modrm_pos + 1;
+    if (mod == 3) {
+        *end_out = end;
+        return 1;
+    }
+    if (rm == 4) {
+        uint8_t sib;
+
+        if (end >= len)
+            return 0;
+        sib = code[end++];
+        if (mod == 0 && (sib & 7) == 5)
+            end += 4;
+    } else if (mod == 0 && rm == 5) {
+        end += 4;
+    }
+    if (mod == 1)
+        end++;
+    else if (mod == 2)
+        end += 4;
+    if (end > len)
+        return 0;
+    *end_out = end;
+    return 1;
+}
+
+/* Conservatively prove that the instructions between a flag load and its
+ * test preserve the loaded register.  Only prologue operations present in
+ * the admitted musl 1.1.x builds are decoded; calls and unknown instructions
+ * fail closed. */
+static int x86_64_musl_gap_safe(const uint8_t *code, size_t begin,
+                                size_t end, unsigned int flag_reg,
+                                int preserve_flags)
+{
+    size_t i = begin;
+
+    while (i < end) {
+        uint8_t rex = 0;
+        size_t opcode_pos = i;
+        uint8_t opcode;
+        size_t insn_end;
+
+        if (code[i] == 0x90) {
+            i++;
+            continue;
+        }
+        /* mov %fs:disp32, %r64 (stack-canary or thread-pointer load) */
+        if (i + 9 <= end && code[i] == 0x64 &&
+            (code[i + 1] == 0x48 || code[i + 1] == 0x4c) &&
+            code[i + 2] == 0x8b &&
+            (code[i + 3] & 0xc7) == 0x04 && code[i + 4] == 0x25) {
+            unsigned int destination =
+                ((code[i + 3] >> 3) & 7) |
+                ((code[i + 1] & 4) ? 8 : 0);
+
+            if (destination == flag_reg)
+                return 0;
+            i += 9;
+            continue;
+        }
+        if ((code[opcode_pos] & 0xf0) == 0x40) {
+            rex = code[opcode_pos++];
+            if (opcode_pos >= end)
+                return 0;
+        }
+        opcode = code[opcode_pos++];
+
+        if (opcode >= 0xb8 && opcode <= 0xbf) {
+            unsigned int destination =
+                (opcode - 0xb8) | ((rex & 1) ? 8 : 0);
+            size_t immediate_size = (rex & 8) ? 8 : 4;
+
+            if (destination == flag_reg ||
+                immediate_size > end - opcode_pos)
+                return 0;
+            i = opcode_pos + immediate_size;
+            continue;
+        }
+
+        if (opcode == 0x0f) {
+            if (opcode_pos >= end || code[opcode_pos++] != 0x29 ||
+                !x86_64_modrm_end(code, end, opcode_pos, &insn_end))
+                return 0;
+            i = insn_end;
+            continue;
+        }
+
+        if (opcode != 0x89 && opcode != 0x8b && opcode != 0x31 &&
+            opcode != 0xc7)
+            return 0;
+        if (opcode == 0x31 && preserve_flags)
+            return 0;
+        if (!x86_64_modrm_end(code, end, opcode_pos, &insn_end))
+            return 0;
+
+        uint8_t modrm = code[opcode_pos];
+        unsigned int mod = modrm >> 6;
+        unsigned int destination;
+
+        if (opcode == 0x8b) {
+            destination = ((modrm >> 3) & 7) | ((rex & 4) ? 8 : 0);
+            if (destination == flag_reg)
+                return 0;
+        } else if (mod == 3) {
+            destination = (modrm & 7) | ((rex & 1) ? 8 : 0);
+            if (destination == flag_reg)
+                return 0;
+        }
+        if (opcode == 0xc7) {
+            if (((modrm >> 3) & 7) != 0 || 4 > end - insn_end)
+                return 0;
+            insn_end += 4;
+        }
+        i = insn_end;
+    }
+    return i == end;
+}
+
+/* Old musl releases load the two struct __libc thread-state words into a
+ * register and branch on a subsequent `test reg, reg`.  Newer builds compare
+ * the RIP-relative memory operand directly.  Decode the old form only when
+ * the complete load/test/zero-branch data-use pattern is present. */
+static int decode_x86_64_musl_flag_load(const uint8_t *code, size_t len,
+                                        size_t i, uintptr_t *addr_out,
+                                        size_t *end_out)
+{
+    size_t insn_len;
+    unsigned int reg;
+    uint64_t target;
+
+    if (i + 6 <= len && code[i] == 0x8b &&
+        (code[i + 1] & 0xc7) == 0x05) {
+        insn_len = 6;
+        reg = (code[i + 1] >> 3) & 7;
+    } else if (i + 7 <= len && code[i] == 0x44 && code[i + 1] == 0x8b &&
+               (code[i + 2] & 0xc7) == 0x05) {
+        insn_len = 7;
+        reg = ((code[i + 2] >> 3) & 7) + 8;
+    } else {
+        return 0;
+    }
+
+    if (!u64_add_i64_checked(
+            (uint64_t)(uintptr_t)(code + i + insn_len),
+            read_i32_le(code + i + insn_len - sizeof(uint32_t)), &target) ||
+        target > UINTPTR_MAX)
+        return 0;
+
+    for (size_t j = i + insn_len;
+         j <= i + insn_len + 64 && j < len; j++) {
+        size_t test_len;
+        size_t test_end;
+
+        if (reg < 8 && j + 2 <= len && code[j] == 0x85 &&
+            code[j + 1] == (uint8_t)(0xc0 | reg | (reg << 3))) {
+            test_len = 2;
+        } else if (reg >= 8 && j + 3 <= len && code[j] == 0x45 &&
+                   code[j + 1] == 0x85 &&
+                   code[j + 2] ==
+                       (uint8_t)(0xc0 | (reg & 7) | ((reg & 7) << 3))) {
+            test_len = 3;
+        } else {
+            continue;
+        }
+
+        if (!x86_64_musl_gap_safe(code, i + insn_len, j, reg, 0))
+            continue;
+        test_end = j + test_len;
+        /* pthread_create skips its thread setup when either flag is zero.
+         * Old builds initialize stack arguments between TEST and JE, so
+         * prove that every intervening instruction preserves EFLAGS. */
+        for (size_t k = test_end;
+             k <= test_end + 64 && k < len; k++) {
+            size_t branch_len;
+
+            if (k + 6 <= len && code[k] == 0x0f && code[k + 1] == 0x84)
+                branch_len = 6;
+            else if (k + 2 <= len && code[k] == 0x74)
+                branch_len = 2;
+            else
+                continue;
+            if (!x86_64_musl_gap_safe(code, test_end, k,
+                                       UINT_MAX, 1))
+                continue;
+            *addr_out = (uintptr_t)target;
+            *end_out = k + branch_len;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int x86_64_musl_libc_candidate(const struct loaded_obj *libc_obj,
+                                      uintptr_t candidate, uintptr_t second,
+                                      uintptr_t *addr_out)
+{
+    void *checked;
+
+    if (candidate > UINTPTR_MAX - g_musl_layout->libc_threaded ||
+        second != candidate + g_musl_layout->libc_threaded ||
+        candidate < libc_obj->base ||
+        candidate - libc_obj->base > INT64_MAX ||
+        !loaded_obj_signed_offset_pointer(
+            libc_obj, (int64_t)(candidate - libc_obj->base),
+            g_musl_layout->libc_size, PF_W, &checked))
+        return 0;
+    *addr_out = (uintptr_t)checked;
+    return 1;
+}
+
 static int decode_x86_64_musl_libc_addr(const struct loaded_obj *libc_obj,
                                         const uint8_t *code, size_t len,
                                         uintptr_t *addr_out)
@@ -4374,22 +4917,43 @@ static int decode_x86_64_musl_libc_addr(const struct loaded_obj *libc_obj,
 
         for (size_t j = i + 7; j + 7 <= len && j <= i + 160; j++) {
             uintptr_t second;
-            void *checked;
 
             if (code[j] != cmp_opcode || code[j + 1] != 0x3d ||
                 code[j + 6] != 0)
                 continue;
             second = (uintptr_t)(code + j + 7) +
                      (intptr_t)read_i32_le(code + j + 2);
-            if (second != candidate + g_musl_layout->libc_threaded ||
-                candidate < libc_obj->base ||
-                candidate - libc_obj->base > INT64_MAX ||
-                !loaded_obj_signed_offset_pointer(
-                    libc_obj, (int64_t)(candidate - libc_obj->base),
-                    g_musl_layout->libc_size, PF_W, &checked))
-                continue;
-            *addr_out = (uintptr_t)checked;
-            return 1;
+            if (x86_64_musl_libc_candidate(libc_obj, candidate, second,
+                                           addr_out))
+                return 1;
+        }
+    }
+
+    if (g_musl_layout->libc_flag_width != sizeof(uint32_t))
+        return 0;
+
+    for (size_t i = 0; i < len; i++) {
+        uintptr_t first;
+        size_t first_end;
+
+        if (!decode_x86_64_musl_flag_load(code, len, i, &first,
+                                           &first_end) ||
+            first < libc_obj->base +
+                        g_musl_layout->libc_can_do_threads)
+            continue;
+        uintptr_t candidate =
+            first - g_musl_layout->libc_can_do_threads;
+
+        for (size_t j = first_end;
+             j < len && j <= first_end + 160; j++) {
+            uintptr_t second;
+            size_t second_end;
+
+            if (decode_x86_64_musl_flag_load(code, len, j, &second,
+                                              &second_end) &&
+                x86_64_musl_libc_candidate(libc_obj, candidate, second,
+                                           addr_out))
+                return 1;
         }
     }
     return 0;
@@ -4644,6 +5208,29 @@ static int g_nobj;
 static int g_global_scope_root = -1;
 static uint16_t g_global_scope_indices[MAX_TOTAL_OBJS];
 static uint16_t g_global_scope_count;
+
+static int dl_object_is_visible(const struct loaded_obj *obj)
+{
+    return obj && obj->visible;
+}
+
+static int dl_flags_startup_mapped(uint32_t flags)
+{
+    if (flags & (LDR_FLAG_INTERP | LDR_FLAG_DATA))
+        return 0;
+    return !(flags & LDR_FLAG_DLOPEN) ||
+           (flags & LDR_FLAG_DLOPEN_EARLY);
+}
+
+static unsigned long long dl_visible_object_count(void)
+{
+    unsigned long long count = 0;
+
+    for (int i = 0; i < g_nobj; i++)
+        if (dl_object_is_visible(&g_all_objs[i]))
+            count++;
+    return count;
+}
 
 /* Per-object metadata for dlopen'd objects (used by protect_object) */
 static struct dlfrz_lib_meta g_dl_metas[MAX_TOTAL_OBJS];
@@ -5671,7 +6258,8 @@ static int glro_dl_find_object(void *pc, void *result)
 {
     uintptr_t addr = (uintptr_t)pc;
     for (int i = 0; i < g_nobj; i++) {
-        if (loaded_obj_contains(&g_all_objs[i], addr, 1)) {
+        if (dl_object_is_visible(&g_all_objs[i]) &&
+            loaded_obj_contains(&g_all_objs[i], addr, 1)) {
             /* struct dl_find_object layout on x86-64 (glibc 2.35+):
              *   0: dlfo_flags           (unsigned long long)
              *   8: dlfo_map_start       (void *)
@@ -9899,56 +10487,34 @@ static int apply_prelinked_override_fallbacks(struct loaded_obj *obj,
 
 /* ==== Map one object's PT_LOAD segments ================================ */
 
-/*
- * Reserve virtual address ranges for all objects.  When all objects share
- * a high base address (PIE/DSOs only), a single contiguous reservation
- * suffices.  When a non-PIE executable is present (base_addr=0, mapped at
- * its original link address), the range is split into two reservations so
- * the bootstrap binary in between is not disturbed.
- */
+/* Reserve each startup-mapped object independently.  Lazy manifest objects
+ * can sit between promoted closure members in base-address order; reserving
+ * the min/max span would consume those dormant objects' future ranges and
+ * make their later MAP_FIXED_NOREPLACE admission fail. */
 static int reserve_address_range(const struct dlfrz_lib_meta *metas,
                                   const int *idx_map, int nobj,
                                   _Bool memcpy_mode)
 {
-    /* Partition objects into native-address (base_addr=0, non-PIE exe)
-     * and relocated (base_addr>0, DSOs + PIE executables). */
-    uint64_t nat_lo = UINT64_MAX, nat_hi = 0;
-    uint64_t rel_lo = UINT64_MAX, rel_hi = 0;
+    (void)memcpy_mode;
     for (int i = 0; i < nobj; i++) {
         int mi = idx_map[i];
         uint64_t lo = metas[mi].base_addr + page_floor(metas[mi].vaddr_lo);
         uint64_t hi = metas[mi].base_addr +
                       ALIGN_UP(metas[mi].vaddr_hi, g_page_size);
-        if (metas[mi].base_addr == 0) {
-            if (lo < nat_lo) nat_lo = lo;
-            if (hi > nat_hi) nat_hi = hi;
-        } else {
-            if (lo < rel_lo) rel_lo = lo;
-            if (hi > rel_hi) rel_hi = hi;
-        }
-    }
+        uint64_t end;
+        void *mapping;
 
-    /* Reserve collisions without making holes or trailing guard pages
-     * accessible.  Individual PT_LOAD pages are enabled by map_object(). */
-    int res_prot = PROT_NONE;
-    (void)memcpy_mode;
-
-    if (nat_lo < nat_hi) {
-        nat_hi += 4 * g_page_size;
-        void *m = mmap((void *)nat_lo, nat_hi - nat_lo, res_prot,
+        if (hi <= lo || !u64_add_checked(hi, 4 * g_page_size, &end) ||
+            end - lo > SIZE_MAX)
+            return -1;
+        mapping = mmap((void *)(uintptr_t)lo, (size_t)(end - lo),
+                       PROT_NONE,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
                        -1, 0);
-        if (m == MAP_FAILED) return -1;
+        if (mapping == MAP_FAILED)
+            return -1;
     }
-    if (rel_lo < rel_hi) {
-        rel_hi += 4 * g_page_size;
-        void *m = mmap((void *)rel_lo, rel_hi - rel_lo, res_prot,
-                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
-                       -1, 0);
-        if (m == MAP_FAILED) return -1;
-    }
-    if (nat_lo >= nat_hi && rel_lo >= rel_hi) return -1;
-    return 0;
+    return nobj > 0 ? 0 : -1;
 }
 
 static int phdr_prot(const Elf64_Phdr *ph)
@@ -11559,9 +12125,9 @@ static int dynamic_has_static_tls(int fd, const Elf64_Phdr *ph,
                                   uint16_t phnum)
 {
     /* Locate PT_DYNAMIC and PT_TLS.  DF_STATIC_TLS is only meaningful
-     * if the object actually has a non-empty TLS template — many glibc
-     * libs (e.g. libm.so.6) carry the flag for legacy reasons but
-     * declare zero TLS, so loading them is harmless. */
+     * if the object actually has a non-empty TLS template.  Some system
+     * DSOs retain the flag while declaring zero TLS, which needs no new
+     * static allocation. */
     const Elf64_Phdr *dyn_ph = NULL;
     uint64_t tls_memsz = 0;
     for (uint16_t i = 0; i < phnum; i++) {
@@ -11605,13 +12171,20 @@ static int dl_lazy_static_tls_admitted(const struct loaded_obj *obj,
 {
     int requires_static_tls = 0;
 
-    if (!obj || obj->tls.memsz == 0)
+    if (!obj)
         return 0;
-    for (size_t i = 0; i < obj->dynamic_count; i++) {
-        if (obj->dynamic[i].d_tag == DT_FLAGS &&
-            (obj->dynamic[i].d_un.d_val & 0x10 /* DF_STATIC_TLS */)) {
-            requires_static_tls = 1;
-            break;
+    /* DF_STATIC_TLS describes the object's own TLS block, so a zero-sized
+     * PT_TLS makes that flag harmless.  A TPOFF relocation is different:
+     * an object with no PT_TLS may still import an initial-exec TLS symbol
+     * from a dependency and therefore require the dependency closure to
+     * have received startup static-TLS offsets. */
+    if (obj->tls.memsz != 0) {
+        for (size_t i = 0; i < obj->dynamic_count; i++) {
+            if (obj->dynamic[i].d_tag == DT_FLAGS &&
+                (obj->dynamic[i].d_un.d_val & 0x10 /* DF_STATIC_TLS */)) {
+                requires_static_tls = 1;
+                break;
+            }
         }
     }
     if (!requires_static_tls) {
@@ -11621,10 +12194,37 @@ static int dl_lazy_static_tls_admitted(const struct loaded_obj *obj,
         for (size_t t = 0; t < sizeof(tables) / sizeof(tables[0]) &&
                            !requires_static_tls; t++) {
             for (size_t i = 0; i < counts[t]; i++) {
-                if (ELF64_R_TYPE(tables[t][i].r_info) == ARCH_RELOC_TPOFF) {
-                    requires_static_tls = 1;
-                    break;
+                const Elf64_Rela *rel = &tables[t][i];
+                const Elf64_Sym *reference;
+                const Elf64_Sym *definition;
+                struct loaded_obj *owner = NULL;
+                uint32_t sym_index;
+
+                if (ELF64_R_TYPE(rel->r_info) != ARCH_RELOC_TPOFF)
+                    continue;
+                sym_index = ELF64_R_SYM(rel->r_info);
+                reference = loaded_dynsym(obj, sym_index);
+                if (sym_index == 0) {
+                    owner = (struct loaded_obj *)obj;
+                    definition = NULL;
+                } else {
+                    definition = lookup_relocation_definition(
+                        (struct loaded_obj *)obj, sym_index,
+                        g_all_objs, g_nobj, 0, &owner);
                 }
+
+                /* A late requester may use initial-exec access to TLS that
+                 * already belongs to a startup object.  That owner has a
+                 * real static TPOFF and is safe.  An unresolved strong
+                 * reference or an owner with only dynamic TLS still needs
+                 * new static space and must be refused. */
+                if (owner && owner->tls.memsz != 0 && owner->tls.tpoff != 0)
+                    continue;
+                if (!definition && sym_index != 0 && reference &&
+                    ELF64_ST_BIND(reference->st_info) == STB_WEAK)
+                    continue;
+                requires_static_tls = 1;
+                break;
             }
         }
     }
@@ -11726,6 +12326,7 @@ static int dl_initialize_startup_lookup_scopes(struct loaded_obj *objs,
         obj->needed_count = 0;
         obj->lookup_scope_count = 0;
         obj->lookup_scope_valid = 0;
+        obj->relocation_scope_root_valid = 0;
         if (obj->flags & LDR_FLAG_MAIN_EXE) {
             if (main_index >= 0)
                 return -1;
@@ -11766,17 +12367,66 @@ static int dl_initialize_startup_lookup_scopes(struct loaded_obj *objs,
         }
     }
 
+    if (!dl_object_is_visible(&objs[main_index]))
+        return -1;
     g_global_scope_root = main_index;
-    for (int i = 0; i < nobj; i++)
+    for (int i = 0; i < nobj; i++) {
+        if (!dl_object_is_visible(&objs[i]))
+            continue;
         if (dl_set_relocation_scope_root(&objs[i], main_index, nobj) < 0)
             return -1;
+    }
+    if (dl_build_lookup_scope(&objs[main_index], nobj) < 0)
+        return -1;
+    for (uint16_t i = 0; i < objs[main_index].lookup_scope_count; i++) {
+        uint16_t index = objs[main_index].lookup_scope_indices[i];
+
+        if (index >= nobj || !dl_object_is_visible(&objs[index]))
+            return -1;
+    }
+
+    /* Dormant promoted objects relocate in the breadth-first scope of the
+     * first direct traced root that reaches them.  This mirrors the trace's
+     * load order for shared closures without publishing that scope. */
+    for (int root = 0; root < nobj; root++) {
+        struct loaded_obj *root_obj = &objs[root];
+
+        if (dl_object_is_visible(root_obj) ||
+            !(root_obj->flags & LDR_FLAG_DLOPEN_EARLY) ||
+            !(root_obj->flags & LDR_FLAG_DLOPEN_ROOT))
+            continue;
+        if (dl_build_lookup_scope(root_obj, nobj) < 0)
+            return -1;
+        for (uint16_t i = 0; i < root_obj->lookup_scope_count; i++) {
+            uint16_t index = root_obj->lookup_scope_indices[i];
+            struct loaded_obj *member;
+
+            if (index >= nobj)
+                return -1;
+            member = &objs[index];
+            if (dl_object_is_visible(member) ||
+                !(member->flags & LDR_FLAG_DLOPEN_EARLY) ||
+                member->relocation_scope_root_valid)
+                continue;
+            if (dl_set_relocation_scope_root(member, root, nobj) < 0)
+                return -1;
+        }
+    }
+    for (int i = 0; i < nobj; i++) {
+        if (!dl_object_is_visible(&objs[i]) &&
+            (objs[i].flags & LDR_FLAG_DLOPEN_EARLY) &&
+            !objs[i].relocation_scope_root_valid)
+            return -1;
+    }
+
     if (dl_append_lookup_scope_to_global(&objs[main_index], nobj) < 0)
         return -1;
 
     /* Keep any packed startup object not reachable from the main object's
      * DT_NEEDED graph globally visible in its prior table order. */
     for (int i = 0; i < nobj; i++)
-        if (dl_append_index_to_global((uint16_t)i, nobj) < 0)
+        if (dl_object_is_visible(&objs[i]) &&
+            dl_append_index_to_global((uint16_t)i, nobj) < 0)
             return -1;
     return 0;
 }
@@ -12630,9 +13280,194 @@ static int dl_transaction_publish_glibc_tls(struct loaded_obj **objects,
     return 0;
 }
 
+static int dl_scope_init_visit(uint16_t index, const uint8_t *members,
+                               uint8_t *state, uint16_t *order,
+                               uint16_t *order_count)
+{
+    struct loaded_obj *obj;
+
+    if (index >= g_nobj || !members[index])
+        return -1;
+    if (state[index] == 2)
+        return 0;
+    if (state[index] == 1)
+        return 0;
+    state[index] = 1;
+    obj = &g_all_objs[index];
+    for (uint16_t i = 0; i < obj->needed_count; i++) {
+        uint16_t dependency = obj->needed_indices[i];
+
+        if (dependency >= g_nobj)
+            return -1;
+        if (members[dependency] &&
+            dl_scope_init_visit(dependency, members, state, order,
+                                order_count) < 0)
+            return -1;
+    }
+    state[index] = 2;
+    if (*order_count >= MAX_TOTAL_OBJS)
+        return -1;
+    order[(*order_count)++] = index;
+    return 0;
+}
+
+static int dl_run_scope_initializers(struct loaded_obj *root)
+{
+    uint8_t members[MAX_TOTAL_OBJS];
+    uint8_t state[MAX_TOTAL_OBJS];
+    uint16_t order[MAX_TOTAL_OBJS];
+    uint16_t order_count = 0;
+    int root_index;
+
+    if (!dl_object_table_index(root, g_nobj, &root_index) ||
+        (!root->lookup_scope_valid &&
+         dl_build_lookup_scope(root, g_nobj) < 0))
+        return -1;
+    memset(members, 0, sizeof(members));
+    memset(state, 0, sizeof(state));
+    for (uint16_t i = 0; i < root->lookup_scope_count; i++) {
+        uint16_t index = root->lookup_scope_indices[i];
+
+        if (index >= g_nobj)
+            return -1;
+        members[index] = 1;
+    }
+    if (dl_scope_init_visit((uint16_t)root_index, members, state, order,
+                            &order_count) < 0)
+        return -1;
+
+    restore_ptr_guard();
+    for (uint16_t i = 0; i < order_count; i++) {
+        struct loaded_obj *obj = &g_all_objs[order[i]];
+        typedef void (*init_fn_t)(int, char **, char **);
+
+        if (!dl_object_is_visible(obj) || obj->init_started)
+            continue;
+        record_object_init(obj);
+        if (obj->init_func)
+            ((init_fn_t)obj->init_func)(g_argc, g_argv, g_envp);
+        for (size_t j = 0; j < obj->init_array_sz; j++)
+            ((init_fn_t)obj->init_array[j])(g_argc, g_argv, g_envp);
+    }
+    return 0;
+}
+
+/* Complete the target-code relocation phases for a set of promoted dormant
+ * objects.  Ordinary/COPY relocations and the startup TLS template are
+ * already complete; keeping these two resolver phases here preserves native
+ * dlopen timing without giving up the static-TLS reservation. */
+static int dl_finish_dormant_relocations(const uint8_t *members)
+{
+    int have_pending = 0;
+
+    if (!members)
+        return -1;
+    for (int i = 0; i < g_nobj; i++) {
+        struct loaded_obj *obj = &g_all_objs[i];
+
+        if (!members[i] ||
+            (!obj->deferred_relocation_phase &&
+             !obj->final_protections_pending))
+            continue;
+        if (!(obj->flags & LDR_FLAG_DLOPEN_EARLY) ||
+            dl_object_is_visible(obj) ||
+            (obj->deferred_relocation_phase != 0 &&
+             obj->deferred_relocation_phase != RELOC_PASS_IFUNC &&
+             obj->deferred_relocation_phase != RELOC_PASS_IRELATIVE))
+            return -1;
+        have_pending = 1;
+    }
+    if (!have_pending)
+        return 0;
+
+    clear_resolution_caches();
+    restore_ptr_guard();
+    for (int phase = RELOC_PASS_IFUNC;
+         phase <= RELOC_PASS_IRELATIVE; phase++) {
+        for (int i = 0; i < g_nobj; i++) {
+            struct loaded_obj *obj = &g_all_objs[i];
+
+            if (!members[i] || obj->deferred_relocation_phase != phase)
+                continue;
+            if (apply_all_relocs(obj, g_all_objs, g_nobj,
+                                 (enum relocation_pass)phase) < 0) {
+                /* A pass may already have executed earlier target resolvers
+                 * in this same object.  Continuing after a partial pass
+                 * would make a retry repeat arbitrary resolver side effects. */
+                ldr_msg("dlfreeze-loader: dormant resolver relocation failed for ");
+                ldr_msg(obj->name ? obj->name : "dlopen object");
+                ldr_msg("\n");
+                _exit(127);
+            }
+            obj->deferred_relocation_phase =
+                phase == RELOC_PASS_IFUNC ? RELOC_PASS_IRELATIVE : 0;
+        }
+    }
+    for (int i = 0; i < g_nobj; i++) {
+        struct loaded_obj *obj = &g_all_objs[i];
+
+        if (!members[i] || !obj->final_protections_pending)
+            continue;
+        if (protect_object(obj, &g_dl_metas[i]) < 0) {
+            dl_set_error(obj->name ? obj->name : "dlopen object",
+                         ": cannot set final memory protections");
+            return -1;
+        }
+        obj->final_protections_pending = 0;
+    }
+    return 0;
+}
+
+static int dl_activate_dormant_scope(struct loaded_obj *root)
+{
+    uint8_t activated[MAX_TOTAL_OBJS];
+    uint16_t new_global = 0;
+
+    if (!root || dl_object_is_visible(root))
+        return root ? 0 : -1;
+    if (!(root->flags & LDR_FLAG_DLOPEN_EARLY) ||
+        (!root->lookup_scope_valid &&
+         dl_build_lookup_scope(root, g_nobj) < 0))
+        return -1;
+    memset(activated, 0, sizeof(activated));
+    for (uint16_t i = 0; i < root->lookup_scope_count; i++) {
+        uint16_t index = root->lookup_scope_indices[i];
+        struct loaded_obj *obj;
+
+        if (index >= g_nobj)
+            return -1;
+        obj = &g_all_objs[index];
+        if (!dl_object_is_visible(obj)) {
+            if (!(obj->flags & LDR_FLAG_DLOPEN_EARLY))
+                return -1;
+            activated[index] = 1;
+        }
+        if (!dl_global_scope_contains(index))
+            new_global++;
+    }
+    if (new_global > MAX_TOTAL_OBJS - g_global_scope_count)
+        return -1;
+    if (dl_finish_dormant_relocations(activated) < 0)
+        return -1;
+    for (int i = 0; i < g_nobj; i++)
+        if (activated[i])
+            g_all_objs[i].visible = 1;
+    if (dl_append_lookup_scope_to_global(root, g_nobj) < 0) {
+        for (int i = 0; i < g_nobj; i++)
+            if (activated[i])
+                g_all_objs[i].visible = 0;
+        return -1;
+    }
+    clear_resolution_caches();
+    return dl_run_scope_initializers(root);
+}
+
 static int dl_transaction_commit(void)
 {
     struct loaded_obj *pending[MAX_TOTAL_OBJS];
+    struct loaded_obj *scope_root;
+    uint8_t dormant_pending[MAX_TOTAL_OBJS];
+    int start_nobj;
     size_t count;
 
     if (!g_dl_transaction.active)
@@ -12643,8 +13478,28 @@ static int dl_transaction_commit(void)
         return -1;
     }
     count = g_dl_transaction.pending_init_count;
+    start_nobj = g_dl_transaction.start_nobj;
+    scope_root = &g_all_objs[g_dl_transaction.scope_root];
     memcpy(pending, g_dl_transaction.pending_init,
            count * sizeof(pending[0]));
+    memset(dormant_pending, 0, sizeof(dormant_pending));
+    for (uint16_t i = 0; i < scope_root->lookup_scope_count; i++) {
+        uint16_t index = scope_root->lookup_scope_indices[i];
+
+        if (index >= g_nobj ||
+            (!dl_object_is_visible(&g_all_objs[index]) &&
+             index < start_nobj &&
+             !(g_all_objs[index].flags & LDR_FLAG_DLOPEN_EARLY))) {
+            dl_set_error("dlopen dependency graph",
+                         ": contains an unactivatable dormant object");
+            return -1;
+        }
+        if (index < start_nobj &&
+            !dl_object_is_visible(&g_all_objs[index]) &&
+            (g_all_objs[index].deferred_relocation_phase ||
+             g_all_objs[index].final_protections_pending))
+            dormant_pending[index] = 1;
+    }
 
     /* Dependency discovery deliberately maps the complete graph before any
      * relocation.  A dependency may resolve an undefined symbol from a
@@ -12700,6 +13555,21 @@ static int dl_transaction_commit(void)
             return -1;
         }
     }
+    for (int i = 0; i < start_nobj; i++) {
+        struct loaded_obj *obj = &g_all_objs[i];
+
+        if (!dormant_pending[i] ||
+            obj->deferred_relocation_phase != RELOC_PASS_IFUNC)
+            continue;
+        if (apply_all_relocs(obj, g_all_objs, g_nobj,
+                             RELOC_PASS_IFUNC) < 0) {
+            ldr_msg("dlfreeze-loader: dormant IFUNC relocation failed for ");
+            ldr_msg(obj->name ? obj->name : "dlopen object");
+            ldr_msg("\n");
+            _exit(127);
+        }
+        obj->deferred_relocation_phase = RELOC_PASS_IRELATIVE;
+    }
     for (size_t i = 0; i < count; i++) {
         struct loaded_obj *obj = pending[i];
 
@@ -12709,6 +13579,21 @@ static int dl_transaction_commit(void)
                          ": IRELATIVE failed");
             return -1;
         }
+    }
+    for (int i = 0; i < start_nobj; i++) {
+        struct loaded_obj *obj = &g_all_objs[i];
+
+        if (!dormant_pending[i] ||
+            obj->deferred_relocation_phase != RELOC_PASS_IRELATIVE)
+            continue;
+        if (apply_all_relocs(obj, g_all_objs, g_nobj,
+                             RELOC_PASS_IRELATIVE) < 0) {
+            ldr_msg("dlfreeze-loader: dormant IRELATIVE failed for ");
+            ldr_msg(obj->name ? obj->name : "dlopen object");
+            ldr_msg("\n");
+            _exit(127);
+        }
+        obj->deferred_relocation_phase = 0;
     }
     for (size_t i = 0; i < count; i++) {
         struct loaded_obj *obj = pending[i];
@@ -12720,6 +13605,18 @@ static int dl_transaction_commit(void)
                          ": cannot set final memory protections");
             return -1;
         }
+    }
+    for (int i = 0; i < start_nobj; i++) {
+        struct loaded_obj *obj = &g_all_objs[i];
+
+        if (!dormant_pending[i] || !obj->final_protections_pending)
+            continue;
+        if (protect_object(obj, &g_dl_metas[i]) < 0) {
+            dl_set_error(obj->name ? obj->name : "dlopen object",
+                         ": cannot set final memory protections");
+            return -1;
+        }
+        obj->final_protections_pending = 0;
     }
 
     if (dl_append_lookup_scope_to_global(
@@ -12738,19 +13635,19 @@ static int dl_transaction_commit(void)
         return -1;
     }
 
+    /* The scope and all TLS state are now committed.  A pre-mapped dormant
+     * dependency joins the same publication point as newly mapped objects;
+     * its constructor is included in the dependency-first walk below. */
+    for (uint16_t i = 0; i < scope_root->lookup_scope_count; i++)
+        g_all_objs[scope_root->lookup_scope_indices[i]].visible = 1;
+
     /* Mark the transaction committed before invoking user constructors so a
      * constructor may itself start an independent recursive dlopen. */
     memset(&g_dl_transaction, 0, sizeof(g_dl_transaction));
-    restore_ptr_guard();
-    for (size_t i = 0; i < count; i++) {
-        struct loaded_obj *obj = pending[i];
-        typedef void (*init_fn_t)(int, char **, char **);
-
-        record_object_init(obj);
-        if (obj->init_func)
-            ((init_fn_t)obj->init_func)(g_argc, g_argv, g_envp);
-        for (size_t j = 0; j < obj->init_array_sz; j++)
-            ((init_fn_t)obj->init_array[j])(g_argc, g_argv, g_envp);
+    clear_resolution_caches();
+    if (dl_run_scope_initializers(scope_root) < 0) {
+        ldr_msg("dlfreeze-loader: committed dlopen scope has invalid init graph\n");
+        _exit(127);
     }
     return 0;
 }
@@ -13040,21 +13937,22 @@ static struct loaded_obj *load_elf_from_file_fd(
         dl_release_runtime_mapping(obj);
         return NULL;
     }
-    if (dl_lazy_static_tls_admitted(obj, path) < 0) {
-        dl_release_runtime_mapping(obj);
-        return NULL;
-    }
-    if (obj->tls.memsz != 0 && next_tls_modid(&obj->tls.modid) < 0) {
-        dl_set_error(path, ": too many TLS modules");
-        dl_release_runtime_mapping(obj);
-        return NULL;
-    }
-
     /* Bump count so symbol resolution includes this object */
     g_nobj = idx + 1;
     if (dl_assign_new_object_scope(obj) < 0) {
         dl_set_error(path, ": cannot establish dependency lookup scope");
         g_nobj = idx;
+        return NULL;
+    }
+    if (dl_lazy_static_tls_admitted(obj, path) < 0) {
+        g_nobj = idx;
+        dl_release_runtime_mapping(obj);
+        return NULL;
+    }
+    if (obj->tls.memsz != 0 && next_tls_modid(&obj->tls.modid) < 0) {
+        dl_set_error(path, ": too many TLS modules");
+        g_nobj = idx;
+        dl_release_runtime_mapping(obj);
         return NULL;
     }
 
@@ -13230,17 +14128,19 @@ static struct loaded_obj *load_embedded_object(
         dl_set_error(ename, ": malformed TLS program header");
         return NULL;
     }
-    if (dl_lazy_static_tls_admitted(obj, ename) < 0)
-        return NULL;
-    if (obj->tls.memsz != 0 && next_tls_modid(&obj->tls.modid) < 0) {
-        dl_set_error(ename, ": too many TLS modules");
-        return NULL;
-    }
-
     /* Bump count so symbol resolution includes this object */
     g_nobj = idx + 1;
     if (dl_assign_new_object_scope(obj) < 0) {
         dl_set_error(ename, ": cannot establish dependency lookup scope");
+        g_nobj = idx;
+        return NULL;
+    }
+    if (dl_lazy_static_tls_admitted(obj, ename) < 0) {
+        g_nobj = idx;
+        return NULL;
+    }
+    if (obj->tls.memsz != 0 && next_tls_modid(&obj->tls.modid) < 0) {
+        dl_set_error(ename, ": too many TLS modules");
         g_nobj = idx;
         return NULL;
     }
@@ -13341,7 +14241,8 @@ static struct loaded_obj *dl_object_for_address(void *return_address)
     uintptr_t address = (uintptr_t)return_address;
 
     for (int i = 0; i < g_nobj; i++)
-        if (loaded_obj_contains(&g_all_objs[i], address, 1))
+        if (dl_object_is_visible(&g_all_objs[i]) &&
+            loaded_obj_contains(&g_all_objs[i], address, 1))
             return &g_all_objs[i];
     return NULL;
 }
@@ -13378,7 +14279,19 @@ static void *my_dlopen(const char *path, int flags)
         return DL_GLOBAL_HANDLE;
 
     for (int i = 0; i < g_nobj; i++) {
-        if (dl_loaded_dependency_matches(&g_all_objs[i], path))
+        if (!dl_loaded_dependency_matches(&g_all_objs[i], path))
+            continue;
+        if (!dl_object_is_visible(&g_all_objs[i])) {
+            if (dl_lazy_dynamic_flags_admitted(&g_all_objs[i], path) < 0 ||
+                dl_activate_dormant_scope(&g_all_objs[i]) < 0) {
+                if (!g_dlerror_valid)
+                    dl_set_error(path,
+                                 ": cannot activate traced dormant closure");
+                restore_ptr_guard();
+                return NULL;
+            }
+        }
+        if (dl_object_is_visible(&g_all_objs[i]))
             return &g_all_objs[i];
     }
 
@@ -13462,7 +14375,12 @@ static struct loaded_obj *dl_object_from_handle(void *handle)
     delta = value - start;
     if (delta % sizeof(g_all_objs[0]) != 0)
         return NULL;
-    return &g_all_objs[delta / sizeof(g_all_objs[0])];
+    {
+        struct loaded_obj *obj =
+            &g_all_objs[delta / sizeof(g_all_objs[0])];
+
+        return dl_object_is_visible(obj) ? obj : NULL;
+    }
 }
 
 static int dl_next_lookup_scope(void *return_address,
@@ -13475,7 +14393,8 @@ static int dl_next_lookup_scope(void *return_address,
     int scoped;
 
     for (int i = 0; i < g_nobj; i++)
-        if (loaded_obj_contains(&g_all_objs[i], address, 1)) {
+        if (dl_object_is_visible(&g_all_objs[i]) &&
+            loaded_obj_contains(&g_all_objs[i], address, 1)) {
             caller_index = i;
             break;
         }
@@ -13486,9 +14405,10 @@ static int dl_next_lookup_scope(void *return_address,
     if (scoped < 0)
         return -1;
     if (scoped == 0) {
-        *count_out = (uint16_t)g_nobj;
+        *count_out = 0;
         for (int i = 0; i < g_nobj; i++)
-            order[i] = (uint16_t)i;
+            if (dl_object_is_visible(&g_all_objs[i]))
+                order[(*count_out)++] = (uint16_t)i;
     }
     for (uint16_t i = 0; i < *count_out; i++)
         if (order[i] == (uint16_t)caller_index) {
@@ -13739,7 +14659,11 @@ static void *my_dlvsym(void *handle, const char *symbol, const char *version)
     }
 
     for (int i = 0; i < g_nobj; i++) {
-        const Elf64_Sym *sym =
+        const Elf64_Sym *sym;
+
+        if (!dl_object_is_visible(&g_all_objs[i]))
+            continue;
+        sym =
             lookup_versioned_symbol(&g_all_objs[i], symbol, version);
         uint64_t addr;
 
@@ -13772,7 +14696,8 @@ static int my_dladdr(const void *address_ptr, Dl_info *info)
         return 0;
     memset(info, 0, sizeof(*info));
     for (int i = 0; i < g_nobj; i++) {
-        if (loaded_obj_contains(&g_all_objs[i], address, 1)) {
+        if (dl_object_is_visible(&g_all_objs[i]) &&
+            loaded_obj_contains(&g_all_objs[i], address, 1)) {
             obj = &g_all_objs[i];
             break;
         }
@@ -13953,15 +14878,17 @@ static int my_dl_iterate_phdr(
         void *data)
 {
     int ret = 0;
+    unsigned long long active_count = dl_visible_object_count();
     for (int i = 0; i < g_nobj; i++) {
-        if (!g_all_objs[i].phdr) continue;
+        if (!dl_object_is_visible(&g_all_objs[i]) ||
+            !g_all_objs[i].phdr) continue;
         struct dl_phdr_info info;
         memset(&info, 0, sizeof(info));
         info.dlpi_addr    = (ElfW(Addr))g_all_objs[i].base;
         info.dlpi_name    = g_all_objs[i].name ? g_all_objs[i].name : "";
         info.dlpi_phdr    = g_all_objs[i].phdr;
         info.dlpi_phnum   = g_all_objs[i].phdr_num;
-        info.dlpi_adds    = (unsigned long long)g_nobj;
+        info.dlpi_adds    = active_count;
         info.dlpi_subs    = 0;
         ret = callback(&info, sizeof(info), data);
         if (ret != 0) return ret;
@@ -14593,6 +15520,10 @@ static void topo_visit_init(int idx, struct loaded_obj *objs, int nobj,
                             char *state, int *order, int *order_count)
 {
     if (state[idx] != 0) return;
+    if (!dl_object_is_visible(&objs[idx])) {
+        state[idx] = 2;
+        return;
+    }
     state[idx] = 1;
     struct loaded_obj *obj = &objs[idx];
     if (obj->dynamic && obj->dynstr) {
@@ -14609,6 +15540,7 @@ static void topo_visit_init(int idx, struct loaded_obj *objs, int nobj,
                     continue;
                 for (int j = 0; j < nobj; j++) {
                     if (j == idx) continue;
+                    if (!dl_object_is_visible(&objs[j])) continue;
                     if (state[j] != 0) continue; /* done or cycle */
                     if (dl_name_matches(objs[j].name, needed)) {
                         topo_visit_init(j, objs, nobj, state, order,
@@ -14803,9 +15735,8 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
 
     int nobj = 0;
     for (uint32_t i = 0; i < num_entries; i++)
-        if (!(metas[i].flags & LDR_FLAG_INTERP) &&
-            !(metas[i].flags & LDR_FLAG_DLOPEN) &&
-            !(metas[i].flags & LDR_FLAG_DATA)) nobj++;
+        if (dl_flags_startup_mapped(metas[i].flags))
+            nobj++;
 
     if (nobj == 0) { ldr_err("no objects to load", NULL); return -1; }
     if (nobj > MAX_TOTAL_OBJS) { ldr_err("too many objects", NULL); return -1; }
@@ -14815,36 +15746,51 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     int idx_map[nobj];    /* idx_map[oi] = manifest index */
     memset(objs, 0, nobj * sizeof(struct loaded_obj));
 
-    /* Build in order: exe first, then shared libs (skip DLOPEN, DATA) */
+    /* Preserve the pre-linker's object/TLS numbering for ordinary startup
+     * objects, then append dormant promoted closures. */
     int oi = 0;
     for (uint32_t i = 0; i < num_entries; i++) {
-        if (metas[i].flags & LDR_FLAG_INTERP) continue;
+        if (!dl_flags_startup_mapped(metas[i].flags)) continue;
         if (metas[i].flags & LDR_FLAG_DLOPEN) continue;
-        if (metas[i].flags & LDR_FLAG_DATA) continue;
         if (!(metas[i].flags & LDR_FLAG_MAIN_EXE)) continue;
         objs[oi].name  = strtab + entries[i].name_offset;
         objs[oi].flags = metas[i].flags;
+        objs[oi].visible = 1;
         idx_map[oi] = (int)i;
         oi++;
     }
     for (uint32_t i = 0; i < num_entries; i++) {
-        if (metas[i].flags & LDR_FLAG_INTERP) continue;
+        if (!dl_flags_startup_mapped(metas[i].flags)) continue;
         if (metas[i].flags & LDR_FLAG_DLOPEN) continue;
-        if (metas[i].flags & LDR_FLAG_DATA) continue;
         if (metas[i].flags & LDR_FLAG_MAIN_EXE) continue;
         objs[oi].name  = strtab + entries[i].name_offset;
         objs[oi].flags = metas[i].flags;
+        objs[oi].visible = 1;
         idx_map[oi] = (int)i;
         oi++;
+    }
+    for (uint32_t i = 0; i < num_entries; i++) {
+        if (!dl_flags_startup_mapped(metas[i].flags)) continue;
+        if (!(metas[i].flags & LDR_FLAG_DLOPEN)) continue;
+        objs[oi].name = strtab + entries[i].name_offset;
+        objs[oi].flags = metas[i].flags;
+        objs[oi].visible = 0;
+        objs[oi].deferred_relocation_phase = RELOC_PASS_IFUNC;
+        objs[oi].final_protections_pending = 1;
+        idx_map[oi] = (int)i;
+        oi++;
+    }
+    if (oi != nobj) {
+        ldr_err("inconsistent startup object classification", NULL);
+        return -1;
     }
 
     if (argc > 0 && argv && objs[0].name && objs[0].name[0])
         argv[0] = (char *)objs[0].name;
 
-    /* 2. Map all objects into memory at pre-assigned addresses.
-     *    Reserve the entire VA range in one mmap call first, then
-     *    map individual segments on top.  This reduces mmap syscalls
-     *    from N*M (objects*segments) to 1 + N*M_file-backed. */
+    /* 2. Map all ordinary and promoted-dormant objects into memory at their
+     *    pre-assigned addresses.  Each range is reserved independently so
+     *    unpromoted manifest objects retain their later lazy-load ranges. */
     ldr_dbg("[loader] mapping objects...\n");
     if (reserve_address_range(metas, idx_map, nobj, srcfd < 0) < 0) {
         ldr_err("failed to reserve address range", NULL);
@@ -14852,6 +15798,7 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     }
     for (int i = 0; i < nobj; i++) {
         int mi = idx_map[i];
+        g_dl_metas[i] = metas[mi];
         if (map_object(mem, mem_foff, srcfd, &metas[mi], &entries[mi], &objs[i], 1) < 0)
             return -1;
         objs[i].phdr      = (const Elf64_Phdr *)(objs[i].base + metas[mi].phdr_off);
@@ -14984,6 +15931,7 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
                      !g_real_rewinddir || !g_real_telldir ||
                      !g_real_errno_location ||
                      !g_real_seekdir); i++) {
+                if (!dl_object_is_visible(&objs[i])) continue;
                 if (!objs[i].dynsym || !objs[i].dynstr) continue;
                 for (uint32_t s = 0; s < objs[i].dynsym_count; s++) {
                     const Elf64_Sym *sym = &objs[i].dynsym[s];
@@ -15072,6 +16020,23 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
             for (int i = 0; i < nobj; i++) {
                 const uint32_t *obj_fixups = NULL;
                 uint32_t obj_fixup_count = 0;
+
+                /* Promoted dlopen closures were deliberately excluded from
+                 * the packer's pre-link transaction.  Their ordinary and
+                 * COPY relocations must precede the startup TLS copy, but
+                 * target resolvers retain native first-dlopen timing. */
+                if (objs[i].flags & LDR_FLAG_DLOPEN_EARLY) {
+                    if (pass == RELOC_PASS_IFUNC ||
+                        pass == RELOC_PASS_IRELATIVE)
+                        continue;
+                    if (apply_all_relocs(&objs[i], objs, nobj, pass) < 0) {
+                        ldr_msg("dlfreeze-loader: dormant relocation failed for ");
+                        ldr_msg(objs[i].name);
+                        ldr_msg("\n");
+                        _exit(127);
+                    }
+                    continue;
+                }
 
                 if (runtime_fixups != NULL &&
                     metas[idx_map[i]].runtime_fixup_count != 0) {
@@ -15184,6 +16149,8 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         if (tp)
             copy_tdata(objs, nobj, tp);
         for (int i = 0; i < nobj; i++) {
+            if (objs[i].deferred_relocation_phase)
+                continue;
             if (apply_all_relocs(&objs[i], objs, nobj,
                                  RELOC_PASS_IFUNC) < 0) {
                 ldr_msg("dlfreeze-loader: IFUNC relocation failed for ");
@@ -15193,6 +16160,8 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
             }
         }
         for (int i = 0; i < nobj; i++) {
+            if (objs[i].deferred_relocation_phase)
+                continue;
             if (apply_all_relocs(&objs[i], objs, nobj,
                                  RELOC_PASS_IRELATIVE) < 0) {
                 ldr_msg("dlfreeze-loader: IRELATIVE failed for ");
@@ -15217,6 +16186,8 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
      * and executing them would raise SIGILL.  The extra mprotect calls
      * are a no-op when the permissions already match. */
     for (int i = 0; i < nobj; i++) {
+        if (objs[i].final_protections_pending)
+            continue;
         if (protect_object(&objs[i], &metas[idx_map[i]]) < 0) {
             ldr_err("cannot set final memory protections for", objs[i].name);
             _exit(127);
@@ -15346,7 +16317,8 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
 
         for (int oi = 0; oi < order_count; oi++) {
             int i = order[oi];
-            if (objs[i].flags & LDR_FLAG_MAIN_EXE) continue;
+            if (!dl_object_is_visible(&objs[i]) ||
+                (objs[i].flags & LDR_FLAG_MAIN_EXE)) continue;
             ldr_dbg("[loader] init: ");
             ldr_dbg(objs[i].name);
             ldr_dbg("\n");

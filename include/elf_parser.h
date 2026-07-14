@@ -15,6 +15,8 @@ struct elf_info {
     char      soname[256];      /* DT_SONAME */
     int       is_dynamic;       /* has PT_DYNAMIC */
     int       is_pie;           /* ET_DYN (position-independent) */
+    uint64_t  tls_memsz;        /* PT_TLS p_memsz (zero is valid) */
+    int       has_static_tls;    /* closure needs static placement (DF/TPOFF) */
 };
 
 /* Parse an ELF file and extract dynamic linking info */

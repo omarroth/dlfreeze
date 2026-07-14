@@ -9,8 +9,6 @@ Usage:
     tests/python_repl_pty.py [--dlfreeze build/dlfreeze] [--python python3]
 """
 
-from __future__ import annotations
-
 import argparse
 import errno
 import fcntl
@@ -25,7 +23,6 @@ import sys
 import tempfile
 import termios
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
@@ -47,11 +44,16 @@ class CheckFailure(RuntimeError):
     pass
 
 
-@dataclass
+class UnsupportedDirectLoad(RuntimeError):
+    pass
+
+
 class PtyResult:
-    returncode: int
-    output: str
-    saw_prompt: bool
+    def __init__(self, returncode: int, output: str,
+                 saw_prompt: bool) -> None:
+        self.returncode = returncode
+        self.output = output
+        self.saw_prompt = saw_prompt
 
 
 def wait_status_to_returncode(status: int) -> int:
@@ -237,7 +239,7 @@ def python_stdlib(python: str) -> str:
                 "import os,sysconfig; "
                 "print(os.path.realpath(sysconfig.get_path('stdlib')))",
             ],
-            text=True,
+            universal_newlines=True,
             stderr=subprocess.STDOUT,
         )
     except subprocess.CalledProcessError as error:
@@ -283,6 +285,13 @@ def run_check(args: argparse.Namespace, work: Path) -> None:
         args.verbose,
     )
     require_success("freeze-time REPL", traced, TRACE_MARKER)
+    if (
+        "direct-load is unavailable for runtime " in traced.output
+        and "creating an extraction-mode binary" in traced.output
+    ):
+        raise UnsupportedDirectLoad(
+            "target runtime does not support direct-load"
+        )
     if "mode       : direct-load" not in traced.output:
         raise CheckFailure(
             "packer did not produce a direct-load artifact\n"
@@ -342,6 +351,9 @@ def main() -> int:
         else:
             with tempfile.TemporaryDirectory(prefix="dlfreeze-python-repl-") as tmp:
                 run_check(args, Path(tmp))
+    except UnsupportedDirectLoad as error:
+        print(f"SKIP: {error}", file=sys.stderr)
+        return 77
     except (CheckFailure, OSError) as error:
         print(f"FAIL: {error}", file=sys.stderr)
         return 1

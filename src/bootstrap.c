@@ -469,7 +469,9 @@ static int direct_metadata_is_valid(const uint8_t *mem, uint64_t mem_foff,
     const uint32_t metadata_flag_mask = entry_type_mask |
                                         DLFRZ_FLAG_PRELINKED |
                                         DLFRZ_FLAG_NEEDS_RTLD |
-                                        DLFRZ_FLAG_RUNTIME_SCAN;
+                                        DLFRZ_FLAG_RUNTIME_SCAN |
+                                        DLFRZ_FLAG_DLOPEN_EARLY |
+                                        DLFRZ_FLAG_DLOPEN_ROOT;
     long page_size_long = sysconf(_SC_PAGESIZE);
     if (page_size_long <= 0 ||
         ((uint64_t)page_size_long & ((uint64_t)page_size_long - 1)) != 0)
@@ -492,6 +494,17 @@ static int direct_metadata_is_valid(const uint8_t *mem, uint64_t mem_foff,
             return 0;
         if ((meta->flags & entry_type_mask) !=
             (entry->flags & entry_type_mask))
+            return 0;
+        if ((meta->flags & (DLFRZ_FLAG_DLOPEN_EARLY |
+                            DLFRZ_FLAG_DLOPEN_ROOT)) &&
+            (meta->flags & (DLFRZ_FLAG_DLOPEN | DLFRZ_FLAG_SHLIB)) !=
+                (DLFRZ_FLAG_DLOPEN | DLFRZ_FLAG_SHLIB))
+            return 0;
+        if ((meta->flags & DLFRZ_FLAG_DLOPEN) &&
+            ((meta->flags & (DLFRZ_FLAG_PRELINKED |
+                             DLFRZ_FLAG_RUNTIME_SCAN)) ||
+             meta->runtime_fixup_off != 0 ||
+             meta->runtime_fixup_count != 0))
             return 0;
         if (meta->runtime_fixup_off > runtime_fixup_count ||
             meta->runtime_fixup_count >
@@ -621,8 +634,9 @@ static int direct_metadata_is_valid(const uint8_t *mem, uint64_t mem_foff,
 
         if (tls_count != 0 && tls_memsz != 0 &&
             !(entry->flags & (DLFRZ_FLAG_INTERP |
-                              DLFRZ_FLAG_DLOPEN |
-                              DLFRZ_FLAG_DATA))) {
+                              DLFRZ_FLAG_DATA)) &&
+            (!(entry->flags & DLFRZ_FLAG_DLOPEN) ||
+             (meta->flags & DLFRZ_FLAG_DLOPEN_EARLY))) {
             uint64_t next_tls;
 
 #if defined(__aarch64__)

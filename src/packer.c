@@ -1652,23 +1652,26 @@ static int prelink_objects(const char *output_path,
     for (int i = 0; i < nobj; i++) {
         uint32_t fixup_off = 0, fixup_count = 0;
 
-        metas[i].flags |= DLFRZ_FLAG_PRELINKED;
         metas[i].runtime_fixup_off = 0;
         metas[i].runtime_fixup_count = 0;
         metas[i]._reserved = 0;
 
         if (metas[i].flags & DLFRZ_FLAG_INTERP) {
+            metas[i].flags &= ~DLFRZ_FLAG_PRELINKED;
             metas[i].flags &= ~DLFRZ_FLAG_RUNTIME_SCAN;
             continue;
         }
         if (metas[i].flags & DLFRZ_FLAG_DLOPEN) {
+            metas[i].flags &= ~DLFRZ_FLAG_PRELINKED;
             metas[i].flags &= ~DLFRZ_FLAG_RUNTIME_SCAN;
             continue;
         }
         if (metas[i].flags & DLFRZ_FLAG_DATA) {
+            metas[i].flags &= ~DLFRZ_FLAG_PRELINKED;
             metas[i].flags &= ~DLFRZ_FLAG_RUNTIME_SCAN;
             continue;
         }
+        metas[i].flags |= DLFRZ_FLAG_PRELINKED;
 
         if (prelink_obj_collect_runtime_fixups(&objs[i],
                                               &runtime_fixups,
@@ -2649,6 +2652,13 @@ static int direct_runtime_supported(const struct pack_options *opts)
 
 int pack_frozen(const struct pack_options *opts)
 {
+    if (opts->direct_load &&
+        dep_mark_dlopen_early_closures(opts->deps) < 0) {
+        fprintf(stderr,
+                "dlfreeze: cannot classify traced static-TLS closures\n");
+        return -1;
+    }
+
     FILE *out = fopen(opts->output_path, "wb");
     if (!out) { perror(opts->output_path); return -1; }
 
@@ -2808,6 +2818,7 @@ int pack_frozen(const struct pack_options *opts)
         if (!metas) goto fail2;
 
         uint64_t base = DIRECT_LOAD_BASE;
+        int first_lib = 1 + (opts->deps->interp_path ? 1 : 0);
         for (int i = 0; i < eidx; i++) {
             if (entries[i].flags & DLFRZ_FLAG_DATA) {
                 metas[i].flags = DLFRZ_FLAG_DATA; /* mark so loader can skip */
@@ -2817,6 +2828,17 @@ int pack_frozen(const struct pack_options *opts)
                                  &metas[i]) < 0) {
                 goto fail2;
             }
+            if (i >= first_lib && i < first_lib + opts->deps->count) {
+                const struct resolved_lib *lib =
+                    &opts->deps->libs[i - first_lib];
+
+                if (lib->from_dlopen && lib->dlopen_early)
+                    metas[i].flags |= DLFRZ_FLAG_DLOPEN_EARLY;
+                if (lib->from_dlopen && lib->dlopen_direct)
+                    metas[i].flags |= DLFRZ_FLAG_DLOPEN_ROOT;
+            }
+            if (metas[i].flags & DLFRZ_FLAG_DLOPEN)
+                metas[i].flags &= ~DLFRZ_FLAG_RUNTIME_SCAN;
             if ((entries[i].flags & DLFRZ_FLAG_MAIN_EXE) &&
                 metas[i].main_sym == 0) {
                 fprintf(stderr,
@@ -2916,7 +2938,10 @@ int pack_frozen(const struct pack_options *opts)
                             meta_off, eidx_save) == 0) {
             printf("  pre-linked : yes\n");
             for (int i = 0; i < eidx_save; i++)
-                metas[i].flags |= DLFRZ_FLAG_PRELINKED;
+                if (!(metas[i].flags & (DLFRZ_FLAG_INTERP |
+                                        DLFRZ_FLAG_DLOPEN |
+                                        DLFRZ_FLAG_DATA)))
+                    metas[i].flags |= DLFRZ_FLAG_PRELINKED;
         } else {
             printf("  pre-linked : no (failed, will use runtime relocation)\n");
         }

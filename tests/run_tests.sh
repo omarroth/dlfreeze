@@ -75,7 +75,7 @@ run_with_timeout_seconds() {
     shift
 
     if command -v timeout &>/dev/null; then
-        if timeout --help 2>&1 | grep -q -- '--kill-after'; then
+        if timeout --help 2>&1 | grep -- '--kill-after' >/dev/null; then
             timeout --kill-after="$TEST_TIMEOUT_KILL_AFTER" "$limit" "$@"
         else
             timeout "$limit" "$@"
@@ -123,7 +123,8 @@ capture_output_in_dir() {
 
 path_is_elf() {
     local path="$1"
-    command -v file &>/dev/null && file -b "$path" 2>/dev/null | grep -q 'ELF'
+    command -v file &>/dev/null &&
+        file -b "$path" 2>/dev/null | grep 'ELF' >/dev/null
 }
 
 resolve_ruby_elf() {
@@ -403,7 +404,7 @@ C
         return
     fi
 
-    if ! file "$bin" | grep -q 'interpreter .*ld-musl'; then
+    if ! file "$bin" | grep 'interpreter .*ld-musl' >/dev/null; then
         skip "musl-hello-direct" "musl-gcc did not produce a dynamic musl executable"
         rm -f "$src" "$bin" "$out"
         return
@@ -478,7 +479,7 @@ C
         return
     fi
 
-    if ! file "$bin" | grep -q 'interpreter .*ld-musl'; then
+    if ! file "$bin" | grep 'interpreter .*ld-musl' >/dev/null; then
         skip "musl-ctor-direct" "musl-gcc did not produce a dynamic musl executable"
         rm -f "$src" "$bin" "$out"
         return
@@ -546,13 +547,14 @@ C
         return
     fi
 
-    if ! file "$bin" | grep -q 'interpreter .*ld-musl'; then
+    if ! file "$bin" | grep 'interpreter .*ld-musl' >/dev/null; then
         skip "musl-copy-reloc-direct" "musl-gcc did not produce a dynamic musl executable"
         rm -f "$src" "$bin" "$out"
         return
     fi
 
-    if ! readelf -W -r "$bin" | grep -q 'R_X86_64_COPY.*stderr'; then
+    if ! readelf -W -r "$bin" |
+            grep 'R_X86_64_COPY.*stderr' >/dev/null; then
         skip "musl-copy-reloc-direct" "musl-gcc did not emit stderr COPY relocation"
         rm -f "$src" "$bin" "$out"
         return
@@ -624,7 +626,7 @@ C
         return
     fi
 
-    if ! file "$bin" | grep -q 'interpreter .*ld-musl'; then
+    if ! file "$bin" | grep 'interpreter .*ld-musl' >/dev/null; then
         skip "musl-multibyte-direct" "musl-gcc did not produce a dynamic musl executable"
         rm -f "$src" "$bin" "$out"
         return
@@ -701,7 +703,7 @@ C
         return
     fi
 
-    if ! readelf -W -l "$lib" | grep -q 'TLS'; then
+    if ! readelf -W -l "$lib" | grep 'TLS' >/dev/null; then
         skip "musl-shared-tls-direct" "musl-gcc did not emit PT_TLS for the shared library"
         rm -f "$src_lib" "$src_main" "$lib" "$bin" "$out"
         return
@@ -713,7 +715,7 @@ C
         return
     fi
 
-    if ! file "$bin" | grep -q 'interpreter .*ld-musl'; then
+    if ! file "$bin" | grep 'interpreter .*ld-musl' >/dev/null; then
         skip "musl-shared-tls-direct" "musl-gcc did not produce a dynamic musl executable"
         rm -f "$src_lib" "$src_main" "$lib" "$bin" "$out"
         return
@@ -772,7 +774,7 @@ int main(void) { puts("unknown runtime fallback ok"); return 0; }
 C
     gcc -o "$probe" "$src"
     interp=$(LC_ALL=C readelf -W -l "$probe" 2>/dev/null |
-        sed -n 's@.*Requesting program interpreter: \([^]]*\).*@\1@p' | head -1)
+        sed -n 's@.*Requesting program interpreter: \([^]]*\).*@\1@p')
     if [ -z "$interp" ] || [[ "$(basename "$interp")" != ld-linux* ]]; then
         skip "unknown-runtime-fallback" "fixture requires a glibc host"
         rm -f "$src" "$probe"
@@ -840,7 +842,7 @@ C
         return
     fi
 
-    if ! file "$bin" | grep -q 'interpreter .*ld-linux'; then
+    if ! file "$bin" | grep 'interpreter .*ld-linux' >/dev/null; then
         skip "glibc-stack-end-direct" "gcc did not produce a dynamic glibc executable"
         rm -f "$src" "$bin" "$out"
         return
@@ -1343,7 +1345,8 @@ C
             continue
         fi
         if [ "$runtime" = musl ] &&
-           ! file "$bin" 2>/dev/null | grep -q 'interpreter .*ld-musl'; then
+           ! file "$bin" 2>/dev/null |
+               grep 'interpreter .*ld-musl' >/dev/null; then
             skip "musl direct exit lifecycle" \
                 "musl-gcc did not produce a dynamic musl executable"
             rm -f "$bin" "$out"
@@ -1483,7 +1486,8 @@ C
             continue
         fi
         if [ "$runtime" = musl ] &&
-           ! file "$bin" 2>/dev/null | grep -q 'interpreter .*ld-musl'; then
+           ! file "$bin" 2>/dev/null |
+               grep 'interpreter .*ld-musl' >/dev/null; then
             skip "musl direct preinit order" \
                 "musl-gcc did not produce a dynamic musl executable"
             rm -f "$bin" "$out" "$log"
@@ -1538,6 +1542,7 @@ test_direct_metadata_validation() {
     local src="$BUILD/direct_metadata.c" bin="$BUILD/direct_metadata"
     local out="$BUILD/direct_metadata.frozen"
     local prelinked="$BUILD/direct_metadata_prelinked.frozen"
+    local early_invalid="$BUILD/direct_metadata_early_invalid.frozen"
     local log="$BUILD/direct_metadata.log"
     local size meta_off meta_flags actual rc=0 freeze_rc=0
 
@@ -1547,7 +1552,7 @@ int main(void) { puts("metadata-target-ran"); return 0; }
 C
     if ! gcc -fPIE -pie -o "$bin" "$src"; then
         fail "direct metadata validation" "compile failed"
-        rm -f "$src" "$bin" "$out" "$prelinked" "$log"
+        rm -f "$src" "$bin" "$out" "$prelinked" "$early_invalid" "$log"
         return
     fi
 
@@ -1556,7 +1561,7 @@ C
 
     if [ "$freeze_rc" -eq 0 ] || [ "$freeze_rc" -eq 77 ]; then
         if readelf -W -l "$out" 2>/dev/null |
-           grep -Eq 'GNU_STACK[[:space:]].*RW[[:space:]]'; then
+           grep -E 'GNU_STACK[[:space:]].*RW[[:space:]]' >/dev/null; then
             pass "frozen non-executable stack policy"
         else
             fail "frozen non-executable stack policy" \
@@ -1565,11 +1570,11 @@ C
     fi
     if [ "$freeze_rc" -eq 77 ]; then
         skip "direct metadata validation" "$DIRECT_FREEZE_REASON"
-        rm -f "$src" "$bin" "$out" "$prelinked" "$log"
+        rm -f "$src" "$bin" "$out" "$prelinked" "$early_invalid" "$log"
         return
     fi
     if [ "$freeze_rc" -ne 0 ]; then
-        rm -f "$src" "$bin" "$out" "$prelinked" "$log"
+        rm -f "$src" "$bin" "$out" "$prelinked" "$early_invalid" "$log"
         return
     fi
 
@@ -1577,7 +1582,7 @@ C
     meta_off=$DIRECT_META_OFF
     if [ "$meta_off" -gt $((size - 64 - 48)) ]; then
         fail "direct metadata validation" "metadata field lies outside payload"
-        rm -f "$src" "$bin" "$out" "$prelinked" "$log"
+        rm -f "$src" "$bin" "$out" "$prelinked" "$early_invalid" "$log"
         return
     fi
 
@@ -1607,6 +1612,23 @@ C
             "fixture was not prelinked"
     fi
 
+    # DLFRZ_FLAG_DLOPEN_EARLY is metadata-only and is valid exclusively on a
+    # traced DLOPEN object.  Byte 49 is the second little-endian byte of the
+    # 32-bit flags field; setting bit 0x04 there adds flag 0x400 to the main.
+    cp "$out" "$early_invalid"
+    printf '\004' | dd of="$early_invalid" bs=1 seek=$((meta_off + 49)) \
+        conv=notrunc status=none
+    actual=""; rc=0
+    capture_output actual "$early_invalid" || rc=$?
+    if [ "$rc" -eq 127 ] &&
+       [[ "$actual" == *"invalid direct-load object metadata"* ]] &&
+       [[ "$actual" != *"metadata-target-ran"* ]]; then
+        pass "direct metadata dormant-flag validation"
+    else
+        fail "direct metadata dormant-flag validation" \
+            "exit=$rc output=$actual"
+    fi
+
     # dlfrz_lib_meta.phdr_entsz is the 16-bit field at byte offset 46.
     printf '\000\000' | dd of="$out" bs=1 seek=$((meta_off + 46)) \
         conv=notrunc status=none
@@ -1618,7 +1640,7 @@ C
     else
         fail "direct metadata validation" "exit=$rc output=$actual"
     fi
-    rm -f "$src" "$bin" "$out" "$prelinked" "$log"
+    rm -f "$src" "$bin" "$out" "$prelinked" "$early_invalid" "$log"
 }
 
 # ===================================================================
@@ -1747,7 +1769,7 @@ C
         return
     fi
     if ! readelf -W -l "$bin" 2>/dev/null |
-         grep -Eq 'TLS[[:space:]].*0x2000([[:space:]]|$)'; then
+         grep -E 'TLS[[:space:]].*0x2000([[:space:]]|$)' >/dev/null; then
         fail "static TLS alignment direct-load" \
             "fixture does not contain an 8192-byte-aligned PT_TLS"
         rm -f "$src" "$bin" "$out" "$bad" "$log"
@@ -1861,7 +1883,7 @@ test_nobits_tls_outside_load_direct() {
     local src="$BUILD/nobits_tls.c" bin="$BUILD/nobits_tls"
     local mutsrc="$BUILD/nobits_tls_mutate.c" mut="$BUILD/nobits_tls_mutate"
     local out="$BUILD/nobits_tls.frozen" log="$BUILD/nobits_tls.log"
-    local expect actual rc_e=0 rc_a=0 freeze_rc=0
+    local expect actual reason rc_e=0 rc_a=0 freeze_rc=0 mut_rc=0
 
     cat > "$src" <<'C'
 #include <stdio.h>
@@ -1912,48 +1934,92 @@ int main(int argc, char **argv) {
     step = tls->p_align > 0x1000 ? tls->p_align : 0x1000;
     for (uint64_t multiple = 1; multiple <= 64 && !changed; multiple++) {
         uint64_t shift;
-        Elf64_Phdr candidate = *tls;
-        int contained = 0;
 
         if (multiple > UINT64_MAX / step)
             break;
         shift = multiple * step;
-        if (candidate.p_vaddr < shift || candidate.p_offset < shift)
-            continue;
-        candidate.p_vaddr -= shift;
-        candidate.p_paddr -= candidate.p_paddr >= shift ? shift : 0;
-        candidate.p_offset -= shift;
-        for (int i = 0; i < eh.e_phnum; i++) {
-            uint64_t delta;
-            if (ph[i].p_type != PT_LOAD ||
-                candidate.p_vaddr < ph[i].p_vaddr)
-                continue;
-            delta = candidate.p_vaddr - ph[i].p_vaddr;
-            if (delta <= ph[i].p_memsz &&
-                candidate.p_memsz <= ph[i].p_memsz - delta) {
-                contained = 1;
-                break;
+        /* Prefer moving toward lower addresses, but old GNU ld can place a
+         * pure-.tbss PT_TLS at a small file offset that cannot be reduced by
+         * a page.  Moving vaddr and offset forward by the same aligned delta
+         * preserves ELF congruence and represents the same zero-byte
+         * template semantics. */
+        for (int forward = 0; forward <= 1 && !changed; forward++) {
+            Elf64_Phdr candidate = *tls;
+            int contained = 0;
+
+            if (!forward) {
+                if (candidate.p_vaddr < shift ||
+                    candidate.p_offset < shift)
+                    continue;
+                candidate.p_vaddr -= shift;
+                if (candidate.p_paddr >= shift)
+                    candidate.p_paddr -= shift;
+                candidate.p_offset -= shift;
+            } else {
+                if (candidate.p_vaddr > UINT64_MAX - shift ||
+                    candidate.p_paddr > UINT64_MAX - shift ||
+                    candidate.p_offset > UINT64_MAX - shift)
+                    continue;
+                candidate.p_vaddr += shift;
+                candidate.p_paddr += shift;
+                candidate.p_offset += shift;
+            }
+            for (int i = 0; i < eh.e_phnum; i++) {
+                uint64_t delta;
+                if (ph[i].p_type != PT_LOAD ||
+                    candidate.p_vaddr < ph[i].p_vaddr)
+                    continue;
+                delta = candidate.p_vaddr - ph[i].p_vaddr;
+                if (delta <= ph[i].p_memsz &&
+                    candidate.p_memsz <= ph[i].p_memsz - delta) {
+                    contained = 1;
+                    break;
+                }
+            }
+            if (!contained) {
+                *tls = candidate;
+                changed = 1;
             }
         }
-        if (!contained) {
-            *tls = candidate;
-            changed = 1;
-        }
     }
-    if (!changed || fseek(file, (long)(eh.e_phoff +
+    if (!changed)
+        return 5;
+    if (fseek(file, (long)(eh.e_phoff +
             (uint64_t)tls_index * sizeof(*ph)), SEEK_SET) != 0 ||
         fwrite(tls, 1, sizeof(*tls), file) != sizeof(*tls) ||
         fclose(file) != 0)
-        return 5;
+        return 6;
     free(ph);
     return 0;
 }
 C
 
-    if ! gcc -fPIE -pie -o "$bin" "$src" ||
-       ! gcc -o "$mut" "$mutsrc" || ! "$mut" "$bin"; then
+    if ! gcc -fPIE -pie -o "$bin" "$src"; then
         fail "NOBITS TLS outside PT_LOAD direct-load" \
-            "could not construct zero-template TLS fixture"
+            "fixture compile failed"
+        rm -f "$src" "$bin" "$mutsrc" "$mut" "$out" "$log"
+        return
+    fi
+    if ! gcc -o "$mut" "$mutsrc"; then
+        fail "NOBITS TLS outside PT_LOAD direct-load" \
+            "fixture mutator compile failed"
+        rm -f "$src" "$bin" "$mutsrc" "$mut" "$out" "$log"
+        return
+    fi
+    "$mut" "$bin" || mut_rc=$?
+    if [ "$mut_rc" -ge 3 ] && [ "$mut_rc" -le 5 ]; then
+        case "$mut_rc" in
+            3) reason="toolchain emitted more than one PT_TLS segment" ;;
+            4) reason="toolchain did not emit a single zero-file-size PT_TLS segment" ;;
+            5) reason="toolchain PT_TLS layout has no valid aligned move outside PT_LOAD" ;;
+        esac
+        skip "NOBITS TLS outside PT_LOAD direct-load" "$reason"
+        rm -f "$src" "$bin" "$mutsrc" "$mut" "$out" "$log"
+        return
+    fi
+    if [ "$mut_rc" -ne 0 ]; then
+        fail "NOBITS TLS outside PT_LOAD direct-load" \
+            "fixture mutation failed (exit=$mut_rc)"
         rm -f "$src" "$bin" "$mutsrc" "$mut" "$out" "$log"
         return
     fi
@@ -2681,7 +2747,7 @@ C
         return
     fi
     if ! readelf -d "$top" 2>/dev/null |
-            grep -Eq '\(RUNPATH\).*\$ORIGIN/deps'; then
+            grep -E '\(RUNPATH\).*\$ORIGIN/deps' >/dev/null; then
         skip "direct-dlopen RUNPATH/ORIGIN" \
             "linker did not emit the requested DT_RUNPATH"
         rm -rf "$root"
@@ -2906,7 +2972,7 @@ C
         return
     fi
     if ! readelf -d "$top" 2>/dev/null |
-            grep -q 'Shared library: \[libdlfrz_missing_dep.so\]'; then
+            grep 'Shared library: \[libdlfrz_missing_dep.so\]' >/dev/null; then
         fail "direct-dlopen missing dependency" \
             "linker did not retain the DT_NEEDED edge"
         rm -rf "$root"
@@ -3008,7 +3074,7 @@ C
         return
     fi
     if readelf -d "$b" 2>/dev/null |
-            grep -q 'Shared library: \[libdlfrz_sibling_c.so\]'; then
+            grep 'Shared library: \[libdlfrz_sibling_c.so\]' >/dev/null; then
         fail "direct-dlopen sibling scope" \
             "consumer unexpectedly has a direct dependency on provider"
         rm -rf "$root"
@@ -3188,7 +3254,7 @@ C
     if [ "$needed_order" != \
          "libdlfrz_bfs_a.so libdlfrz_bfs_b.so " ] ||
        readelf -d "$top" 2>/dev/null |
-            grep -q 'Shared library: \[libdlfrz_bfs_c.so\]'; then
+            grep 'Shared library: \[libdlfrz_bfs_c.so\]' >/dev/null; then
         fail "direct-dlopen breadth-first scope" \
             "required root->A,B; A->C graph was not retained: $needed_order"
         rm -rf "$root"
@@ -3298,7 +3364,8 @@ C
         rm -rf "$root"
         return
     fi
-    if ! readelf -r "$c" 2>/dev/null | grep -q 'ifunc_data_target'; then
+    if ! readelf -r "$c" 2>/dev/null |
+            grep 'ifunc_data_target' >/dev/null; then
         skip "direct-dlopen IFUNC/data ordering" \
             "toolchain did not emit the required data relocation"
         rm -rf "$root"
@@ -3508,7 +3575,7 @@ C
         return
     fi
     if ! readelf -d "$noopen" 2>/dev/null |
-            grep -Eq 'FLAGS_1.*NOOPEN'; then
+            grep -E 'FLAGS_1.*NOOPEN' >/dev/null; then
         skip "direct-dlopen lazy admission" \
             "linker did not emit DF_1_NOOPEN"
         rm -rf "$root"
@@ -3621,74 +3688,173 @@ C
 }
 
 # ===================================================================
-# Test 9h: embedded lazy objects cannot claim initial-exec static TLS
+# Test 9h: traced dlopen closures that require initial-exec TLS are
+# mapped and assigned static TLS at startup, but remain semantically
+# dormant until dlopen activates their exact dependency closure.
 # ===================================================================
 test_direct_dlopen_embedded_static_tls() {
-    echo "--- direct embedded dlopen static-TLS admission ---"
+    echo "--- direct traced dlopen static-TLS promotion ---"
     local root="$BUILD/dlopen_embedded_static_tls"
-    local lib_src="$root/lib.c" lib="$root/libdlfrz_static_tls.so"
-    local prog_src="$root/main.c" prog="$root/main"
+    local dep="$root/libdlfrz_early_tls_dep.so"
+    local root_a="$root/libdlfrz_early_root_a.so"
+    local root_b="$root/libdlfrz_early_root_b.so"
+    local late="$root/libdlfrz_late_static_tls.so"
+    local external_owner="$root/libdlfrz_external_ie_owner.so"
+    local external_requester="$root/libdlfrz_external_ie_requester.so"
+    local late_external_dir="$root/late-external"
+    local late_external_owner="$late_external_dir/libdlfrz_late_external_ie_owner.so"
+    local late_external_requester="$late_external_dir/libdlfrz_late_external_ie_requester.so"
+    local prog="$root/main" parser_gate="$root/elf_parser_gate"
     local out="$root/main.frozen" log="$root/main.log"
-    local lib_abs actual freeze_rc=0 rc=0
+    local dep_abs root_a_abs root_b_abs late_abs external_owner_abs
+    local external_requester_abs
+    local late_external_requester_abs
+    local actual freeze_rc=0 rc=0 late_actual late_rc=0
+    local late_external_actual late_external_rc=0
+    local native_actual native_rc=0
+    local root_relocs=""
+    local have_ifunc=0
+    local use_preloaded_trace=0
+    local -a ifunc_cflags=()
 
     rm -rf "$root"
-    mkdir -p "$root"
-    cat > "$lib_src" <<'C'
-__thread int static_tls_value
-    __attribute__((tls_model("initial-exec"))) = 41;
-int read_static_tls(void) { return static_tls_value; }
-C
-    if ! gcc -shared -fPIC -Wl,-soname,libdlfrz_static_tls.so \
-            -o "$lib" "$lib_src"; then
-        fail "direct embedded static-TLS admission" "library compile failed"
+    mkdir -p "$root" "$late_external_dir"
+    if ! gcc -shared -fPIC -Wl,-soname,libdlfrz_early_tls_dep.so \
+            -o "$dep" tests/direct_early_tls_dep.c; then
+        fail "direct traced static-TLS promotion" \
+            "dependency compile failed"
         rm -rf "$root"
         return
     fi
-    if ! readelf -d "$lib" 2>/dev/null | grep -q 'STATIC_TLS'; then
-        skip "direct embedded static-TLS admission" \
-            "toolchain did not emit DF_STATIC_TLS"
+    if ! gcc -shared -fPIC \
+            -Wl,-soname,libdlfrz_external_ie_owner.so \
+            -o "$external_owner" tests/direct_external_ie_owner.c ||
+       ! gcc -shared -fPIC \
+            -Wl,-soname,libdlfrz_external_ie_requester.so \
+            -Wl,-rpath,'$ORIGIN' -L"$root" \
+            -o "$external_requester" tests/direct_external_ie_requester.c \
+            -ldlfrz_external_ie_owner ||
+       ! gcc -shared -fPIC \
+            -Wl,-soname,libdlfrz_late_external_ie_owner.so \
+            -o "$late_external_owner" tests/direct_external_ie_owner.c ||
+       ! gcc -shared -fPIC \
+            -Wl,-soname,libdlfrz_late_external_ie_requester.so \
+            -Wl,-rpath,'$ORIGIN' -L"$late_external_dir" \
+            -o "$late_external_requester" \
+            tests/direct_external_ie_requester.c \
+            -ldlfrz_late_external_ie_owner; then
+        fail "direct traced external-IE TLS promotion" \
+            "external-IE fixtures failed to compile"
+        rm -rf "$root"
+        return
+    fi
+    if ! gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -Iinclude \
+            -o "$parser_gate" tests/elf_parser_gate.c src/elf_parser.c ||
+       ! "$parser_gate" "$dep" "$external_requester"; then
+        fail "ELF parser static-TLS classification" \
+            "self/external TPOFF or malformed-bound gate failed"
+        rm -rf "$root"
+        return
+    fi
+    pass "ELF parser static-TLS classification"
+
+    if compiler_supports_gnu_ifunc "$root"; then
+        have_ifunc=1
+        ifunc_cflags=(-DDIRECT_EARLY_HAVE_IFUNC=1)
+    else
+        skip "direct traced dormant IRELATIVE timing" \
+            "target toolchain does not support GNU IFUNC"
+    fi
+
+    if ! gcc "${ifunc_cflags[@]}" -shared -fPIC -DROOT_EVENT="'A'" \
+            -Wl,-soname,libdlfrz_early_root_a.so -Wl,-rpath,'$ORIGIN' \
+            -L"$root" -o "$root_a" tests/direct_early_tls_root.c \
+            -ldlfrz_early_tls_dep ||
+       ! gcc "${ifunc_cflags[@]}" -shared -fPIC -DROOT_EVENT="'B'" \
+            -Wl,-soname,libdlfrz_early_root_b.so -Wl,-rpath,'$ORIGIN' \
+            -L"$root" -o "$root_b" tests/direct_early_tls_root.c \
+            -ldlfrz_early_tls_dep ||
+       ! gcc -shared -fPIC -Wl,-soname,libdlfrz_late_static_tls.so \
+            -o "$late" tests/direct_late_static_tls.c; then
+        fail "direct traced static-TLS promotion" "root compile failed"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$have_ifunc" -eq 1 ]; then
+        root_relocs=$(readelf -rW "$root_a" 2>/dev/null || true)
+    fi
+    if [ "$have_ifunc" -eq 1 ] &&
+       ! grep -q 'IRELATIVE' <<<"$root_relocs"; then
+        fail "direct traced dormant IRELATIVE timing" \
+            "IFUNC-capable toolchain emitted no IRELATIVE relocation"
         rm -rf "$root"
         return
     fi
 
-    lib_abs=$(realpath "$lib")
-    cat > "$prog_src" <<C
-#include <dlfcn.h>
-#include <stdio.h>
-#include <stdlib.h>
-int main(void) {
-    int expect_reject = getenv("DLFRZ_EXPECT_STATIC_TLS_REJECT") != NULL;
-    void *handle = dlopen("$lib_abs", RTLD_NOW);
-    if (!handle) {
-        if (expect_reject) {
-            puts("embedded-static-tls-rejected");
-            return 0;
-        }
-        fprintf(stderr, "native dlopen failed: %s\n", dlerror());
-        return 1;
-    }
-    if (expect_reject)
-        return 2;
-    int (*read_value)(void) = (int (*)(void))dlsym(handle, "read_static_tls");
-    return !read_value || read_value() != 41;
-}
-C
-    if ! gcc -o "$prog" "$prog_src" -ldl; then
-        fail "direct embedded static-TLS admission" "program compile failed"
+    dep_abs=$(realpath "$dep")
+    root_a_abs=$(realpath "$root_a")
+    root_b_abs=$(realpath "$root_b")
+    late_abs=$(realpath "$late")
+    external_owner_abs=$(realpath "$external_owner")
+    external_requester_abs=$(realpath "$external_requester")
+    late_external_requester_abs=$(realpath "$late_external_requester")
+    if ! gcc "${ifunc_cflags[@]}" -std=c11 -D_GNU_SOURCE -rdynamic -pthread \
+            -DROOT_A_PATH="\"$root_a_abs\"" \
+            -DROOT_B_PATH="\"$root_b_abs\"" \
+            -DDEP_PATH="\"$dep_abs\"" \
+            -DLATE_PATH="\"$late_abs\"" \
+            -DEXTERNAL_IE_OWNER_PATH="\"$external_owner_abs\"" \
+            -DEXTERNAL_IE_PATH="\"$external_requester_abs\"" \
+            -DLATE_EXTERNAL_IE_PATH="\"$late_external_requester_abs\"" \
+            -o "$prog" tests/direct_early_tls_main.c -ldl; then
+        fail "direct traced static-TLS promotion" "program compile failed"
         rm -rf "$root"
         return
     fi
-    if ! "$prog"; then
-        skip "direct embedded static-TLS admission" \
-            "native loader has no static-TLS surplus for the trace fixture"
-        rm -rf "$root"
-        return
+    capture_output native_actual "$prog" || native_rc=$?
+    if [ "$native_rc" -ne 0 ]; then
+        if [[ "$native_actual" == *"initial-exec TLS resolves to dynamic definition"* ]]; then
+            use_preloaded_trace=1
+            echo "INFO: native libc rejects runtime initial-exec TLS; using the startup-preloaded trace fixture"
+        elif [[ "$native_actual" == *"cannot allocate memory in static TLS block"* ]]; then
+            skip "direct traced static-TLS promotion" \
+                "native loader has no static-TLS surplus for the trace fixture"
+            skip "direct traced external-IE TLS promotion" \
+                "native loader has no static-TLS surplus for the trace fixture"
+            skip "direct untraced static-TLS rejection" \
+                "native trace fixture cannot run"
+            skip "direct untraced external-IE rejection" \
+                "native trace fixture cannot run"
+            if [ "$have_ifunc" -eq 1 ]; then
+                skip "direct traced dormant IRELATIVE timing" \
+                    "native trace fixture cannot run"
+            fi
+            rm -rf "$root"
+            return
+        else
+            fail "direct traced static-TLS promotion" \
+                "native control exit=$native_rc output=$native_actual"
+            rm -rf "$root"
+            return
+        fi
     fi
 
-    freeze_require_direct "direct embedded static-TLS admission" "$log" \
-        "$out" -t "$prog" -- || freeze_rc=$?
+    if [ "$use_preloaded_trace" -eq 1 ]; then
+        freeze_require_direct "direct traced static-TLS promotion" "$log" \
+            "$out" -t "$prog" trace || freeze_rc=$?
+    else
+        freeze_require_direct "direct traced static-TLS promotion" "$log" \
+            "$out" -t "$prog" -- || freeze_rc=$?
+    fi
     if [ "$freeze_rc" -eq 77 ]; then
-        skip "direct embedded static-TLS admission" "$DIRECT_FREEZE_REASON"
+        skip "direct traced static-TLS promotion" "$DIRECT_FREEZE_REASON"
+        skip "direct traced external-IE TLS promotion" "$DIRECT_FREEZE_REASON"
+        skip "direct untraced static-TLS rejection" "$DIRECT_FREEZE_REASON"
+        skip "direct untraced external-IE rejection" "$DIRECT_FREEZE_REASON"
+        if [ "$have_ifunc" -eq 1 ]; then
+            skip "direct traced dormant IRELATIVE timing" \
+                "$DIRECT_FREEZE_REASON"
+        fi
         rm -rf "$root"
         return
     fi
@@ -3697,16 +3863,146 @@ C
         return
     fi
 
-    mv "$lib" "${lib}.bak"
-    capture_output actual env DLFRZ_EXPECT_STATIC_TLS_REJECT=1 \
-        "$out" || rc=$?
-    mv "${lib}.bak" "$lib"
+    mv "$dep" "${dep}.bak"
+    mv "$root_a" "${root_a}.bak"
+    mv "$root_b" "${root_b}.bak"
+    mv "$external_owner" "${external_owner}.bak"
+    mv "$external_requester" "${external_requester}.bak"
+    capture_output actual "$out" || rc=$?
+    mv "${dep}.bak" "$dep"
+    mv "${root_a}.bak" "$root_a"
+    mv "${root_b}.bak" "$root_b"
+    mv "${external_owner}.bak" "$external_owner"
+    mv "${external_requester}.bak" "$external_requester"
     actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
     if [ "$rc" -eq 0 ] &&
-       [ "$actual" = "embedded-static-tls-rejected" ]; then
-        pass "direct embedded static-TLS rejection"
+       [ "$actual" = "promoted-static-tls-ok" ]; then
+        pass "direct traced static-TLS promotion"
+        pass "direct traced external-IE TLS promotion"
+        if [ "$have_ifunc" -eq 1 ]; then
+            pass "direct traced dormant IRELATIVE timing"
+        fi
     else
-        fail "direct embedded static-TLS admission" \
+        fail "direct traced static-TLS promotion" \
+            "exit=$rc actual=$actual"
+        fail "direct traced external-IE TLS promotion" \
+            "exit=$rc actual=$actual"
+        if [ "$have_ifunc" -eq 1 ]; then
+            fail "direct traced dormant IRELATIVE timing" \
+                "exit=$rc actual=$actual"
+        fi
+    fi
+
+    capture_output late_actual "$out" late || late_rc=$?
+    late_actual=$(printf '%s\n' "$late_actual" | strip_dlfreeze_warnings)
+    if [ "$late_rc" -eq 0 ] &&
+       [ "$late_actual" = "untraced-static-tls-rejected" ]; then
+        pass "direct untraced static-TLS rejection"
+    else
+        fail "direct untraced static-TLS rejection" \
+            "exit=$late_rc actual=$late_actual"
+    fi
+
+    capture_output late_external_actual "$out" external-late ||
+        late_external_rc=$?
+    late_external_actual=$(printf '%s\n' "$late_external_actual" | \
+        strip_dlfreeze_warnings)
+    if [ "$late_external_rc" -eq 0 ] &&
+       [ "$late_external_actual" = "untraced-external-ie-rejected" ]; then
+        pass "direct untraced external-IE rejection"
+    else
+        fail "direct untraced external-IE rejection" \
+            "exit=$late_external_rc actual=$late_external_actual"
+    fi
+    rm -rf "$root"
+}
+
+# ===================================================================
+# Test 9i: a late initial-exec requester may use TLS that belongs to an
+# ordinary startup object.  No new static allocation is needed in this
+# case; the defining module already has a fixed TP offset in every thread.
+# ===================================================================
+test_direct_dlopen_startup_owned_ie() {
+    echo "--- direct late initial-exec import from startup TLS owner ---"
+    local root="$BUILD/dlopen_startup_owned_ie"
+    local owner="$root/libdlfrz_external_ie_owner.so"
+    local requester="$root/libdlfrz_external_ie_requester.so"
+    local prog="$root/main" out="$root/main.frozen" log="$root/main.log"
+    local requester_abs actual native_actual
+    local native_rc=0 freeze_rc=0 rc=0
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    if ! gcc -shared -fPIC -Wl,-soname,libdlfrz_external_ie_owner.so \
+            -o "$owner" tests/direct_external_ie_owner.c ||
+       ! gcc -shared -fPIC \
+            -Wl,-soname,libdlfrz_external_ie_requester.so \
+            -Wl,-rpath,'$ORIGIN' -L"$root" -o "$requester" \
+            tests/direct_external_ie_requester.c \
+            -ldlfrz_external_ie_owner; then
+        fail "direct startup-owned initial-exec import" \
+            "TLS fixtures failed to compile"
+        rm -rf "$root"
+        return
+    fi
+
+    # Keep this proof independent of linker advisory flags.  The requester
+    # itself must have no TLS template, while a real IE relocation imports
+    # the owner's TLS symbol.
+    if readelf -lW "$requester" 2>/dev/null | \
+            grep -E '^[[:space:]]*TLS[[:space:]]' >/dev/null ||
+       ! readelf -rW "$requester" 2>/dev/null | \
+            grep -E 'R_(X86_64_TPOFF64|AARCH64_TLS_TPREL64)' >/dev/null; then
+        fail "direct startup-owned initial-exec import" \
+            "requester is not a no-PT_TLS initial-exec import fixture"
+        rm -rf "$root"
+        return
+    fi
+
+    requester_abs=$(realpath "$requester")
+    if ! gcc -std=c11 -D_GNU_SOURCE -pthread \
+            -DREQUESTER_PATH="\"$requester_abs\"" \
+            -Wl,-rpath,'$ORIGIN' -L"$root" -o "$prog" \
+            tests/direct_startup_ie_main.c \
+            -ldlfrz_external_ie_owner -ldl; then
+        fail "direct startup-owned initial-exec import" \
+            "program compile failed"
+        rm -rf "$root"
+        return
+    fi
+    capture_output native_actual "$prog" || native_rc=$?
+    if [ "$native_rc" -ne 0 ] ||
+       [ "$native_actual" != "startup-owned-initial-exec-ok" ]; then
+        fail "direct startup-owned initial-exec import" \
+            "native control exit=$native_rc output=$native_actual"
+        rm -rf "$root"
+        return
+    fi
+
+    freeze_require_direct "direct startup-owned initial-exec import" \
+        "$log" "$out" "$prog" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "direct startup-owned initial-exec import" \
+            "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+
+    # The owner must come from the startup image.  Only the untraced
+    # requester remains on disk for the late dlopen transaction.
+    mv "$owner" "${owner}.bak"
+    capture_output actual "$out" || rc=$?
+    mv "${owner}.bak" "$owner"
+    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+    if [ "$rc" -eq 0 ] &&
+       [ "$actual" = "startup-owned-initial-exec-ok" ]; then
+        pass "direct startup-owned initial-exec import"
+    else
+        fail "direct startup-owned initial-exec import" \
             "exit=$rc actual=$actual"
     fi
     rm -rf "$root"
@@ -3774,7 +4070,8 @@ C
     capture_output_split actual stderr_out "$out" || rc=$?
 
     if [ "$expect" = "$actual" ] && [ "$rc" -eq 0 ]; then
-        if echo "$stderr_out" | grep -q "warning.*not in frozen image" 2>/dev/null; then
+        if printf '%s\n' "$stderr_out" |
+                grep "warning.*not in frozen image" >/dev/null 2>&1; then
             pass "direct-dlopen fallback+warning"
         else
             pass "direct-dlopen fallback (no warning)"
@@ -3803,7 +4100,7 @@ test_python3_direct() {
     # Freeze with -d (direct) and -t (trace dlopen) to capture C extensions
     freeze_require_direct "python3-direct" "$log" "$out" -t -- \
         "$pypath" -c \
-        'import hashlib,sqlite3; [getattr(hashlib,n)(b"hello").hexdigest() for n in ("md5","sha1","sha256","sha3_256")]; sqlite3.connect(":memory:").close(); print("traced")' ||
+        'import _blake2,hashlib,sqlite3; [getattr(hashlib,n)(b"hello").hexdigest() for n in ("md5","sha1","sha256","sha3_256")]; _blake2.blake2b(b"hello").hexdigest(); _blake2.blake2s(b"hello").hexdigest(); sqlite3.connect(":memory:").close(); print("traced")' ||
         freeze_rc=$?
     if [ "$freeze_rc" -eq 77 ]; then
         skip "python3 direct hashlib" "$DIRECT_FREEZE_REASON"
@@ -3866,19 +4163,25 @@ test_python_repl_pty_direct() {
 
     local python work="$BUILD/python-repl-pty-work"
     local log="$BUILD/python-repl-pty.log"
-    local total_timeout
+    local total_timeout rc=0 reason
     python=$(readlink -f "$(command -v python3)")
     total_timeout=$((TEST_FREEZE_TIMEOUT + 2 * TEST_RUN_TIMEOUT + 30))
     rm -rf "$work"
     rm -f "$log"
 
-    if run_with_timeout_seconds "$total_timeout" env -u DLFREEZE_NO_FORK \
+    run_with_timeout_seconds "$total_timeout" env -u DLFREEZE_NO_FORK \
             "$python" tests/python_repl_pty.py \
             --dlfreeze "$DLFREEZE" --python "$python" \
             --work-dir "$work" \
             --freeze-timeout "$TEST_FREEZE_TIMEOUT" \
-            --run-timeout "$TEST_RUN_TIMEOUT" >"$log" 2>&1; then
+            --run-timeout "$TEST_RUN_TIMEOUT" >"$log" 2>&1 || rc=$?
+    if [ "$rc" -eq 0 ]; then
         pass "Python REPL PTY direct-load"
+    elif [ "$rc" -eq 77 ]; then
+        reason=$(grep -m1 '^SKIP: ' "$log" 2>/dev/null || true)
+        reason=${reason#SKIP: }
+        skip "Python REPL PTY direct-load" \
+            "${reason:-target runtime does not support direct-load}"
     else
         fail "Python REPL PTY direct-load" \
             "interactive trace or frozen REPL protocol failed"
@@ -4261,15 +4564,15 @@ C
             return
         fi
     fi
-    if ! readelf -W -l "$lib" | grep -Eq \
-         'TLS[[:space:]].*0x2000([[:space:]]|$)'; then
+    if ! readelf -W -l "$lib" | grep -E \
+         'TLS[[:space:]].*0x2000([[:space:]]|$)' >/dev/null; then
         fail "dlopen TLS per-thread direct-load" \
             "fixture does not contain 8192-byte-aligned PT_TLS"
         rm -f "$libsrc" "$lib" "$src" "$bin" "$out" "$log"
         return
     fi
     if [ -n "$tlsdesc_reloc" ] &&
-       ! readelf -W -r "$lib" | grep -q "$tlsdesc_reloc"; then
+       ! readelf -W -r "$lib" | grep "$tlsdesc_reloc" >/dev/null; then
         fail "dlopen TLS per-thread direct-load" \
             "fixture does not contain $tlsdesc_reloc"
         rm -f "$libsrc" "$lib" "$src" "$bin" "$out" "$log"
@@ -4605,7 +4908,8 @@ C
         return
     fi
     if ! readelf --dyn-syms -W "$lib" 2>/dev/null |
-            grep -Eq '1234[[:space:]]+0[[:space:]]+NOTYPE.*ABS[[:space:]]+dlfrz_absolute_symbol$'; then
+            grep -E '1234[[:space:]]+0[[:space:]]+NOTYPE.*ABS[[:space:]]+dlfrz_absolute_symbol$' \
+                >/dev/null; then
         skip "direct symbol definition addresses" \
             "linker did not export the SHN_ABS fixture"
         rm -rf "$root"
@@ -4836,7 +5140,7 @@ C
     local actual rc=0
     capture_output actual env DLFREEZE_NO_FORK=1 "$out" || rc=$?
     if [ "$rc" -eq 127 ] &&
-       printf '%s\n' "$actual" | grep -q 'unsupported relocation'; then
+       printf '%s\n' "$actual" | grep 'unsupported relocation' >/dev/null; then
         pass "unsupported relocation direct-load"
     else
         fail "unsupported relocation direct-load" "rc=$rc out=$actual"
@@ -5154,7 +5458,7 @@ test_dlsym_special_consistency_direct() {
     local out="$BUILD/dlsym_special_consistency.frozen"
     local log="$BUILD/dlsym_special_consistency.log"
     local label="dlsym special consistency direct-load"
-    local expect actual rc_e=0 rc_a=0 freeze_rc=0
+    local expect actual reason rc_e=0 rc_a=0 freeze_rc=0
     rm -f "$log"
 
     cat > "$src" <<'C'
@@ -5164,13 +5468,18 @@ test_dlsym_special_consistency_direct() {
 
 int main(void) {
     Dl_info info;
+    void *global_puts;
     void *libc_handle;
     void *global_dlopen;
     void *handle_dlopen;
     void *global_dlsym;
     void *handle_dlsym;
 
-    if (!dladdr((void *)puts, &info) || !info.dli_fname)
+    /* Taking puts directly may yield this executable's PLT entry, causing
+     * dladdr to identify the PIE rather than libc.  Resolve the definition
+     * through the native loader before constructing the libc handle. */
+    global_puts = dlsym(RTLD_DEFAULT, "puts");
+    if (!global_puts || !dladdr(global_puts, &info) || !info.dli_fname)
         return 1;
     libc_handle = dlopen(info.dli_fname, RTLD_NOW);
     if (!libc_handle)
@@ -5207,6 +5516,15 @@ C
         return
     fi
     capture_output expect "$bin" || rc_e=$?
+    if [ "$rc_e" -ge 1 ] && [ "$rc_e" -le 4 ]; then
+        case "$rc_e" in
+            1|2) reason="native loader could not construct a libc handle" ;;
+            3|4) reason="native loader lacks the required libc-handle symbol semantics" ;;
+        esac
+        skip "$label" "$reason (exit $rc_e)"
+        rm -f "$src" "$bin" "$out" "$log"
+        return
+    fi
     if [ "$rc_e" -ne 0 ] || [ "$expect" != "special-consistency-ok" ]; then
         fail "$label" "native fixture failed (exit $rc_e): $expect"
         rm -f "$src" "$bin" "$out" "$log"
@@ -5497,7 +5815,7 @@ C
         return
     fi
     if ! readelf -Wr "$good" 2>/dev/null |
-            grep -q 'memcpy@GOOD_1'; then
+            grep 'memcpy@GOOD_1' >/dev/null; then
         skip "$label" "linker did not retain the versioned memcpy relocation"
         rm -f "$libsrc" "$map" "$src" "$lib" "$good"
         return
@@ -5531,7 +5849,8 @@ C
     if ! objcopy --dump-section .dynstr="$dynstr" "$bad" 2>/dev/null ||
        ! sed -i 's/GOOD_1/FAKE_1/g' "$dynstr" ||
        ! objcopy --update-section .dynstr="$dynstr" "$bad" 2>/dev/null ||
-       ! readelf -Wr "$bad" 2>/dev/null | grep -q 'memcpy@FAKE_1'; then
+       ! readelf -Wr "$bad" 2>/dev/null |
+            grep 'memcpy@FAKE_1' >/dev/null; then
         fail "$label (forged)" "could not forge the version requirement"
         rm -f "$libsrc" "$map" "$src" "$lib" "$good" "$bad" \
             "$dynstr" "$good_out" "$good_log"
@@ -5712,7 +6031,7 @@ C
 test_musl_layout_gate() {
     echo "--- musl private runtime layout gate ---"
     local helper="$BUILD/musl_layout_gate"
-    local decoder_helper="$BUILD/aarch64_musl_decoder_gate"
+    local decoder_helper
     local src="$BUILD/musl_layout_target.c"
     local bin="$BUILD/musl_layout_target"
     local bad_bin="$BUILD/musl_layout_target.unknown"
@@ -5738,7 +6057,21 @@ test_musl_layout_gate() {
         return
     fi
 
-    if [ "$(uname -m)" = aarch64 ]; then
+    if [ "$(uname -m)" = x86_64 ]; then
+        decoder_helper="$BUILD/x86_64_musl_decoder_gate"
+        if ! gcc -Wall -Wextra -D_GNU_SOURCE -Iinclude \
+                -fno-stack-protector -ffunction-sections -fdata-sections \
+                -Wl,--gc-sections -o "$decoder_helper" \
+                tests/x86_64_musl_decoder_gate.c -ldl -pthread; then
+            fail "x86-64 musl layout decoder" "compile failed"
+        elif "$decoder_helper"; then
+            pass "x86-64 musl layout decoder"
+        else
+            fail "x86-64 musl layout decoder" \
+                "old register-flag fixture was not decoded safely"
+        fi
+    elif [ "$(uname -m)" = aarch64 ]; then
+        decoder_helper="$BUILD/aarch64_musl_decoder_gate"
         if ! gcc -Wall -Wextra -D_GNU_SOURCE -Iinclude \
                 -fno-stack-protector -ffunction-sections -fdata-sections \
                 -Wl,--gc-sections -o "$decoder_helper" \
@@ -5775,15 +6108,15 @@ C
         rm -f "$helper" "$src" "$bin"
         return
     fi
-    if ! file "$bin" 2>/dev/null | grep -q 'interpreter .*ld-musl'; then
+    if ! file "$bin" 2>/dev/null |
+            grep 'interpreter .*ld-musl' >/dev/null; then
         skip "musl layout integration gate" \
             "musl-gcc did not produce a dynamic musl executable"
         rm -f "$helper" "$src" "$bin"
         return
     fi
     interp=$(readelf -W -l "$bin" 2>/dev/null |
-        sed -n 's/.*Requesting program interpreter: \([^]]*\)].*/\1/p' |
-        head -n 1)
+        sed -n 's/.*Requesting program interpreter: \([^]]*\)].*/\1/p')
     if [ -z "$interp" ] || [ ! -r "$interp" ]; then
         skip "musl layout integration gate" \
             "could not locate the target interpreter"
@@ -5900,7 +6233,7 @@ test_glibc_layout_gate() {
     local out="$BUILD/glibc_layout_stale.frozen"
     local missing_release_out="$BUILD/glibc_layout_release_missing.frozen"
     local log="$BUILD/glibc_layout_stale.log"
-    local interp bad_interp_abs size meta_off actual
+    local interp bad_interp_abs size meta_off actual libc_banner
     local rc=0 freeze_rc=0
 
     if ! gcc -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
@@ -5917,7 +6250,11 @@ test_glibc_layout_gate() {
         return
     fi
 
-    if ! ldd --version 2>&1 | grep -Eqi 'glibc|GNU libc'; then
+    # Avoid a producer/grep -q pipeline under pipefail: grep may close the
+    # pipe after the first matching line, making ldd's harmless SIGPIPE look
+    # like a negative capability result.
+    libc_banner=$(ldd --version 2>&1 || true)
+    if ! grep -Eqi 'glibc|GNU libc' <<<"$libc_banner"; then
         skip "glibc layout integration gate" "fixture requires glibc"
         rm -f "$helper"
         return
@@ -5941,8 +6278,7 @@ C
         return
     fi
     interp=$(readelf -W -l "$bin" 2>/dev/null |
-        sed -n 's/.*Requesting program interpreter: \([^]]*\)].*/\1/p' |
-        head -n 1)
+        sed -n 's/.*Requesting program interpreter: \([^]]*\)].*/\1/p')
     if [ -z "$interp" ] || [ ! -r "$interp" ]; then
         skip "glibc layout integration gate" \
             "could not locate the target interpreter"
@@ -5994,10 +6330,12 @@ C
     # Matching an rtld size tuple is insufficient if libc comes from a
     # different release.  Mutate only the copied interpreter's stable release
     # banner; the pair must be packaged for extraction, never direct-loaded.
-    if ! cp "$interp" "$mismatch_interp" ||
-       ! "$helper" --release-mismatch "$mismatch_interp"; then
+    if ! cp "$interp" "$mismatch_interp"; then
         fail "mismatched glibc runtime extraction gate" \
-            "could not construct a mismatched interpreter"
+            "could not copy the target interpreter"
+    elif ! "$helper" --release-mismatch "$mismatch_interp"; then
+        skip "mismatched glibc runtime extraction gate" \
+            "interpreter has no mutable stable-release identity"
     else
         bad_interp_abs=$(readlink -f "$mismatch_interp")
         if ! gcc -Wl,--dynamic-linker="$bad_interp_abs" \
@@ -6163,6 +6501,7 @@ test_direct_dlopen_ifunc_data_order
 test_direct_copy_ifunc_order
 test_direct_dlopen_admission_flags
 test_direct_dlopen_embedded_static_tls
+test_direct_dlopen_startup_owned_ie
 test_direct_dlopen_fallback
 test_python3_direct
 test_python_repl_pty_direct
