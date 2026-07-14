@@ -12,6 +12,9 @@
 struct dlfrz_lib_meta;
 struct dlfrz_entry;
 
+#define DLFRZ_HANDOFF_APPLICATION_STARTED '1'
+#define DLFRZ_HANDOFF_TERMINAL_REFUSAL     'R'
+
 /*
  * Load all libraries from the frozen binary's in-memory payload,
  * resolve relocations, set up TLS, and jump to the executable's _start.
@@ -23,8 +26,9 @@ struct dlfrz_entry;
  *   entries:      manifest entry array (num_entries elements)
  *   strtab:       string table
  *   num_entries:  number of entries
- *   handoff_fd:    optional pipe written immediately before constructors;
- *                  -1 disables the parent notification
+ *   handoff_fd:    optional pipe written immediately before target code, or
+ *                  with a terminal-refusal marker for an incompatible direct
+ *                  artifact; -1 disables the parent notification
  *   argc, argv, envp: passed to the loaded program's entry point
  *
  * On success this function does NOT return — it transfers control to the

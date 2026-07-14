@@ -1,5 +1,7 @@
 #include "packer.h"
 #include "common.h"
+#include "glibc_layout.h"
+#include "musl_layout.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -90,6 +92,28 @@ typedef Elf64_Xword Elf64_Relr;
 #ifndef PRELINK_TLS_TCB_SIZE
 #define PRELINK_TLS_TCB_SIZE 0
 #endif
+
+static int u64_add_checked(uint64_t left, uint64_t right, uint64_t *out)
+{
+    if (right > UINT64_MAX - left)
+        return 0;
+    *out = left + right;
+    return 1;
+}
+
+static int u64_align_up_checked(uint64_t value, uint64_t align,
+                                uint64_t *out)
+{
+    uint64_t mask;
+
+    if (align == 0 || (align & (align - 1)) != 0)
+        return 0;
+    mask = align - 1;
+    if (value > UINT64_MAX - mask)
+        return 0;
+    *out = (value + mask) & ~mask;
+    return 1;
+}
 
 /* Starting base address for direct-loaded objects (above bootstrap VA) */
 #define DIRECT_LOAD_BASE  0x200000000ULL
@@ -193,6 +217,68 @@ static size_t filesize(const char *path)
 {
     struct stat st;
     return (stat(path, &st) == 0) ? (size_t)st.st_size : 0;
+}
+
+static int make_transaction_copy(const char *path, const char *suffix,
+                                 char copy_path[PATH_MAX])
+{
+    struct stat st;
+    char buffer[1 << 16];
+    int src = -1;
+    int dst = -1;
+    int rc = -1;
+
+    if (snprintf(copy_path, PATH_MAX, "%s.%s.XXXXXX", path, suffix) >=
+        PATH_MAX) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    src = open(path, O_RDONLY | O_CLOEXEC);
+    if (src < 0 || fstat(src, &st) < 0)
+        goto out;
+    dst = mkstemp(copy_path);
+    if (dst < 0)
+        goto out;
+    if (fchmod(dst, st.st_mode & 0777) < 0)
+        goto out;
+
+    for (;;) {
+        ssize_t got = read(src, buffer, sizeof(buffer));
+
+        if (got < 0) {
+            if (errno == EINTR)
+                continue;
+            goto out;
+        }
+        if (got == 0)
+            break;
+        for (ssize_t written = 0; written < got;) {
+            ssize_t n = write(dst, buffer + written, (size_t)(got - written));
+
+            if (n < 0) {
+                if (errno == EINTR)
+                    continue;
+                goto out;
+            }
+            if (n == 0) {
+                errno = EIO;
+                goto out;
+            }
+            written += n;
+        }
+    }
+    if (fsync(dst) < 0)
+        goto out;
+    rc = 0;
+
+out:
+    if (src >= 0)
+        close(src);
+    if (dst >= 0 && close(dst) < 0)
+        rc = -1;
+    if (rc < 0 && dst >= 0)
+        unlink(copy_path);
+    return rc;
 }
 
 static uint64_t find_named_symbol(FILE *f, const Elf64_Ehdr *ehdr,
@@ -686,7 +772,12 @@ static int compute_lib_meta(const char *path, uint64_t base, uint32_t flags,
                             struct dlfrz_lib_meta *meta)
 {
     FILE *f = fopen(path, "rb");
+    struct stat st;
     if (!f) { perror(path); return -1; }
+
+    if (fstat(fileno(f), &st) < 0 || st.st_size < (off_t)sizeof(Elf64_Ehdr)) {
+        fclose(f); return -1;
+    }
 
     Elf64_Ehdr ehdr;
     if (fread(&ehdr, 1, sizeof(ehdr), f) != sizeof(ehdr)) {
@@ -695,6 +786,10 @@ static int compute_lib_meta(const char *path, uint64_t base, uint32_t flags,
     if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0 ||
         ehdr.e_ident[EI_CLASS] != ELFCLASS64 ||
         ehdr.e_ident[EI_DATA] != ELFDATA2LSB ||
+        ehdr.e_ident[EI_VERSION] != EV_CURRENT ||
+        ehdr.e_version != EV_CURRENT ||
+        (ehdr.e_type != ET_DYN && ehdr.e_type != ET_EXEC) ||
+        ehdr.e_ehsize != sizeof(Elf64_Ehdr) ||
         ehdr.e_phentsize != sizeof(Elf64_Phdr)) {
         fprintf(stderr, "dlfreeze: %s: unsupported or malformed ELF\n", path);
         fclose(f); return -1;
@@ -729,9 +824,10 @@ static int compute_lib_meta(const char *path, uint64_t base, uint32_t flags,
         meta->flags |= DLFRZ_FLAG_RUNTIME_SCAN;
 
     /* Read program headers to get VA span */
-    if (ehdr.e_phnum == 0 ||
-        (uint64_t)ehdr.e_phoff +
-            (uint64_t)ehdr.e_phnum * sizeof(Elf64_Phdr) > (uint64_t)LONG_MAX) {
+    if (ehdr.e_phnum == 0 || ehdr.e_phoff > (uint64_t)st.st_size ||
+        (uint64_t)ehdr.e_phnum >
+            ((uint64_t)st.st_size - ehdr.e_phoff) / sizeof(Elf64_Phdr) ||
+        ehdr.e_phoff > (uint64_t)LONG_MAX) {
         fclose(f); return -1;
     }
     size_t phsz = (size_t)ehdr.e_phnum * sizeof(Elf64_Phdr);
@@ -744,19 +840,83 @@ static int compute_lib_meta(const char *path, uint64_t base, uint32_t flags,
 
     uint64_t lo = UINT64_MAX, hi = 0, phdr_vaddr = UINT64_MAX;
     uint64_t phdr_file_end = ehdr.e_phoff + phsz;
+    uint64_t max_load_align = 1;
+    int tls_count = 0;
+    Elf64_Phdr *tls_phdr = NULL;
     for (int i = 0; i < ehdr.e_phnum; i++) {
         Elf64_Phdr *ph = (Elf64_Phdr *)(phdrs + i * ehdr.e_phentsize);
-        if (ph->p_type != PT_LOAD) continue;
-        if (ph->p_vaddr < lo) lo = ph->p_vaddr;
-        if (ph->p_memsz > UINT64_MAX - ph->p_vaddr) {
+        if (ph->p_offset > (uint64_t)st.st_size ||
+            ph->p_filesz > (uint64_t)st.st_size - ph->p_offset ||
+            ph->p_memsz > UINT64_MAX - ph->p_vaddr ||
+            ((ph->p_type == PT_LOAD || ph->p_type == PT_DYNAMIC ||
+              ph->p_type == PT_TLS) && ph->p_filesz > ph->p_memsz)) {
             free(phdrs); fclose(f); return -1;
         }
+        if (ph->p_type == PT_TLS) {
+            if (++tls_count != 1 ||
+                (ph->p_align > 1 &&
+                 (ph->p_align & (ph->p_align - 1)) != 0)) {
+                fprintf(stderr,
+                        "dlfreeze: %s: malformed PT_TLS program header\n",
+                        path);
+                free(phdrs); fclose(f); return -1;
+            }
+            tls_phdr = ph;
+        }
+        if (ph->p_type != PT_LOAD) continue;
+        if (ph->p_align > 1 &&
+            ((ph->p_align & (ph->p_align - 1)) != 0 ||
+             (ph->p_vaddr & (ph->p_align - 1)) !=
+                 (ph->p_offset & (ph->p_align - 1)))) {
+            free(phdrs); fclose(f); return -1;
+        }
+        if (ph->p_align > max_load_align)
+            max_load_align = ph->p_align;
+        if (ph->p_vaddr < lo) lo = ph->p_vaddr;
         uint64_t end = ph->p_vaddr + ph->p_memsz;
         if (end > hi) hi = end;
         if (ehdr.e_phoff >= ph->p_offset &&
             phdr_file_end >= ehdr.e_phoff &&
             phdr_file_end - ph->p_offset <= ph->p_filesz)
             phdr_vaddr = ph->p_vaddr + (ehdr.e_phoff - ph->p_offset);
+    }
+
+    if (tls_phdr) {
+        uint64_t tls_align = tls_phdr->p_align ? tls_phdr->p_align : 1;
+
+        if ((tls_phdr->p_vaddr & (tls_align - 1)) !=
+            (tls_phdr->p_offset & (tls_align - 1))) {
+            free(phdrs); fclose(f); return -1;
+        }
+        if (tls_phdr->p_filesz != 0) {
+            int template_contained = 0;
+
+            for (int i = 0; i < ehdr.e_phnum; i++) {
+                Elf64_Phdr *load =
+                    (Elf64_Phdr *)(phdrs + i * ehdr.e_phentsize);
+                uint64_t delta;
+
+                if (load->p_type != PT_LOAD ||
+                    tls_phdr->p_vaddr < load->p_vaddr ||
+                    tls_phdr->p_offset < load->p_offset)
+                    continue;
+                delta = tls_phdr->p_vaddr - load->p_vaddr;
+                if (tls_phdr->p_offset - load->p_offset != delta ||
+                    delta > load->p_filesz ||
+                    tls_phdr->p_filesz > load->p_filesz - delta ||
+                    delta > load->p_memsz ||
+                    tls_phdr->p_filesz > load->p_memsz - delta)
+                    continue;
+                template_contained = 1;
+                break;
+            }
+            if (!template_contained) {
+                fprintf(stderr,
+                        "dlfreeze: %s: PT_TLS template is not contained "
+                        "in file-backed PT_LOAD\n", path);
+                free(phdrs); fclose(f); return -1;
+            }
+        }
     }
 
     if (flags & DLFRZ_FLAG_MAIN_EXE) {
@@ -772,10 +932,14 @@ static int compute_lib_meta(const char *path, uint64_t base, uint32_t flags,
             meta->main_sym = find_main_from_entry(f, &ehdr, phdrs);
     }
 
+    if (!u64_align_up_checked(base, max_load_align, &meta->base_addr)) {
+        free(phdrs); fclose(f); return -1;
+    }
+
     free(phdrs);
     fclose(f);
 
-    if (lo > hi || phdr_vaddr == UINT64_MAX || phdr_vaddr > UINT32_MAX) {
+    if (lo >= hi || phdr_vaddr == UINT64_MAX || phdr_vaddr > UINT32_MAX) {
         fprintf(stderr, "dlfreeze: %s: program headers are not loadable\n", path);
         return -1;
     }
@@ -1001,16 +1165,16 @@ static uint64_t pl_resolve_sym(struct prelink_obj *objs, int nobj,
     return result;
 }
 
-static void pl_parse_dynamic(struct prelink_obj *obj, uint64_t base,
-                              const uint8_t *phdr_base,
-                              uint16_t phdr_num, uint16_t phdr_entsz)
+static int pl_parse_dynamic(struct prelink_obj *obj, uint64_t base,
+                            const uint8_t *phdr_base,
+                            uint16_t phdr_num, uint16_t phdr_entsz)
 {
     const Elf64_Phdr *dyn_ph = NULL;
     for (int i = 0; i < phdr_num; i++) {
         const Elf64_Phdr *ph = (const Elf64_Phdr *)(phdr_base + i * phdr_entsz);
         if (ph->p_type == PT_DYNAMIC) { dyn_ph = ph; break; }
     }
-    if (!dyn_ph) return;
+    if (!dyn_ph) return 0;
 
     const Elf64_Dyn *dyn = (const Elf64_Dyn *)(base + dyn_ph->p_vaddr);
     size_t dyn_count = dyn_ph->p_memsz / sizeof(Elf64_Dyn);
@@ -1093,11 +1257,16 @@ static void pl_parse_dynamic(struct prelink_obj *obj, uint64_t base,
     for (int i = 0; i < phdr_num; i++) {
         const Elf64_Phdr *ph = (const Elf64_Phdr *)(phdr_base + i * phdr_entsz);
         if (ph->p_type == PT_TLS) {
+            if ((ph->p_align > 1 &&
+                 (ph->p_align & (ph->p_align - 1)) != 0) ||
+                ph->p_filesz > ph->p_memsz)
+                return -1;
             obj->tls_memsz  = ph->p_memsz;
             obj->tls_align  = ph->p_align ? ph->p_align : 1;
             break;
         }
     }
+    return 0;
 }
 
 static void pl_apply_relr(struct prelink_obj *obj)
@@ -1230,19 +1399,12 @@ static int prelink_obj_collect_runtime_fixups(const struct prelink_obj *obj,
                 if (type == ARCH_RELOC_ABS) {
                     uint32_t sidx = ELF64_R_SYM(rel->r_info);
 
-                    if (sidx != 0 && sidx < obj->dynsym_count) {
-                        const Elf64_Sym *sym = &obj->dynsym[sidx];
-                        const char *name = obj->dynstr + sym->st_name;
-                        uint64_t slot = *(const uint64_t *)(obj->base + rel->r_offset);
-                        int versioned = obj->versym &&
-                            (obj->versym[sidx] & 0x7fff) > 1;
-
-                        if (slot == 0 || runtime_reloc_name_match(name) ||
-                            ELF64_ST_BIND(sym->st_info) != STB_WEAK ||
-                            versioned) {
-                            needs_fixup = 1;
-                        }
-                    }
+                    /* An imported ABS relocation may name an IFUNC.  The
+                     * prelinker deliberately writes no resolver result, so
+                     * retain every symbolic ABS record for the loader's
+                     * post-template IFUNC phase (weak references included). */
+                    if (sidx != 0 && sidx < obj->dynsym_count)
+                        needs_fixup = 1;
                 } else {
                     needs_fixup = 1;
                 }
@@ -1251,17 +1413,14 @@ static int prelink_obj_collect_runtime_fixups(const struct prelink_obj *obj,
             } else if (type == ARCH_RELOC_GLOB_DAT ||
                        type == ARCH_RELOC_JUMP_SLOT) {
                 uint32_t sidx = ELF64_R_SYM(rel->r_info);
-                uint64_t slot = *(const uint64_t *)(obj->base + rel->r_offset);
 
-                if (slot == 0) {
+                /* Object-table discovery is depth-first, while ELF symbol
+                 * lookup is breadth-first over DT_NEEDED.  Keep every
+                 * symbolic GOT/PLT relocation as a compact runtime fixup so
+                 * the audited loader scope, visibility, and version rules
+                 * determine the final binding. */
+                if (sidx != 0 && sidx < obj->dynsym_count)
                     needs_fixup = 1;
-                } else if (sidx != 0 && sidx < obj->dynsym_count) {
-                    const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
-                    if (runtime_reloc_name_match(name) ||
-                        (obj->versym &&
-                         (obj->versym[sidx] & 0x7fff) > 1))
-                        needs_fixup = 1;
-                }
             }
 
             if (!needs_fixup)
@@ -1295,9 +1454,20 @@ static int prelink_objects(const char *output_path,
                            uint64_t meta_off,
                            int nobj)
 {
+    char transaction_path[PATH_MAX];
+
+    /* Relocations and metadata form one commit.  Work on a same-directory
+     * copy so a child crash, ENOSPC, or short write cannot leave a partially
+     * relocated artifact that the runtime later treats as clean input. */
+    if (make_transaction_copy(output_path, "prelink", transaction_path) < 0) {
+        perror("pre-link transaction copy");
+        return -1;
+    }
+
     pid_t pid = fork();
     if (pid < 0) {
         perror("fork");
+        unlink(transaction_path);
         return -1;
     }
 
@@ -1307,20 +1477,27 @@ static int prelink_objects(const char *output_path,
         while (waitpid(pid, &status, 0) < 0) {
             if (errno != EINTR) {
                 perror("waitpid");
+                unlink(transaction_path);
                 return -1;
             }
         }
-        if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
-            return 0;
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+            if (rename(transaction_path, output_path) == 0)
+                return 0;
+            perror("pre-link transaction commit");
+            unlink(transaction_path);
+            return -1;
+        }
 
         fprintf(stderr, "dlfreeze: pre-linker %s\n",
                 WIFSIGNALED(status) ? "crashed" : "failed");
+        unlink(transaction_path);
         return -1;
     }
 
     /* ==== Child process ==== */
 
-    FILE *outf = fopen(output_path, "r+b");
+    FILE *outf = fopen(transaction_path, "r+b");
     if (!outf) _exit(1);
 
     pl_cache_init();
@@ -1382,9 +1559,10 @@ static int prelink_objects(const char *output_path,
         objs[i].name = "";
 
         /* 2. Parse PT_DYNAMIC */
-        pl_parse_dynamic(&objs[i], base,
-                         (const uint8_t *)(base + m->phdr_off),
-                         m->phdr_num, m->phdr_entsz);
+        if (pl_parse_dynamic(&objs[i], base,
+                             (const uint8_t *)(base + m->phdr_off),
+                             m->phdr_num, m->phdr_entsz) < 0)
+            _exit(1);
 
         free(phdr_buf);
     }
@@ -1401,12 +1579,24 @@ static int prelink_objects(const char *output_path,
         if (metas[i].flags & DLFRZ_FLAG_DATA) continue;
         if (objs[i].tls_memsz > 0) {
             uint64_t align = objs[i].tls_align;
+            uint64_t next_tls;
+
             if (PRELINK_TLS_ABOVE_TP) {
-                total_tls = ALIGN_UP(total_tls, align);
+                if (!u64_align_up_checked(total_tls, align, &next_tls) ||
+                    next_tls > INT64_MAX)
+                    _exit(1);
+                total_tls = next_tls;
                 objs[i].tls_tpoff = (int64_t)total_tls;
-                total_tls += objs[i].tls_memsz;
+                if (!u64_add_checked(total_tls, objs[i].tls_memsz,
+                                     &total_tls) ||
+                    total_tls > INT64_MAX)
+                    _exit(1);
             } else {
-                total_tls = ALIGN_UP(total_tls + objs[i].tls_memsz, align);
+                if (!u64_add_checked(total_tls, objs[i].tls_memsz,
+                                     &next_tls) ||
+                    !u64_align_up_checked(next_tls, align, &total_tls) ||
+                    total_tls > INT64_MAX)
+                    _exit(1);
                 objs[i].tls_tpoff = -(int64_t)total_tls;
             }
             objs[i].tls_modid = (size_t)(oi + 1);  /* matches loader's oi+1 */
@@ -1554,7 +1744,8 @@ static int prelink_objects(const char *output_path,
             _exit(1);
     }
 
-    fclose(outf);
+    if (fflush(outf) != 0 || fsync(fileno(outf)) < 0 || fclose(outf) != 0)
+        _exit(1);
     free(runtime_fixups);
     free(objs);
     _exit(0);
@@ -2260,46 +2451,193 @@ static int elf_defines_symbol(const char *path, const char *name)
     return found;
 }
 
-static int file_contains_string(const char *path, const char *needle)
+/* Read the two exported private-rtld object sizes used as a validated glibc
+ * layout key.  This intentionally requires a bounded on-disk DYNSYM: if the
+ * interpreter does not expose enough metadata to identify a known layout,
+ * the safe result is extraction mode. */
+static enum dlfrz_glibc_layout_id elf_glibc_layout(const char *path,
+                                                    int *minor_out)
+{
+    enum dlfrz_glibc_layout_id layout = DLFRZ_GLIBC_LAYOUT_UNKNOWN;
+    uint64_t glro_size = 0;
+    uint64_t gl_size = 0;
+    struct stat st;
+    uint8_t *map = MAP_FAILED;
+    int fd = -1;
+
+    if (minor_out)
+        *minor_out = -1;
+
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0 || fstat(fd, &st) < 0 || st.st_size < (off_t)sizeof(Elf64_Ehdr))
+        goto out;
+    map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (map == MAP_FAILED)
+        goto out;
+    if (dlfrz_glibc_is_development_release(map, (size_t)st.st_size))
+        goto out;
+
+    const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *)map;
+    size_t file_size = (size_t)st.st_size;
+
+    if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0 ||
+        ehdr->e_ident[EI_CLASS] != ELFCLASS64 ||
+        ehdr->e_ident[EI_DATA] != ELFDATA2LSB ||
+        ehdr->e_shentsize != sizeof(Elf64_Shdr) ||
+        ehdr->e_shnum == 0 || ehdr->e_shoff > file_size ||
+        (size_t)ehdr->e_shnum >
+            (file_size - (size_t)ehdr->e_shoff) / sizeof(Elf64_Shdr))
+        goto out;
+
+    const Elf64_Shdr *shdrs =
+        (const Elf64_Shdr *)(map + (size_t)ehdr->e_shoff);
+    for (uint16_t i = 0; i < ehdr->e_shnum; i++) {
+        const Elf64_Shdr *sh = &shdrs[i];
+
+        if (sh->sh_type != SHT_DYNSYM ||
+            sh->sh_entsize != sizeof(Elf64_Sym) ||
+            sh->sh_link >= ehdr->e_shnum || sh->sh_offset > file_size ||
+            sh->sh_size > file_size - (size_t)sh->sh_offset ||
+            sh->sh_size % sizeof(Elf64_Sym) != 0)
+            continue;
+
+        const Elf64_Shdr *str_sh = &shdrs[sh->sh_link];
+        if (str_sh->sh_type != SHT_STRTAB || str_sh->sh_offset > file_size ||
+            str_sh->sh_size > file_size - (size_t)str_sh->sh_offset)
+            continue;
+
+        const Elf64_Sym *syms =
+            (const Elf64_Sym *)(map + (size_t)sh->sh_offset);
+        const char *strtab = (const char *)(map + (size_t)str_sh->sh_offset);
+        size_t nsyms = (size_t)sh->sh_size / sizeof(Elf64_Sym);
+        size_t str_size = (size_t)str_sh->sh_size;
+
+        for (size_t j = 0; j < nsyms; j++) {
+            const Elf64_Sym *sym = &syms[j];
+            const char *name;
+            size_t remain;
+
+            if (ELF64_ST_TYPE(sym->st_info) != STT_OBJECT ||
+                sym->st_shndx == SHN_UNDEF || sym->st_size == 0 ||
+                sym->st_name >= str_size)
+                continue;
+            name = strtab + sym->st_name;
+            remain = str_size - sym->st_name;
+            if (remain > sizeof("_rtld_global_ro") - 1 &&
+                memcmp(name, "_rtld_global_ro",
+                       sizeof("_rtld_global_ro") - 1) == 0 &&
+                name[sizeof("_rtld_global_ro") - 1] == '\0')
+                glro_size = sym->st_size;
+            else if (remain > sizeof("_rtld_global") - 1 &&
+                     memcmp(name, "_rtld_global",
+                            sizeof("_rtld_global") - 1) == 0 &&
+                     name[sizeof("_rtld_global") - 1] == '\0')
+                gl_size = sym->st_size;
+        }
+    }
+
+    layout = dlfrz_glibc_layout_lookup(ehdr->e_machine, glro_size, gl_size);
+    {
+        int minor = dlfrz_glibc_stable_release_minor(map, file_size);
+
+        if (minor < 0 ||
+            !dlfrz_glibc_layout_release_is_supported(layout, minor)) {
+            layout = DLFRZ_GLIBC_LAYOUT_UNKNOWN;
+        } else if (minor_out) {
+            *minor_out = minor;
+        }
+    }
+
+out:
+    if (map != MAP_FAILED)
+        munmap(map, (size_t)st.st_size);
+    if (fd >= 0)
+        close(fd);
+    return layout;
+}
+
+static int file_glibc_release_minor(const char *path)
 {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     struct stat st;
-    void *map;
-    int found = 0;
+    void *map = MAP_FAILED;
+    int minor = -1;
 
     if (fd < 0)
-        return 0;
+        return -1;
     if (fstat(fd, &st) < 0 || st.st_size <= 0)
         goto out;
     map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (map == MAP_FAILED)
         goto out;
-    found = memmem(map, (size_t)st.st_size, needle, strlen(needle)) != NULL;
-    munmap(map, (size_t)st.st_size);
+    if (!dlfrz_glibc_is_development_release(map, (size_t)st.st_size))
+        minor = dlfrz_glibc_stable_release_minor(map, (size_t)st.st_size);
 
 out:
+    if (map != MAP_FAILED)
+        munmap(map, (size_t)st.st_size);
     close(fd);
-    return found;
+    return minor;
+}
+
+static const struct dlfrz_musl_layout *file_musl_layout(const char *path)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    struct stat st;
+    uint8_t *map = MAP_FAILED;
+    const struct dlfrz_musl_layout *layout = NULL;
+
+    if (fd < 0)
+        return NULL;
+    if (fstat(fd, &st) < 0 || st.st_size < (off_t)sizeof(Elf64_Ehdr))
+        goto out;
+    map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (map == MAP_FAILED)
+        goto out;
+    const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *)map;
+    if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) == 0 &&
+        ehdr->e_ident[EI_CLASS] == ELFCLASS64 &&
+        ehdr->e_ident[EI_DATA] == ELFDATA2LSB &&
+        ehdr->e_ident[EI_VERSION] == EV_CURRENT &&
+        ehdr->e_version == EV_CURRENT)
+        layout = dlfrz_musl_layout_lookup(ehdr->e_machine, map,
+                                           (size_t)st.st_size);
+
+out:
+    if (map != MAP_FAILED)
+        munmap(map, (size_t)st.st_size);
+    close(fd);
+    return layout;
 }
 
 static int direct_runtime_supported(const struct pack_options *opts)
 {
     const char *interp_path = opts->deps->interp_path;
     const char *base;
+    int interp_minor = -1;
 
     if (!interp_path)
         return 0;
     base = strrchr(interp_path, '/');
     base = base ? base + 1 : interp_path;
-    if (strncmp(base, "ld-musl", 7) == 0)
-        return file_contains_string(interp_path, "musl libc (");
+    if (strncmp(base, "ld-musl", 7) == 0) {
+        /* The loader changes the target thread pointer in place.  A static
+         * glibc (or unknown-libc) bootstrap cannot safely keep using its own
+         * wrappers afterward.  Identify the actual bootstrap ELF by musl's
+         * hidden __copy_tls implementation, not by the compiler command name
+         * (some CI images alias musl-gcc to plain gcc). */
+        return file_musl_layout(interp_path) != NULL &&
+               elf_defines_symbol(opts->bootstrap_path, "__copy_tls");
+    }
     if (strncmp(base, "ld-linux", 8) != 0 ||
-        !elf_defines_symbol(interp_path, "_rtld_global") ||
-        !elf_defines_symbol(interp_path, "_rtld_global_ro"))
+        elf_glibc_layout(interp_path, &interp_minor) ==
+            DLFRZ_GLIBC_LAYOUT_UNKNOWN)
         return 0;
 
     for (int i = 0; i < opts->deps->count; i++) {
         if (strcmp(opts->deps->libs[i].name, "libc.so.6") == 0 &&
+            file_glibc_release_minor(opts->deps->libs[i].path) ==
+                interp_minor &&
             elf_defines_symbol(opts->deps->libs[i].path,
                                "gnu_get_libc_version") &&
             elf_defines_symbol(opts->deps->libs[i].path,
@@ -2509,6 +2847,9 @@ int pack_frozen(const struct pack_options *opts)
                     break;
                 }
             } else {
+                /* compute_lib_meta aligns each load bias to the largest
+                 * PT_LOAD p_align required by that object. */
+                base = metas[i].base_addr;
                 /* Leave room for the loader's trailing guard pages even when
                  * an object's high VA is exactly on a 2 MiB boundary. */
                 if (metas[i].vaddr_hi > UINT64_MAX - 4 * PAYLOAD_ALIGN) {
@@ -2557,8 +2898,9 @@ int pack_frozen(const struct pack_options *opts)
     struct dlfrz_entry *entries_copy = NULL;
     if (metas) {
         entries_copy = malloc(eidx * sizeof(*entries));
-        if (entries_copy)
-            memcpy(entries_copy, entries, eidx * sizeof(*entries));
+        if (!entries_copy)
+            goto fail2;
+        memcpy(entries_copy, entries, eidx * sizeof(*entries));
     }
 
     free(entries);

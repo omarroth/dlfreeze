@@ -295,6 +295,28 @@ static int payload_range_valid(uint64_t offset, uint64_t length,
     return relative <= payload_size && length <= payload_size - relative;
 }
 
+static int u64_add_checked(uint64_t left, uint64_t right, uint64_t *out)
+{
+    if (right > UINT64_MAX - left)
+        return 0;
+    *out = left + right;
+    return 1;
+}
+
+static int u64_align_up_checked(uint64_t value, uint64_t align,
+                                uint64_t *out)
+{
+    uint64_t mask;
+
+    if (align == 0 || (align & (align - 1)) != 0)
+        return 0;
+    mask = align - 1;
+    if (value > UINT64_MAX - mask)
+        return 0;
+    *out = (value + mask) & ~mask;
+    return 1;
+}
+
 static int embedded_name_valid(const char *name)
 {
     const char *p = name;
@@ -398,6 +420,12 @@ static int direct_metadata_is_valid(const uint8_t *mem, uint64_t mem_foff,
         ((uint64_t)page_size_long & ((uint64_t)page_size_long - 1)) != 0)
         return 0;
     const uint64_t page_size = (uint64_t)page_size_long;
+#if defined(__aarch64__)
+    /* Both supported AArch64 TLS variants reserve two words above TP. */
+    uint64_t total_tls = 16;
+#else
+    uint64_t total_tls = 0;
+#endif
 
     for (uint32_t i = 0; i < num_entries; i++) {
         const struct dlfrz_entry *entry = &entries[i];
@@ -461,6 +489,10 @@ static int direct_metadata_is_valid(const uint8_t *mem, uint64_t mem_foff,
         uint64_t lo = UINT64_MAX;
         uint64_t hi = 0;
         uint64_t phdr_vaddr = UINT64_MAX;
+        uint64_t tls_memsz = 0;
+        uint64_t tls_align = 1;
+        uint16_t tls_count = 0;
+        const Elf64_Phdr *tls_phdr = NULL;
         const uint64_t phdr_file_end =
             ehdr->e_phoff + (uint64_t)ehdr->e_phnum * sizeof(Elf64_Phdr);
 
@@ -470,8 +502,18 @@ static int direct_metadata_is_valid(const uint8_t *mem, uint64_t mem_foff,
             if (ph->p_type == PT_LOAD && ph->p_align > 1 &&
                 ((ph->p_align & (ph->p_align - 1)) != 0 ||
                  (ph->p_vaddr & (ph->p_align - 1)) !=
-                    (ph->p_offset & (ph->p_align - 1))))
+                    (ph->p_offset & (ph->p_align - 1)) ||
+                 (meta->base_addr & (ph->p_align - 1)) != 0))
                 return 0;
+            if (ph->p_type == PT_TLS) {
+                if (++tls_count != 1 ||
+                    (ph->p_align > 1 &&
+                     (ph->p_align & (ph->p_align - 1)) != 0))
+                    return 0;
+                tls_memsz = ph->p_memsz;
+                tls_align = ph->p_align ? ph->p_align : 1;
+                tls_phdr = ph;
+            }
             if (ph->p_offset > entry->data_size ||
                 ph->p_filesz > entry->data_size - ph->p_offset ||
                 ph->p_memsz > UINT64_MAX - ph->p_vaddr)
@@ -490,6 +532,55 @@ static int direct_metadata_is_valid(const uint8_t *mem, uint64_t mem_foff,
                 phdr_file_end - ph->p_offset <= ph->p_filesz)
                 phdr_vaddr = ph->p_vaddr +
                              (ehdr->e_phoff - ph->p_offset);
+        }
+
+        if (tls_phdr) {
+            if ((tls_phdr->p_vaddr & (tls_align - 1)) !=
+                (tls_phdr->p_offset & (tls_align - 1)))
+                return 0;
+            if (tls_phdr->p_filesz != 0) {
+                int template_contained = 0;
+
+                for (uint16_t p = 0; p < ehdr->e_phnum; p++) {
+                    const Elf64_Phdr *load = &phdrs[p];
+                    uint64_t delta;
+
+                    if (load->p_type != PT_LOAD ||
+                        tls_phdr->p_vaddr < load->p_vaddr ||
+                        tls_phdr->p_offset < load->p_offset)
+                        continue;
+                    delta = tls_phdr->p_vaddr - load->p_vaddr;
+                    if (tls_phdr->p_offset - load->p_offset != delta ||
+                        delta > load->p_filesz ||
+                        tls_phdr->p_filesz > load->p_filesz - delta ||
+                        delta > load->p_memsz ||
+                        tls_phdr->p_filesz > load->p_memsz - delta)
+                        continue;
+                    template_contained = 1;
+                    break;
+                }
+                if (!template_contained)
+                    return 0;
+            }
+        }
+
+        if (tls_count != 0 && tls_memsz != 0 &&
+            !(entry->flags & (DLFRZ_FLAG_INTERP |
+                              DLFRZ_FLAG_DLOPEN |
+                              DLFRZ_FLAG_DATA))) {
+            uint64_t next_tls;
+
+#if defined(__aarch64__)
+            if (!u64_align_up_checked(total_tls, tls_align, &next_tls) ||
+                !u64_add_checked(next_tls, tls_memsz, &total_tls))
+                return 0;
+#else
+            if (!u64_add_checked(total_tls, tls_memsz, &next_tls) ||
+                !u64_align_up_checked(next_tls, tls_align, &total_tls))
+                return 0;
+#endif
+            if (total_tls > INT64_MAX)
+                return 0;
         }
 
         if (lo >= hi || phdr_vaddr == UINT64_MAX ||
@@ -663,8 +754,9 @@ int main(int argc, char **argv)
     memcpy(&fixup_off, ft.pad + 8, sizeof(fixup_off));
     memcpy(&fixup_count, ft.pad + 16, sizeof(fixup_count));
     if (meta_off != 0) {
-        /* Direct-load mode: try in a child first so we can fall back to
-         * extraction if the in-process loader fails for this binary. */
+        /* Direct-load mode: try in a child first.  A clean, runtime-relocated
+         * payload may fall back to extraction before application handoff;
+         * a prelinked payload must never be handed back to the system rtld. */
         size_t metasz = ft.num_entries * sizeof(struct dlfrz_lib_meta);
         if (!payload_range_valid(meta_off, metasz,
                                  payload_offset, payload_size) ||
@@ -737,6 +829,15 @@ int main(int argc, char **argv)
             return 127;
         }
 
+        int prelinked_payload = 0;
+        for (uint32_t i = 0; i < ft.num_entries; i++) {
+            if (!(metas[i].flags & DLFRZ_FLAG_DATA) &&
+                (metas[i].flags & DLFRZ_FLAG_PRELINKED)) {
+                prelinked_payload = 1;
+                break;
+            }
+        }
+
         /* DLFREEZE_NO_FORK=1 → run loader_run() directly (for debugging) */
         if (bs_env_enabled("DLFREEZE_NO_FORK")) {
             loader_run(ldr_mem, ldr_mem_foff, ldr_srcfd, metas, ent, strtab,
@@ -749,8 +850,8 @@ int main(int argc, char **argv)
             return 127;
         }
 
-        /* Run direct-load in a child so failures before application handoff
-         * can fall back to extraction without risking duplicated effects. */
+        /* Run direct-load in a child so clean-payload failures before
+         * application handoff can fall back without duplicated effects. */
         int handoff_pipe[2];
         if (pipe2(handoff_pipe, O_CLOEXEC) < 0) {
             perror("pipe2");
@@ -824,19 +925,33 @@ int main(int argc, char **argv)
                                sizeof(handoff_marker));
         } while (handoff_len < 0 && errno == EINTR);
         close(handoff_pipe[0]);
-        int application_started = handoff_len == 1 && handoff_marker == '1';
+        int application_started = handoff_len == 1 &&
+            handoff_marker == DLFRZ_HANDOFF_APPLICATION_STARTED;
+        int terminal_refusal = handoff_len == 1 &&
+            handoff_marker == DLFRZ_HANDOFF_TERMINAL_REFUSAL;
 
         if (from_memory == 0 && ldr_mem_foff == 0 && ldr_mem)
             munmap((void *)ldr_mem, st.st_size);
 
         free(metas);
 
+        if (terminal_refusal) {
+            free(ent); free(strtab); close(sfd);
+            return 127;
+        }
         if (application_started || direct_interrupted) {
             free(ent); free(strtab); close(sfd);
             if (WIFEXITED(lst))
                 return WEXITSTATUS(lst);
             if (WIFSIGNALED(lst))
                 reraise_child_signal(WTERMSIG(lst));
+            return 127;
+        }
+        if (prelinked_payload) {
+            fprintf(stderr,
+                    "dlfreeze: refusing extraction fallback for a prelinked "
+                    "direct-load artifact\n");
+            free(ent); free(strtab); close(sfd);
             return 127;
         }
     }

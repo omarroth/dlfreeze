@@ -26,8 +26,11 @@
 #include <limits.h>
 #include <pthread.h>
 #include <locale.h>
+#include <dlfcn.h>
 
 #include "common.h"
+#include "glibc_layout.h"
+#include "musl_layout.h"
 #include "loader.h"
 
 /* ---- flag constants (must match common.h) ----------------------------- */
@@ -52,6 +55,16 @@ typedef Elf64_Xword Elf64_Relr;
 /* Fallback for pre-4.17 kernel headers */
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
+#endif
+
+#ifndef DF_1_NOOPEN
+#define DF_1_NOOPEN 0x00000040
+#endif
+#ifndef DF_1_NODEFLIB
+#define DF_1_NODEFLIB 0x00000800
+#endif
+#ifndef DF_1_PIE
+#define DF_1_PIE 0x08000000
 #endif
 
 /* ---- architecture abstraction ----------------------------------------- */
@@ -178,10 +191,6 @@ typedef Elf64_Xword Elf64_Relr;
   #error "Unsupported architecture"
 #endif
 
-/* Zeroed page used as target for unresolved OBJECT symbols.
- * Prevents NULL dereference crashes in IFUNC resolvers. */
-static void *g_null_page;
-
 /* Debug verbosity — enabled by DLFREEZE_DEBUG=1 env var.
  * Set before TLS swap (getenv is safe in bootstrap's libc). */
 static int g_debug;
@@ -195,11 +204,98 @@ static int g_glibc_early_init_done;
 static int g_perf_mode;
 static int g_is_musl_runtime;
 static uintptr_t g_musl_tp_self_delta;
+static uintptr_t g_musl_libc_addr;
+static uintptr_t g_musl_stack_guard;
+static const struct dlfrz_musl_layout *g_musl_layout;
 static uint64_t g_page_size = 4096;
+
+/* Present in static musl startup, absent from glibc and other bootstrap
+ * libcs.  This is an identity check only; the loader never calls it. */
+extern void *__copy_tls(unsigned char *) __attribute__((weak));
+extern uintptr_t __stack_chk_guard __attribute__((weak));
 
 static uint64_t page_floor(uint64_t value)
 {
     return value & ~(g_page_size - 1);
+}
+
+static int u64_add_checked(uint64_t left, uint64_t right, uint64_t *out)
+{
+    if (right > UINT64_MAX - left)
+        return 0;
+    *out = left + right;
+    return 1;
+}
+
+static int u64_mul_checked(uint64_t left, uint64_t right, uint64_t *out)
+{
+    if (left != 0 && right > UINT64_MAX / left)
+        return 0;
+    *out = left * right;
+    return 1;
+}
+
+static int u64_align_up_checked(uint64_t value, uint64_t align,
+                                uint64_t *out)
+{
+    uint64_t mask;
+
+    if (align == 0 || (align & (align - 1)) != 0)
+        return 0;
+    mask = align - 1;
+    if (value > UINT64_MAX - mask)
+        return 0;
+    *out = (value + mask) & ~mask;
+    return 1;
+}
+
+static int u64_add_i64_checked(uint64_t base, int64_t delta, uint64_t *out)
+{
+    if (delta >= 0)
+        return u64_add_checked(base, (uint64_t)delta, out);
+
+    uint64_t magnitude = (uint64_t)(-(delta + 1)) + 1;
+    if (magnitude > base)
+        return 0;
+    *out = base - magnitude;
+    return 1;
+}
+
+static int i64_add_u64_checked(int64_t base, uint64_t addend, int64_t *out)
+{
+    if (base >= 0) {
+        if (addend > (uint64_t)(INT64_MAX - base))
+            return 0;
+        *out = base + (int64_t)addend;
+        return 1;
+    }
+
+    uint64_t magnitude = (uint64_t)(-(base + 1)) + 1;
+    if (addend >= magnitude) {
+        uint64_t positive = addend - magnitude;
+
+        if (positive > INT64_MAX)
+            return 0;
+        *out = (int64_t)positive;
+        return 1;
+    }
+
+    magnitude -= addend;
+    if (magnitude == (uint64_t)INT64_MAX + 1) {
+        *out = INT64_MIN;
+        return 1;
+    }
+    *out = -(int64_t)magnitude;
+    return 1;
+}
+
+static int i64_add_checked(int64_t left, int64_t right, int64_t *out)
+{
+    if ((right > 0 && left > INT64_MAX - right) ||
+        (right < 0 && left < INT64_MIN - right))
+        return 0;
+    *out = left + right;
+    return 1;
 }
 
 #if defined(__aarch64__)
@@ -333,8 +429,6 @@ static uint64_t aarch64_extract_main_from_entry(uintptr_t map_start,
 struct aarch64_tlsdesc_arg {
     uint64_t modid;
     uint64_t offset;
-    int64_t  dtv_offset;
-    uint64_t entry_shift;
 };
 
 #define AARCH64_TLSDESC_ARGS_PER_PAGE 127
@@ -342,8 +436,8 @@ struct aarch64_tlsdesc_arg {
 extern uintptr_t dlfreeze_aarch64_tlsdesc_static(void *);
 extern uintptr_t dlfreeze_aarch64_tlsdesc_dynamic(void *);
 static int64_t dlfreeze_aarch64_tlsdesc_resolve_c(void *arg_in);
-static void *musl_lazy_install_tls(uintptr_t tp, unsigned long modid,
-                                   unsigned long ti_offset);
+static void *runtime_tls_get_addr(uintptr_t tp, unsigned long modid,
+                                  unsigned long ti_offset);
 
 struct aarch64_tlsdesc_page {
     struct aarch64_tlsdesc_page *next;
@@ -365,33 +459,16 @@ __asm__(
     ".size dlfreeze_aarch64_tlsdesc_static, .-dlfreeze_aarch64_tlsdesc_static\n"
     /* Dynamic TLSDESC resolver.  AArch64 TLSDESC ABI: only x0 (and the
      * flags) may be clobbered; all other GPRs and FP registers must be
-     * preserved.  Fast path inline; slow path (empty DTV slot) calls
-     * dlfreeze_aarch64_tlsdesc_resolve_c which lazily allocates a per-
-     * thread TLS block. */
+     * preserved.  Route every lookup through the checked C resolver: an
+     * inline DTV lookup cannot safely read a module slot without first
+     * validating that thread's DTV capacity. */
     ".global dlfreeze_aarch64_tlsdesc_dynamic\n"
     ".hidden dlfreeze_aarch64_tlsdesc_dynamic\n"
     ".type dlfreeze_aarch64_tlsdesc_dynamic, %function\n"
     "dlfreeze_aarch64_tlsdesc_dynamic:\n"
     "\tstp x1, x2, [sp, #-16]!\n"
     "\tstp x3, x4, [sp, #-16]!\n"
-    "\tmrs x1, tpidr_el0\n"
     "\tldr x0, [x0, #8]\n"            /* x0 = arg pointer (kept until end) */
-    "\tldp x2, x3, [x0]\n"            /* x2=modid, x3=offset */
-    "\tldr x4, [x0, #16]\n"           /* x4=dtv_offset */
-    "\tldr x4, [x1, x4]\n"            /* x4 = DTV pointer */
-    "\tcbz x4, 1f\n"                  /* no DTV — slow path */
-    "\tldr x2, [x0, #24]\n"           /* x2 = entry_shift (overwrite modid) */
-    "\tldr x4, [x0]\n"                /* x4 = modid */
-    "\tlsl x2, x4, x2\n"              /* x2 = modid << shift */
-    "\tldr x4, [x0, #16]\n"           /* reload dtv_offset */
-    "\tldr x4, [x1, x4]\n"            /* DTV again */
-    "\tldr x4, [x4, x2]\n"            /* x4 = DTV[byte_idx] */
-    "\tcbz x4, 1f\n"                  /* empty slot — slow path */
-    "\tadd x0, x4, x3\n"              /* tls_block + offset */
-    "\tsub x0, x0, x1\n"              /* return relative to tp */
-    "\tldp x3, x4, [sp], #16\n"
-    "\tldp x1, x2, [sp], #16\n"
-    "\tret\n"
     "1:\n"
     /* Slow path: x0 still holds the arg pointer.  Save remaining
      * caller-clobbered GPRs and call into C. */
@@ -404,7 +481,49 @@ __asm__(
     "\tstp x13, x14, [sp, #-16]!\n"
     "\tstp x15, x16, [sp, #-16]!\n"
     "\tstp x17, x18, [sp, #-16]!\n"
+    "\tsub sp, sp, #528\n"
+    "\tstp q0, q1, [sp, #0]\n"
+    "\tstp q2, q3, [sp, #32]\n"
+    "\tstp q4, q5, [sp, #64]\n"
+    "\tstp q6, q7, [sp, #96]\n"
+    "\tstp q8, q9, [sp, #128]\n"
+    "\tstp q10, q11, [sp, #160]\n"
+    "\tstp q12, q13, [sp, #192]\n"
+    "\tstp q14, q15, [sp, #224]\n"
+    "\tstp q16, q17, [sp, #256]\n"
+    "\tstp q18, q19, [sp, #288]\n"
+    "\tstp q20, q21, [sp, #320]\n"
+    "\tstp q22, q23, [sp, #352]\n"
+    "\tstp q24, q25, [sp, #384]\n"
+    "\tstp q26, q27, [sp, #416]\n"
+    "\tstp q28, q29, [sp, #448]\n"
+    "\tstp q30, q31, [sp, #480]\n"
+    "\tmrs x17, fpcr\n"
+    "\tmrs x18, fpsr\n"
+    "\tstr x17, [sp, #512]\n"
+    "\tstr x18, [sp, #520]\n"
     "\tbl dlfreeze_aarch64_tlsdesc_resolve_c\n"
+    "\tldr x17, [sp, #512]\n"
+    "\tldr x18, [sp, #520]\n"
+    "\tmsr fpcr, x17\n"
+    "\tmsr fpsr, x18\n"
+    "\tldp q0, q1, [sp, #0]\n"
+    "\tldp q2, q3, [sp, #32]\n"
+    "\tldp q4, q5, [sp, #64]\n"
+    "\tldp q6, q7, [sp, #96]\n"
+    "\tldp q8, q9, [sp, #128]\n"
+    "\tldp q10, q11, [sp, #160]\n"
+    "\tldp q12, q13, [sp, #192]\n"
+    "\tldp q14, q15, [sp, #224]\n"
+    "\tldp q16, q17, [sp, #256]\n"
+    "\tldp q18, q19, [sp, #288]\n"
+    "\tldp q20, q21, [sp, #320]\n"
+    "\tldp q22, q23, [sp, #352]\n"
+    "\tldp q24, q25, [sp, #384]\n"
+    "\tldp q26, q27, [sp, #416]\n"
+    "\tldp q28, q29, [sp, #448]\n"
+    "\tldp q30, q31, [sp, #480]\n"
+    "\tadd sp, sp, #528\n"
     "\tldp x17, x18, [sp], #16\n"
     "\tldp x15, x16, [sp], #16\n"
     "\tldp x13, x14, [sp], #16\n"
@@ -445,7 +564,7 @@ static int64_t dlfreeze_aarch64_tlsdesc_resolve_c(void *arg_in)
 {
     struct aarch64_tlsdesc_arg *arg = (struct aarch64_tlsdesc_arg *)arg_in;
     uintptr_t tp = arch_get_tp();
-    uintptr_t tls_addr = (uintptr_t)musl_lazy_install_tls(
+    uintptr_t tls_addr = (uintptr_t)runtime_tls_get_addr(
         tp, (unsigned long)arg->modid, (unsigned long)arg->offset);
     return (int64_t)(tls_addr - tp);
 }
@@ -498,7 +617,15 @@ __asm__(
     "\tpushq %r11\n"
     "\tpushq %rbx\n"
     "\tmovq 8(%rax), %rdi\n"
+    /* The bootstrap is built for baseline x86-64/SSE2.  FXSAVE preserves
+     * every FP/SIMD state component that such nested C code may modify,
+     * including x87, MXCSR, and XMM0-XMM15.  Legacy SSE instructions leave
+     * wider AVX register lanes untouched. */
+    "\tsubq $512, %rsp\n"
+    "\tfxsave64 (%rsp)\n"
     "\tcall dlfreeze_x86_64_tlsdesc_resolve_c\n"
+    "\tfxrstor64 (%rsp)\n"
+    "\taddq $512, %rsp\n"
     "\tpopq %rbx\n"
     "\tpopq %r11\n"
     "\tpopq %r10\n"
@@ -528,12 +655,6 @@ static struct x86_64_tlsdesc_arg *alloc_x86_64_tlsdesc_arg(void)
     return &page->args[page->used++];
 }
 #endif
-
-#define MUSL_PROGNAME_NEAR_ENVIRON_MAX              0x100
-#define MUSL_ENVIRON_TO_INIT_FINI_LIST_PTR_OLD      0x1a8
-#define MUSL_ENVIRON_TO_INIT_FINI_LIST_SENTINEL_OLD 0x560
-#define MUSL_ENVIRON_TO_INIT_FINI_LIST_PTR_NEW      0xa70
-#define MUSL_ENVIRON_TO_INIT_FINI_LIST_SENTINEL_NEW 0x78
 
 static const char *path_basename(const char *path)
 {
@@ -842,8 +963,8 @@ static signal_handler_t vfs_signal(int signum, signal_handler_t handler)
  *
  * We detect the layout at runtime by parsing the embedded ld-linux.so's
  * .dynsym for the _rtld_global_ro and _rtld_global OBJECT symbols.  Exact
- * known size pairs use validated profiles; unknown modern pairs are derived
- * from struct sizes, release metadata, and stable tail-field placement.
+ * known size pairs use validated profiles.  Unknown pairs are rejected:
+ * total structure size does not reveal where glibc inserted new fields.
  *
  * To add a new glibc layout profile, use:
  *   gdb -batch -ex 'start' -ex 'ptype /o struct rtld_global_ro' /bin/true
@@ -1444,134 +1565,20 @@ static const struct glibc_ver_offsets glibc_2_41_debian = {
 
 static uint8_t *g_fake_rtld_global;
 static uint8_t *g_fake_rtld_global_ro;
-#if defined(__aarch64__)
-#define DEFAULT_GLIBC_OFFSETS (&glibc_aarch64_2_35)
-#else
-#define DEFAULT_GLIBC_OFFSETS (&glibc_2_40)
-#endif
-static const struct glibc_ver_offsets *g_glibc_off = DEFAULT_GLIBC_OFFSETS;
-static struct glibc_ver_offsets g_glibc_derived_offsets;
+static const struct glibc_ver_offsets *g_glibc_off;
 static int g_glibc_rtld_fixed;
 static int g_glibc_minor = -1;
 static size_t g_tls_static_size = 0x1080;
 static size_t g_tls_static_align = 0x40;
 
-static const struct glibc_ver_offsets *fallback_glibc_offsets_for_minor(int minor)
-{
-#if defined(__aarch64__)
-    if (minor >= 43)
-        return &glibc_aarch64_2_43;
-    if (minor >= 41)
-        return &glibc_aarch64_2_41;
-    if (minor >= 40)
-        return &glibc_aarch64_2_40_legacy_sized_rtld;
-    if (minor >= 36)
-        return &glibc_aarch64_2_35;
-    if (minor >= 35)
-        return &glibc_aarch64_2_35_large_pthread;
-    if (minor >= 31)
-        return &glibc_aarch64_2_31;
-    return &glibc_aarch64_2_27;
-#else
-    if (minor >= 40)
-        return &glibc_2_40;
-    if (minor >= 37)
-        return &glibc_2_37;
-    if (minor >= 34)
-        return &glibc_2_34;
-    if (minor >= 29)
-        return &glibc_2_29;
-    return &glibc_2_17;
-#endif
-}
-
-static const struct glibc_ver_offsets *
-fallback_glibc_offsets_for_machine(uint16_t machine, int minor,
-                                   size_t glro_size, size_t gl_size)
-{
-    if (machine == EM_AARCH64) {
-        if (gl_size > 0) {
-            if (gl_size < 2600)
-                return &glibc_aarch64_2_43;
-            if (gl_size < 3600)
-                return &glibc_aarch64_2_41;
-            if (gl_size >= 4512 && gl_size < 4600)
-                return &glibc_aarch64_2_36_debian;
-            if (gl_size >= 4480 && gl_size < 4512) {
-                if (gl_size < 4496 || minor == 35)
-                    return &glibc_aarch64_2_35_large_pthread;
-                return (minor >= 40 || glro_size >= 704) ?
-                    &glibc_aarch64_2_40_legacy_sized_rtld :
-                    &glibc_aarch64_2_35;
-            }
-            if (gl_size >= 4120 && gl_size < 4180)
-                return &glibc_aarch64_2_31;
-            if (gl_size >= 4060 && gl_size < 4120)
-                return &glibc_aarch64_2_27;
-        }
-        if (minor >= 43)
-            return &glibc_aarch64_2_43;
-        if (minor >= 41)
-            return &glibc_aarch64_2_41;
-        if (minor == 35)
-            return &glibc_aarch64_2_35_large_pthread;
-        if (minor >= 40 || glro_size >= 704)
-            return &glibc_aarch64_2_40_legacy_sized_rtld;
-        if (minor >= 36 || glro_size >= 672)
-            return &glibc_aarch64_2_35;
-        if (minor >= 35)
-            return &glibc_aarch64_2_35_large_pthread;
-        if (minor >= 31 || glro_size >= 624)
-            return &glibc_aarch64_2_31;
-        return &glibc_aarch64_2_27;
-    }
-
-    if (machine == EM_X86_64) {
-        if (gl_size > 0) {
-            if (gl_size < 2600)
-                return &glibc_2_40;
-            if (gl_size < 3200)
-                return &glibc_2_41_debian;
-            if (gl_size >= 4320) {
-                if (minor >= 40)
-                    return &glibc_2_40_legacy_sized_rtld;
-                if (minor >= 37)
-                    return &glibc_2_37;
-                return &glibc_2_36_debian;
-            }
-            if (gl_size >= 4280)
-                return &glibc_2_34;
-            if (gl_size >= 3996)
-                return &glibc_2_31_debian;
-            if (gl_size >= 3980)
-                return &glibc_2_29;
-            if (gl_size >= 3940)
-                return &glibc_2_17;
-        }
-        if (minor >= 40) {
-            if (glro_size >= 952)
-                return &glibc_2_41_debian;
-            return &glibc_2_40;
-        }
-        if (minor >= 37 || glro_size >= 952)
-            return &glibc_2_37;
-        if (minor >= 34 || glro_size >= 896) {
-            if (glro_size > 0 && glro_size <= 896)
-                return &glibc_2_36_debian;
-            return &glibc_2_34;
-        }
-        if (minor >= 29 || glro_size >= 536)
-            return &glibc_2_29;
-        return &glibc_2_17;
-    }
-
-    return NULL;
-}
-
 /* Some glibc startup and thread paths read __libc_stack_end from ld-linux.
  * Direct-load mode does not map the real
  * interpreter, so provide loader-owned storage for that symbol. */
 static void *g_fake_libc_stack_end;
+static int g_fake_libc_enable_secure;
+static char **g_fake_dl_argv;
+static uintptr_t g_fake_stack_chk_guard;
+static uintptr_t g_fake_pointer_chk_guard;
 
 /* Fake link_map used by __cxa_thread_atexit_impl and other glibc internals
  * that dereference _rtld_global._dl_ns[0]._ns_loaded (offset 0).
@@ -2359,40 +2366,59 @@ static void fixup_rtld_for_glibc(const struct glibc_ver_offsets *o)
 /*
  * Detect glibc struct layout by parsing the embedded ld-linux.so (INTERP)
  * ELF to extract st_size of _rtld_global_ro and _rtld_global symbols.
- * The ELF machine plus both sizes identify known layout profiles when a
- * validated row exists.  Otherwise modern glibc layouts can be derived from
- * the same size/version data without requiring a new distro-specific row.
+ * The ELF machine plus both sizes identify a validated layout admission key.
+ * A glibc development marker is rejected even when its sizes match a stable
+ * release, because private-field consumers can change without changing size.
  *
  * This reads the actual struct sizes from the frozen interpreter, rather
  * than relying on the build host's glibc version.
  */
 
-/* Known layout profiles, keyed by _rtld_global_ro AND _rtld_global st_size.
- * Both sizes are needed to disambiguate versions that share a glro_size
- * (e.g. glibc 2.34 and 2.40+ both have glro=928 but different gl sizes). */
-static const struct {
-    uint16_t machine;    /* ELF e_machine of ld-linux.so */
-    size_t glro_size;   /* expected st_size of _rtld_global_ro */
-    size_t gl_size;     /* expected st_size of _rtld_global    */
-    const struct glibc_ver_offsets *offsets;
-} glibc_layout_table[] = {
-    { EM_X86_64,  440, 3960, &glibc_2_17 },    /* glibc 2.17–2.28 x86-64 */
-    { EM_AARCH64, 520, 4088, &glibc_aarch64_2_27 }, /* glibc 2.27     AArch64 */
-    { EM_X86_64,  536, 3992, &glibc_2_29 },    /* glibc 2.29–2.33 x86-64 (Ubuntu) */
-    { EM_X86_64,  544, 4000, &glibc_2_31_debian }, /* glibc 2.31     x86-64 (Debian 11) */
-    { EM_AARCH64, 624, 4152, &glibc_aarch64_2_31 }, /* glibc 2.31     AArch64 */
-    { EM_AARCH64, 704, 4488, &glibc_aarch64_2_35_large_pthread }, /* glibc 2.35 AArch64 */
-    { EM_AARCH64, 672, 4520, &glibc_aarch64_2_36_debian }, /* glibc 2.36 AArch64 (Debian 12) */
-    { EM_AARCH64, 688, 4504, &glibc_aarch64_2_35 }, /* glibc 2.35–2.39 AArch64 */
-    { EM_AARCH64, 400, 2272, &glibc_aarch64_2_43 }, /* glibc 2.43+    AArch64 */
-    { EM_AARCH64, 704, 4504, &glibc_aarch64_2_40_legacy_sized_rtld }, /* glibc 2.40 AArch64 */
-    { EM_AARCH64, 704, 3040, &glibc_aarch64_2_41 }, /* glibc 2.41     AArch64 (Debian/trixie) */
-    { EM_X86_64,  896, 4336, &glibc_2_36_debian }, /* glibc 2.36     x86-64 (Debian 12) */
-    { EM_X86_64,  928, 4304, &glibc_2_34 },    /* glibc 2.34–2.36 x86-64 */
-    { EM_X86_64,  952, 4352, &glibc_2_37 },    /* glibc 2.37–2.39 x86-64; 2.40+ disambiguated by symbol versions */
-    { EM_X86_64,  928, 2120, &glibc_2_40 },    /* glibc 2.40+     x86-64 */
-    { EM_X86_64,  952, 2888, &glibc_2_41_debian }, /* glibc 2.41    x86-64 (Debian/trixie) */
-};
+static const struct glibc_ver_offsets *
+glibc_offsets_for_layout(enum dlfrz_glibc_layout_id layout, int glibc_minor)
+{
+    switch (layout) {
+    case DLFRZ_GLIBC_X86_2_17:
+        return &glibc_2_17;
+    case DLFRZ_GLIBC_AARCH64_2_27:
+        return &glibc_aarch64_2_27;
+    case DLFRZ_GLIBC_X86_2_29:
+        return &glibc_2_29;
+    case DLFRZ_GLIBC_X86_2_31_DEBIAN:
+        return &glibc_2_31_debian;
+    case DLFRZ_GLIBC_AARCH64_2_31:
+        return &glibc_aarch64_2_31;
+    case DLFRZ_GLIBC_AARCH64_2_35_LARGE:
+        return &glibc_aarch64_2_35_large_pthread;
+    case DLFRZ_GLIBC_AARCH64_2_36_DEBIAN:
+        return &glibc_aarch64_2_36_debian;
+    case DLFRZ_GLIBC_AARCH64_2_35:
+        return &glibc_aarch64_2_35;
+    case DLFRZ_GLIBC_AARCH64_2_43:
+        return &glibc_aarch64_2_43;
+    case DLFRZ_GLIBC_AARCH64_2_40_LEGACY:
+        return &glibc_aarch64_2_40_legacy_sized_rtld;
+    case DLFRZ_GLIBC_AARCH64_2_41:
+        return &glibc_aarch64_2_41;
+    case DLFRZ_GLIBC_X86_2_36_DEBIAN:
+        return &glibc_2_36_debian;
+    case DLFRZ_GLIBC_X86_2_34:
+        return &glibc_2_34;
+    case DLFRZ_GLIBC_X86_2_37_OR_2_40_LEGACY:
+        if (glibc_minor >= 37 && glibc_minor <= 39)
+            return &glibc_2_37;
+        if (glibc_minor == 40)
+            return &glibc_2_40_legacy_sized_rtld;
+        return NULL;
+    case DLFRZ_GLIBC_X86_2_40:
+        return &glibc_2_40;
+    case DLFRZ_GLIBC_X86_2_41_DEBIAN:
+        return &glibc_2_41_debian;
+    case DLFRZ_GLIBC_LAYOUT_UNKNOWN:
+        break;
+    }
+    return NULL;
+}
 
 /* Convert a virtual address to a file offset using PT_LOAD segments. */
 static uint64_t elf_vaddr_to_foff(const uint8_t *elf, const Elf64_Ehdr *ehdr,
@@ -2406,374 +2432,6 @@ static uint64_t elf_vaddr_to_foff(const uint8_t *elf, const Elf64_Ehdr *ehdr,
             return ph[i].p_offset + (vaddr - ph[i].p_vaddr);
     }
     return (uint64_t)-1;
-}
-
-static int elf_section_name_matches(const char *strtab, size_t strtab_size,
-                                    uint32_t name_offset, const char *expect)
-{
-    size_t i = 0;
-
-    if ((size_t)name_offset >= strtab_size)
-        return 0;
-    while (expect[i]) {
-        if ((size_t)name_offset + i >= strtab_size ||
-            strtab[name_offset + i] != expect[i])
-            return 0;
-        i++;
-    }
-    return (size_t)name_offset + i < strtab_size &&
-           strtab[name_offset + i] == '\0';
-}
-
-static size_t elf_section_size_by_name(const uint8_t *elf,
-                                       const Elf64_Ehdr *ehdr,
-                                       size_t elf_size,
-                                       const char *name)
-{
-    const uint8_t *shbase;
-    const Elf64_Shdr *shstr;
-    const char *shstrtab;
-    size_t shdr_bytes;
-
-    if (ehdr->e_shoff == 0 || ehdr->e_shnum == 0 ||
-        ehdr->e_shstrndx == SHN_UNDEF || ehdr->e_shstrndx >= ehdr->e_shnum ||
-        ehdr->e_shentsize < sizeof(Elf64_Shdr))
-        return 0;
-    if (ehdr->e_shoff > elf_size)
-        return 0;
-    shdr_bytes = (size_t)ehdr->e_shnum * (size_t)ehdr->e_shentsize;
-    if ((size_t)ehdr->e_shnum != 0 &&
-        shdr_bytes / (size_t)ehdr->e_shnum != (size_t)ehdr->e_shentsize)
-        return 0;
-    if (shdr_bytes > elf_size - (size_t)ehdr->e_shoff)
-        return 0;
-
-    shbase = elf + ehdr->e_shoff;
-    shstr = (const Elf64_Shdr *)(shbase +
-        (size_t)ehdr->e_shstrndx * ehdr->e_shentsize);
-    if (shstr->sh_offset > elf_size ||
-        shstr->sh_size > elf_size - shstr->sh_offset)
-        return 0;
-    shstrtab = (const char *)(elf + shstr->sh_offset);
-
-    for (uint16_t i = 0; i < ehdr->e_shnum; i++) {
-        const Elf64_Shdr *sh = (const Elf64_Shdr *)(shbase +
-            (size_t)i * ehdr->e_shentsize);
-
-        if (!elf_section_name_matches(shstrtab, shstr->sh_size,
-                                      sh->sh_name, name))
-            continue;
-        if (sh->sh_type != SHT_PROGBITS || !(sh->sh_flags & SHF_ALLOC) ||
-            !(sh->sh_flags & SHF_WRITE))
-            return 0;
-        return sh->sh_size;
-    }
-
-    return 0;
-}
-
-static size_t infer_glibc_global_size_from_data_section(const uint8_t *elf,
-                                                        const Elf64_Ehdr *ehdr,
-                                                        size_t elf_size)
-{
-    size_t data_size = elf_section_size_by_name(elf, ehdr, elf_size, ".data");
-    size_t gl_size = data_size;
-
-    if (gl_size < 512 || gl_size > GL_SIZE + sizeof(uint32_t))
-        return 0;
-    if ((gl_size & (sizeof(uintptr_t) - 1)) == sizeof(uint32_t))
-        gl_size -= sizeof(uint32_t);
-    if ((gl_size & (sizeof(uintptr_t) - 1)) != 0)
-        gl_size &= ~(sizeof(uintptr_t) - 1);
-    if (gl_size < 512 || gl_size > GL_SIZE)
-        return 0;
-    return gl_size;
-}
-
-static void glibc_offsets_mark_absent(struct glibc_ver_offsets *o)
-{
-    o->glro_tls_static_size = -1;
-    o->glro_tls_static_align = -1;
-    o->glro_debug_printf = -1;
-    o->glro_mcount = -1;
-    o->glro_open = -1;
-    o->glro_close = -1;
-    o->glro_catch_error = -1;
-    o->glro_error_free = -1;
-    o->glro_find_object = -1;
-    o->gl_tls_static_size = -1;
-    o->gl_tls_static_align = -1;
-    o->gl_nns = -1;
-    o->gl_stack_flags = -1;
-    o->gl_tls_generation = -1;
-    o->gl_stack_used = -1;
-    o->gl_stack_user = -1;
-    o->gl_stack_cache = -1;
-    o->gl_rtld_lock_recursive = -1;
-    o->gl_rtld_unlock_recursive = -1;
-    o->gl_make_stack_executable = -1;
-    o->pthread_size = -1;
-    o->pthread_tid_off = -1;
-    o->pthread_rseq_off = -1;
-    o->pthread_rseq_cpu_id_off = -1;
-}
-
-static int glibc_set_offset(int *field, size_t off)
-{
-    if (off > (size_t)INT_MAX)
-        return 0;
-    *field = (int)off;
-    return 1;
-}
-
-static int glibc_offset_fits(int off, size_t width, size_t size)
-{
-    return off < 0 || ((size_t)off <= size && width <= size - (size_t)off);
-}
-
-static void glibc_copy_glro_offsets(struct glibc_ver_offsets *dst,
-                                    const struct glibc_ver_offsets *src,
-                                    size_t glro_size)
-{
-    if (!src)
-        return;
-    if (glibc_offset_fits(src->glro_tls_static_size, sizeof(size_t), glro_size) &&
-        glibc_offset_fits(src->glro_tls_static_align, sizeof(size_t), glro_size)) {
-        dst->glro_tls_static_size = src->glro_tls_static_size;
-        dst->glro_tls_static_align = src->glro_tls_static_align;
-    }
-    if (glibc_offset_fits(src->glro_debug_printf, sizeof(void *), glro_size))
-        dst->glro_debug_printf = src->glro_debug_printf;
-    if (glibc_offset_fits(src->glro_mcount, sizeof(void *), glro_size))
-        dst->glro_mcount = src->glro_mcount;
-    if (glibc_offset_fits(src->glro_open, sizeof(void *), glro_size))
-        dst->glro_open = src->glro_open;
-    if (glibc_offset_fits(src->glro_close, sizeof(void *), glro_size))
-        dst->glro_close = src->glro_close;
-    if (glibc_offset_fits(src->glro_catch_error, sizeof(void *), glro_size))
-        dst->glro_catch_error = src->glro_catch_error;
-    if (glibc_offset_fits(src->glro_error_free, sizeof(void *), glro_size))
-        dst->glro_error_free = src->glro_error_free;
-    if (glibc_offset_fits(src->glro_find_object, sizeof(void *), glro_size))
-        dst->glro_find_object = src->glro_find_object;
-}
-
-static void glibc_copy_global_offsets(struct glibc_ver_offsets *dst,
-                                      const struct glibc_ver_offsets *src,
-                                      size_t gl_size)
-{
-    if (!src)
-        return;
-    if (glibc_offset_fits(src->gl_tls_static_size, sizeof(size_t), gl_size) &&
-        glibc_offset_fits(src->gl_tls_static_align, sizeof(size_t), gl_size)) {
-        dst->gl_tls_static_size = src->gl_tls_static_size;
-        dst->gl_tls_static_align = src->gl_tls_static_align;
-    }
-    if (glibc_offset_fits(src->gl_nns, sizeof(size_t), gl_size))
-        dst->gl_nns = src->gl_nns;
-    if (glibc_offset_fits(src->gl_stack_flags, sizeof(int), gl_size))
-        dst->gl_stack_flags = src->gl_stack_flags;
-    if (glibc_offset_fits(src->gl_tls_generation, sizeof(size_t), gl_size))
-        dst->gl_tls_generation = src->gl_tls_generation;
-    if (glibc_offset_fits(src->gl_stack_used, 2 * sizeof(uintptr_t), gl_size))
-        dst->gl_stack_used = src->gl_stack_used;
-    if (glibc_offset_fits(src->gl_stack_user, 2 * sizeof(uintptr_t), gl_size))
-        dst->gl_stack_user = src->gl_stack_user;
-    if (glibc_offset_fits(src->gl_stack_cache, 2 * sizeof(uintptr_t), gl_size))
-        dst->gl_stack_cache = src->gl_stack_cache;
-    if (glibc_offset_fits(src->gl_rtld_lock_recursive, sizeof(void *), gl_size))
-        dst->gl_rtld_lock_recursive = src->gl_rtld_lock_recursive;
-    if (glibc_offset_fits(src->gl_rtld_unlock_recursive, sizeof(void *), gl_size))
-        dst->gl_rtld_unlock_recursive = src->gl_rtld_unlock_recursive;
-    if (glibc_offset_fits(src->gl_make_stack_executable, sizeof(void *), gl_size))
-        dst->gl_make_stack_executable = src->gl_make_stack_executable;
-}
-
-static int glibc_offsets_have_required_tls(const struct glibc_ver_offsets *o)
-{
-    return (o->glro_tls_static_size >= 0 && o->glro_tls_static_align >= 0) ||
-           (o->gl_tls_static_size >= 0 && o->gl_tls_static_align >= 0);
-}
-
-static int glibc_assign_modern_glro_hooks(struct glibc_ver_offsets *o,
-                                          uint16_t machine,
-                                          size_t glro_size,
-                                          int effective_minor)
-{
-    size_t debug;
-    int compact_tail = 0;
-
-    if (effective_minor < 34 || glro_size < 128 || glro_size > GLRO_SIZE)
-        return 0;
-
-    if (machine == EM_X86_64)
-        compact_tail = glro_size == 928 ||
-                       (effective_minor >= 40 && glro_size < 952);
-    else if (machine == EM_AARCH64)
-        compact_tail = glro_size <= 512 ||
-                       (effective_minor < 40 && glro_size == 704);
-    else
-        return 0;
-
-    debug = compact_tail ? glro_size - 112 : glro_size - 104;
-    if ((debug & (sizeof(uintptr_t) - 1)) != 0 || debug + 80 > glro_size)
-        return 0;
-
-    glibc_set_offset(&o->glro_debug_printf, debug);
-    glibc_set_offset(&o->glro_mcount, debug + 8);
-    glibc_set_offset(&o->glro_open, debug + 24);
-    glibc_set_offset(&o->glro_close, debug + 32);
-    glibc_set_offset(&o->glro_catch_error, debug + 40);
-    glibc_set_offset(&o->glro_error_free, debug + 48);
-    glibc_set_offset(&o->glro_find_object, debug + 72);
-    return 1;
-}
-
-static int glibc_effective_minor(uint16_t machine, size_t gl_size, int minor)
-{
-    if (minor >= 0)
-        return minor;
-
-    if (machine == EM_AARCH64) {
-        if (gl_size < 2600)
-            return 43;
-        if (gl_size < 3600)
-            return 41;
-        if (gl_size >= 4480)
-            return 35;
-        if (gl_size >= 4120)
-            return 31;
-        if (gl_size >= 4060)
-            return 27;
-        return 35;
-    }
-    if (gl_size < 2600)
-        return 40;
-    if (gl_size < 3200)
-        return 41;
-    if (gl_size >= 4280)
-        return 37;
-    if (gl_size >= 3980)
-        return 31;
-    if (gl_size >= 3940)
-        return 27;
-    return 37;
-}
-
-static int glibc_infer_modern_glro_tls(struct glibc_ver_offsets *o,
-                                       uint16_t machine,
-                                       size_t glro_size,
-                                       int effective_minor)
-{
-    int delta;
-    size_t tls_size_off;
-
-    if (o->glro_debug_printf < 0 || effective_minor < 34)
-        return 0;
-
-    if (machine == EM_AARCH64) {
-        if (effective_minor >= 40)
-            delta = 128;
-        else if (glro_size <= 672)
-            delta = 104;
-        else
-            delta = 120;
-    } else if (machine == EM_X86_64) {
-        if (effective_minor >= 40)
-            delta = 144;
-        else if (glro_size <= 896)
-            delta = 120;
-        else
-            delta = 136;
-    } else {
-        return 0;
-    }
-
-    if (o->glro_debug_printf < delta)
-        return 0;
-    tls_size_off = (size_t)(o->glro_debug_printf - delta);
-    if ((tls_size_off & (sizeof(size_t) - 1)) != 0 ||
-        tls_size_off + 2 * sizeof(size_t) > glro_size)
-        return 0;
-
-    glibc_set_offset(&o->glro_tls_static_size, tls_size_off);
-    glibc_set_offset(&o->glro_tls_static_align, tls_size_off + sizeof(size_t));
-    return 1;
-}
-
-static int glibc_infer_modern_global(struct glibc_ver_offsets *o,
-                                     uint16_t machine,
-                                     size_t gl_size)
-{
-    size_t nns;
-
-    if (gl_size < 512 || gl_size > GL_SIZE)
-        return 0;
-    if (machine == EM_AARCH64) {
-        if (gl_size < 3600) {
-            if (gl_size < 352 + sizeof(size_t))
-                return 0;
-            nns = gl_size - 352;
-        } else {
-            nns = 2688;
-        }
-    } else if (machine == EM_X86_64) {
-        if (gl_size < 3200) {
-            if (gl_size < 328 + sizeof(size_t))
-                return 0;
-            nns = gl_size - 328;
-        } else {
-            nns = 2560;
-        }
-    } else {
-        return 0;
-    }
-
-    if (nns + sizeof(size_t) <= gl_size)
-        glibc_set_offset(&o->gl_nns, nns);
-    if (gl_size < 144)
-        return 0;
-
-    glibc_set_offset(&o->gl_stack_flags, gl_size - 144);
-    glibc_set_offset(&o->gl_tls_generation, gl_size - 88);
-    glibc_set_offset(&o->gl_stack_used, gl_size - 72);
-    glibc_set_offset(&o->gl_stack_user, gl_size - 56);
-    glibc_set_offset(&o->gl_stack_cache, gl_size - 40);
-    return 1;
-}
-
-static void glibc_infer_aarch64_pthread(struct glibc_ver_offsets *o,
-                                        uint16_t machine,
-                                        int effective_minor,
-                                        size_t glro_size,
-                                        size_t gl_size)
-{
-    if (machine != EM_AARCH64)
-        return;
-
-    o->pthread_tid_off = 0xd0;
-    if (effective_minor >= 41) {
-        o->pthread_size = 0x720;
-        o->pthread_rseq_off = -1;
-        o->pthread_rseq_cpu_id_off = -1;
-    } else if (effective_minor == 35 ||
-               (gl_size >= 4480 && gl_size < 4496 && glro_size >= 704)) {
-        o->pthread_size = 0x7c0;
-        o->pthread_rseq_off = 0x7a0;
-        o->pthread_rseq_cpu_id_off = 0x7a4;
-    } else if (effective_minor >= 35) {
-        o->pthread_size = 0x740;
-        o->pthread_rseq_off = 0x720;
-        o->pthread_rseq_cpu_id_off = 0x724;
-    } else if (effective_minor >= 31) {
-        o->pthread_size = 0x720;
-        o->pthread_rseq_off = -1;
-        o->pthread_rseq_cpu_id_off = -1;
-    } else {
-        o->pthread_size = 0x710;
-        o->pthread_rseq_off = -1;
-        o->pthread_rseq_cpu_id_off = -1;
-    }
 }
 
 static void ldr_dbg_offset(const char *prefix, int off)
@@ -2819,101 +2477,9 @@ static void debug_dump_glibc_offsets(const char *source,
 #endif
 }
 
-static const struct glibc_ver_offsets *derive_glibc_offsets_from_layout(
-    uint16_t machine,
-    size_t glro_size,
-    size_t gl_size,
-    int glibc_minor)
-{
-    int effective_minor;
-    int have_any = 0;
-    const struct glibc_ver_offsets *fallback;
-    struct glibc_ver_offsets *o = &g_glibc_derived_offsets;
-
-    if ((!glro_size && !gl_size) || glro_size > GLRO_SIZE || gl_size > GL_SIZE)
-        return NULL;
-
-    glibc_offsets_mark_absent(o);
-    effective_minor = glibc_effective_minor(machine, gl_size, glibc_minor);
-    fallback = fallback_glibc_offsets_for_machine(machine, effective_minor,
-                                                  glro_size, gl_size);
-
-    if (glro_size > 0) {
-        int glro_ok = glibc_assign_modern_glro_hooks(o, machine, glro_size,
-                                                     effective_minor) &&
-                      glibc_infer_modern_glro_tls(o, machine, glro_size,
-                                                  effective_minor);
-        if (!glro_ok)
-            glibc_copy_glro_offsets(o, fallback, glro_size);
-        have_any = have_any || glro_ok || o->glro_debug_printf >= 0 ||
-                   o->glro_tls_static_size >= 0;
-    } else {
-        *o = fallback ? *fallback : *o;
-        have_any = fallback != NULL;
-    }
-
-    if (gl_size > 0) {
-        int global_ok = effective_minor >= 34 &&
-                        glibc_infer_modern_global(o, machine, gl_size);
-        if (!global_ok)
-            glibc_copy_global_offsets(o, fallback, gl_size);
-        have_any = have_any || global_ok || o->gl_nns >= 0 ||
-                   o->gl_stack_flags >= 0;
-    } else if (fallback) {
-        o->gl_tls_static_size = fallback->gl_tls_static_size;
-        o->gl_tls_static_align = fallback->gl_tls_static_align;
-        o->gl_nns = fallback->gl_nns;
-        o->gl_stack_flags = fallback->gl_stack_flags;
-        o->gl_tls_generation = fallback->gl_tls_generation;
-        o->gl_stack_used = fallback->gl_stack_used;
-        o->gl_stack_user = fallback->gl_stack_user;
-        o->gl_stack_cache = fallback->gl_stack_cache;
-        o->gl_rtld_lock_recursive = fallback->gl_rtld_lock_recursive;
-        o->gl_rtld_unlock_recursive = fallback->gl_rtld_unlock_recursive;
-        o->gl_make_stack_executable = fallback->gl_make_stack_executable;
-        have_any = 1;
-    }
-
-    if (!have_any || !glibc_offsets_have_required_tls(o))
-        return NULL;
-    glibc_infer_aarch64_pthread(o, machine, effective_minor,
-                                glro_size, gl_size);
-
-    return o;
-}
-
 static int scan_glibc_2_minor(const char *buf, size_t len)
 {
     static const char tag[] = "GLIBC_2.";
-    const size_t tag_len = sizeof(tag) - 1;
-    int max_minor = -1;
-
-    for (size_t i = 0; i + tag_len < len; i++) {
-        int minor = 0;
-        int digits = 0;
-        size_t j;
-
-        if (memcmp(buf + i, tag, tag_len) != 0)
-            continue;
-
-        for (j = i + tag_len; j < len; j++) {
-            unsigned char c = (unsigned char)buf[j];
-            if (c < '0' || c > '9')
-                break;
-            if (minor < 1000)
-                minor = minor * 10 + (int)(c - '0');
-            digits++;
-        }
-        if (digits > 0 && minor > max_minor)
-            max_minor = minor;
-    }
-
-    return max_minor;
-}
-
-static int scan_glibc_release_minor(const char *buf, size_t len)
-{
-    static const char tag[] = "release version 2.";
     const size_t tag_len = sizeof(tag) - 1;
     int max_minor = -1;
 
@@ -3147,6 +2713,16 @@ detect_glibc_offsets_from_interp(const uint8_t *mem, uint64_t mem_foff,
     if (ehdr->e_ident[EI_MAG0] != 0x7f || ehdr->e_ident[EI_MAG1] != 'E' ||
         ehdr->e_ident[EI_MAG2] != 'L'  || ehdr->e_ident[EI_MAG3] != 'F')
         return NULL;
+    if (ehdr->e_ident[EI_CLASS] != ELFCLASS64 ||
+        ehdr->e_ident[EI_DATA] != ELFDATA2LSB ||
+        ehdr->e_ident[EI_VERSION] != EV_CURRENT ||
+        ehdr->e_version != EV_CURRENT ||
+        ehdr->e_phentsize != sizeof(Elf64_Phdr))
+        return NULL;
+    if (dlfrz_glibc_is_development_release(elf, elf_size)) {
+        ldr_dbg("[loader] refusing glibc development snapshot\n");
+        return NULL;
+    }
 
     int glibc_minor = -1;
     size_t glro_size = 0, gl_size = 0;
@@ -3154,7 +2730,7 @@ detect_glibc_offsets_from_interp(const uint8_t *mem, uint64_t mem_foff,
     const char *str = NULL;
     size_t dynstr_size = 0;
 
-    if (ehdr->e_phoff <= elf_size && ehdr->e_phentsize >= sizeof(Elf64_Phdr) &&
+    if (ehdr->e_phoff <= elf_size &&
         ehdr->e_phnum <= (elf_size - (size_t)ehdr->e_phoff) / ehdr->e_phentsize) {
         const Elf64_Phdr *phdrs = (const Elf64_Phdr *)(elf + ehdr->e_phoff);
         uint64_t dyn_foff = 0;
@@ -3236,69 +2812,80 @@ detect_glibc_offsets_from_interp(const uint8_t *mem, uint64_t mem_foff,
     if (glibc_minor < 0)
         glibc_minor = scan_glibc_2_minor((const char *)elf, elf_size);
     {
-        int release_minor = scan_glibc_release_minor((const char *)elf, elf_size);
-        if (release_minor > glibc_minor)
-            glibc_minor = release_minor;
+        int release_minor =
+            dlfrz_glibc_stable_release_minor((const char *)elf, elf_size);
+
+        /* A highest GLIBC_2.* symbol version is only an ABI floor.  It must
+         * never substitute for a positive runtime release identity, even in
+         * a stale or post-packaging-mutated direct artifact. */
+        if (release_minor < 0) {
+            ldr_dbg("[loader] missing stable glibc release identity\n");
+            return NULL;
+        }
+        if (glibc_minor > release_minor) {
+            ldr_dbg("[loader] inconsistent glibc release identity\n");
+            return NULL;
+        }
+        glibc_minor = release_minor;
     }
 
     scan_section_rtld_global_symbols(elf, ehdr, elf_size, &glro_size,
                                      &gl_size, &found);
 
-    if (!gl_size) {
-        gl_size = infer_glibc_global_size_from_data_section(elf, ehdr, elf_size);
-        if (gl_size) {
-            ldr_dbg("[loader] inferred _rtld_global size from ld-linux .data section\n");
-            ldr_dbg_hex("[loader]   _rtld_global size=0x", gl_size);
-        }
+    enum dlfrz_glibc_layout_id layout =
+        dlfrz_glibc_layout_lookup(ehdr->e_machine, glro_size, gl_size);
+    if (!dlfrz_glibc_layout_release_is_supported(layout, glibc_minor)) {
+        ldr_dbg("[loader] ambiguous glibc private rtld layout identity\n");
+        return NULL;
+    }
+    const struct glibc_ver_offsets *offsets =
+        glibc_offsets_for_layout(layout, glibc_minor);
+
+    if (!offsets) {
+        ldr_dbg("[loader] unsupported glibc private rtld layout\n");
+        ldr_dbg_hex("[loader]   _rtld_global_ro size=0x", glro_size);
+        ldr_dbg_hex("[loader]   _rtld_global size=0x", gl_size);
+        return NULL;
     }
 
-    if (!glro_size && !gl_size) return NULL;  /* no usable layout signal */
+    if (glibc_minor >= 0)
+        g_glibc_minor = glibc_minor;
+    if (layout == DLFRZ_GLIBC_X86_2_37_OR_2_40_LEGACY &&
+        glibc_minor >= 40)
+        ldr_dbg("[loader] detected x86-64 glibc 2.40+ legacy-sized rtld layout\n");
+    else
+        ldr_dbg("[loader] matched validated glibc private rtld layout\n");
+    debug_dump_glibc_offsets("validated-symbol-sizes", ehdr->e_machine,
+                             glibc_minor, glro_size, gl_size, offsets);
+    return offsets;
+}
 
-    /* Match against known layouts (both sizes needed for disambiguation) */
-    for (size_t i = 0; i < sizeof(glibc_layout_table)/sizeof(glibc_layout_table[0]); i++) {
-        if (glibc_layout_table[i].machine == ehdr->e_machine &&
-            glibc_layout_table[i].glro_size == glro_size &&
-            glibc_layout_table[i].gl_size == gl_size) {
-            if (glibc_minor >= 0)
-                g_glibc_minor = glibc_minor;
-            if (ehdr->e_machine == EM_X86_64 && glro_size == 952 &&
-                gl_size == 4352 && glibc_minor >= 40) {
-                ldr_dbg("[loader] detected x86-64 glibc 2.40+ legacy-sized rtld layout\n");
-                debug_dump_glibc_offsets("exact-symbols-legacy-sized",
-                                         ehdr->e_machine, glibc_minor,
-                                         glro_size, gl_size,
-                                         &glibc_2_40_legacy_sized_rtld);
-                return &glibc_2_40_legacy_sized_rtld;
-            }
-            ldr_dbg("[loader] detected _rtld_global_ro size from ld-linux.so, matched layout\n");
-            debug_dump_glibc_offsets("exact-symbols", ehdr->e_machine,
-                                     glibc_minor, glro_size, gl_size,
-                                     glibc_layout_table[i].offsets);
-            return glibc_layout_table[i].offsets;
-        }
+static const struct dlfrz_musl_layout *
+detect_musl_layout_from_interp(const uint8_t *mem, uint64_t mem_foff,
+                               const struct dlfrz_entry *entries,
+                               const struct dlfrz_lib_meta *metas,
+                               uint32_t num_entries)
+{
+    for (uint32_t i = 0; i < num_entries; i++) {
+        const uint8_t *elf;
+        const Elf64_Ehdr *ehdr;
+
+        if (!(metas[i].flags & LDR_FLAG_INTERP))
+            continue;
+        if (entries[i].data_offset < mem_foff ||
+            entries[i].data_size < sizeof(Elf64_Ehdr))
+            return NULL;
+        elf = mem + (entries[i].data_offset - mem_foff);
+        ehdr = (const Elf64_Ehdr *)elf;
+        if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0 ||
+            ehdr->e_ident[EI_CLASS] != ELFCLASS64 ||
+            ehdr->e_ident[EI_DATA] != ELFDATA2LSB ||
+            ehdr->e_ident[EI_VERSION] != EV_CURRENT ||
+            ehdr->e_version != EV_CURRENT)
+            return NULL;
+        return dlfrz_musl_layout_lookup(ehdr->e_machine, elf,
+                                         (size_t)entries[i].data_size);
     }
-
-    {
-        const struct glibc_ver_offsets *derived =
-            derive_glibc_offsets_from_layout(ehdr->e_machine, glro_size,
-                                             gl_size, glibc_minor);
-        if (derived) {
-            g_glibc_minor = glibc_effective_minor(ehdr->e_machine, gl_size,
-                                                  glibc_minor);
-            ldr_dbg("[loader] derived glibc rtld layout from interpreter layout data\n");
-            ldr_dbg_hex("[loader]   _rtld_global_ro size=0x", glro_size);
-            ldr_dbg_hex("[loader]   _rtld_global size=0x", gl_size);
-            debug_dump_glibc_offsets("derived", ehdr->e_machine,
-                                     g_glibc_minor, glro_size, gl_size,
-                                     derived);
-            return derived;
-        }
-    }
-
-    /* Unknown struct size — log and return NULL for fallback */
-    ldr_dbg("[loader] unknown _rtld_global_ro size, falling back\n");
-    ldr_dbg_hex("[loader]   _rtld_global_ro size=0x", glro_size);
-    ldr_dbg_hex("[loader]   _rtld_global size=0x", gl_size);
     return NULL;
 }
 
@@ -3328,25 +2915,93 @@ static int stub_tunable_is_initialized(void) { return 0; }
 /* _dl_find_dso_for_object — return NULL (not found) */
 static void *stub_dl_find_dso_for_object(void) { return NULL; }
 
-/* _dl_signal_error — fatal: print and abort */
-static void stub_dl_signal_error(void)
+/* Keep the private rtld exception ABI independent of glibc headers.  This is
+ * the three-pointer layout used by every supported glibc release.  Direct
+ * loaded objects are never unloaded, so retaining the mapped input strings is
+ * safer than allocating through the bootstrap libc after the TLS handoff. */
+struct dlfreeze_dl_exception {
+    const char *objname;
+    const char *errstring;
+    char *message_buffer;
+};
+
+static void stub_dl_exception_create(struct dlfreeze_dl_exception *exception,
+                                     const char *objname,
+                                     const char *errstring)
 {
-    ldr_msg("dlfreeze-loader: _dl_signal_error called\n");
+    if (!exception)
+        return;
+    exception->objname = objname ? objname : "";
+    exception->errstring = errstring ? errstring : "";
+    exception->message_buffer = NULL;
+}
+
+static void stub_dl_exception_create_format(
+    struct dlfreeze_dl_exception *exception, const char *objname,
+    const char *format, ...)
+{
+    /* This is an error-only fallback.  Retain the stable format string rather
+     * than invoking a foreign-libc formatter from the loader's TLS context. */
+    stub_dl_exception_create(exception, objname, format ? format : "");
+}
+
+static void stub_dl_exception_free(struct dlfreeze_dl_exception *exception)
+{
+    if (!exception)
+        return;
+    exception->objname = NULL;
+    exception->errstring = NULL;
+    exception->message_buffer = NULL;
+}
+
+/* _dl_fatal_printf is a noreturn private rtld printf.  A literal diagnostic
+ * is deliberately used here: termination must remain reliable even if the
+ * target libc called this because its own runtime state is inconsistent. */
+static void stub_dl_fatal_printf(const char *format, ...)
+    __attribute__((noreturn, format(printf, 1, 2)));
+static void stub_dl_fatal_printf(const char *format, ...)
+{
+    ldr_msg("dlfreeze-loader: fatal glibc loader error: ");
+    ldr_msg(format ? format : "_dl_fatal_printf called");
+    ldr_msg("\n");
+    _exit(127);
+}
+
+/* _dl_signal_error — fatal: print and abort */
+static void stub_dl_signal_error(int errcode, const char *object,
+                                 const char *occasion,
+                                 const char *errstring)
+{
+    (void)errcode;
+    ldr_msg("dlfreeze-loader: glibc loader error");
+    if (occasion) { ldr_msg(" during "); ldr_msg(occasion); }
+    if (object) { ldr_msg(" for "); ldr_msg(object); }
+    if (errstring) { ldr_msg(": "); ldr_msg(errstring); }
+    ldr_msg("\n");
     _exit(127);
 }
 
 /* _dl_signal_exception — fatal */
-static void stub_dl_signal_exception(void)
+static void stub_dl_signal_exception(
+    int errcode, struct dlfreeze_dl_exception *exception,
+    const char *occasion)
 {
-    ldr_msg("dlfreeze-loader: _dl_signal_exception called\n");
-    _exit(127);
+    stub_dl_signal_error(errcode,
+                         exception ? exception->objname : NULL,
+                         occasion,
+                         exception ? exception->errstring : NULL);
 }
 
 /* _dl_catch_exception — call operatep directly (no exception handling) */
-static int stub_dl_catch_exception(void *exc, void (*operate)(void *), void *args)
+static int stub_dl_catch_exception(struct dlfreeze_dl_exception *exc,
+                                   void (*operate)(void *), void *args)
 {
-    (void)exc;
     operate(args);
+    /* glibc's success contract clears the caller-owned result.  Several
+     * callers deliberately leave it uninitialized before entering the
+     * catcher and inspect errstring after a zero return. */
+    if (exc)
+        *exc = (struct dlfreeze_dl_exception){ 0 };
     return 0;
 }
 
@@ -3370,6 +3025,16 @@ static void  stub_dl_deallocate_tls(void *mem) { (void)mem; }
 
 /* _dl_rtld_di_serinfo — no-op */
 static int stub_dl_rtld_di_serinfo(void) { return -1; }
+
+/* The direct loader never enables executable pthread stacks.  Resolve the
+ * private rtld hook so normal startup is well-defined, but fail closed if a
+ * target actually requests the unsupported policy change. */
+static int stub_nptl_change_stack_perm(void *thread)
+{
+    (void)thread;
+    ldr_msg("dlfreeze-loader: executable pthread stacks are unsupported\n");
+    _exit(127);
+}
 
 /* ---- TLS / arch constants --------------------------------------------- */
 #define TCB_ALLOC     4096     /* generous TCB allocation */
@@ -3404,10 +3069,10 @@ static int stub_dl_rtld_di_serinfo(void) { return -1; }
 #define GLIBC_RSEQ_REGISTERED_BIT 0x80
 #define GLIBC_RSEQ_CPU_ID_REGISTRATION_FAILED (-2)
 
-/* Runtime accessors that consult the detected glibc version profile.
- * If the profile leaves the field at -1 we fall back to the default
- * compiled-in macro value (so untested glibc versions still get a
- * reasonable layout — matching modern glibc 2.34+ aarch64). */
+/* Runtime accessors consult the profile validated before any target mapping.
+ * The compiled-in return values only defend against an internal sequencing
+ * error; they do not admit an unrecognized glibc layout.  A negative rseq
+ * field in a validated profile means that the field is intentionally absent. */
 static inline size_t glibc_aarch64_pthread_size(void)
 {
     if (g_glibc_off && g_glibc_off->pthread_size > 0)
@@ -3424,7 +3089,7 @@ static inline int glibc_aarch64_has_rseq_area(void)
 {
     if (g_glibc_off)
         return g_glibc_off->pthread_rseq_off > 0;
-    /* Default profile assumes modern glibc with rseq area. */
+    /* Defensive only: glibc setup cannot reach this without a profile. */
     return 1;
 }
 static inline size_t glibc_aarch64_pthread_rseq_off(void)
@@ -3448,31 +3113,10 @@ static inline size_t glibc_aarch64_pthread_rseq_cpu_id_off(void)
 #define TCB_OFF_PTR_GUARD   24    /* uintptr_t pointer_guard */
 #define TCB_OFF_TID        720    /* pid_t tid              */
 #endif
-#define MUSL_TCB_PRESERVE_OFF 0x20
-#define MUSL_TCB_PRESERVE_LEN 0xb0
-
 #if defined(__x86_64__)
 #define MUSL_TLS_GAP_ABOVE_TP              0
-#define MUSL_THREAD_DTV_OFF_DEFAULT                0x08
-#define MUSL_THREAD_PREV_OFF_DEFAULT               0x10
-#define MUSL_THREAD_NEXT_OFF_DEFAULT               0x18
-#define MUSL_THREAD_SYSINFO_OFF_DEFAULT            0x20
-#define MUSL_THREAD_TID_OFF_DEFAULT                0x30
-#define MUSL_THREAD_ERRNO_OFF_DEFAULT              0x34
-#define MUSL_THREAD_DETACH_STATE_OFF_DEFAULT       0x38
-#define MUSL_THREAD_ROBUST_HEAD_OFF_DEFAULT        0x88
-#define MUSL_THREAD_LOCALE_OFF_DEFAULT             0xa8
 #elif defined(__aarch64__)
 #define MUSL_TLS_GAP_ABOVE_TP              16
-#define MUSL_THREAD_DTV_OFF_DEFAULT                0xc0
-#define MUSL_THREAD_PREV_OFF_DEFAULT               0x08
-#define MUSL_THREAD_NEXT_OFF_DEFAULT               0x10
-#define MUSL_THREAD_SYSINFO_OFF_DEFAULT            0x18
-#define MUSL_THREAD_TID_OFF_DEFAULT                0x20
-#define MUSL_THREAD_ERRNO_OFF_DEFAULT              0x24
-#define MUSL_THREAD_DETACH_STATE_OFF_DEFAULT       0x28
-#define MUSL_THREAD_ROBUST_HEAD_OFF_DEFAULT        0x78
-#define MUSL_THREAD_LOCALE_OFF_DEFAULT             0x98
 #endif
 
 #define MUSL_THREAD_PROBE_LIMIT 0x180
@@ -3489,17 +3133,34 @@ struct musl_thread_layout {
     size_t locale;
 };
 
-static struct musl_thread_layout g_musl_thread = {
-    .dtv          = MUSL_THREAD_DTV_OFF_DEFAULT,
-    .prev         = MUSL_THREAD_PREV_OFF_DEFAULT,
-    .next         = MUSL_THREAD_NEXT_OFF_DEFAULT,
-    .sysinfo      = MUSL_THREAD_SYSINFO_OFF_DEFAULT,
-    .tid          = MUSL_THREAD_TID_OFF_DEFAULT,
-    .errno_off    = MUSL_THREAD_ERRNO_OFF_DEFAULT,
-    .detach_state = MUSL_THREAD_DETACH_STATE_OFF_DEFAULT,
-    .robust_head  = MUSL_THREAD_ROBUST_HEAD_OFF_DEFAULT,
-    .locale       = MUSL_THREAD_LOCALE_OFF_DEFAULT,
-};
+static struct musl_thread_layout g_musl_thread;
+
+/* errno and DTV have small exported accessors whose offsets can be decoded
+ * directly.  tid and detach_state are not adjacent to errno on older musl
+ * releases, so only seed them after independently deriving their offsets
+ * from the target pthread implementation. */
+static int g_musl_target_tid_known;
+static int g_musl_target_errno_known;
+static int g_musl_target_detach_known;
+static int g_musl_target_detach_value = 2;
+
+static void select_musl_thread_layout(
+    const struct dlfrz_musl_layout *layout)
+{
+    g_musl_thread.dtv = layout->thread_dtv;
+    g_musl_thread.prev = layout->thread_prev;
+    g_musl_thread.next = layout->thread_next;
+    g_musl_thread.sysinfo = layout->thread_sysinfo;
+    g_musl_thread.tid = layout->thread_tid;
+    g_musl_thread.errno_off = layout->thread_errno;
+    g_musl_thread.detach_state = layout->thread_detach;
+    g_musl_thread.robust_head = layout->thread_robust;
+    g_musl_thread.locale = layout->thread_locale;
+    g_musl_target_tid_known = 0;
+    g_musl_target_errno_known = 0;
+    g_musl_target_detach_known = 0;
+    g_musl_target_detach_value = layout->detach_initial;
+}
 
 #define MUSL_THREAD_DTV_OFF          (g_musl_thread.dtv)
 #define MUSL_THREAD_PREV_OFF         (g_musl_thread.prev)
@@ -3627,144 +3288,24 @@ static inline uintptr_t *musl_thread_dtv_slot(uintptr_t tp)
     return (uintptr_t *)(musl_thread_self_ptr(tp) + MUSL_THREAD_DTV_OFF);
 }
 
-static int musl_thread_ptr_external(uintptr_t self, uintptr_t val)
-{
-    return val != 0 && val != self &&
-           !(val >= self && val < self + MUSL_THREAD_PROBE_LIMIT);
-}
-
-static void probe_musl_thread_layout(uintptr_t old_self, uintptr_t old_tp)
-{
-    size_t word = sizeof(uintptr_t);
-    long tid;
-    uintptr_t locale;
-    int dtv_probed = 0;
-
-    if (!old_self)
-        return;
-
-    for (size_t off = word; off + word < MUSL_THREAD_PROBE_LIMIT; off += word) {
-        uintptr_t first = *(uintptr_t *)(old_self + off);
-        uintptr_t second = *(uintptr_t *)(old_self + off + word);
-
-        if (first == old_self && second == old_self) {
-            g_musl_thread.prev = off;
-            g_musl_thread.next = off + word;
-            break;
-        }
-    }
-
-    if (old_tp >= old_self + word && old_tp - old_self < MUSL_THREAD_PROBE_LIMIT) {
-        size_t off = (size_t)(old_tp - old_self - word);
-        uintptr_t val = *(uintptr_t *)(old_self + off);
-
-        if (musl_thread_ptr_external(old_self, val))
-            g_musl_thread.dtv = off;
-        dtv_probed = musl_thread_ptr_external(old_self, val);
-    }
-    if (!dtv_probed && old_tp >= old_self && old_tp - old_self < MUSL_THREAD_PROBE_LIMIT) {
-        size_t off = (size_t)(old_tp - old_self);
-        uintptr_t val = *(uintptr_t *)(old_self + off);
-
-        if (musl_thread_ptr_external(old_self, val))
-            g_musl_thread.dtv = off;
-        dtv_probed = musl_thread_ptr_external(old_self, val);
-    }
-    if (!dtv_probed) {
-        for (size_t off = word; off < MUSL_THREAD_PROBE_LIMIT; off += word) {
-            uintptr_t val = *(uintptr_t *)(old_self + off);
-
-            if (musl_thread_ptr_external(old_self, val)) {
-                g_musl_thread.dtv = off;
-                dtv_probed = 1;
-                break;
-            }
-        }
-    }
-
-    tid = syscall(SYS_gettid);
-    for (size_t off = 0; off + sizeof(int) <= MUSL_THREAD_PROBE_LIMIT; off += sizeof(int)) {
-        if (*(int *)(old_self + off) == (int)tid) {
-            g_musl_thread.tid = off;
-            if (off + 2 * sizeof(int) < MUSL_THREAD_PROBE_LIMIT) {
-                g_musl_thread.errno_off = off + sizeof(int);
-                g_musl_thread.detach_state = off + 2 * sizeof(int);
-            }
-            break;
-        }
-    }
-
-    for (size_t off = word; off < MUSL_THREAD_PROBE_LIMIT; off += word) {
-        if (*(uintptr_t *)(old_self + off) == old_self + off) {
-            g_musl_thread.robust_head = off;
-            break;
-        }
-    }
-
-    locale = (uintptr_t)uselocale((locale_t)0);
-    if (locale && locale != (uintptr_t)-1) {
-        for (size_t off = word; off < MUSL_THREAD_PROBE_LIMIT; off += word) {
-            if (*(uintptr_t *)(old_self + off) == locale) {
-                g_musl_thread.locale = off;
-                break;
-            }
-        }
-    }
-}
-
-#if defined(__aarch64__)
-static void current_aarch64_tlsdesc_layout(int64_t *dtv_offset,
-                                           uint64_t *entry_shift)
-{
-    if (g_is_musl_runtime) {
-        *dtv_offset = -8;
-        *entry_shift = 3;
-        return;
-    }
-
-    *dtv_offset = TCB_OFF_DTV;
-    *entry_shift = 4;
-}
-#endif
-
 /* Lazy per-thread musl TLS install — defined later (after `struct
  * loaded_obj`).  Forward declaration so __tls_get_addr can call it. */
 static void *musl_lazy_install_tls(uintptr_t tp, unsigned long modid,
                                    unsigned long ti_offset);
+static void *runtime_tls_get_addr(uintptr_t tp, unsigned long modid,
+                                  unsigned long ti_offset);
+static void tls_runtime_fatal(const char *reason)
+    __attribute__((noreturn));
 
 /* __tls_get_addr — GD/LD TLS model accessor.
  * Looks up the DTV entry for the module and adds the offset. */
 struct tls_index { unsigned long ti_module; unsigned long ti_offset; };
 static void *stub_tls_get_addr(struct tls_index *ti)
 {
-    uintptr_t tp = arch_get_tp();
-    uintptr_t *dtv = g_is_musl_runtime
-        ? *(uintptr_t **)musl_thread_dtv_slot(tp)
-        : *(uintptr_t **)(tp + TCB_OFF_DTV);
-    if (g_is_musl_runtime) {
-        size_t cur_slots = dtv ? dtv[0] : 0;
-        if (dtv && ti->ti_module <= cur_slots && dtv[ti->ti_module]) {
-            return (void *)(dtv[ti->ti_module] + ti->ti_offset);
-        }
-        /* Slot missing — lazily allocate per-thread block. */
-        return musl_lazy_install_tls(tp, ti->ti_module, ti->ti_offset);
-    }
-    if (dtv) {
-        /* glibc convention: tcb->dtv points to dtv[1] in the raw array.
-         * dtv[modid] = {val, to_free} — each slot is 2 uintptr_t's.
-         * So dtv[modid * 2] = pointer to start of that module's TLS block */
-        uintptr_t tls_block = dtv[ti->ti_module * 2];
-        if (tls_block)
-            return (void *)(tls_block + ti->ti_offset);
-        if (g_debug) {
-            ldr_msg("[tls] DTV slot empty mod=");
-            ldr_hex("", ti->ti_module);
-        }
-    }
-    /* Fallback: single-module approximation */
-    if (g_debug)
-        ldr_hex("[tls] FALLBACK off=", ti->ti_offset);
-    return (void *)(tp + ti->ti_offset);
+    if (!ti)
+        return NULL;
+    return runtime_tls_get_addr(arch_get_tp(), ti->ti_module,
+                                ti->ti_offset);
 }
 
 /* Table of stub symbols — searched during resolution */
@@ -3777,6 +3318,11 @@ static const struct stub_sym g_stubs[] = {
     { "__tunable_get_val",       (void *)stub_tunable_get_val       },
     { "__tunable_is_initialized",(void *)stub_tunable_is_initialized},
     { "_dl_find_dso_for_object", (void *)stub_dl_find_dso_for_object},
+    { "_dl_exception_create",    (void *)stub_dl_exception_create   },
+    { "_dl_exception_create_format",
+                                  (void *)stub_dl_exception_create_format},
+    { "_dl_exception_free",      (void *)stub_dl_exception_free     },
+    { "_dl_fatal_printf",        (void *)stub_dl_fatal_printf       },
     { "_dl_signal_error",        (void *)stub_dl_signal_error       },
     { "_dl_signal_exception",    (void *)stub_dl_signal_exception   },
     { "_dl_catch_exception",     (void *)stub_dl_catch_exception    },
@@ -3787,6 +3333,7 @@ static const struct stub_sym g_stubs[] = {
     { "_dl_allocate_tls_init",   (void *)stub_dl_allocate_tls_init  },
     { "_dl_deallocate_tls",      (void *)stub_dl_deallocate_tls     },
     { "_dl_rtld_di_serinfo",     (void *)stub_dl_rtld_di_serinfo    },
+    { "__nptl_change_stack_perm",(void *)stub_nptl_change_stack_perm},
     { "__tls_get_addr",          (void *)stub_tls_get_addr          },
     { NULL, NULL }
 };
@@ -3799,16 +3346,65 @@ static uint64_t lookup_stub(const char *name)
     return 0;
 }
 
-/* Check if a symbol name should resolve to one of our fake OBJECT regions */
+/* Resolve one of the loader-owned OBJECT shims together with the exact amount
+ * of backing storage that is safe to read.  Ordinary relocations need only the
+ * address; COPY relocations must also bound their source read because the
+ * requester's symbol size is not authoritative for our synthetic object. */
+static int lookup_fake_object_region(const char *name, const void **address_out,
+                                     size_t *size_out)
+{
+    const void *address = NULL;
+    size_t size = 0;
+
+    if (strcmp(name, "_rtld_global") == 0) {
+        address = g_fake_rtld_global;
+        size = GL_SIZE;
+    } else if (strcmp(name, "_rtld_global_ro") == 0) {
+        address = g_fake_rtld_global_ro;
+        size = GLRO_SIZE;
+    } else if (strcmp(name, "__libc_stack_end") == 0) {
+        address = &g_fake_libc_stack_end;
+        size = sizeof(g_fake_libc_stack_end);
+    } else if (strcmp(name, "__libc_enable_secure") == 0) {
+        address = &g_fake_libc_enable_secure;
+        size = sizeof(g_fake_libc_enable_secure);
+    } else if (strcmp(name, "_dl_argv") == 0) {
+        address = &g_fake_dl_argv;
+        size = sizeof(g_fake_dl_argv);
+    } else if (strcmp(name, "__stack_chk_guard") == 0) {
+        address = &g_fake_stack_chk_guard;
+        size = sizeof(g_fake_stack_chk_guard);
+    } else if (strcmp(name, "__pointer_chk_guard") == 0) {
+        address = &g_fake_pointer_chk_guard;
+        size = sizeof(g_fake_pointer_chk_guard);
+    } else if (strcmp(name, "__rseq_offset") == 0) {
+        address = &g_rseq_offset;
+        size = sizeof(g_rseq_offset);
+    } else if (strcmp(name, "__rseq_size") == 0) {
+        address = &g_rseq_size;
+        size = sizeof(g_rseq_size);
+    } else if (strcmp(name, "__rseq_flags") == 0) {
+        address = &g_rseq_flags;
+        size = sizeof(g_rseq_flags);
+    }
+
+    if (!address || size == 0)
+        return 0;
+    if (address_out)
+        *address_out = address;
+    if (size_out)
+        *size_out = size;
+    return 1;
+}
+
+/* Check if a symbol name should resolve to one of our fake OBJECT regions. */
 static uint64_t lookup_fake_object(const char *name)
 {
-    if (strcmp(name, "_rtld_global") == 0)
-        return (uint64_t)(uintptr_t)g_fake_rtld_global;
-    if (strcmp(name, "_rtld_global_ro") == 0)
-        return (uint64_t)(uintptr_t)g_fake_rtld_global_ro;
-    if (strcmp(name, "__libc_stack_end") == 0)
-        return (uint64_t)(uintptr_t)&g_fake_libc_stack_end;
-    return 0;
+    const void *address;
+
+    if (!lookup_fake_object_region(name, &address, NULL))
+        return 0;
+    return (uint64_t)(uintptr_t)address;
 }
 
 /* ---- Unified special-symbol hash table --------------------------------
@@ -3834,6 +3430,28 @@ struct obj_tls {
     size_t   modid;       /* DTV module ID (1-indexed)              */
 };
 
+static int tls_tpoff_value(const struct obj_tls *tls, uint64_t symbol_offset,
+                           int64_t addend, int64_t *out)
+{
+    int64_t value;
+
+    if (!tls || tls->memsz == 0 || symbol_offset > tls->memsz ||
+        !i64_add_u64_checked(tls->tpoff, symbol_offset, &value) ||
+        !i64_add_checked(value, addend, out))
+        return 0;
+    return 1;
+}
+
+static int tls_dtpoff_value(const struct obj_tls *tls,
+                            uint64_t symbol_offset, int64_t addend,
+                            uint64_t *out)
+{
+    if (!tls || !u64_add_i64_checked(symbol_offset, addend, out) ||
+        tls->memsz == 0 || *out > tls->memsz)
+        return 0;
+    return 1;
+}
+
 struct loaded_obj {
     const char       *name;
     uint64_t          base;
@@ -3853,6 +3471,10 @@ struct loaded_obj {
     uint32_t          verdef_count;
     const Elf64_Verneed *verneed;
     uint32_t          verneed_count;
+
+    /* Bounded PT_DYNAMIC view, including its terminating DT_NULL entry. */
+    const Elf64_Dyn  *dynamic;
+    size_t            dynamic_count;
 
     /* Relocations */
     const Elf64_Rela *rela;
@@ -3884,6 +3506,24 @@ struct loaded_obj {
     uintptr_t         map_end;     /* base + vaddr_hi (past-the-end) */
     const void       *eh_frame_hdr; /* mapped PT_GNU_EH_FRAME, or NULL */
 
+    /* Whole lazy-load reservation, used to discard an unsuccessful dlopen
+     * transaction without leaving partially mapped dependency objects. */
+    void             *runtime_reservation;
+    size_t            runtime_reservation_size;
+    uint64_t          runtime_dev;
+    uint64_t          runtime_ino;
+    int               runtime_identity_valid;
+
+    /* Direct DT_NEEDED edges and the cached breadth-first dependency
+     * closure rooted at this object.  Indices refer to g_all_objs. */
+    uint16_t          needed_indices[MAX_TOTAL_OBJS];
+    uint16_t          lookup_scope_indices[MAX_TOTAL_OBJS];
+    uint16_t          needed_count;
+    uint16_t          lookup_scope_count;
+    uint16_t          relocation_scope_root;
+    uint8_t           lookup_scope_valid;
+    uint8_t           relocation_scope_root_valid;
+
     /* TLS */
     struct obj_tls    tls;
 };
@@ -3896,9 +3536,173 @@ static uint64_t lookup_elf_symbol_addr(const struct loaded_obj *obj,
 static int loaded_obj_contains(const struct loaded_obj *obj,
                                uintptr_t addr, size_t size)
 {
-    return addr >= obj->map_start &&
-           addr <= obj->map_end &&
-           size <= obj->map_end - addr;
+    if (!obj || !obj->phdr)
+        return 0;
+
+    for (uint16_t i = 0; i < obj->phdr_num; i++) {
+        const Elf64_Phdr *ph = &obj->phdr[i];
+        uintptr_t start;
+        size_t offset;
+
+        if (ph->p_type != PT_LOAD || ph->p_memsz > SIZE_MAX ||
+            ph->p_vaddr > UINTPTR_MAX - obj->base)
+            continue;
+        start = (uintptr_t)obj->base + (uintptr_t)ph->p_vaddr;
+        if (addr < start)
+            continue;
+        offset = addr - start;
+        if (offset <= ph->p_memsz && size <= ph->p_memsz - offset)
+            return 1;
+    }
+    return 0;
+}
+
+static int loaded_obj_file_contains(const struct loaded_obj *obj,
+                                    uintptr_t addr, size_t size)
+{
+    if (!obj || !obj->phdr)
+        return 0;
+
+    for (uint16_t i = 0; i < obj->phdr_num; i++) {
+        const Elf64_Phdr *ph = &obj->phdr[i];
+        uintptr_t start;
+        size_t offset;
+
+        if (ph->p_type != PT_LOAD || ph->p_filesz > ph->p_memsz ||
+            ph->p_filesz > SIZE_MAX ||
+            ph->p_vaddr > UINTPTR_MAX - obj->base)
+            continue;
+        start = (uintptr_t)obj->base + (uintptr_t)ph->p_vaddr;
+        if (addr < start)
+            continue;
+        offset = addr - start;
+        if (offset <= ph->p_filesz && size <= ph->p_filesz - offset)
+            return 1;
+    }
+    return 0;
+}
+
+static int loaded_obj_vaddr_pointer(const struct loaded_obj *obj,
+                                    uint64_t vaddr, size_t size,
+                                    uint32_t required_flags,
+                                    void **pointer_out)
+{
+    uintptr_t addr;
+
+    if (!obj || vaddr > UINTPTR_MAX - obj->base)
+        return 0;
+    addr = (uintptr_t)obj->base + (uintptr_t)vaddr;
+
+    for (uint16_t i = 0; i < obj->phdr_num; i++) {
+        const Elf64_Phdr *ph = &obj->phdr[i];
+        uintptr_t start;
+        size_t offset;
+
+        if (ph->p_type != PT_LOAD ||
+            (ph->p_flags & required_flags) != required_flags ||
+            ph->p_memsz > SIZE_MAX ||
+            ph->p_vaddr > UINTPTR_MAX - obj->base)
+            continue;
+        start = (uintptr_t)obj->base + (uintptr_t)ph->p_vaddr;
+        if (addr < start)
+            continue;
+        offset = addr - start;
+        if (offset <= ph->p_memsz && size <= ph->p_memsz - offset) {
+            if (pointer_out)
+                *pointer_out = (void *)addr;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int loaded_obj_file_vaddr_pointer(const struct loaded_obj *obj,
+                                         uint64_t vaddr, size_t size,
+                                         void **pointer_out)
+{
+    void *pointer;
+
+    if (!loaded_obj_vaddr_pointer(obj, vaddr, size, 0, &pointer) ||
+        !loaded_obj_file_contains(obj, (uintptr_t)pointer, size))
+        return 0;
+    if (pointer_out)
+        *pointer_out = pointer;
+    return 1;
+}
+
+static int discover_eh_frame_header(struct loaded_obj *obj)
+{
+    int found = 0;
+
+    obj->eh_frame_hdr = NULL;
+    for (uint16_t i = 0; i < obj->phdr_num; i++) {
+        const Elf64_Phdr *ph = &obj->phdr[i];
+        void *pointer;
+
+        if (ph->p_type != PT_GNU_EH_FRAME)
+            continue;
+        if (ph->p_filesz == 0 && ph->p_memsz == 0)
+            continue;
+        if (found || ph->p_filesz == 0 || ph->p_filesz > ph->p_memsz ||
+            ph->p_filesz > SIZE_MAX || ph->p_memsz > SIZE_MAX ||
+            !loaded_obj_file_vaddr_pointer(obj, ph->p_vaddr,
+                                            (size_t)ph->p_filesz,
+                                            &pointer) ||
+            !loaded_obj_vaddr_pointer(obj, ph->p_vaddr,
+                                      (size_t)ph->p_memsz, PF_R, NULL))
+            return -1;
+        obj->eh_frame_hdr = pointer;
+        found = 1;
+    }
+    return 0;
+}
+
+static int loaded_obj_signed_offset_pointer(const struct loaded_obj *obj,
+                                            int64_t offset, size_t size,
+                                            uint32_t required_flags,
+                                            void **pointer_out)
+{
+    uintptr_t addr;
+
+    if (offset < 0) {
+        uint64_t magnitude = (uint64_t)(-(offset + 1)) + 1;
+
+        if (magnitude > obj->base)
+            return 0;
+        addr = (uintptr_t)(obj->base - magnitude);
+    } else {
+        if ((uint64_t)offset > UINTPTR_MAX - obj->base)
+            return 0;
+        addr = (uintptr_t)obj->base + (uintptr_t)offset;
+    }
+    if (!loaded_obj_contains(obj, addr, size))
+        return 0;
+
+    if (required_flags != 0) {
+        for (uint16_t i = 0; i < obj->phdr_num; i++) {
+            const Elf64_Phdr *ph = &obj->phdr[i];
+            uintptr_t start;
+            size_t within;
+
+            if (ph->p_type != PT_LOAD ||
+                (ph->p_flags & required_flags) != required_flags ||
+                ph->p_memsz > SIZE_MAX ||
+                ph->p_vaddr > UINTPTR_MAX - obj->base)
+                continue;
+            start = (uintptr_t)obj->base + (uintptr_t)ph->p_vaddr;
+            if (addr < start)
+                continue;
+            within = addr - start;
+            if (within <= ph->p_memsz && size <= ph->p_memsz - within)
+                goto found;
+        }
+        return 0;
+    }
+
+found:
+    if (pointer_out)
+        *pointer_out = (void *)addr;
+    return 1;
 }
 
 /* Objects are finalized in the exact reverse of the order in which their
@@ -4014,6 +3818,208 @@ static int decode_x86_64_musl_dtv_offset(const uint8_t *code, size_t len,
 
             if (off >= 0 && off < MUSL_THREAD_PROBE_LIMIT) {
                 *off_out = (size_t)off;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static int decode_x86_64_mem_disp(const uint8_t *code, size_t len,
+                                  size_t i, size_t opcode_len,
+                                  size_t *off_out, unsigned int *base_out)
+{
+    uint8_t modrm;
+    uint8_t rex = 0;
+    unsigned int mod;
+    unsigned int base;
+    size_t displacement;
+    int off;
+
+    if (i + opcode_len >= len)
+        return 0;
+    if (opcode_len > 1 && (code[i] & 0xf0) == 0x40)
+        rex = code[i];
+    modrm = code[i + opcode_len];
+    mod = modrm >> 6;
+    if (mod != 1 && mod != 2)
+        return 0;
+    displacement = i + opcode_len + 1;
+    if ((modrm & 7) == 4) {
+        uint8_t sib;
+
+        if (displacement >= len)
+            return 0;
+        sib = code[displacement++];
+        /* Accept the RSP/R12 encoding only when the SIB has no index.  An
+         * indexed address is not a direct struct pthread field access. */
+        if (((sib >> 3) & 7) != 4)
+            return 0;
+        base = (sib & 7) | ((rex & 1) ? 8 : 0);
+    } else {
+        base = (modrm & 7) | ((rex & 1) ? 8 : 0);
+    }
+    if (mod == 1) {
+        if (displacement + 1 > len)
+            return 0;
+        off = (int8_t)code[displacement];
+    } else {
+        if (displacement + 4 > len)
+            return 0;
+        off = read_i32_le(code + displacement);
+    }
+    if (off < 0 || off >= MUSL_THREAD_PROBE_LIMIT)
+        return 0;
+    *off_out = (size_t)off;
+    *base_out = base;
+    return 1;
+}
+
+static uint32_t x86_64_musl_self_registers(const uint8_t *code, size_t len)
+{
+    uint32_t registers = 1u << 7; /* first argument: RDI */
+    size_t limit = len < 32 ? len : 32;
+
+    /* GCC and Clang preserve pthread_kill's first argument in a callee-saved
+     * register in the prologue.  Recognize only direct 64-bit register moves
+     * from RDI; do not infer provenance from arbitrary later loads. */
+    for (size_t i = 0; i + 3 <= limit; i++) {
+        uint8_t rex = code[i];
+        uint8_t opcode = code[i + 1];
+        uint8_t modrm = code[i + 2];
+        unsigned int source;
+        unsigned int destination;
+
+        if ((rex & 0xf8) != 0x48 ||
+            (opcode != 0x89 && opcode != 0x8b) ||
+            (modrm >> 6) != 3)
+            continue;
+        if (opcode == 0x89) {
+            source = ((modrm >> 3) & 7) | ((rex & 4) ? 8 : 0);
+            destination = (modrm & 7) | ((rex & 1) ? 8 : 0);
+        } else {
+            source = (modrm & 7) | ((rex & 1) ? 8 : 0);
+            destination = ((modrm >> 3) & 7) | ((rex & 4) ? 8 : 0);
+        }
+        if (source == 7)
+            registers |= 1u << destination;
+    }
+    return registers;
+}
+
+/* pthread_kill loads the target thread's tid immediately before its tkill
+ * syscall.  Decode the closest displaced 32-bit load rather than assuming
+ * that tid precedes errno in struct pthread (it did not in musl 1.1.x). */
+static int decode_x86_64_musl_tid_offset(const uint8_t *code, size_t len,
+                                         size_t *off_out)
+{
+    uint32_t self_registers = x86_64_musl_self_registers(code, len);
+
+    for (size_t i = 0; i + 7 <= len; i++) {
+        uint32_t nr;
+        size_t begin;
+        size_t candidate = 0;
+        int found = 0;
+
+        if (code[i] != 0xb8 || code[i + 5] != 0x0f || code[i + 6] != 0x05)
+            continue;
+        nr = read_u32_le(code + i + 1);
+        if (nr != SYS_tkill && nr != SYS_tgkill)
+            continue;
+
+        begin = i > 48 ? i - 48 : 0;
+        for (size_t j = begin; j < i; j++) {
+            size_t off;
+            unsigned int base;
+
+            if (code[j] == 0x8b &&
+                decode_x86_64_mem_disp(code, i, j, 1, &off, &base) &&
+                (self_registers & (1u << base))) {
+                candidate = off;
+                found = 1;
+            } else if (j + 1 < i && (code[j] & 0xf0) == 0x40 &&
+                       (code[j + 1] == 0x8b || code[j + 1] == 0x63) &&
+                       decode_x86_64_mem_disp(code, i, j, 2, &off, &base) &&
+                       (self_registers & (1u << base))) {
+                candidate = off;
+                found = 1;
+            }
+        }
+        if (found) {
+            *off_out = candidate;
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+/* Old musl pthread_detach stores its detached marker directly; newer musl
+ * transitions a state machine with cmpxchg.  Both expose the field offset. */
+static int decode_x86_64_musl_detach_offset(const uint8_t *code, size_t len,
+                                            size_t *off_out,
+                                            int *initial_out)
+{
+    for (size_t i = 0; i + 3 <= len; i++) {
+        size_t off;
+        unsigned int base;
+        size_t disp_len;
+        size_t imm_pos;
+
+        if (code[i] != 0xc7 || (code[i + 1] & 7) != 7 ||
+            (code[i + 1] >> 6) < 1 || (code[i + 1] >> 6) > 2 ||
+            !decode_x86_64_mem_disp(code, len, i, 1, &off, &base) ||
+            base != 7)
+            continue;
+        disp_len = (code[i + 1] >> 6) == 1 ? 1 : 4;
+        imm_pos = i + 2 + disp_len;
+        if (imm_pos + sizeof(uint32_t) <= len &&
+            read_u32_le(code + imm_pos) == 2) {
+            *off_out = off;
+            /* The old boolean field starts clear; detach writes 2. */
+            *initial_out = 0;
+            return 1;
+        }
+    }
+
+    for (size_t i = 0; i + 4 <= len; i++) {
+        size_t off;
+        unsigned int base;
+
+        if (code[i] == 0xf0 && code[i + 1] == 0x0f &&
+            code[i + 2] == 0xb1 &&
+            (code[i + 3] & 7) == 7 &&
+            (code[i + 3] >> 6) >= 1 && (code[i + 3] >> 6) <= 2 &&
+            decode_x86_64_mem_disp(code, len, i, 3, &off, &base) &&
+            base == 7 && off == g_musl_layout->thread_detach) {
+            *off_out = off;
+            /* State-machine musl transitions JOINABLE (2) to DETACHED. */
+            *initial_out = 2;
+            return 1;
+        }
+    }
+
+    /* musl 1.1.19 first advances the pthread argument to exitlock and
+     * subsequently stores the detached marker through a negative disp8.
+     * Decode that complete, register-preserving sequence; neither operand
+     * alone is evidence for the detached field. */
+    for (size_t i = 0; i + 7 <= len; i++) {
+        uint32_t addend;
+
+        if (code[i] != 0x48 || code[i + 1] != 0x81 ||
+            code[i + 2] != 0xc7)
+            continue;
+        addend = read_u32_le(code + i + 3);
+        for (size_t j = i + 7; j + 7 <= len && j <= i + 32; j++) {
+            int64_t off;
+
+            if (code[j] != 0xc7 || code[j + 1] != 0x47 ||
+                read_u32_le(code + j + 3) != 2)
+                continue;
+            off = (int64_t)addend + (int8_t)code[j + 2];
+            if (off >= 0 && off < MUSL_THREAD_PROBE_LIMIT) {
+                *off_out = (size_t)off;
+                *initial_out = 0;
                 return 1;
             }
         }
@@ -4161,42 +4167,406 @@ static int decode_aarch64_musl_dtv_offset(const uint8_t *code, size_t len,
     }
     return 0;
 }
+
+static uint32_t aarch64_musl_self_registers(const uint8_t *code, size_t len)
+{
+    uint32_t registers = 1u; /* first argument: X0 */
+    size_t limit = len < 32 ? len : 32;
+
+    for (size_t i = 0; i + 4 <= limit; i += 4) {
+        uint32_t insn = read_u32_le(code + i);
+        unsigned int source;
+        unsigned int destination;
+
+        /* MOV Xd, Xm is the ORR Xd, XZR, Xm alias. */
+        if ((insn & 0xffe0ffe0u) == 0xaa0003e0u) {
+            source = (insn >> 16) & 0x1f;
+            destination = insn & 0x1f;
+            if (source == 0)
+                registers |= 1u << destination;
+            continue;
+        }
+
+        /* Some compilers spell the same prologue copy as ADD Xd, X0, #0. */
+        if ((insn & 0xffffffe0u) == 0x91000000u) {
+            destination = insn & 0x1f;
+            registers |= 1u << destination;
+        }
+    }
+    return registers;
+}
+
+/* pthread_kill's inline tkill consumes a tid loaded through the pthread
+ * argument (X0 or its prologue copy).  Requiring both that provenance and
+ * the syscall number prevents a stack/local load from becoming an offset. */
+static int decode_aarch64_musl_tid_offset(const uint8_t *code, size_t len,
+                                          size_t *off_out)
+{
+    uint32_t self_registers = aarch64_musl_self_registers(code, len);
+
+    for (size_t i = 0; i + 4 <= len; i += 4) {
+        size_t candidate = 0;
+        int found = 0;
+        int has_tkill_number = 0;
+        size_t begin;
+
+        if (read_u32_le(code + i) != 0xd4000001u) /* svc #0 */
+            continue;
+        begin = i > 64 ? i - 64 : 0;
+        for (size_t j = begin; j < i; j += 4) {
+            uint32_t insn = read_u32_le(code + j);
+            size_t off;
+            unsigned int base;
+
+            if ((insn & 0x7f800000u) == 0x52800000u &&
+                (insn & 0x1f) == 8 &&
+                (((insn >> 5) & 0xffff) == SYS_tkill ||
+                 ((insn >> 5) & 0xffff) == SYS_tgkill))
+                has_tkill_number = 1;
+
+            if ((insn & 0xffc00000u) != 0xb9400000u &&
+                (insn & 0xffc00000u) != 0xb9800000u)
+                continue;
+            base = (insn >> 5) & 0x1f;
+            if (!(self_registers & (1u << base)))
+                continue;
+            off = ((insn >> 10) & 0xfff) * sizeof(uint32_t);
+            if (off >= MUSL_THREAD_PROBE_LIMIT)
+                continue;
+            candidate = off;
+            found = 1;
+        }
+        if (found && has_tkill_number) {
+            *off_out = candidate;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* As on x86-64, old pthread_detach directly stores a detached marker while
+ * modern implementations use an exclusive state transition. */
+static int decode_aarch64_musl_detach_offset(const uint8_t *code, size_t len,
+                                             size_t *off_out,
+                                             int *initial_out)
+{
+    for (size_t i = 0; i + 4 <= len; i += 4) {
+        uint32_t mov = read_u32_le(code + i);
+        unsigned int value_reg;
+
+        if ((mov & 0x7f800000u) != 0x52800000u ||
+            ((mov >> 5) & 0xffff) != 2)
+            continue;
+        value_reg = mov & 0x1f;
+        for (size_t j = i + 4; j + 4 <= len && j <= i + 16; j += 4) {
+            uint32_t store = read_u32_le(code + j);
+            size_t off;
+
+            if ((store & 0xffc00000u) != 0xb9000000u ||
+                ((store >> 5) & 0x1f) != 0 ||
+                (store & 0x1f) != value_reg)
+                continue;
+            off = ((store >> 10) & 0xfff) * sizeof(uint32_t);
+            if (off < MUSL_THREAD_PROBE_LIMIT) {
+                *off_out = off;
+                *initial_out = 0;
+                return 1;
+            }
+        }
+    }
+
+    for (size_t i = 0; i + 8 <= len; i += 4) {
+        uint32_t add = read_u32_le(code + i);
+        unsigned int address_reg;
+        uint64_t off;
+
+        if ((add & 0xff000000u) != 0x91000000u ||
+            ((add >> 5) & 0x1f) != 0)
+            continue;
+        address_reg = add & 0x1f;
+        off = (add >> 10) & 0xfff;
+        if ((add >> 22) & 1)
+            off <<= 12;
+        if (off >= MUSL_THREAD_PROBE_LIMIT)
+            continue;
+        /* Stack-protected builds may interleave their canary prologue with
+         * the detach transition (Debian 13 places LDAXR 56 bytes after the
+         * address calculation).  Keep admission fail-closed by requiring
+         * the complete JOINABLE (2) -> DETACHED (3) exclusive sequence. */
+        for (size_t j = i + 4; j + 4 <= len && j <= i + 80; j += 4) {
+            uint32_t load = read_u32_le(code + j);
+            unsigned int loaded_reg;
+            int has_joinable_compare = 0;
+            int has_detached_store = 0;
+
+            if ((load & 0xfffffc00u) != 0x885ffc00u ||
+                ((load >> 5) & 0x1f) != address_reg)
+                continue;
+            loaded_reg = load & 0x1f;
+
+            for (size_t k = j + 4; k + 4 <= len && k <= j + 16; k += 4) {
+                uint32_t compare = read_u32_le(code + k);
+
+                if ((compare & 0xff00001fu) == 0x7100001fu &&
+                    ((compare >> 5) & 0x1f) == loaded_reg &&
+                    ((compare >> 10) & 0xfff) == 2 &&
+                    ((compare >> 22) & 1) == 0) {
+                    has_joinable_compare = 1;
+                    break;
+                }
+            }
+            if (!has_joinable_compare)
+                continue;
+
+            size_t store_begin = j > i + 16 ? j - 16 : i + 4;
+            for (size_t k = store_begin;
+                 k + 4 <= len && k <= j + 24; k += 4) {
+                uint32_t store = read_u32_le(code + k);
+                unsigned int value_reg;
+
+                if ((store & 0xffe0fc00u) != 0x8800fc00u ||
+                    ((store >> 5) & 0x1f) != address_reg)
+                    continue;
+                value_reg = store & 0x1f;
+                for (size_t m = i + 4; m <= k; m += 4) {
+                    uint32_t mov = read_u32_le(code + m);
+
+                    if ((mov & 0x7f800000u) == 0x52800000u &&
+                        ((mov >> 5) & 0xffff) == 3 &&
+                        ((mov >> 21) & 3) == 0 &&
+                        (mov & 0x1f) == value_reg) {
+                        has_detached_store = 1;
+                        break;
+                    }
+                }
+                if (has_detached_store)
+                    break;
+            }
+            if (has_detached_store) {
+                *off_out = (size_t)off;
+                *initial_out = 2;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
 #endif
 
-static void probe_musl_thread_layout_from_target(const struct loaded_obj *libc_obj)
+#if defined(__x86_64__)
+static int decode_x86_64_musl_libc_addr(const struct loaded_obj *libc_obj,
+                                        const uint8_t *code, size_t len,
+                                        uintptr_t *addr_out)
 {
+    uint8_t cmp_opcode = g_musl_layout->libc_flag_width == 1 ? 0x80 : 0x83;
+
+    for (size_t i = 0; i + 7 <= len; i++) {
+        uintptr_t first;
+
+        if (code[i] != cmp_opcode || code[i + 1] != 0x3d ||
+            code[i + 6] != 0)
+            continue;
+        first = (uintptr_t)(code + i + 7) +
+                (intptr_t)read_i32_le(code + i + 2);
+        if (first < libc_obj->base + g_musl_layout->libc_can_do_threads)
+            continue;
+        uintptr_t candidate = first - g_musl_layout->libc_can_do_threads;
+
+        for (size_t j = i + 7; j + 7 <= len && j <= i + 160; j++) {
+            uintptr_t second;
+            void *checked;
+
+            if (code[j] != cmp_opcode || code[j + 1] != 0x3d ||
+                code[j + 6] != 0)
+                continue;
+            second = (uintptr_t)(code + j + 7) +
+                     (intptr_t)read_i32_le(code + j + 2);
+            if (second != candidate + g_musl_layout->libc_threaded ||
+                candidate < libc_obj->base ||
+                candidate - libc_obj->base > INT64_MAX ||
+                !loaded_obj_signed_offset_pointer(
+                    libc_obj, (int64_t)(candidate - libc_obj->base),
+                    g_musl_layout->libc_size, PF_W, &checked))
+                continue;
+            *addr_out = (uintptr_t)checked;
+            return 1;
+        }
+    }
+    return 0;
+}
+#elif defined(__aarch64__)
+static int aarch64_decode_musl_adrp(uintptr_t pc, uint32_t insn,
+                                    unsigned int *rd_out,
+                                    uintptr_t *page_out)
+{
+    int64_t imm;
+
+    if ((insn & 0x9f000000u) != 0x90000000u)
+        return 0;
+    imm = (int64_t)((((uint64_t)insn >> 5) & 0x7ffffu) << 2 |
+                    (((uint64_t)insn >> 29) & 3));
+    if (imm & (1 << 20))
+        imm -= (1 << 21);
+    imm <<= 12;
+    *rd_out = insn & 0x1f;
+    *page_out = (uintptr_t)((int64_t)(pc & ~(uintptr_t)0xfff) + imm);
+    return 1;
+}
+
+static int decode_aarch64_musl_libc_addr(const struct loaded_obj *libc_obj,
+                                         const uint8_t *code, size_t len,
+                                         uintptr_t *addr_out)
+{
+    for (size_t i = 0; i + 4 <= len; i += 4) {
+        unsigned int page_reg;
+        uintptr_t page;
+
+        if (!aarch64_decode_musl_adrp((uintptr_t)(code + i),
+                                      read_u32_le(code + i),
+                                      &page_reg, &page))
+            continue;
+        for (size_t j = i + 4; j + 4 <= len && j <= i + 64; j += 4) {
+            uint32_t load = read_u32_le(code + j);
+            uintptr_t first;
+
+            if ((load & 0xffc00000u) != 0x39400000u ||
+                ((load >> 5) & 0x1f) != page_reg)
+                continue;
+            first = page + ((load >> 10) & 0xfff);
+            if (first < libc_obj->base +
+                        g_musl_layout->libc_can_do_threads)
+                continue;
+            uintptr_t candidate =
+                first - g_musl_layout->libc_can_do_threads;
+
+            for (size_t k = j + 4; k + 8 <= len && k <= j + 96; k += 4) {
+                uint32_t add = read_u32_le(code + k);
+                unsigned int base_reg;
+                uint64_t addend;
+
+                if ((add & 0xff000000u) != 0x91000000u ||
+                    ((add >> 5) & 0x1f) != page_reg)
+                    continue;
+                base_reg = add & 0x1f;
+                addend = (add >> 10) & 0xfff;
+                if ((add >> 22) & 1)
+                    addend <<= 12;
+                if (page + addend != candidate)
+                    continue;
+                /* pthread_create may finish its argument setup between the
+                 * address calculation and the threaded flag load (musl
+                 * 1.2.5 AArch64 places the load 32 bytes later). */
+                for (size_t m = k + 4; m + 4 <= len && m <= k + 48;
+                     m += 4) {
+                    uint32_t second = read_u32_le(code + m);
+                    void *checked;
+
+                    if ((second & 0xffc00000u) != 0x39400000u ||
+                        ((second >> 5) & 0x1f) != base_reg ||
+                        ((second >> 10) & 0xfff) !=
+                            g_musl_layout->libc_threaded ||
+                        candidate < libc_obj->base ||
+                        candidate - libc_obj->base > INT64_MAX ||
+                        !loaded_obj_signed_offset_pointer(
+                            libc_obj,
+                            (int64_t)(candidate - libc_obj->base),
+                            g_musl_layout->libc_size, PF_W, &checked))
+                        continue;
+                    *addr_out = (uintptr_t)checked;
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+#endif
+
+static int validate_musl_layout_from_target(const struct loaded_obj *libc_obj)
+{
+    g_musl_target_tid_known = 0;
+    g_musl_target_errno_known = 0;
+    g_musl_target_detach_known = 0;
+    g_musl_target_detach_value = g_musl_layout->detach_initial;
 #if defined(__x86_64__)
     uint64_t addr;
     size_t off;
 
     if (!libc_obj)
-        return;
+        return 0;
 
     addr = musl_defined_symbol_addr(libc_obj, "__errno_location");
     if (addr && loaded_obj_contains(libc_obj, (uintptr_t)addr, 32) &&
-        decode_x86_64_musl_errno_offset((const uint8_t *)(uintptr_t)addr, 32, &off)) {
-        g_musl_thread.errno_off = off;
-        if (off >= sizeof(int))
-            g_musl_thread.tid = off - sizeof(int);
-        if (off + sizeof(int) < MUSL_THREAD_PROBE_LIMIT)
-            g_musl_thread.detach_state = off + sizeof(int);
+        decode_x86_64_musl_errno_offset((const uint8_t *)(uintptr_t)addr, 32,
+                                        &off) &&
+        off == g_musl_layout->thread_errno) {
+        g_musl_target_errno_known = 1;
+    } else {
+        ldr_dbg("[loader] musl profile mismatch: errno\n");
+        return 0;
     }
 
     addr = musl_defined_symbol_addr(libc_obj, "__tls_get_addr");
     if (addr && loaded_obj_contains(libc_obj, (uintptr_t)addr, 48) &&
-        decode_x86_64_musl_dtv_offset((const uint8_t *)(uintptr_t)addr, 48, &off))
-        g_musl_thread.dtv = off;
+        decode_x86_64_musl_dtv_offset((const uint8_t *)(uintptr_t)addr, 48,
+                                      &off) &&
+        off == g_musl_layout->thread_dtv) {
+        /* validated */
+    } else {
+        ldr_dbg("[loader] musl profile mismatch: DTV\n");
+        return 0;
+    }
+
+    addr = musl_defined_symbol_addr(libc_obj, "pthread_kill");
+    if (addr && loaded_obj_contains(libc_obj, (uintptr_t)addr, 128) &&
+        decode_x86_64_musl_tid_offset((const uint8_t *)(uintptr_t)addr,
+                                      128, &off) &&
+        off == g_musl_layout->thread_tid) {
+        g_musl_target_tid_known = 1;
+    } else {
+        ldr_dbg("[loader] musl profile mismatch: tid\n");
+        return 0;
+    }
+
+    addr = musl_defined_symbol_addr(libc_obj, "pthread_detach");
+    if (addr && loaded_obj_contains(libc_obj, (uintptr_t)addr, 128) &&
+        decode_x86_64_musl_detach_offset((const uint8_t *)(uintptr_t)addr,
+                                         128, &off,
+                                         &g_musl_target_detach_value) &&
+        off == g_musl_layout->thread_detach &&
+        g_musl_target_detach_value == g_musl_layout->detach_initial) {
+        g_musl_target_detach_known = 1;
+    } else {
+        ldr_dbg("[loader] musl profile mismatch: detach state\n");
+        return 0;
+    }
+
+    addr = musl_defined_symbol_addr(libc_obj, "pthread_create");
+    if (!addr || !loaded_obj_contains(libc_obj, (uintptr_t)addr, 768) ||
+        !decode_x86_64_musl_libc_addr(
+            libc_obj, (const uint8_t *)(uintptr_t)addr, 768,
+            &g_musl_libc_addr))
+    {
+        ldr_dbg("[loader] musl profile mismatch: libc state base\n");
+        return 0;
+    }
 #elif defined(__aarch64__)
     uint64_t addr;
     size_t off;
 
     if (!libc_obj)
-        return;
+        return 0;
 
     addr = musl_defined_symbol_addr(libc_obj, "pthread_self");
     if (addr && loaded_obj_contains(libc_obj, (uintptr_t)addr, 32) &&
-        decode_aarch64_musl_self_delta((const uint8_t *)(uintptr_t)addr, 32, &off))
-        g_musl_tp_self_delta = off;
+        decode_aarch64_musl_self_delta((const uint8_t *)(uintptr_t)addr, 32,
+                                       &off) &&
+        off == g_musl_layout->tp_self_delta) {
+        /* validated */
+    } else {
+        ldr_dbg("[loader] musl profile mismatch: pthread self\n");
+        return 0;
+    }
 
     addr = musl_defined_symbol_addr(libc_obj, "__errno_location");
     if (addr && loaded_obj_contains(libc_obj, (uintptr_t)addr, 32)) {
@@ -4206,70 +4576,64 @@ static void probe_musl_thread_layout_from_target(const struct loaded_obj *libc_o
             tp_rel + (int64_t)g_musl_tp_self_delta >= 0 &&
             tp_rel + (int64_t)g_musl_tp_self_delta < MUSL_THREAD_PROBE_LIMIT) {
             off = (size_t)(tp_rel + (int64_t)g_musl_tp_self_delta);
-            g_musl_thread.errno_off = off;
-            if (off >= sizeof(int))
-                g_musl_thread.tid = off - sizeof(int);
-            if (off + sizeof(int) < MUSL_THREAD_PROBE_LIMIT)
-                g_musl_thread.detach_state = off + sizeof(int);
+            if (off == g_musl_layout->thread_errno)
+                g_musl_target_errno_known = 1;
         }
+    }
+    if (!g_musl_target_errno_known) {
+        ldr_dbg("[loader] musl profile mismatch: errno\n");
+        return 0;
     }
 
     addr = musl_defined_symbol_addr(libc_obj, "__tls_get_addr");
     if (addr && loaded_obj_contains(libc_obj, (uintptr_t)addr, 64) &&
         decode_aarch64_musl_dtv_offset((const uint8_t *)(uintptr_t)addr, 64,
-                                       g_musl_tp_self_delta, &off))
-        g_musl_thread.dtv = off;
+                                       g_musl_tp_self_delta, &off) &&
+        off == g_musl_layout->thread_dtv) {
+        /* validated */
+    } else {
+        ldr_dbg("[loader] musl profile mismatch: DTV\n");
+        return 0;
+    }
+
+    addr = musl_defined_symbol_addr(libc_obj, "pthread_kill");
+    if (addr && loaded_obj_contains(libc_obj, (uintptr_t)addr, 128) &&
+        decode_aarch64_musl_tid_offset((const uint8_t *)(uintptr_t)addr,
+                                       128, &off) &&
+        off == g_musl_layout->thread_tid) {
+        g_musl_target_tid_known = 1;
+    } else {
+        ldr_dbg("[loader] musl profile mismatch: tid\n");
+        return 0;
+    }
+
+    addr = musl_defined_symbol_addr(libc_obj, "pthread_detach");
+    if (addr && loaded_obj_contains(libc_obj, (uintptr_t)addr, 128) &&
+        decode_aarch64_musl_detach_offset((const uint8_t *)(uintptr_t)addr,
+                                          128, &off,
+                                          &g_musl_target_detach_value) &&
+        off == g_musl_layout->thread_detach &&
+        g_musl_target_detach_value == g_musl_layout->detach_initial) {
+        g_musl_target_detach_known = 1;
+    } else {
+        ldr_dbg("[loader] musl profile mismatch: detach state\n");
+        return 0;
+    }
+
+    addr = musl_defined_symbol_addr(libc_obj, "pthread_create");
+    if (!addr || !loaded_obj_contains(libc_obj, (uintptr_t)addr, 768) ||
+        !decode_aarch64_musl_libc_addr(
+            libc_obj, (const uint8_t *)(uintptr_t)addr, 768,
+            &g_musl_libc_addr))
+    {
+        ldr_dbg("[loader] musl profile mismatch: libc state base\n");
+        return 0;
+    }
 #else
     (void)libc_obj;
+    return 0;
 #endif
-}
-
-static void seed_musl_startup_globals(struct loaded_obj *objs, int nobj)
-{
-    const struct loaded_obj *libc_obj;
-    uint64_t env_addr;
-    uint64_t prog_addr;
-    uint64_t prog_full_addr;
-    uint64_t first_prog_addr = 0;
-    uintptr_t ptr_delta = MUSL_ENVIRON_TO_INIT_FINI_LIST_PTR_OLD;
-    uintptr_t sentinel_delta = MUSL_ENVIRON_TO_INIT_FINI_LIST_SENTINEL_OLD;
-    uintptr_t ptr_addr;
-    uintptr_t sentinel_addr;
-
-    libc_obj = find_musl_libc(objs, nobj);
-    if (!libc_obj)
-        return;
-
-    env_addr = musl_defined_symbol_addr(libc_obj, "__environ");
-    if (!env_addr)
-        return;
-
-    prog_addr = musl_defined_symbol_addr(libc_obj, "__progname");
-    prog_full_addr = musl_defined_symbol_addr(libc_obj, "__progname_full");
-    if (prog_addr && prog_addr > env_addr)
-        first_prog_addr = prog_addr;
-    if (prog_full_addr && prog_full_addr > env_addr &&
-        (!first_prog_addr || prog_full_addr < first_prog_addr))
-        first_prog_addr = prog_full_addr;
-
-    if (first_prog_addr &&
-        first_prog_addr - env_addr >= MUSL_PROGNAME_NEAR_ENVIRON_MAX) {
-        ptr_delta = MUSL_ENVIRON_TO_INIT_FINI_LIST_PTR_NEW;
-        sentinel_delta = MUSL_ENVIRON_TO_INIT_FINI_LIST_SENTINEL_NEW;
-    }
-
-    if (env_addr < sentinel_delta)
-        return;
-    ptr_addr = (uintptr_t)(env_addr + ptr_delta);
-    sentinel_addr = (uintptr_t)(env_addr - sentinel_delta);
-    if (!loaded_obj_contains(libc_obj, ptr_addr, sizeof(uintptr_t)) ||
-        !loaded_obj_contains(libc_obj, sentinel_addr, 1)) {
-        if (g_debug)
-            ldr_dbg("[loader] musl startup list seed skipped: offset outside map\n");
-        return;
-    }
-
-    *(uintptr_t *)ptr_addr = sentinel_addr;
+    return 1;
 }
 
 /* ---- dlopen support globals ------------------------------------------ */
@@ -4277,9 +4641,151 @@ static void seed_musl_startup_globals(struct loaded_obj *objs, int nobj)
 /* Global object table — populated by loader_run, extended by my_dlopen. */
 static struct loaded_obj g_all_objs[MAX_TOTAL_OBJS];
 static int g_nobj;
+static int g_global_scope_root = -1;
+static uint16_t g_global_scope_indices[MAX_TOTAL_OBJS];
+static uint16_t g_global_scope_count;
 
 /* Per-object metadata for dlopen'd objects (used by protect_object) */
 static struct dlfrz_lib_meta g_dl_metas[MAX_TOTAL_OBJS];
+
+static int dl_object_table_index(const struct loaded_obj *obj, int nobj,
+                                 int *index_out)
+{
+    uintptr_t address = (uintptr_t)obj;
+    uintptr_t start = (uintptr_t)&g_all_objs[0];
+    uintptr_t end;
+    uintptr_t delta;
+
+    if (!obj || nobj < 0 || nobj > MAX_TOTAL_OBJS)
+        return 0;
+    end = (uintptr_t)&g_all_objs[nobj];
+    if (address < start || address >= end)
+        return 0;
+    delta = address - start;
+    if (delta % sizeof(g_all_objs[0]) != 0)
+        return 0;
+    *index_out = (int)(delta / sizeof(g_all_objs[0]));
+    return 1;
+}
+
+static int dl_add_dependency_edge(struct loaded_obj *requester,
+                                  struct loaded_obj *dependency, int nobj)
+{
+    int requester_index;
+    int dependency_index;
+
+    if (!dl_object_table_index(requester, nobj, &requester_index) ||
+        !dl_object_table_index(dependency, nobj, &dependency_index))
+        return -1;
+    (void)requester_index;
+    for (uint16_t i = 0; i < requester->needed_count; i++)
+        if (requester->needed_indices[i] == (uint16_t)dependency_index)
+            return 0;
+    if (requester->needed_count >= MAX_TOTAL_OBJS)
+        return -1;
+    requester->needed_indices[requester->needed_count++] =
+        (uint16_t)dependency_index;
+    requester->lookup_scope_valid = 0;
+    return 0;
+}
+
+static int dl_build_lookup_scope(struct loaded_obj *root, int nobj)
+{
+    uint8_t seen[MAX_TOTAL_OBJS];
+    int root_index;
+    uint16_t cursor = 0;
+
+    if (!dl_object_table_index(root, nobj, &root_index))
+        return -1;
+    memset(seen, 0, sizeof(seen));
+    root->lookup_scope_count = 1;
+    root->lookup_scope_indices[0] = (uint16_t)root_index;
+    seen[root_index] = 1;
+
+    while (cursor < root->lookup_scope_count) {
+        uint16_t current_index = root->lookup_scope_indices[cursor++];
+        struct loaded_obj *current;
+
+        if (current_index >= nobj)
+            goto malformed;
+        current = &g_all_objs[current_index];
+        if (current->needed_count > MAX_TOTAL_OBJS)
+            goto malformed;
+        for (uint16_t i = 0; i < current->needed_count; i++) {
+            uint16_t dependency_index = current->needed_indices[i];
+
+            if (dependency_index >= nobj)
+                goto malformed;
+            if (seen[dependency_index])
+                continue;
+            if (root->lookup_scope_count >= MAX_TOTAL_OBJS)
+                goto malformed;
+            seen[dependency_index] = 1;
+            root->lookup_scope_indices[root->lookup_scope_count++] =
+                dependency_index;
+        }
+    }
+    root->lookup_scope_valid = 1;
+    return 0;
+
+malformed:
+    root->lookup_scope_count = 0;
+    root->lookup_scope_valid = 0;
+    return -1;
+}
+
+static int dl_set_relocation_scope_root(struct loaded_obj *obj,
+                                        int root_index, int nobj)
+{
+    int index;
+
+    if (!dl_object_table_index(obj, nobj, &index) || root_index < 0 ||
+        root_index >= nobj)
+        return -1;
+    (void)index;
+    obj->relocation_scope_root = (uint16_t)root_index;
+    obj->relocation_scope_root_valid = 1;
+    return 0;
+}
+
+static int dl_global_scope_contains(uint16_t index)
+{
+    for (uint16_t i = 0; i < g_global_scope_count; i++)
+        if (g_global_scope_indices[i] == index)
+            return 1;
+    return 0;
+}
+
+static int dl_append_lookup_scope_to_global(struct loaded_obj *root,
+                                            int nobj)
+{
+    if (!root->lookup_scope_valid && dl_build_lookup_scope(root, nobj) < 0)
+        return -1;
+    for (uint16_t i = 0; i < root->lookup_scope_count; i++) {
+        uint16_t index = root->lookup_scope_indices[i];
+
+        if (index >= nobj)
+            return -1;
+        if (dl_global_scope_contains(index))
+            continue;
+        if (g_global_scope_count >= MAX_TOTAL_OBJS)
+            return -1;
+        g_global_scope_indices[g_global_scope_count++] = index;
+    }
+    return 0;
+}
+
+static int dl_append_index_to_global(uint16_t index, int nobj)
+{
+    if (index >= nobj)
+        return -1;
+    if (dl_global_scope_contains(index))
+        return 0;
+    if (g_global_scope_count >= MAX_TOTAL_OBJS)
+        return -1;
+    g_global_scope_indices[g_global_scope_count++] = index;
+    return 0;
+}
 
 static uint64_t resolve_main_address(struct loaded_obj *objs, int nobj,
                                      const int *idx_map,
@@ -4341,25 +4847,169 @@ static uint64_t resolve_main_address(struct loaded_obj *objs, int nobj,
     return main_addr;
 }
 
-static void discover_tls_template(struct loaded_obj *obj,
-                                  const Elf64_Phdr *phdrs,
-                                  int phnum)
+#define RUNTIME_TLS_MAX_ALIGN (1ULL << 30)
+
+static int runtime_tls_template_valid(const struct loaded_obj *obj)
 {
+    uint64_t align;
+
+    if (!obj || obj->tls.memsz == 0)
+        return 0;
+    align = obj->tls.align ? obj->tls.align : 1;
+    if (obj->tls.filesz > obj->tls.memsz || obj->tls.memsz > SIZE_MAX ||
+        obj->tls.vaddr > UINT64_MAX - obj->tls.memsz ||
+        align > RUNTIME_TLS_MAX_ALIGN || (align & (align - 1)) != 0 ||
+        (obj->tls.filesz != 0 &&
+         !loaded_obj_file_vaddr_pointer(obj, obj->tls.vaddr,
+                                        (size_t)obj->tls.filesz, NULL)))
+        return 0;
+    return 1;
+}
+
+static int runtime_tls_mapping_size(const struct loaded_obj *obj,
+                                    size_t *mapping_len_out)
+{
+    uint64_t align;
+    uint64_t allocation_size;
+    uint64_t map_len_u64;
+
+    if (!runtime_tls_template_valid(obj))
+        return 0;
+    align = obj->tls.align ? obj->tls.align : 1;
+    if (!u64_add_checked(obj->tls.memsz, align - 1, &allocation_size) ||
+        !u64_align_up_checked(allocation_size, g_page_size, &map_len_u64) ||
+        map_len_u64 == 0 || map_len_u64 > SIZE_MAX)
+        return 0;
+    *mapping_len_out = (size_t)map_len_u64;
+    return 1;
+}
+
+static int allocate_runtime_tls_block(const struct loaded_obj *obj,
+                                      void **mapping_out,
+                                      size_t *mapping_len_out,
+                                      uintptr_t *tls_base_out)
+{
+    uint64_t align;
+    uint64_t tls_base_u64;
+    uint64_t tls_end;
+    uint64_t map_end;
+    size_t map_len;
+    void *mapping;
+
+    *mapping_out = NULL;
+    *mapping_len_out = 0;
+    *tls_base_out = 0;
+    if (!runtime_tls_mapping_size(obj, &map_len))
+        return -1;
+
+    align = obj->tls.align ? obj->tls.align : 1;
+    mapping = mmap(NULL, map_len, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapping == MAP_FAILED)
+        return -1;
+    if (!u64_align_up_checked((uintptr_t)mapping, align, &tls_base_u64) ||
+        !u64_add_checked(tls_base_u64, obj->tls.memsz, &tls_end) ||
+        !u64_add_checked((uintptr_t)mapping, map_len, &map_end) ||
+        tls_end > map_end) {
+        munmap(mapping, map_len);
+        return -1;
+    }
+
+    if (obj->tls.filesz != 0) {
+        memcpy((void *)(uintptr_t)tls_base_u64,
+               (const void *)(uintptr_t)(obj->base + obj->tls.vaddr),
+               (size_t)obj->tls.filesz);
+    }
+    if (obj->tls.memsz > obj->tls.filesz) {
+        memset((void *)(uintptr_t)(tls_base_u64 + obj->tls.filesz), 0,
+               (size_t)(obj->tls.memsz - obj->tls.filesz));
+    }
+
+    *mapping_out = mapping;
+    *mapping_len_out = map_len;
+    *tls_base_out = (uintptr_t)tls_base_u64;
+    return 0;
+}
+
+static int runtime_tls_address(const struct loaded_obj *obj,
+                               uintptr_t tls_base, unsigned long offset,
+                               void **address_out)
+{
+    uint64_t address;
+
+    if (!runtime_tls_template_valid(obj) ||
+        (uint64_t)offset > obj->tls.memsz ||
+        !u64_add_checked(tls_base, (uint64_t)offset, &address) ||
+        address > UINTPTR_MAX)
+        return 0;
+    *address_out = (void *)(uintptr_t)address;
+    return 1;
+}
+
+static int static_tls_block_address(uintptr_t tp,
+                                    const struct loaded_obj *obj,
+                                    uint8_t **address_out)
+{
+    uint64_t magnitude;
+    uintptr_t address;
+
+    if (!runtime_tls_template_valid(obj) || obj->tls.tpoff == 0)
+        return 0;
+    if (obj->tls.tpoff < 0) {
+        magnitude = (uint64_t)(-(obj->tls.tpoff + 1)) + 1;
+        if (magnitude > tp || magnitude > g_tls_static_size ||
+            obj->tls.memsz > magnitude)
+            return 0;
+        address = tp - (uintptr_t)magnitude;
+    } else {
+        uint64_t offset = (uint64_t)obj->tls.tpoff;
+
+        if (offset > g_tls_static_size ||
+            obj->tls.memsz > g_tls_static_size - offset ||
+            offset > UINTPTR_MAX - tp)
+            return 0;
+        address = tp + (uintptr_t)offset;
+    }
+    *address_out = (uint8_t *)address;
+    return 1;
+}
+
+static int discover_tls_template(struct loaded_obj *obj,
+                                 const Elf64_Phdr *phdrs,
+                                 int phnum)
+{
+    int found = 0;
+
     for (int i = 0; i < phnum; i++) {
         uint64_t align;
 
         if (phdrs[i].p_type != PT_TLS)
             continue;
+        if (found)
+            return -1;
+        found = 1;
         align = phdrs[i].p_align ? phdrs[i].p_align : 1;
+        if (phdrs[i].p_filesz > phdrs[i].p_memsz ||
+            phdrs[i].p_memsz > SIZE_MAX ||
+            phdrs[i].p_vaddr > UINT64_MAX - phdrs[i].p_memsz ||
+            align > RUNTIME_TLS_MAX_ALIGN ||
+            (align & (align - 1)) != 0 ||
+            (phdrs[i].p_vaddr & (align - 1)) !=
+                (phdrs[i].p_offset & (align - 1)) ||
+            (phdrs[i].p_filesz != 0 &&
+             !loaded_obj_file_vaddr_pointer(obj, phdrs[i].p_vaddr,
+                                            (size_t)phdrs[i].p_filesz,
+                                            NULL)))
+            return -1;
         obj->tls.filesz = phdrs[i].p_filesz;
         obj->tls.memsz = phdrs[i].p_memsz;
         obj->tls.vaddr = phdrs[i].p_vaddr;
         obj->tls.align = align;
-        return;
     }
+    return 0;
 }
 
-static size_t next_tls_modid(void)
+static int next_tls_modid(size_t *modid_out)
 {
     size_t max_modid = 0;
 
@@ -4367,7 +5017,10 @@ static size_t next_tls_modid(void)
         if (g_all_objs[i].tls.modid > max_modid)
             max_modid = g_all_objs[i].tls.modid;
     }
-    return max_modid + 1;
+    if (max_modid == SIZE_MAX || max_modid >= MAX_TOTAL_OBJS)
+        return -1;
+    *modid_out = max_modid + 1;
+    return 0;
 }
 
 static int install_musl_dlopen_tls(struct loaded_obj *obj)
@@ -4375,56 +5028,62 @@ static int install_musl_dlopen_tls(struct loaded_obj *obj)
     uintptr_t tp;
     uintptr_t *old_dtv;
     uintptr_t *dtv;
+    uintptr_t *new_dtv = NULL;
     size_t old_slots = 0;
     size_t new_slots;
-    size_t dtv_bytes;
-    size_t align;
-    size_t map_len;
-    void *map;
+    size_t dtv_bytes = 0;
+    size_t tls_map_len = 0;
+    void *tls_map = NULL;
     uintptr_t tls_base;
+    uint64_t dtv_words;
+    uint64_t dtv_bytes_u64;
 
     if (!g_is_musl_runtime || obj->tls.memsz == 0 || obj->tls.modid == 0)
         return 0;
+    if (!runtime_tls_template_valid(obj) ||
+        obj->tls.modid > MAX_TOTAL_OBJS)
+        return -1;
 
     tp = arch_get_tp();
     old_dtv = *(uintptr_t **)musl_thread_dtv_slot(tp);
-    if (old_dtv)
+    if (old_dtv) {
         old_slots = old_dtv[0];
+        if (old_slots > MAX_TOTAL_OBJS)
+            return -1;
+    }
 
     new_slots = obj->tls.modid;
     dtv = old_dtv;
-    if (!dtv || old_slots < new_slots) {
-        dtv_bytes = ALIGN_UP((new_slots + 1) * sizeof(uintptr_t), g_page_size);
-        dtv = mmap(NULL, dtv_bytes, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (dtv == MAP_FAILED)
-            return -1;
-        memset(dtv, 0, dtv_bytes);
-        if (old_dtv && old_slots + 1 > 0) {
-            memcpy(dtv, old_dtv, (old_slots + 1) * sizeof(uintptr_t));
-        }
-        dtv[0] = new_slots;
-        *(uintptr_t **)musl_thread_dtv_slot(tp) = dtv;
-    }
-
-    if (dtv[obj->tls.modid])
+    if (dtv && old_slots >= new_slots && dtv[obj->tls.modid])
         return 0;
 
-    align = obj->tls.align ? (size_t)obj->tls.align : sizeof(uintptr_t);
-    map_len = ALIGN_UP(obj->tls.memsz + align, g_page_size);
-    map = mmap(NULL, map_len, PROT_READ | PROT_WRITE,
-               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (map == MAP_FAILED)
-        return -1;
+    if (!dtv || old_slots < new_slots) {
+        if (!u64_add_checked(new_slots, 1, &dtv_words) ||
+            !u64_mul_checked(dtv_words, sizeof(uintptr_t), &dtv_words) ||
+            !u64_align_up_checked(dtv_words, g_page_size, &dtv_bytes_u64) ||
+            dtv_bytes_u64 == 0 || dtv_bytes_u64 > SIZE_MAX)
+            return -1;
+        dtv_bytes = (size_t)dtv_bytes_u64;
+        new_dtv = mmap(NULL, dtv_bytes, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (new_dtv == MAP_FAILED)
+            return -1;
+        if (old_dtv)
+            memcpy(new_dtv, old_dtv,
+                   (old_slots + 1) * sizeof(uintptr_t));
+        new_dtv[0] = new_slots;
+        dtv = new_dtv;
+    }
 
-    tls_base = ALIGN_UP((uintptr_t)map, align);
-    memcpy((void *)tls_base, (const void *)(obj->base + obj->tls.vaddr),
-           obj->tls.filesz);
-    if (obj->tls.memsz > obj->tls.filesz) {
-        memset((void *)(tls_base + obj->tls.filesz), 0,
-               obj->tls.memsz - obj->tls.filesz);
+    if (allocate_runtime_tls_block(obj, &tls_map, &tls_map_len,
+                                   &tls_base) < 0) {
+        if (new_dtv)
+            munmap(new_dtv, dtv_bytes);
+        return -1;
     }
     dtv[obj->tls.modid] = tls_base;
+    if (new_dtv)
+        *(uintptr_t **)musl_thread_dtv_slot(tp) = new_dtv;
 
     if (g_debug) {
         ldr_msg("[loader] musl dlopen tls: ");
@@ -4432,6 +5091,8 @@ static int install_musl_dlopen_tls(struct loaded_obj *obj)
         ldr_dbg_hex(" mod=0x", obj->tls.modid);
         ldr_dbg_hex(" block=0x", tls_base);
     }
+    (void)tls_map;
+    (void)tls_map_len;
     return 0;
 }
 
@@ -4446,6 +5107,13 @@ static void *musl_lazy_install_tls(uintptr_t tp, unsigned long modid,
                                    unsigned long ti_offset)
 {
     struct loaded_obj *obj = NULL;
+    uintptr_t *new_dtv = NULL;
+    size_t new_dtv_bytes = 0;
+    void *tls_map = NULL;
+    size_t tls_map_len = 0;
+    uintptr_t tls_base;
+    void *address;
+
     for (int i = 0; i < g_nobj; i++) {
         if (g_all_objs[i].tls.modid == modid &&
             g_all_objs[i].tls.memsz != 0) {
@@ -4454,50 +5122,59 @@ static void *musl_lazy_install_tls(uintptr_t tp, unsigned long modid,
         }
     }
     if (!obj)
-        return (void *)(tp + ti_offset);
+        tls_runtime_fatal("unknown musl TLS module");
+    if (!runtime_tls_template_valid(obj) || modid > MAX_TOTAL_OBJS ||
+        (uint64_t)ti_offset > obj->tls.memsz)
+        tls_runtime_fatal("invalid musl TLS module or offset");
 
     uintptr_t *dtv = *(uintptr_t **)musl_thread_dtv_slot(tp);
     size_t cur_slots = dtv ? dtv[0] : 0;
+    if (cur_slots > MAX_TOTAL_OBJS)
+        tls_runtime_fatal("invalid musl DTV capacity");
     if (!dtv || cur_slots < modid) {
         size_t new_slots = modid;
-        size_t bytes = (new_slots + 1) * sizeof(uintptr_t);
-        bytes = ALIGN_UP(bytes, g_page_size);
-        uintptr_t *new_dtv = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
-                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        uint64_t words;
+        uint64_t bytes_u64;
+
+        if (!u64_add_checked(new_slots, 1, &words) ||
+            !u64_mul_checked(words, sizeof(uintptr_t), &words) ||
+            !u64_align_up_checked(words, g_page_size, &bytes_u64) ||
+            bytes_u64 == 0 || bytes_u64 > SIZE_MAX)
+            tls_runtime_fatal("musl DTV size overflow");
+        new_dtv_bytes = (size_t)bytes_u64;
+        new_dtv = mmap(NULL, new_dtv_bytes, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (new_dtv == MAP_FAILED)
-            return (void *)(tp + ti_offset);
-        memset(new_dtv, 0, bytes);
-        if (dtv && cur_slots > 0)
+            tls_runtime_fatal("cannot grow musl DTV");
+        if (dtv)
             memcpy(new_dtv, dtv, (cur_slots + 1) * sizeof(uintptr_t));
         new_dtv[0] = new_slots;
-        *(uintptr_t **)musl_thread_dtv_slot(tp) = new_dtv;
         dtv = new_dtv;
     }
 
     if (!dtv[modid]) {
-        size_t align = obj->tls.align ? (size_t)obj->tls.align
-                                       : sizeof(uintptr_t);
-        size_t map_len = ALIGN_UP(obj->tls.memsz + align, g_page_size);
-        void *map = mmap(NULL, map_len, PROT_READ | PROT_WRITE,
-                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (map == MAP_FAILED)
-            return (void *)(tp + ti_offset);
-        uintptr_t base = ALIGN_UP((uintptr_t)map, align);
-        memcpy((void *)base, (const void *)(obj->base + obj->tls.vaddr),
-               obj->tls.filesz);
-        if (obj->tls.memsz > obj->tls.filesz)
-            memset((void *)(base + obj->tls.filesz), 0,
-                   obj->tls.memsz - obj->tls.filesz);
-        dtv[modid] = base;
+        if (allocate_runtime_tls_block(obj, &tls_map, &tls_map_len,
+                                       &tls_base) < 0) {
+            if (new_dtv)
+                munmap(new_dtv, new_dtv_bytes);
+            tls_runtime_fatal("cannot allocate musl TLS block");
+        }
+        dtv[modid] = tls_base;
         if (g_debug) {
             ldr_msg("[tls] musl lazy install ");
             ldr_msg(obj->name ? obj->name : "?");
             ldr_dbg_hex(" mod=", modid);
-            ldr_dbg_hex(" blk=", base);
+            ldr_dbg_hex(" blk=", tls_base);
         }
     }
+    if (new_dtv)
+        *(uintptr_t **)musl_thread_dtv_slot(tp) = new_dtv;
 
-    return (void *)(dtv[modid] + ti_offset);
+    if (!runtime_tls_address(obj, dtv[modid], ti_offset, &address))
+        tls_runtime_fatal("musl TLS address overflow");
+    (void)tls_map;
+    (void)tls_map_len;
+    return address;
 }
 
 /* install_glibc_dlopen_tls — allocate a TLS block for a dlopen'd module
@@ -4506,77 +5183,177 @@ static void *musl_lazy_install_tls(uintptr_t tp, unsigned long modid,
  *   dtv[modid*2]   = pointer to TLS block
  *   dtv[modid*2+1] = to_free marker
  * Only called for glibc runtime; musl uses install_musl_dlopen_tls. */
-static int install_glibc_dlopen_tls(struct loaded_obj *obj)
+static int glibc_dtv_map_size(size_t capacity, size_t *map_size_out)
 {
-    if (g_is_musl_runtime || obj->tls.memsz == 0 || obj->tls.modid == 0)
+    uint64_t entries;
+    uint64_t words;
+    uint64_t bytes;
+
+    if (capacity > MAX_TOTAL_OBJS ||
+        !u64_add_checked(capacity, 1, &entries) ||
+        !u64_mul_checked(entries, 2, &words) ||
+        !u64_add_checked(words, 2, &words) ||
+        !u64_mul_checked(words, sizeof(uintptr_t), &bytes) ||
+        !u64_align_up_checked(bytes, g_page_size, &bytes) ||
+        bytes == 0 || bytes > SIZE_MAX)
         return 0;
+    *map_size_out = (size_t)bytes;
+    return 1;
+}
 
-    uintptr_t tp = arch_get_tp();
-    uintptr_t *dtv = *(uintptr_t **)(tp + TCB_OFF_DTV);
-
-    /* Compute required raw DTV capacity.  The raw array is:
-     *   raw_dtv[0]=generation, raw_dtv[1]=unused, raw_dtv[2..] = dtv[0..]
-     * dtv (stored in tcb) points to raw_dtv+2.
-     * Slot numbering: dtv[modid*2] = val, dtv[modid*2+1] = free_marker.
-     * We need (modid+1) dtv_t entries, each 2 words → (modid+1)*2 words. */
-    size_t need_words = (obj->tls.modid + 1) * 2;
+static int glibc_dtv_capacity(uintptr_t *dtv, size_t *capacity_out)
+{
+    size_t capacity;
 
     if (!dtv) {
-        /* No DTV at all yet — allocate fresh */
-        size_t raw_bytes = (need_words + 2) * sizeof(uintptr_t);
-        raw_bytes = ALIGN_UP(raw_bytes, g_page_size);
-        uintptr_t *raw = mmap(NULL, raw_bytes, PROT_READ | PROT_WRITE,
-                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (raw == MAP_FAILED) return -1;
-        raw[0] = 1;  /* generation */
-        raw[1] = 0;
-        dtv = raw + 2;
-        *(uintptr_t **)(tp + TCB_OFF_DTV) = dtv;
-    } else {
-        /* Check if current DTV is large enough.  The generation counter
-         * lives at dtv[-2] (raw_dtv[0]).  We scan existing slots to
-         * determine the old capacity. */
-        size_t old_cap = 0;
-        /* Walk backwards from dtv pointer: raw_dtv = dtv - 2 */
-        uintptr_t *raw_dtv = dtv - 2;
-        /* Estimate old capacity from the allocation: look for the largest
-         * populated modid.  Fall back to g_nobj as a safe upper bound. */
-        for (int i = 0; i < g_nobj; i++) {
-            if (g_all_objs[i].tls.memsz == 0) continue;
-            size_t s = (g_all_objs[i].tls.modid + 1) * 2;
-            if (s > old_cap) old_cap = s;
-        }
+        *capacity_out = 0;
+        return 1;
+    }
+    capacity = dtv[-2];
+    if (capacity > MAX_TOTAL_OBJS)
+        return 0;
+    *capacity_out = capacity;
+    return 1;
+}
 
-        if (need_words > old_cap) {
-            /* Grow: allocate new, copy old, install */
-            size_t raw_bytes = (need_words + 2) * sizeof(uintptr_t);
-            raw_bytes = ALIGN_UP(raw_bytes, g_page_size);
-            uintptr_t *new_raw = mmap(NULL, raw_bytes, PROT_READ | PROT_WRITE,
-                                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            if (new_raw == MAP_FAILED) return -1;
-            /* Copy old raw array: generation + unused + old_cap words */
-            memcpy(new_raw, raw_dtv, (old_cap + 2) * sizeof(uintptr_t));
-            dtv = new_raw + 2;
-            *(uintptr_t **)(tp + TCB_OFF_DTV) = dtv;
+static int glibc_static_tls_capacity(size_t *capacity_out)
+{
+    size_t capacity = 0;
+
+    for (int i = 0; i < g_nobj; i++) {
+        const struct loaded_obj *obj = &g_all_objs[i];
+
+        if (obj->tls.memsz == 0 || obj->tls.tpoff == 0)
+            continue;
+        if (!runtime_tls_template_valid(obj) || obj->tls.modid == 0 ||
+            obj->tls.modid > MAX_TOTAL_OBJS)
+            return 0;
+        if (obj->tls.modid > capacity)
+            capacity = obj->tls.modid;
+    }
+    *capacity_out = capacity;
+    return 1;
+}
+
+/* Reconstruct static slots from the thread pointer instead of reading them
+ * beyond an old DTV's advertised capacity.  Some supported pthread paths can
+ * hand us a conservative DTV header; that header remains the only safe bound
+ * for copying the old allocation. */
+static int glibc_seed_static_tls_slots(uintptr_t tp, uintptr_t *dtv,
+                                       size_t capacity)
+{
+    if (!tp || !dtv)
+        return 0;
+    for (int i = 0; i < g_nobj; i++) {
+        const struct loaded_obj *obj = &g_all_objs[i];
+        uint8_t *static_block;
+
+        if (obj->tls.memsz == 0 || obj->tls.tpoff == 0)
+            continue;
+        if (obj->tls.modid == 0 || obj->tls.modid > capacity ||
+            !static_tls_block_address(tp, obj, &static_block))
+            return 0;
+        dtv[obj->tls.modid * 2] = (uintptr_t)static_block;
+        dtv[obj->tls.modid * 2 + 1] = 0;
+    }
+    return 1;
+}
+
+static int glibc_tls_slot_allocated(uintptr_t value)
+{
+    /* glibc uses TLS_DTV_UNALLOCATED ((void *) -1l) as well as NULL for
+     * an empty dynamic slot, depending on which update/teardown path ran. */
+    return value != 0 && value != UINTPTR_MAX;
+}
+
+static int install_glibc_tls_for_thread(uintptr_t tp,
+                                        struct loaded_obj *obj)
+{
+    uintptr_t *old_dtv;
+    uintptr_t *dtv;
+    uintptr_t *new_raw = NULL;
+    size_t old_capacity = 0;
+    size_t static_capacity = 0;
+    size_t new_map_size = 0;
+    void *tls_map = NULL;
+    size_t tls_map_len = 0;
+    uintptr_t tls_base;
+
+    if (!tp || !runtime_tls_template_valid(obj) || obj->tls.modid == 0 ||
+        obj->tls.modid > MAX_TOTAL_OBJS)
+        return -1;
+
+    old_dtv = *(uintptr_t **)(tp + TCB_OFF_DTV);
+    if (!glibc_dtv_capacity(old_dtv, &old_capacity) ||
+        !glibc_static_tls_capacity(&static_capacity))
+        return -1;
+    if (old_dtv && old_capacity >= obj->tls.modid &&
+        glibc_tls_slot_allocated(old_dtv[obj->tls.modid * 2]))
+        return 0;
+
+    dtv = old_dtv;
+    if (!old_dtv || old_capacity < obj->tls.modid) {
+        size_t new_capacity = obj->tls.modid;
+
+        if (static_capacity > new_capacity)
+            new_capacity = static_capacity;
+
+        if (!glibc_dtv_map_size(new_capacity, &new_map_size))
+            return -1;
+        new_raw = mmap(NULL, new_map_size, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (new_raw == MAP_FAILED)
+            return -1;
+        dtv = new_raw + 2;
+        if (old_dtv) {
+            size_t old_map_size;
+            uint64_t old_words;
+            uint64_t old_bytes;
+
+            if (!glibc_dtv_map_size(old_capacity, &old_map_size) ||
+                !u64_add_checked(old_capacity, 1, &old_words) ||
+                !u64_mul_checked(old_words, 2, &old_words) ||
+                !u64_add_checked(old_words, 2, &old_words) ||
+                !u64_mul_checked(old_words, sizeof(uintptr_t), &old_bytes) ||
+                old_bytes > old_map_size) {
+                munmap(new_raw, new_map_size);
+                return -1;
+            }
+            memcpy(new_raw, old_dtv - 2, (size_t)old_bytes);
+        }
+        new_raw[0] = new_capacity;
+        new_raw[1] = 0;
+        dtv[0] = 1;
+        dtv[1] = 0;
+        if (!glibc_seed_static_tls_slots(tp, dtv, new_capacity)) {
+            munmap(new_raw, new_map_size);
+            return -1;
         }
     }
 
-    /* Allocate the TLS block for this module */
-    size_t align = obj->tls.align ? (size_t)obj->tls.align : sizeof(uintptr_t);
-    size_t map_len = ALIGN_UP(obj->tls.memsz + align, g_page_size);
-    void *map = mmap(NULL, map_len, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (map == MAP_FAILED) return -1;
+    if (obj->tls.tpoff != 0) {
+        uint8_t *static_block;
 
-    uintptr_t tls_base = ALIGN_UP((uintptr_t)map, align);
-    memcpy((void *)tls_base, (const void *)(obj->base + obj->tls.vaddr),
-           obj->tls.filesz);
-    if (obj->tls.memsz > obj->tls.filesz)
-        memset((void *)(tls_base + obj->tls.filesz), 0,
-               obj->tls.memsz - obj->tls.filesz);
+        if (!static_tls_block_address(tp, obj, &static_block)) {
+            if (new_raw)
+                munmap(new_raw, new_map_size);
+            return -1;
+        }
+        tls_base = (uintptr_t)static_block;
+    } else if (allocate_runtime_tls_block(obj, &tls_map, &tls_map_len,
+                                          &tls_base) < 0) {
+        if (new_raw)
+            munmap(new_raw, new_map_size);
+        return -1;
+    }
 
-    dtv[obj->tls.modid * 2]     = tls_base;
+    dtv[obj->tls.modid * 2] = tls_base;
+    /* The target libc treats a non-NULL to_free marker as malloc storage.
+     * Our block came from mmap, so publishing that mapping pointer here
+     * would make thread teardown read allocator metadata before the map. */
     dtv[obj->tls.modid * 2 + 1] = 0;
+    if (new_raw)
+        *(uintptr_t **)(tp + TCB_OFF_DTV) = dtv;
 
     if (g_debug) {
         ldr_msg("[loader] glibc dlopen tls: ");
@@ -4584,7 +5361,80 @@ static int install_glibc_dlopen_tls(struct loaded_obj *obj)
         ldr_dbg_hex(" mod=0x", obj->tls.modid);
         ldr_dbg_hex(" block=0x", tls_base);
     }
+    (void)tls_map_len;
     return 0;
+}
+
+static int install_glibc_dlopen_tls(struct loaded_obj *obj)
+{
+    if (g_is_musl_runtime || obj->tls.memsz == 0 || obj->tls.modid == 0)
+        return 0;
+
+    return install_glibc_tls_for_thread(arch_get_tp(), obj);
+}
+
+static void tls_runtime_fatal(const char *reason)
+{
+    ldr_msg("dlfreeze-loader: fatal TLS runtime failure: ");
+    ldr_msg(reason);
+    ldr_msg("\n");
+    _exit(127);
+}
+
+static int dl_transaction_tls_address(uintptr_t tp, unsigned long modid,
+                                      unsigned long ti_offset,
+                                      void **address_out);
+
+static void *runtime_tls_get_addr(uintptr_t tp, unsigned long modid,
+                                  unsigned long ti_offset)
+{
+    struct loaded_obj *obj = NULL;
+    void *address;
+    int transaction_result = dl_transaction_tls_address(
+        tp, modid, ti_offset, &address);
+
+    if (transaction_result > 0)
+        return address;
+    if (transaction_result < 0)
+        tls_runtime_fatal("cannot stage transaction TLS block");
+
+    for (int i = 0; i < g_nobj; i++) {
+        if (g_all_objs[i].tls.modid == modid &&
+            g_all_objs[i].tls.memsz != 0) {
+            obj = &g_all_objs[i];
+            break;
+        }
+    }
+    if (!obj || !runtime_tls_template_valid(obj) ||
+        (uint64_t)ti_offset > obj->tls.memsz)
+        tls_runtime_fatal("invalid TLS module or offset");
+
+    if (g_is_musl_runtime)
+        return musl_lazy_install_tls(tp, modid, ti_offset);
+
+    {
+        uintptr_t *dtv = *(uintptr_t **)(tp + TCB_OFF_DTV);
+        uintptr_t tls_block = 0;
+        size_t capacity = 0;
+
+        if (!glibc_dtv_capacity(dtv, &capacity))
+            tls_runtime_fatal("invalid glibc DTV capacity");
+        if (dtv && modid <= capacity)
+            tls_block = dtv[(size_t)modid * 2];
+        if (!glibc_tls_slot_allocated(tls_block)) {
+            if (install_glibc_tls_for_thread(tp, obj) < 0)
+                tls_runtime_fatal("cannot install glibc TLS block");
+            dtv = *(uintptr_t **)(tp + TCB_OFF_DTV);
+            if (!glibc_dtv_capacity(dtv, &capacity))
+                tls_runtime_fatal("invalid grown glibc DTV capacity");
+            if (dtv && modid <= capacity)
+                tls_block = dtv[(size_t)modid * 2];
+        }
+        if (!glibc_tls_slot_allocated(tls_block) ||
+            !runtime_tls_address(obj, tls_block, ti_offset, &address))
+            tls_runtime_fatal("missing glibc TLS DTV slot");
+    }
+    return address;
 }
 
 #if defined(__x86_64__)
@@ -4593,36 +5443,9 @@ static int64_t dlfreeze_x86_64_tlsdesc_resolve_c(void *arg_in)
 {
     struct x86_64_tlsdesc_arg *arg = (struct x86_64_tlsdesc_arg *)arg_in;
     uintptr_t tp = arch_get_tp();
-
-    if (g_is_musl_runtime) {
-        uintptr_t tls_addr = (uintptr_t)musl_lazy_install_tls(
-            tp, (unsigned long)arg->modid, (unsigned long)arg->offset);
-        return (int64_t)(tls_addr - tp);
-    }
-
-    uintptr_t *dtv = *(uintptr_t **)(tp + TCB_OFF_DTV);
-    uintptr_t tls_block = dtv ? dtv[arg->modid * 2] : 0;
-    if (!tls_block) {
-        for (int obj_index = 0; obj_index < g_nobj; obj_index++) {
-            if (g_all_objs[obj_index].tls.modid == arg->modid &&
-                g_all_objs[obj_index].tls.memsz != 0) {
-                install_glibc_dlopen_tls(&g_all_objs[obj_index]);
-                break;
-            }
-        }
-        dtv = *(uintptr_t **)(tp + TCB_OFF_DTV);
-        tls_block = dtv ? dtv[arg->modid * 2] : 0;
-    }
-
-    if (tls_block)
-        return (int64_t)((tls_block + arg->offset) - tp);
-
-    {
-        struct tls_index ti;
-        ti.ti_module = (unsigned long)arg->modid;
-        ti.ti_offset = (unsigned long)arg->offset;
-        return (int64_t)((uintptr_t)stub_tls_get_addr(&ti) - tp);
-    }
+    uintptr_t tls_addr = (uintptr_t)runtime_tls_get_addr(
+        tp, (unsigned long)arg->modid, (unsigned long)arg->offset);
+    return (int64_t)(tls_addr - tp);
 }
 #endif
 
@@ -4633,6 +5456,9 @@ static int g_tls_init_count;
 static void *stub_dl_allocate_tls_init(void *mem)
 {
     uintptr_t tp = (uintptr_t)mem;
+
+    if (!mem)
+        return NULL;
     g_tls_init_count++;
     ldr_dbg("[loader] _dl_allocate_tls_init #");
     ldr_dbg_hex("", (uint64_t)g_tls_init_count);
@@ -4645,42 +5471,65 @@ static void *stub_dl_allocate_tls_init(void *mem)
         ldr_dbg_hex("[loader]   tp+0x10 before=", *(uintptr_t *)(tp + 16));
     }
     for (int i = 0; i < g_nobj; i++) {
-        if (g_all_objs[i].tls.memsz == 0) continue;
+        struct loaded_obj *obj = &g_all_objs[i];
+        uint8_t *dst;
+        const uint8_t *src;
+
+        if (obj->tls.memsz == 0)
+            continue;
+        if (!runtime_tls_template_valid(obj))
+            return NULL;
+        src = obj->tls.filesz != 0
+            ? (const uint8_t *)(uintptr_t)(obj->base + obj->tls.vaddr)
+            : NULL;
         /* dlopen'd modules (tpoff==0) live in separate per-thread TLS
          * blocks pointed to by the DTV.  When glibc recycles a cached
          * stack, _dl_allocate_tls_init is called without _dl_allocate_tls,
          * so the existing DTV block is reused and must be reset back to
          * the module's .tdata/.tbss image.  Otherwise __thread variables
          * defined in dlopened libraries would leak across threads. */
-        if (g_all_objs[i].tls.tpoff == 0) {
+        if (obj->tls.tpoff == 0) {
             uintptr_t *dtv = *(uintptr_t **)(tp + TCB_OFF_DTV);
-            if (!dtv) continue;
-            uintptr_t blk = dtv[g_all_objs[i].tls.modid * 2];
-            if (!blk) continue;
-            uint8_t *dst = (uint8_t *)blk;
-            const uint8_t *src = (const uint8_t *)(
-                g_all_objs[i].base + g_all_objs[i].tls.vaddr);
-            memcpy(dst, src, g_all_objs[i].tls.filesz);
-            size_t bss = g_all_objs[i].tls.memsz - g_all_objs[i].tls.filesz;
+            size_t capacity = 0;
+            uintptr_t blk;
+
+            if (!glibc_dtv_capacity(dtv, &capacity))
+                return NULL;
+            if (!dtv || obj->tls.modid > capacity ||
+                !glibc_tls_slot_allocated(dtv[obj->tls.modid * 2])) {
+                if (install_glibc_tls_for_thread(tp, obj) < 0)
+                    return NULL;
+                dtv = *(uintptr_t **)(tp + TCB_OFF_DTV);
+                if (!glibc_dtv_capacity(dtv, &capacity) || !dtv ||
+                    obj->tls.modid > capacity)
+                    return NULL;
+            }
+            blk = dtv[obj->tls.modid * 2];
+            if (!glibc_tls_slot_allocated(blk))
+                return NULL;
+            dst = (uint8_t *)blk;
+            if (obj->tls.filesz != 0)
+                memcpy(dst, src, (size_t)obj->tls.filesz);
+            size_t bss = (size_t)(obj->tls.memsz - obj->tls.filesz);
             if (bss > 0)
-                memset(dst + g_all_objs[i].tls.filesz, 0, bss);
+                memset(dst + obj->tls.filesz, 0, bss);
             ldr_dbg("[loader] tls_init dlopen: ");
-            ldr_dbg(g_all_objs[i].name ? g_all_objs[i].name : "?");
-            ldr_dbg_hex(" mod=", g_all_objs[i].tls.modid);
+            ldr_dbg(obj->name ? obj->name : "?");
+            ldr_dbg_hex(" mod=", obj->tls.modid);
             ldr_dbg_hex(" blk=", blk);
             continue;
         }
-        uint8_t *dst = (uint8_t *)(tp + g_all_objs[i].tls.tpoff);
-        const uint8_t *src = (const uint8_t *)(
-            g_all_objs[i].base + g_all_objs[i].tls.vaddr);
+        if (!static_tls_block_address(tp, obj, &dst))
+            return NULL;
         ldr_dbg("[loader] tls_init: ");
-        ldr_dbg(g_all_objs[i].name ? g_all_objs[i].name : "?");
-        ldr_dbg_hex(" tpoff=", (uintptr_t)g_all_objs[i].tls.tpoff);
-        memcpy(dst, src, g_all_objs[i].tls.filesz);
+        ldr_dbg(obj->name ? obj->name : "?");
+        ldr_dbg_hex(" tpoff=", (uintptr_t)obj->tls.tpoff);
+        if (obj->tls.filesz != 0)
+            memcpy(dst, src, (size_t)obj->tls.filesz);
         /* Zero the .tbss portion */
-        size_t bss = g_all_objs[i].tls.memsz - g_all_objs[i].tls.filesz;
+        size_t bss = (size_t)(obj->tls.memsz - obj->tls.filesz);
         if (bss > 0)
-            memset(dst + g_all_objs[i].tls.filesz, 0, bss);
+            memset(dst + obj->tls.filesz, 0, bss);
     }
 
     /* Ensure TCB self-pointers survive the TLS re-init (cached stack
@@ -4700,58 +5549,74 @@ static void *stub_dl_allocate_tls_init(void *mem)
 static uintptr_t g_last_tls_tp;
 static void *stub_dl_allocate_tls(void *mem)
 {
+    uintptr_t *raw_dtv;
+    uintptr_t *dtv;
+    void *tls_maps[MAX_TOTAL_OBJS];
+    size_t tls_map_lengths[MAX_TOTAL_OBJS];
+    size_t tls_map_count = 0;
+    size_t capacity = 0;
+    size_t raw_dtv_map_size;
+
     g_tls_alloc_count++;
     ldr_dbg("[loader] _dl_allocate_tls #");
     ldr_dbg_hex("", (uint64_t)g_tls_alloc_count);
     ldr_dbg_hex("[loader]   tid=", (uint64_t)syscall(SYS_gettid));
-    if (!mem) return NULL;
+    if (!mem)
+        return NULL;
     uintptr_t tp = (uintptr_t)mem;
 
-    /* Set up a minimal DTV for the new thread so __tls_get_addr works.
-     * glibc convention: tcbhead.dtv = &raw_dtv[1] (in dtv_t units, each
-     * dtv_t is 2 * sizeof(uintptr_t) = 16 bytes on x86-64).
-     *   raw_dtv[0].counter = generation
-     *   raw_dtv[1]         = unused / nptl bookkeeping
-     *   raw_dtv[modid]     = {val, to_free} for TLS module modid (1-indexed)
-     * So tcbhead.dtv[-1].counter = generation, tcbhead.dtv[modid] = module.
-     */
-    size_t dtv_slots = 2 + (size_t)g_nobj;
-    size_t raw_dtv_bytes = (1 + dtv_slots) * 2 * sizeof(uintptr_t); /* +1 for dtv[-1] */
-    uintptr_t *raw_dtv = mmap(NULL, ALIGN_UP(raw_dtv_bytes, g_page_size),
-        PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (raw_dtv != MAP_FAILED) {
-        raw_dtv[0] = 1;  /* generation counter at raw_dtv[0] = tcb->dtv[-1] */
-        raw_dtv[1] = 0;
-        /* The pointer stored in tcb->dtv is offset by one dtv_t entry */
-        uintptr_t *dtv = raw_dtv + 2; /* skip dtv_t[0] = 2 uintptr_t's */
-        for (int i = 0; i < g_nobj; i++) {
-            if (g_all_objs[i].tls.memsz == 0) continue;
-            size_t slot = g_all_objs[i].tls.modid;
-            if (slot >= dtv_slots) continue;
-            if (g_all_objs[i].tls.tpoff != 0) {
-                /* Static TLS — block is in the pre-allocated area */
-                dtv[slot * 2]     = tp + (uintptr_t)g_all_objs[i].tls.tpoff;
-            } else {
-                /* dlopen'd module — allocate separate TLS block */
-                size_t al = g_all_objs[i].tls.align;
-                if (!al) al = sizeof(uintptr_t);
-                size_t ml = ALIGN_UP(g_all_objs[i].tls.memsz + al, g_page_size);
-                void *blk = mmap(NULL, ml, PROT_READ | PROT_WRITE,
-                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-                if (blk == MAP_FAILED) continue;
-                uintptr_t ba = ALIGN_UP((uintptr_t)blk, al);
-                memcpy((void *)ba,
-                       (const void *)(g_all_objs[i].base + g_all_objs[i].tls.vaddr),
-                       g_all_objs[i].tls.filesz);
-                if (g_all_objs[i].tls.memsz > g_all_objs[i].tls.filesz)
-                    memset((void *)(ba + g_all_objs[i].tls.filesz), 0,
-                           g_all_objs[i].tls.memsz - g_all_objs[i].tls.filesz);
-                dtv[slot * 2] = ba;
-            }
-            dtv[slot * 2 + 1] = 0;
-        }
-        *(uintptr_t *)(tp + TCB_OFF_DTV) = (uintptr_t)dtv;
+    for (int i = 0; i < g_nobj; i++) {
+        if (g_all_objs[i].tls.memsz == 0)
+            continue;
+        if (!runtime_tls_template_valid(&g_all_objs[i]) ||
+            g_all_objs[i].tls.modid == 0 ||
+            g_all_objs[i].tls.modid > MAX_TOTAL_OBJS)
+            return NULL;
+        if (g_all_objs[i].tls.modid > capacity)
+            capacity = g_all_objs[i].tls.modid;
     }
+    if (!glibc_dtv_map_size(capacity, &raw_dtv_map_size))
+        return NULL;
+    raw_dtv = mmap(NULL, raw_dtv_map_size, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (raw_dtv == MAP_FAILED)
+        return NULL;
+
+    raw_dtv[0] = capacity;
+    raw_dtv[1] = 0;
+    dtv = raw_dtv + 2;
+    dtv[0] = 1;
+    dtv[1] = 0;
+    for (int i = 0; i < g_nobj; i++) {
+        struct loaded_obj *obj = &g_all_objs[i];
+        size_t slot;
+
+        if (obj->tls.memsz == 0)
+            continue;
+        slot = obj->tls.modid;
+        if (obj->tls.tpoff != 0) {
+            uint8_t *static_block;
+
+            if (!static_tls_block_address(tp, obj, &static_block))
+                goto fail_dtv;
+            dtv[slot * 2] = (uintptr_t)static_block;
+            dtv[slot * 2 + 1] = 0;
+        } else {
+            void *tls_map;
+            size_t tls_map_len;
+            uintptr_t tls_base;
+
+            if (allocate_runtime_tls_block(obj, &tls_map, &tls_map_len,
+                                           &tls_base) < 0)
+                goto fail_dtv;
+            dtv[slot * 2] = tls_base;
+            dtv[slot * 2 + 1] = 0;
+            tls_maps[tls_map_count] = tls_map;
+            tls_map_lengths[tls_map_count] = tls_map_len;
+            tls_map_count++;
+        }
+    }
+    *(uintptr_t *)(tp + TCB_OFF_DTV) = (uintptr_t)dtv;
 
     /* Initialize TCB self-pointers so that %fs:0 and %fs:0x10 are valid
      * as soon as the new thread starts.  glibc's allocate_stack is
@@ -4773,6 +5638,11 @@ static void *stub_dl_allocate_tls(void *mem)
     /* Copy .tdata for all TLS modules */
     void *ret = stub_dl_allocate_tls_init(mem);
 
+    if (!ret) {
+        *(uintptr_t *)(tp + TCB_OFF_DTV) = 0;
+        goto fail_dtv;
+    }
+
     restore_ptr_guard();
 
     /* Verify our writes survived — debug diagnostics */
@@ -4784,6 +5654,12 @@ static void *stub_dl_allocate_tls(void *mem)
         ldr_dbg_hex("[loader] alloc_tls done tp+0x18=", *(uintptr_t *)(tp + 24));
     }
     return ret;
+
+fail_dtv:
+    for (size_t i = 0; i < tls_map_count; i++)
+        munmap(tls_maps[i], tls_map_lengths[i]);
+    munmap(raw_dtv, raw_dtv_map_size);
+    return NULL;
 }
 
 /* ---- _dl_find_object implementation ---------------------------------- */
@@ -4795,7 +5671,7 @@ static int glro_dl_find_object(void *pc, void *result)
 {
     uintptr_t addr = (uintptr_t)pc;
     for (int i = 0; i < g_nobj; i++) {
-        if (addr >= g_all_objs[i].map_start && addr < g_all_objs[i].map_end) {
+        if (loaded_obj_contains(&g_all_objs[i], addr, 1)) {
             /* struct dl_find_object layout on x86-64 (glibc 2.35+):
              *   0: dlfo_flags           (unsigned long long)
              *   8: dlfo_map_start       (void *)
@@ -4839,6 +5715,36 @@ static int g_dlerror_valid;
 /* String pool for dlopen'd object names */
 static char g_dl_strbuf[8192];
 static size_t g_dl_strbuf_used;
+
+/* A recursive dlopen is one transaction.  Constructors and dynamic TLS
+ * publication are deferred until every DT_NEEDED edge and relocation has
+ * succeeded, so a late missing dependency cannot run an earlier object's
+ * constructor. */
+struct dl_load_transaction {
+    int active;
+    int start_nobj;
+    int high_water;
+    int scope_root;
+    int scope_root_valid;
+    size_t start_strbuf_used;
+    size_t start_init_order_count;
+    uint16_t start_global_scope_count;
+    struct loaded_obj *pending_init[MAX_TOTAL_OBJS];
+    size_t pending_init_count;
+    uintptr_t tls_bases[MAX_TOTAL_OBJS + 1];
+    void *tls_maps[MAX_TOTAL_OBJS];
+    size_t tls_map_lengths[MAX_TOTAL_OBJS];
+    size_t tls_map_count;
+#if defined(__aarch64__)
+    struct aarch64_tlsdesc_page *start_tlsdesc_page;
+    size_t start_tlsdesc_used;
+#elif defined(__x86_64__)
+    struct x86_64_tlsdesc_page *start_tlsdesc_page;
+    size_t start_tlsdesc_used;
+#endif
+};
+
+static struct dl_load_transaction g_dl_transaction;
 
 /* ==== Embedded data-file VFS ========================================== */
 /*
@@ -6686,8 +7592,11 @@ static int sym_cache_lookup(const char *name, uint32_t gh, uint64_t *out)
     return 0;
 }
 
-static void sym_cache_store(const char *name, uint32_t gh,
-                            uint8_t state, uint64_t value)
+/* Cache keys must outlive every API call that can query this table.  In
+ * practice callers pass a name from a loaded object's bounded DT_STRTAB;
+ * never retain a dlsym caller's stack/heap buffer here. */
+static void sym_cache_store_canonical(const char *name, uint32_t gh,
+                                      uint8_t state, uint64_t value)
 {
     uint32_t idx = gh & (RESOLVE_CACHE_SIZE - 1);
     for (uint32_t n = 0; n < RESOLVE_CACHE_SIZE; n++) {
@@ -6969,6 +7878,28 @@ static int loaded_symbol_name_eq(const struct loaded_obj *obj,
     return value && strcmp(value, name) == 0;
 }
 
+static int symbol_visible_outside_object(const Elf64_Sym *sym)
+{
+    unsigned int visibility;
+
+    if (!sym)
+        return 0;
+    visibility = ELF64_ST_VISIBILITY(sym->st_other);
+    return visibility != STV_HIDDEN && visibility != STV_INTERNAL;
+}
+
+static int symbol_must_bind_locally(const Elf64_Sym *sym)
+{
+    unsigned int visibility;
+
+    if (!sym || sym->st_shndx == SHN_UNDEF)
+        return 0;
+    visibility = ELF64_ST_VISIBILITY(sym->st_other);
+    return ELF64_ST_BIND(sym->st_info) == STB_LOCAL ||
+           visibility == STV_HIDDEN || visibility == STV_INTERNAL ||
+           visibility == STV_PROTECTED;
+}
+
 static const Elf64_Sym *lookup_gnu_hash(const struct loaded_obj *obj,
                                          const char *name, uint32_t gh)
 {
@@ -7003,6 +7934,7 @@ static const Elf64_Sym *lookup_gnu_hash(const struct loaded_obj *obj,
 
             if (sym && sym->st_shndx != SHN_UNDEF &&
                 ELF64_ST_BIND(sym->st_info) != STB_LOCAL &&
+                symbol_visible_outside_object(sym) &&
                 loaded_symbol_name_eq(obj, sym, name) &&
                 symbol_hidden(obj, idx, &hidden)) {
                 /* Prefer default version (versym without HIDDEN bit) */
@@ -7043,6 +7975,7 @@ static const Elf64_Sym *lookup_sysv_hash(const struct loaded_obj *obj,
             return NULL;
         if (sym->st_shndx != SHN_UNDEF &&
             ELF64_ST_BIND(sym->st_info) != STB_LOCAL &&
+            symbol_visible_outside_object(sym) &&
             loaded_symbol_name_eq(obj, sym, name) &&
             symbol_hidden(obj, idx, &hidden)) {
             if (!hidden)
@@ -7073,6 +8006,25 @@ static const Elf64_Sym *lookup_linear(const struct loaded_obj *obj,
     return NULL;
 }
 
+static const Elf64_Sym *lookup_linear_external(const struct loaded_obj *obj,
+                                                const char *name)
+{
+    if (!obj->dynsym || !obj->dynstr)
+        return NULL;
+    for (uint32_t i = 1; i < obj->dynsym_count; i++) {
+        const Elf64_Sym *sym = loaded_dynsym(obj, i);
+
+        if (!sym)
+            return NULL;
+        if (sym->st_shndx != SHN_UNDEF &&
+            ELF64_ST_BIND(sym->st_info) != STB_LOCAL &&
+            symbol_visible_outside_object(sym) &&
+            loaded_symbol_name_eq(obj, sym, name))
+            return sym;
+    }
+    return NULL;
+}
+
 static const Elf64_Sym *lookup_object_symbol(const struct loaded_obj *obj,
                                               const char *name,
                                               uint32_t gnu_hash)
@@ -7081,7 +8033,68 @@ static const Elf64_Sym *lookup_object_symbol(const struct loaded_obj *obj,
         return lookup_gnu_hash(obj, name, gnu_hash);
     if (obj->sysv_hash)
         return lookup_sysv_hash(obj, name, sysv_hash_calc(name));
-    return lookup_linear(obj, name);
+    return lookup_linear_external(obj, name);
+}
+
+/* Convert a definition to its runtime address without trusting st_value.
+ * TLS definitions are offsets in their module, SHN_ABS values are already
+ * absolute, and every other definition must remain inside one PT_LOAD.
+ * IFUNC resolvers additionally have to reside in executable memory. */
+static int resolve_defined_symbol_address(struct loaded_obj *obj,
+                                          const Elf64_Sym *sym,
+                                          uint64_t *address_out,
+                                          int *cacheable_out)
+{
+    unsigned int type;
+    void *pointer;
+    size_t size;
+
+    if (!obj || !sym || !address_out || sym->st_shndx == SHN_UNDEF)
+        return 0;
+    if (cacheable_out)
+        *cacheable_out = 1;
+    type = ELF64_ST_TYPE(sym->st_info);
+
+    if (type == STT_TLS) {
+        if (sym->st_shndx >= SHN_LORESERVE ||
+            !runtime_tls_template_valid(obj) || obj->tls.modid == 0 ||
+            sym->st_value > obj->tls.memsz ||
+            sym->st_size > obj->tls.memsz - sym->st_value)
+            return 0;
+        pointer = runtime_tls_get_addr(arch_get_tp(), obj->tls.modid,
+                                       (unsigned long)sym->st_value);
+        if (!pointer)
+            return 0;
+        *address_out = (uint64_t)(uintptr_t)pointer;
+        if (cacheable_out)
+            *cacheable_out = 0;
+        return 1;
+    }
+
+    if (sym->st_shndx == SHN_ABS) {
+        /* An absolute IFUNC would escape the owning object's executable
+         * mappings, so it cannot be validated safely. */
+        if (type == STT_GNU_IFUNC)
+            return 0;
+        *address_out = sym->st_value;
+        return 1;
+    }
+    if (sym->st_shndx >= SHN_LORESERVE || sym->st_size > SIZE_MAX)
+        return 0;
+
+    size = type == STT_GNU_IFUNC ? 1 : (size_t)sym->st_size;
+    if (!loaded_obj_vaddr_pointer(obj, sym->st_value, size,
+                                  type == STT_GNU_IFUNC ? PF_X : 0,
+                                  &pointer))
+        return 0;
+    if (type == STT_GNU_IFUNC) {
+        typedef uint64_t (*ifunc_t)(void);
+
+        *address_out = ((ifunc_t)pointer)();
+    } else {
+        *address_out = (uint64_t)(uintptr_t)pointer;
+    }
+    return 1;
 }
 
 static int elf_strtab_name_eq(const char *strtab, size_t strtab_size,
@@ -7145,39 +8158,20 @@ static const char *defined_symbol_version(const struct loaded_obj *obj,
     return NULL;
 }
 
-/* Return 1 and the requested/defined version name for a versioned
- * relocation, 0 for an unversioned symbol, or -1 for malformed metadata. */
-static int relocation_symbol_version(const struct loaded_obj *obj,
-                                     uint32_t sym_index,
-                                     const char **version_out)
+/* Resolve a version index through VERNEED.  A COPY-relocated import is
+ * defined in the executable's dynsym, but its version still belongs to
+ * VERNEED, so st_shndx cannot be used to choose between VERNEED and VERDEF.
+ * Return 1 when found, 0 when this table does not own the index, and -1 for
+ * malformed metadata. */
+static int needed_symbol_version(const struct loaded_obj *obj,
+                                 uint16_t version_index,
+                                 const char **version_out)
 {
-    const Elf64_Sym *reference;
-    uint16_t raw_version;
-    uint16_t version_index;
     uintptr_t cursor;
 
     *version_out = NULL;
-    if (!obj->versym)
-        return 0;
-    if (sym_index >= obj->dynsym_count)
-        return -1;
-
-    if (!loaded_versym_value(obj, sym_index, &raw_version))
-        return -1;
-    version_index = raw_version & 0x7fff;
-    if (version_index <= 1)
-        return 0;
-
-    reference = loaded_dynsym(obj, sym_index);
-    if (!reference)
-        return -1;
-    if (reference->st_shndx != SHN_UNDEF) {
-        *version_out = defined_symbol_version(obj, sym_index);
-        return *version_out ? 1 : -1;
-    }
-
     if (!obj->verneed || obj->verneed_count == 0)
-        return -1;
+        return 0;
 
     cursor = (uintptr_t)obj->verneed;
     for (uint32_t i = 0; i < obj->verneed_count; i++) {
@@ -7198,9 +8192,7 @@ static int relocation_symbol_version(const struct loaded_obj *obj,
                 return -1;
             if ((aux->vna_other & 0x7fff) == version_index) {
                 *version_out = loaded_dynstr_value(obj, aux->vna_name);
-                if (!*version_out)
-                    return -1;
-                return 1;
+                return *version_out ? 1 : -1;
             }
             if (aux->vna_next == 0)
                 break;
@@ -7214,7 +8206,49 @@ static int relocation_symbol_version(const struct loaded_obj *obj,
                                 sizeof(Elf64_Verneed), &cursor))
             return -1;
     }
-    return -1;
+    return 0;
+}
+
+/* Resolve the version attached to any dynsym entry by version-index table
+ * membership.  VERNEED is intentionally checked first for executable COPY
+ * symbols; normal definitions then fall through to VERDEF. */
+static int symbol_version_name(const struct loaded_obj *obj,
+                               uint32_t sym_index,
+                               const char **version_out)
+{
+    uint16_t raw_version;
+    uint16_t version_index;
+    const char *defined_version;
+    int needed;
+
+    *version_out = NULL;
+    if (!obj->versym)
+        return 0;
+    if (sym_index >= obj->dynsym_count ||
+        !loaded_versym_value(obj, sym_index, &raw_version))
+        return -1;
+    version_index = raw_version & 0x7fff;
+    if (version_index <= 1)
+        return 0;
+
+    needed = needed_symbol_version(obj, version_index, version_out);
+    if (needed != 0)
+        return needed;
+
+    defined_version = defined_symbol_version(obj, sym_index);
+    if (!defined_version)
+        return -1;
+    *version_out = defined_version;
+    return 1;
+}
+
+/* Return 1 and the requested/defined version name for a versioned
+ * relocation, 0 for an unversioned symbol, or -1 for malformed metadata. */
+static int relocation_symbol_version(const struct loaded_obj *obj,
+                                     uint32_t sym_index,
+                                     const char **version_out)
+{
+    return symbol_version_name(obj, sym_index, version_out);
 }
 
 static const Elf64_Sym *lookup_versioned_symbol(const struct loaded_obj *obj,
@@ -7258,12 +8292,13 @@ static const Elf64_Sym *lookup_versioned_symbol(const struct loaded_obj *obj,
 
                 if (sym && sym->st_shndx != SHN_UNDEF &&
                     ELF64_ST_BIND(sym->st_info) != STB_LOCAL &&
+                    symbol_visible_outside_object(sym) &&
                     loaded_symbol_name_eq(obj, sym, name)) {
-                    const char *defined_version =
-                        defined_symbol_version(obj, idx);
+                    const char *candidate_version = NULL;
 
-                    if (defined_version &&
-                        strcmp(defined_version, version) == 0)
+                    if (symbol_version_name(obj, idx,
+                                            &candidate_version) == 1 &&
+                        strcmp(candidate_version, version) == 0)
                         return sym;
                 }
             }
@@ -7293,12 +8328,13 @@ static const Elf64_Sym *lookup_versioned_symbol(const struct loaded_obj *obj,
                 return NULL;
             if (sym->st_shndx != SHN_UNDEF &&
                 ELF64_ST_BIND(sym->st_info) != STB_LOCAL &&
+                symbol_visible_outside_object(sym) &&
                 loaded_symbol_name_eq(obj, sym, name)) {
-                const char *defined_version =
-                    defined_symbol_version(obj, idx);
+                const char *candidate_version = NULL;
 
-                if (defined_version &&
-                    strcmp(defined_version, version) == 0)
+                if (symbol_version_name(obj, idx,
+                                        &candidate_version) == 1 &&
+                    strcmp(candidate_version, version) == 0)
                     return sym;
             }
             idx = view.chains[idx];
@@ -7308,16 +8344,17 @@ static const Elf64_Sym *lookup_versioned_symbol(const struct loaded_obj *obj,
 
     for (uint32_t i = 1; i < obj->dynsym_count; i++) {
         const Elf64_Sym *sym = loaded_dynsym(obj, i);
-        const char *defined_version;
+        const char *candidate_version = NULL;
 
         if (!sym)
             return NULL;
         if (sym->st_shndx == SHN_UNDEF ||
             ELF64_ST_BIND(sym->st_info) == STB_LOCAL ||
+            !symbol_visible_outside_object(sym) ||
             !loaded_symbol_name_eq(obj, sym, name))
             continue;
-        defined_version = defined_symbol_version(obj, i);
-        if (defined_version && strcmp(defined_version, version) == 0)
+        if (symbol_version_name(obj, i, &candidate_version) == 1 &&
+            strcmp(candidate_version, version) == 0)
             return sym;
     }
     return NULL;
@@ -7349,6 +8386,78 @@ static const Elf64_Sym *lookup_relocation_definition(
     if (versioned < 0)
         return NULL;
 
+    /* Hidden/internal definitions never leave their object, and protected
+     * definitions are visible to others but cannot be preempted inside the
+     * defining object.  COPY relocations deliberately skip requester
+     * storage and must still locate the source definition. */
+    if (!skip_requester && symbol_must_bind_locally(reference)) {
+        if (owner_out)
+            *owner_out = requester;
+        return reference;
+    }
+
+    if (objs == g_all_objs && g_global_scope_count != 0) {
+        uint8_t searched[MAX_TOTAL_OBJS];
+        int requester_index;
+        struct loaded_obj *root;
+
+        if (!dl_object_table_index(requester, nobj, &requester_index) ||
+            !requester->relocation_scope_root_valid ||
+            requester->relocation_scope_root >= nobj)
+            return NULL;
+        (void)requester_index;
+        memset(searched, 0, sizeof(searched));
+
+        /* Preserve the loader's historical flattened global visibility:
+         * startup objects and previously committed dlopen groups precede
+         * the current transaction's breadth-first dependency scope. */
+        for (uint16_t s = 0; s < g_global_scope_count; s++) {
+            uint16_t index = g_global_scope_indices[s];
+            const Elf64_Sym *candidate;
+
+            if (index >= nobj)
+                return NULL;
+            searched[index] = 1;
+            if (skip_requester && &objs[index] == requester)
+                continue;
+            candidate = versioned
+                ? lookup_versioned_symbol(&objs[index], name, version)
+                : lookup_object_symbol(&objs[index], name, gh);
+            if (candidate) {
+                if (owner_out)
+                    *owner_out = &objs[index];
+                return candidate;
+            }
+        }
+
+        root = &g_all_objs[requester->relocation_scope_root];
+        if (!root->lookup_scope_valid &&
+            dl_build_lookup_scope(root, nobj) < 0)
+            return NULL;
+        for (uint16_t s = 0; s < root->lookup_scope_count; s++) {
+            uint16_t index = root->lookup_scope_indices[s];
+            const Elf64_Sym *candidate;
+
+            if (index >= nobj)
+                return NULL;
+            if (searched[index])
+                continue;
+            searched[index] = 1;
+            if (skip_requester && &objs[index] == requester)
+                continue;
+            candidate = versioned
+                ? lookup_versioned_symbol(&objs[index], name, version)
+                : lookup_object_symbol(&objs[index], name, gh);
+            if (candidate) {
+                if (owner_out)
+                    *owner_out = &objs[index];
+                return candidate;
+            }
+        }
+        return NULL;
+    }
+
+    /* Bootstrap/unit-test fallback before the global graph is initialized. */
     for (int i = 0; i < nobj; i++) {
         const Elf64_Sym *candidate;
 
@@ -7435,6 +8544,7 @@ static void *my_dlsym(void *handle, const char *symbol);
 static void *my_dlvsym(void *handle, const char *symbol, const char *version);
 static int   my_dlclose(void *handle);
 static char *my_dlerror(void);
+static int   my_dladdr(const void *address, Dl_info *info);
 static int   my_dl_iterate_phdr(
                  int (*callback)(struct dl_phdr_info *, size_t, void *),
                  void *data);
@@ -7474,6 +8584,7 @@ static const struct stub_sym g_overrides[] = {
     { "dlvsym",          (void *)my_dlvsym          },
     { "dlclose",         (void *)my_dlclose         },
     { "dlerror",         (void *)my_dlerror         },
+    { "dladdr",          (void *)my_dladdr          },
     { "dl_iterate_phdr", (void *)my_dl_iterate_phdr },
     { "__tls_get_addr",  (void *)stub_tls_get_addr  },
     { "memcpy",          (void *)bootstrap_memcpy   },
@@ -7567,6 +8678,10 @@ static void build_special_table(void)
     if (g_fake_rtld_global_ro)
         SPEC_INSERT("_rtld_global_ro", g_fake_rtld_global_ro);
     SPEC_INSERT("__libc_stack_end", &g_fake_libc_stack_end);
+    SPEC_INSERT("__libc_enable_secure", &g_fake_libc_enable_secure);
+    SPEC_INSERT("_dl_argv", &g_fake_dl_argv);
+    SPEC_INSERT("__stack_chk_guard", &g_fake_stack_chk_guard);
+    SPEC_INSERT("__pointer_chk_guard", &g_fake_pointer_chk_guard);
     SPEC_INSERT("__rseq_offset", &g_rseq_offset);
     SPEC_INSERT("__rseq_size",   &g_rseq_size);
     SPEC_INSERT("__rseq_flags",  &g_rseq_flags);
@@ -7591,100 +8706,456 @@ static uint64_t lookup_special(const char *name, uint32_t gh)
     return 0;
 }
 
-static int maybe_runtime_override_name(const char *name)
+enum relocation_special_provider {
+    SPECIAL_PROVIDER_SCOPE,
+    SPECIAL_PROVIDER_INTERP,
+    SPECIAL_PROVIDER_GLIBC_PRIVATE
+};
+
+/* Loader-owned implementations must not turn a forged symbol version into a
+ * successful binding.  Keep the provider-less interpreter ABI explicit;
+ * every other public shim has to be backed by a real object in the normal
+ * relocation scope. */
+static enum relocation_special_provider
+relocation_special_provider(const char *name)
 {
-    for (const struct stub_sym *o = g_overrides; o->name; o++)
-        if (strcmp(name, o->name) == 0)
-            return 1;
+    if (strcmp(name, "__tls_get_addr") == 0 ||
+        strcmp(name, "__libc_stack_end") == 0 ||
+        strcmp(name, "__stack_chk_guard") == 0 ||
+        strcmp(name, "__pointer_chk_guard") == 0 ||
+        strcmp(name, "__rseq_offset") == 0 ||
+        strcmp(name, "__rseq_size") == 0 ||
+        strcmp(name, "__rseq_flags") == 0)
+        return SPECIAL_PROVIDER_INTERP;
 
-    if (g_vfs_count > 0) {
-        for (const struct stub_sym *o = g_vfs_overrides; o->name; o++)
-            if (strcmp(name, o->name) == 0)
-                return 1;
+    if (strcmp(name, "__tunable_get_val") == 0 ||
+        strcmp(name, "__tunable_is_initialized") == 0 ||
+        strcmp(name, "_dl_find_dso_for_object") == 0 ||
+        strcmp(name, "_dl_exception_create") == 0 ||
+        strcmp(name, "_dl_exception_create_format") == 0 ||
+        strcmp(name, "_dl_exception_free") == 0 ||
+        strcmp(name, "_dl_fatal_printf") == 0 ||
+        strcmp(name, "_dl_signal_error") == 0 ||
+        strcmp(name, "_dl_signal_exception") == 0 ||
+        strcmp(name, "_dl_catch_exception") == 0 ||
+        strcmp(name, "_dl_audit_symbind_alt") == 0 ||
+        strcmp(name, "_dl_audit_preinit") == 0 ||
+        strcmp(name, "_dl_get_tls_static_info") == 0 ||
+        strcmp(name, "_dl_allocate_tls") == 0 ||
+        strcmp(name, "_dl_allocate_tls_init") == 0 ||
+        strcmp(name, "_dl_deallocate_tls") == 0 ||
+        strcmp(name, "_dl_rtld_di_serinfo") == 0 ||
+        strcmp(name, "__nptl_change_stack_perm") == 0 ||
+        strcmp(name, "_rtld_global") == 0 ||
+        strcmp(name, "_rtld_global_ro") == 0 ||
+        strcmp(name, "__libc_enable_secure") == 0 ||
+        strcmp(name, "_dl_argv") == 0)
+        return SPECIAL_PROVIDER_GLIBC_PRIVATE;
+
+    return SPECIAL_PROVIDER_SCOPE;
+}
+
+static int frozen_dynstr_equal(const char *dynstr, size_t dynstr_size,
+                               uint32_t offset, const char *expected)
+{
+    size_t length;
+
+    if (!expected || (size_t)offset >= dynstr_size)
+        return 0;
+    length = strlen(expected);
+    return length < dynstr_size - (size_t)offset &&
+           memcmp(dynstr + offset, expected, length) == 0 &&
+           dynstr[offset + length] == '\0';
+}
+
+/* Prove an interpreter-owned version against the actual frozen interpreter.
+ * The interpreter is intentionally not mapped into the normal lookup scope,
+ * so its bounded on-disk dynamic metadata is the provider catalog. */
+static int frozen_interp_exports_version(const char *name,
+                                         const char *version)
+{
+    const uint8_t *elf;
+    const Elf64_Ehdr *ehdr;
+    const Elf64_Phdr *phdrs;
+    const Elf64_Dyn *dynamic = NULL;
+    size_t elf_size;
+    size_t dynamic_count = 0;
+    uint64_t symtab_vaddr = 0, strtab_vaddr = 0, versym_vaddr = 0;
+    uint64_t verdef_vaddr = 0, hash_vaddr = 0, gnu_hash_vaddr = 0;
+    uint64_t symtab_foff, strtab_foff, versym_foff, verdef_foff;
+    size_t strtab_size = 0;
+    uint32_t verdef_count = 0, symbol_count = 0;
+    const Elf64_Sym *symbols;
+    const uint16_t *versym;
+    const char *dynstr;
+    int interp_index = -1;
+
+    if (!name || !version || !g_frozen_mem || !g_frozen_entries ||
+        !g_frozen_metas)
+        return 0;
+    for (uint32_t i = 0; i < g_frozen_num_entries; i++) {
+        if (g_frozen_metas[i].flags & LDR_FLAG_INTERP) {
+            interp_index = (int)i;
+            break;
+        }
     }
+    if (interp_index < 0 ||
+        g_frozen_entries[interp_index].data_offset < g_frozen_mem_foff ||
+        g_frozen_entries[interp_index].data_size > SIZE_MAX)
+        return 0;
+    elf = g_frozen_mem +
+        (g_frozen_entries[interp_index].data_offset - g_frozen_mem_foff);
+    elf_size = (size_t)g_frozen_entries[interp_index].data_size;
+    if (elf_size < sizeof(Elf64_Ehdr))
+        return 0;
+    ehdr = (const Elf64_Ehdr *)elf;
+    if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0 ||
+        ehdr->e_ident[EI_CLASS] != ELFCLASS64 ||
+        ehdr->e_ident[EI_DATA] != ELFDATA2LSB ||
+        ehdr->e_ident[EI_VERSION] != EV_CURRENT ||
+        ehdr->e_version != EV_CURRENT ||
+        ehdr->e_phentsize != sizeof(Elf64_Phdr) ||
+        ehdr->e_phoff > elf_size ||
+        ehdr->e_phnum > (elf_size - (size_t)ehdr->e_phoff) /
+                         sizeof(Elf64_Phdr))
+        return 0;
+    phdrs = (const Elf64_Phdr *)(elf + ehdr->e_phoff);
+    for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+        if (phdrs[i].p_type != PT_DYNAMIC)
+            continue;
+        if (phdrs[i].p_offset > elf_size ||
+            phdrs[i].p_filesz > elf_size - (size_t)phdrs[i].p_offset)
+            return 0;
+        dynamic = (const Elf64_Dyn *)(elf + phdrs[i].p_offset);
+        dynamic_count = (size_t)phdrs[i].p_filesz / sizeof(Elf64_Dyn);
+        break;
+    }
+    if (!dynamic)
+        return 0;
+    for (size_t i = 0; i < dynamic_count; i++) {
+        if (dynamic[i].d_tag == DT_NULL)
+            break;
+        switch (dynamic[i].d_tag) {
+        case DT_SYMTAB: symtab_vaddr = dynamic[i].d_un.d_ptr; break;
+        case DT_SYMENT:
+            if (dynamic[i].d_un.d_val != sizeof(Elf64_Sym)) return 0;
+            break;
+        case DT_STRTAB: strtab_vaddr = dynamic[i].d_un.d_ptr; break;
+        case DT_STRSZ:
+            if (dynamic[i].d_un.d_val > SIZE_MAX) return 0;
+            strtab_size = (size_t)dynamic[i].d_un.d_val;
+            break;
+        case DT_VERSYM: versym_vaddr = dynamic[i].d_un.d_ptr; break;
+        case DT_VERDEF: verdef_vaddr = dynamic[i].d_un.d_ptr; break;
+        case DT_VERDEFNUM:
+            if (dynamic[i].d_un.d_val > UINT32_MAX) return 0;
+            verdef_count = (uint32_t)dynamic[i].d_un.d_val;
+            break;
+        case DT_HASH: hash_vaddr = dynamic[i].d_un.d_ptr; break;
+        case DT_GNU_HASH: gnu_hash_vaddr = dynamic[i].d_un.d_ptr; break;
+        }
+    }
+    if (!symtab_vaddr || !strtab_vaddr || !strtab_size || !versym_vaddr ||
+        !verdef_vaddr || !verdef_count)
+        return 0;
+    symtab_foff = elf_vaddr_to_foff(elf, ehdr, symtab_vaddr);
+    strtab_foff = elf_vaddr_to_foff(elf, ehdr, strtab_vaddr);
+    versym_foff = elf_vaddr_to_foff(elf, ehdr, versym_vaddr);
+    verdef_foff = elf_vaddr_to_foff(elf, ehdr, verdef_vaddr);
+    if (symtab_foff == (uint64_t)-1 || strtab_foff == (uint64_t)-1 ||
+        versym_foff == (uint64_t)-1 || verdef_foff == (uint64_t)-1 ||
+        strtab_foff > elf_size || strtab_size > elf_size - strtab_foff ||
+        symtab_foff > elf_size || versym_foff > elf_size ||
+        verdef_foff > elf_size)
+        return 0;
+    if (hash_vaddr) {
+        uint64_t hash_foff = elf_vaddr_to_foff(elf, ehdr, hash_vaddr);
+        if (hash_foff == (uint64_t)-1 || hash_foff > elf_size ||
+            elf_size - hash_foff < 2 * sizeof(uint32_t))
+            return 0;
+        symbol_count = ((const uint32_t *)(elf + hash_foff))[1];
+    } else if (gnu_hash_vaddr) {
+        symbol_count = elf_gnu_hash_symbol_count(elf, ehdr, elf_size,
+                                                  gnu_hash_vaddr);
+    }
+    if (!symbol_count ||
+        symbol_count > (elf_size - symtab_foff) / sizeof(Elf64_Sym) ||
+        symbol_count > (elf_size - versym_foff) / sizeof(uint16_t))
+        return 0;
+    symbols = (const Elf64_Sym *)(elf + symtab_foff);
+    versym = (const uint16_t *)(elf + versym_foff);
+    dynstr = (const char *)(elf + strtab_foff);
 
-    return strcmp(name, "_rtld_global") == 0
-        || strcmp(name, "_rtld_global_ro") == 0
-        || strcmp(name, "__libc_stack_end") == 0
-        || strcmp(name, "__rseq_offset") == 0
-        || strcmp(name, "__rseq_size") == 0
-        || strcmp(name, "__rseq_flags") == 0
-        || strcmp(name, "signal") == 0
-        || strcmp(name, "sigaction") == 0
-        || strcmp(name, "__sigaction") == 0;
+    for (uint32_t i = 1; i < symbol_count; i++) {
+        uint16_t version_index;
+        uint64_t cursor = verdef_foff;
+
+        if (symbols[i].st_shndx == SHN_UNDEF ||
+            ELF64_ST_BIND(symbols[i].st_info) == STB_LOCAL ||
+            !symbol_visible_outside_object(&symbols[i]) ||
+            !frozen_dynstr_equal(dynstr, strtab_size,
+                                 symbols[i].st_name, name))
+            continue;
+        version_index = versym[i] & 0x7fff;
+        if (version_index <= 1)
+            continue;
+        for (uint32_t n = 0; n < verdef_count; n++) {
+            const Elf64_Verdef *definition;
+            uint64_t aux_offset;
+            const Elf64_Verdaux *aux;
+
+            if (cursor > elf_size ||
+                elf_size - cursor < sizeof(Elf64_Verdef))
+                return 0;
+            definition = (const Elf64_Verdef *)(elf + cursor);
+            if (definition->vd_version != VER_DEF_CURRENT ||
+                !u64_add_checked(cursor, definition->vd_aux, &aux_offset) ||
+                aux_offset > elf_size ||
+                elf_size - aux_offset < sizeof(Elf64_Verdaux))
+                return 0;
+            aux = (const Elf64_Verdaux *)(elf + aux_offset);
+            if ((definition->vd_ndx & 0x7fff) == version_index) {
+                if (frozen_dynstr_equal(dynstr, strtab_size,
+                                        aux->vda_name, version))
+                    return 1;
+                break;
+            }
+            if (definition->vd_next == 0)
+                break;
+            if (!u64_add_checked(cursor, definition->vd_next, &cursor))
+                return 0;
+        }
+    }
+    return 0;
+}
+
+static uint64_t raw_relocation_special(const char *name, uint32_t gh)
+{
+    uint64_t address;
+
+    if (g_special_tab_ready)
+        return lookup_special(name, gh);
+    address = lookup_override(name);
+    if (!address)
+        address = lookup_stub(name);
+    if (!address)
+        address = lookup_fake_object(name);
+    return address;
+}
+
+static uint64_t lookup_relocation_special(struct loaded_obj *requester,
+                                          uint32_t sym_index,
+                                          struct loaded_obj *objs, int nobj)
+{
+    const Elf64_Sym *reference;
+    const char *name;
+    const char *version = NULL;
+    enum relocation_special_provider provider;
+    uint64_t address;
+    int versioned;
+
+    if (!requester || !requester->dynsym || sym_index == 0 ||
+        sym_index >= requester->dynsym_count)
+        return 0;
+    reference = loaded_dynsym(requester, sym_index);
+    if (!reference || !(name = loaded_symbol_name(requester, reference)))
+        return 0;
+    address = raw_relocation_special(name, gnu_hash_calc(name));
+    if (!address)
+        return 0;
+    versioned = relocation_symbol_version(requester, sym_index, &version);
+    if (versioned < 0)
+        return 0;
+    provider = relocation_special_provider(name);
+
+    /* Unversioned public/interpreter contracts are required by musl and by
+     * older runtimes.  Private glibc contracts are never unversioned. */
+    if (!versioned)
+        return provider == SPECIAL_PROVIDER_GLIBC_PRIVATE ? 0 : address;
+    if (!version)
+        return 0;
+    if (provider == SPECIAL_PROVIDER_SCOPE)
+        return lookup_relocation_definition(requester, sym_index, objs, nobj,
+                                             0, NULL) ? address : 0;
+    if (provider == SPECIAL_PROVIDER_GLIBC_PRIVATE &&
+        strcmp(version, "GLIBC_PRIVATE") != 0)
+        return 0;
+    if (lookup_relocation_definition(requester, sym_index, objs, nobj,
+                                     0, NULL))
+        return address;
+    return frozen_interp_exports_version(name, version) ? address : 0;
+}
+
+/* Apply the same provider/version admission policy to dlsym and dlvsym.
+ * `scope_provider_visible` means the API's selected lookup scope already
+ * produced a real definition with the requested name/version.  Interpreter
+ * contracts are proved against the frozen interpreter because it is not in
+ * g_all_objs. */
+static uint64_t lookup_api_special(const char *name, const char *version,
+                                   int scope_provider_visible)
+{
+    enum relocation_special_provider provider;
+    uint64_t address;
+
+    if (!name)
+        return 0;
+    address = raw_relocation_special(name, gnu_hash_calc(name));
+    if (!address)
+        return 0;
+    provider = relocation_special_provider(name);
+
+    if (!version) {
+        if (provider == SPECIAL_PROVIDER_GLIBC_PRIVATE)
+            return 0;
+        if (provider == SPECIAL_PROVIDER_SCOPE && !scope_provider_visible)
+            return 0;
+        return address;
+    }
+    if (provider == SPECIAL_PROVIDER_SCOPE)
+        return scope_provider_visible ? address : 0;
+    if (provider == SPECIAL_PROVIDER_GLIBC_PRIVATE &&
+        strcmp(version, "GLIBC_PRIVATE") != 0)
+        return 0;
+    return (scope_provider_visible ||
+            frozen_interp_exports_version(name, version)) ? address : 0;
 }
 
 /*
  * Global symbol search — exe first, then libs in load order.
  * Returns resolved virtual address or 0.
  */
-static uint64_t resolve_sym(struct loaded_obj *objs, int nobj,
-                             const char *name)
+static int dl_build_global_lookup_order(int nobj,
+                                        uint16_t *order,
+                                        uint16_t *count_out)
+{
+    uint8_t seen[MAX_TOTAL_OBJS];
+    uint16_t count = 0;
+
+    *count_out = 0;
+    if (nobj < 0 || nobj > MAX_TOTAL_OBJS)
+        return -1;
+    if (g_global_scope_count == 0)
+        return 0;
+    memset(seen, 0, sizeof(seen));
+    for (uint16_t i = 0; i < g_global_scope_count; i++) {
+        uint16_t index = g_global_scope_indices[i];
+
+        if (index >= nobj)
+            return -1;
+        if (!seen[index]) {
+            seen[index] = 1;
+            order[count++] = index;
+        }
+    }
+    if (g_dl_transaction.active &&
+        g_dl_transaction.scope_root_valid) {
+        struct loaded_obj *root;
+
+        if (g_dl_transaction.scope_root < 0 ||
+            g_dl_transaction.scope_root >= nobj)
+            return -1;
+        root = &g_all_objs[g_dl_transaction.scope_root];
+        if (!root->lookup_scope_valid &&
+            dl_build_lookup_scope(root, nobj) < 0)
+            return -1;
+        for (uint16_t i = 0; i < root->lookup_scope_count; i++) {
+            uint16_t index = root->lookup_scope_indices[i];
+
+            if (index >= nobj)
+                return -1;
+            if (!seen[index]) {
+                seen[index] = 1;
+                order[count++] = index;
+            }
+        }
+    }
+    *count_out = count;
+    return 1;
+}
+
+static int resolve_sym_address(struct loaded_obj *objs, int nobj,
+                               const char *name, uint64_t *address_out)
 {
     uint32_t gh = gnu_hash_calc(name);
+    uint16_t order[MAX_TOTAL_OBJS];
+    uint16_t order_count = 0;
+    int scoped_order;
 
     uint64_t cached = 0;
     int c = sym_cache_lookup(name, gh, &cached);
-    if (c == 1) return cached;
-    if (c == -1) return 0;
+    if (c == 1) {
+        *address_out = cached;
+        return 1;
+    }
+    if (c == -1)
+        return 0;
 
-    /* Check unified special-symbol table (overrides, stubs, fake rtld) */
-    if (g_special_tab_ready) {
-        uint64_t ovr = lookup_special(name, gh);
+    /* The interpreter is not represented in the ordinary object scope, so
+     * admit only its provider-less contracts before searching real objects.
+     * Public loader shims are admitted below only after their provider has
+     * actually been found in the selected scope. */
+    {
+        uint64_t ovr = lookup_api_special(name, NULL, 0);
+
         if (ovr) {
-            sym_cache_store(name, gh, CACHE_FOUND, ovr);
-            return ovr;
-        }
-    } else {
-        /* Fallback to linear lookup before table is built */
-        uint64_t ovr = lookup_override(name);
-        if (ovr) {
-            sym_cache_store(name, gh, CACHE_FOUND, ovr);
-            return ovr;
+            *address_out = ovr;
+            return 1;
         }
     }
 
-    for (int i = 0; i < nobj; i++) {
+    scoped_order = objs == g_all_objs
+        ? dl_build_global_lookup_order(nobj, order, &order_count) : 0;
+    if (scoped_order < 0)
+        return 0;
+    for (int position = 0;
+         position < (scoped_order ? (int)order_count : nobj);
+         position++) {
+        int i = scoped_order ? order[position] : position;
         const Elf64_Sym *sym = lookup_object_symbol(&objs[i], name, gh);
         if (sym) {
-            uint64_t addr = objs[i].base + sym->st_value;
-            /* IFUNC symbols: the value is a resolver function, call it */
-            if (ELF64_ST_TYPE(sym->st_info) == STT_GNU_IFUNC) {
-                typedef uint64_t (*ifunc_t)(void);
-                addr = ((ifunc_t)addr)();
+            const char *canonical_name;
+            uint64_t special;
+            uint64_t addr;
+            int cacheable;
+
+            special = lookup_api_special(name, NULL, 1);
+            if (special) {
+                *address_out = special;
+                return 1;
             }
-            sym_cache_store(name, gh, CACHE_FOUND, addr);
-            return addr;
+            if (!resolve_defined_symbol_address(&objs[i], sym, &addr,
+                                                &cacheable))
+                continue;
+            canonical_name = loaded_symbol_name(&objs[i], sym);
+            if (cacheable && canonical_name)
+                sym_cache_store_canonical(canonical_name, gh,
+                                          CACHE_FOUND, addr);
+            *address_out = addr;
+            return 1;
         }
     }
-
-    /* Check stubs and fake objects before giving up */
-    if (g_special_tab_ready) {
-        /* Already checked in unified table above */
-    } else {
-        uint64_t stub = lookup_stub(name);
-        if (!stub) stub = lookup_fake_object(name);
-        if (stub) {
-            sym_cache_store(name, gh, CACHE_FOUND, stub);
-            return stub;
-        }
-    }
-
-    sym_cache_store(name, gh, CACHE_MISS, 0);
     return 0;
 }
 
-static uint64_t resolve_relocation_symbol(struct loaded_obj *requester,
-                                          uint32_t sym_index,
-                                          struct loaded_obj *objs, int nobj)
+static uint64_t resolve_sym(struct loaded_obj *objs, int nobj,
+                            const char *name)
+{
+    uint64_t address = 0;
+
+    (void)resolve_sym_address(objs, nobj, name, &address);
+    return address;
+}
+
+static int resolve_relocation_symbol(struct loaded_obj *requester,
+                                     uint32_t sym_index,
+                                     struct loaded_obj *objs, int nobj,
+                                     uint64_t *address_out)
 {
     const char *name;
-    const char *version;
     const Elf64_Sym *reference;
     const Elf64_Sym *sym;
     struct loaded_obj *owner = NULL;
     uint64_t addr;
-    int versioned;
 
     if (!requester->dynsym || !requester->dynstr ||
         sym_index == 0 || sym_index >= requester->dynsym_count)
@@ -7695,42 +9166,73 @@ static uint64_t resolve_relocation_symbol(struct loaded_obj *requester,
     name = loaded_symbol_name(requester, reference);
     if (!name)
         return 0;
-    versioned = relocation_symbol_version(requester, sym_index, &version);
-    if (versioned < 0)
-        return 0;
+    /* A requester-local hidden/internal/protected definition wins even when
+     * its name is also implemented by a loader override. */
+    if (symbol_must_bind_locally(reference))
+        return resolve_defined_symbol_address(requester, reference,
+                                              address_out, NULL);
 
-    /* Loader-provided ABI shims intentionally satisfy the corresponding
-     * libc/rtld interfaces regardless of the requester's version tag. */
-    addr = g_special_tab_ready
-        ? lookup_special(name, gnu_hash_calc(name))
-        : lookup_override(name);
-    if (!addr && !g_special_tab_ready) {
-        addr = lookup_stub(name);
-        if (!addr)
-            addr = lookup_fake_object(name);
+    addr = lookup_relocation_special(requester, sym_index, objs, nobj);
+    if (addr) {
+        *address_out = addr;
+        return 1;
     }
-    if (addr)
-        return addr;
-
-    if (!versioned)
-        return resolve_sym(objs, nobj, name);
 
     sym = lookup_relocation_definition(requester, sym_index, objs, nobj, 0,
                                        &owner);
-    if (!sym || !owner)
+    if (!sym || !owner ||
+        !resolve_defined_symbol_address(owner, sym, &addr, NULL))
         return 0;
-    addr = owner->base + sym->st_value;
-    if (ELF64_ST_TYPE(sym->st_info) == STT_GNU_IFUNC) {
-        typedef uint64_t (*ifunc_t)(void);
-        addr = ((ifunc_t)addr)();
-    }
-    return addr;
+    *address_out = addr;
+    return 1;
+}
+
+enum relocation_pass {
+    RELOC_PASS_ORDINARY = 0,
+    RELOC_PASS_COPY,
+    RELOC_PASS_IFUNC,
+    RELOC_PASS_IRELATIVE
+};
+
+/* Classify a symbolic relocation without invoking its resolver.  This must
+ * mirror resolve_relocation_symbol's override precedence: a loader-provided
+ * ABI shim suppresses an underlying ELF IFUNC definition. */
+static int relocation_symbol_is_ifunc(struct loaded_obj *requester,
+                                      uint32_t sym_index,
+                                      struct loaded_obj *objs, int nobj)
+{
+    const Elf64_Sym *reference;
+    const Elf64_Sym *definition;
+    struct loaded_obj *owner = NULL;
+    const char *name;
+    uint64_t special;
+
+    if (!requester->dynsym || !requester->dynstr || sym_index == 0 ||
+        sym_index >= requester->dynsym_count)
+        return 0;
+    reference = loaded_dynsym(requester, sym_index);
+    if (!reference)
+        return 0;
+    name = loaded_symbol_name(requester, reference);
+    if (!name)
+        return 0;
+    if (symbol_must_bind_locally(reference))
+        return ELF64_ST_TYPE(reference->st_info) == STT_GNU_IFUNC;
+
+    special = lookup_relocation_special(requester, sym_index, objs, nobj);
+    if (special)
+        return 0;
+
+    definition = lookup_relocation_definition(
+        requester, sym_index, objs, nobj, 0, &owner);
+    return definition && owner &&
+           ELF64_ST_TYPE(definition->st_info) == STT_GNU_IFUNC;
 }
 
 #if defined(__aarch64__) || defined(__x86_64__)
 static int resolve_tlsdesc_target(struct loaded_obj *obj,
                                   struct loaded_obj *all, int nobj,
-                                  uint32_t sidx, uint64_t addend,
+                                  uint32_t sidx, int64_t addend,
                                   size_t *modid_out,
                                   uint64_t *offset_out,
                                   int64_t *tprel_out,
@@ -7747,12 +9249,18 @@ static int resolve_tlsdesc_target(struct loaded_obj *obj,
      * a direct offset into the object's own TLS block.  Use a synthetic
      * zero-offset symbol so the owner remains `obj`. */
     if (sidx == 0) {
+        uint64_t offset;
+
         if (obj->tls.memsz == 0 || obj->tls.modid == 0)
             return -1;
+        if (!u64_add_i64_checked(0, addend, &offset) ||
+            offset > obj->tls.memsz)
+            return -1;
         *modid_out = obj->tls.modid;
-        *offset_out = addend;
+        *offset_out = offset;
         if (obj->tls.tpoff != 0) {
-            *tprel_out = obj->tls.tpoff + (int64_t)addend;
+            if (!i64_add_u64_checked(obj->tls.tpoff, offset, tprel_out))
+                return -1;
             *have_tprel_out = 1;
         } else {
             *tprel_out = 0;
@@ -7778,9 +9286,13 @@ static int resolve_tlsdesc_target(struct loaded_obj *obj,
         return -1;
 
     *modid_out = owner->tls.modid;
-    *offset_out = sym->st_value + addend;
+    if (!u64_add_i64_checked(sym->st_value, addend, offset_out) ||
+        *offset_out > owner->tls.memsz)
+        return -1;
     if (owner->tls.tpoff != 0) {
-        *tprel_out = owner->tls.tpoff + (int64_t)*offset_out;
+        if (!i64_add_u64_checked(owner->tls.tpoff, *offset_out,
+                                 tprel_out))
+            return -1;
         *have_tprel_out = 1;
     } else {
         *tprel_out = 0;
@@ -7817,18 +9329,13 @@ static int apply_aarch64_tlsdesc_reloc(struct loaded_obj *obj,
     }
 
     {
-        int64_t dtv_offset;
-        uint64_t entry_shift;
         struct aarch64_tlsdesc_arg *arg = alloc_aarch64_tlsdesc_arg();
 
         if (!arg)
             return -1;
 
-        current_aarch64_tlsdesc_layout(&dtv_offset, &entry_shift);
         arg->modid = modid;
         arg->offset = offset;
-        arg->dtv_offset = dtv_offset;
-        arg->entry_shift = entry_shift;
 
         slot[0] = (uint64_t)(uintptr_t)dlfreeze_aarch64_tlsdesc_dynamic;
         slot[1] = (uint64_t)(uintptr_t)arg;
@@ -7879,13 +9386,261 @@ static int apply_x86_64_tlsdesc_reloc(struct loaded_obj *obj,
 #endif
 #endif /* __aarch64__ || __x86_64__ */
 
+static int validate_relocation_record(struct loaded_obj *obj,
+                                      const Elf64_Rela *rel,
+                                      const Elf64_Sym **reference_out,
+                                      const char **name_out,
+                                      void **slot_out)
+{
+    uint32_t type = ELF64_R_TYPE(rel->r_info);
+    uint32_t sidx = ELF64_R_SYM(rel->r_info);
+    const Elf64_Sym *reference = NULL;
+    const char *name = NULL;
+    size_t width = sizeof(uint64_t);
+    void *slot = NULL;
+
+    if (sidx != 0) {
+        reference = loaded_dynsym(obj, sidx);
+        if (!reference)
+            return -1;
+        name = loaded_symbol_name(obj, reference);
+        if (!name)
+            return -1;
+    }
+
+    if ((type == ARCH_RELOC_RELATIVE || type == ARCH_RELOC_IRELATIVE) &&
+        sidx != 0)
+        return -1;
+
+    if (type == 0) {
+        width = 0;
+    } else if (type == ARCH_RELOC_COPY) {
+        if (!reference || reference->st_size > SIZE_MAX)
+            return -1;
+        width = (size_t)reference->st_size;
+    } else if (type == ARCH_RELOC_TLSDESC) {
+        width = 2 * sizeof(uint64_t);
+    }
+
+    if (width != 0 &&
+        !loaded_obj_vaddr_pointer(obj, rel->r_offset, width, PF_W, &slot))
+        return -1;
+
+    if (type == ARCH_RELOC_IRELATIVE) {
+        void *resolver;
+
+        if (!loaded_obj_signed_offset_pointer(obj, rel->r_addend, 1, PF_X,
+                                              &resolver))
+            return -1;
+    }
+
+    if (reference_out)
+        *reference_out = reference;
+    if (name_out)
+        *name_out = name;
+    if (slot_out)
+        *slot_out = slot;
+    return 0;
+}
+
+static int relocation_destination_overlaps_tls(
+    const struct loaded_obj *obj, uint64_t offset, size_t size)
+{
+    uint64_t relocation_end;
+
+    if (!obj || size == 0)
+        return 0;
+    if (!u64_add_checked(offset, size, &relocation_end))
+        return 1;
+    if (obj->tls.memsz != 0) {
+        uint64_t tls_end;
+
+        if (!u64_add_checked(obj->tls.vaddr, obj->tls.memsz, &tls_end))
+            return 1;
+        return offset < tls_end && obj->tls.vaddr < relocation_end;
+    }
+    /* Initial-load preflight runs before setup_tls() populates obj->tls, but
+     * the mapped program headers are already available. */
+    for (uint16_t i = 0; obj->phdr && i < obj->phdr_num; i++) {
+        const Elf64_Phdr *ph = &obj->phdr[i];
+        uint64_t tls_end;
+
+        if (ph->p_type != PT_TLS || ph->p_memsz == 0)
+            continue;
+        if (!u64_add_checked(ph->p_vaddr, ph->p_memsz, &tls_end))
+            return 1;
+        if (offset < tls_end && ph->p_vaddr < relocation_end)
+            return 1;
+    }
+    return 0;
+}
+
+/* Reject structurally unsupported resolver destinations before any target
+ * resolver in the graph can run.  In particular, reporting this only from
+ * the IFUNC/IRELATIVE pass is too late for dlopen: an earlier resolver may
+ * already have made externally visible changes that transaction rollback
+ * cannot undo. */
+static int preflight_resolver_relocation_destinations(
+    struct loaded_obj *targets, int ntargets,
+    struct loaded_obj *scope, int nscope)
+{
+    for (int oi = 0; oi < ntargets; oi++) {
+        struct loaded_obj *obj = &targets[oi];
+        const Elf64_Rela *tables[] = { obj->rela, obj->jmprel };
+        size_t counts[] = { obj->rela_count, obj->jmprel_count };
+
+        for (size_t t = 0; t < sizeof(tables) / sizeof(tables[0]); t++) {
+            for (size_t i = 0; i < counts[t]; i++) {
+                const Elf64_Rela *rel = &tables[t][i];
+                uint32_t type = ELF64_R_TYPE(rel->r_info);
+                uint32_t sidx = ELF64_R_SYM(rel->r_info);
+                int invokes_resolver = type == ARCH_RELOC_IRELATIVE;
+
+                if (!invokes_resolver &&
+                    (type == ARCH_RELOC_ABS ||
+                     type == ARCH_RELOC_GLOB_DAT ||
+                     type == ARCH_RELOC_JUMP_SLOT)) {
+                    invokes_resolver = relocation_symbol_is_ifunc(
+                        obj, sidx, scope, nscope);
+                }
+                if (!invokes_resolver)
+                    continue;
+                if (validate_relocation_record(obj, rel, NULL, NULL, NULL) < 0)
+                    return -1;
+                if (relocation_destination_overlaps_tls(
+                        obj, rel->r_offset, sizeof(uint64_t))) {
+                    ldr_err("IFUNC relocation into PT_TLS is unsupported in",
+                            obj->name);
+                    return -1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+static int apply_copy_relocation(struct loaded_obj *obj,
+                                 struct loaded_obj *objs, int nobj,
+                                 const Elf64_Rela *rel,
+                                 const Elf64_Sym *reference,
+                                 const char *name)
+{
+    struct loaded_obj *owner = NULL;
+    const Elf64_Sym *definition;
+    void *destination;
+    void *source;
+    size_t destination_size;
+    size_t source_size;
+    size_t copy_size;
+
+    if (!reference || reference->st_size > SIZE_MAX)
+        return -1;
+    destination_size = (size_t)reference->st_size;
+    if (destination_size != 0 &&
+        !loaded_obj_vaddr_pointer(obj, rel->r_offset, destination_size, PF_W,
+                                  &destination)) {
+        ldr_err("COPY relocation destination is outside PT_LOAD in",
+                obj->name);
+        return -1;
+    }
+
+    definition = lookup_relocation_definition(obj,
+        ELF64_R_SYM(rel->r_info), objs, nobj, 1, &owner);
+    if (!definition || !owner) {
+        const void *fake_source;
+
+        if (name && lookup_relocation_special(
+                        obj, ELF64_R_SYM(rel->r_info), objs, nobj) &&
+            lookup_fake_object_region(name, &fake_source, &source_size)) {
+            copy_size = destination_size < source_size
+                ? destination_size : source_size;
+            if (copy_size != 0)
+                memcpy(destination, fake_source, copy_size);
+            return 0;
+        }
+        if (ELF64_ST_BIND(reference->st_info) != STB_WEAK) {
+            ldr_err("unresolved COPY symbol", name ? name : obj->name);
+            return -1;
+        }
+        return 0;
+    }
+
+    copy_size = destination_size;
+    if (definition->st_size < copy_size)
+        copy_size = (size_t)definition->st_size;
+    if (copy_size == 0)
+        return 0;
+    if (!loaded_obj_vaddr_pointer(owner, definition->st_value, copy_size, 0,
+                                  &source)) {
+        ldr_err("COPY relocation source is outside PT_LOAD in", owner->name);
+        return -1;
+    }
+    memcpy(destination, source, copy_size);
+    return 0;
+}
+
 static int apply_prelinked_runtime_reloc(struct loaded_obj *obj,
                                          struct loaded_obj *objs, int nobj,
-                                         const Elf64_Rela *rel)
+                                         const Elf64_Rela *rel,
+                                         enum relocation_pass pass)
 {
     uint64_t base = obj->base;
     uint32_t type = ELF64_R_TYPE(rel->r_info);
     uint32_t sidx = ELF64_R_SYM(rel->r_info);
+    const Elf64_Sym *reference;
+    const char *symbol_name;
+    void *relocation_slot;
+    int symbolic_ifunc;
+
+    if (validate_relocation_record(obj, rel, &reference, &symbol_name,
+                                   &relocation_slot) < 0) {
+        ldr_err("malformed relocation in", obj->name);
+        return -1;
+    }
+
+    if (type == ARCH_RELOC_IRELATIVE) {
+        typedef uint64_t (*ifunc_t)(void);
+        ifunc_t resolver;
+
+        if (pass != RELOC_PASS_IRELATIVE)
+            return 0;
+        if (relocation_destination_overlaps_tls(
+                obj, rel->r_offset, sizeof(uint64_t))) {
+            ldr_err("IFUNC relocation into PT_TLS is unsupported in",
+                    obj->name);
+            return -1;
+        }
+        resolver = (ifunc_t)(base + rel->r_addend);
+        *(uint64_t *)relocation_slot = resolver();
+        return 0;
+    }
+
+    if (type == ARCH_RELOC_COPY) {
+        if (pass != RELOC_PASS_COPY)
+            return 0;
+        if (g_debug) {
+            ldr_msg("COPY reloc: ");
+            ldr_msg(symbol_name);
+            ldr_msg("\n");
+        }
+        return apply_copy_relocation(obj, objs, nobj, rel, reference,
+                                     symbol_name);
+    }
+
+    if (pass != RELOC_PASS_ORDINARY && pass != RELOC_PASS_IFUNC)
+        return 0;
+    symbolic_ifunc =
+        (type == ARCH_RELOC_ABS || type == ARCH_RELOC_GLOB_DAT ||
+         type == ARCH_RELOC_JUMP_SLOT) &&
+        relocation_symbol_is_ifunc(obj, sidx, objs, nobj);
+    if ((pass == RELOC_PASS_IFUNC) != symbolic_ifunc)
+        return 0;
+    if (symbolic_ifunc && relocation_destination_overlaps_tls(
+            obj, rel->r_offset, sizeof(uint64_t))) {
+        ldr_err("IFUNC relocation into PT_TLS is unsupported in",
+                obj->name);
+        return -1;
+    }
 
 #if defined(__aarch64__)
     if (type == ARCH_RELOC_TLSDESC) {
@@ -7898,60 +9653,27 @@ static int apply_prelinked_runtime_reloc(struct loaded_obj *obj,
     }
 #endif
 
-    if (type == ARCH_RELOC_IRELATIVE) {
-        typedef uint64_t (*ifunc_t)(void);
-        ifunc_t resolver = (ifunc_t)(base + rel->r_addend);
-        *(uint64_t *)(base + rel->r_offset) = resolver();
-        return 0;
-    }
-
-    if (type == ARCH_RELOC_COPY) {
-        uint32_t sidx = ELF64_R_SYM(rel->r_info);
-        if (sidx == 0) return 0;
-        const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
-        uint64_t src_size = obj->dynsym[sidx].st_size;
-        if (g_debug) {
-            ldr_msg("COPY reloc: ");
-            ldr_msg(name);
-            ldr_msg("\n");
-        }
-        {
-            struct loaded_obj *owner = NULL;
-            const Elf64_Sym *definition = lookup_relocation_definition(
-                obj, sidx, objs, nobj, 1, &owner);
-
-            if (definition && owner) {
-                uint64_t src = owner->base + definition->st_value;
-                uint64_t sz = src_size && src_size < definition->st_size
-                    ? src_size : definition->st_size;
-
-                memcpy((void *)(base + rel->r_offset), (void *)src, sz);
-                return 0;
-            }
-        }
-        return 0;
-    }
-
     if (type == ARCH_RELOC_ABS) {
         if (sidx == 0)
             return 0;
 
         {
-            uint64_t addr = resolve_relocation_symbol(obj, sidx, objs, nobj);
+            uint64_t addr = 0;
+            int resolved = resolve_relocation_symbol(
+                obj, sidx, objs, nobj, &addr);
 
-            if (!addr && ELF64_ST_BIND(obj->dynsym[sidx].st_info) != STB_WEAK
-                && ELF64_ST_TYPE(obj->dynsym[sidx].st_info) == STT_OBJECT
-                && g_null_page) {
-                addr = (uint64_t)(uintptr_t)g_null_page;
+            if (!resolved && ELF64_ST_BIND(reference->st_info) != STB_WEAK) {
+                ldr_err("unresolved relocation symbol", symbol_name);
+                return -1;
             }
 
-            *(uint64_t *)(base + rel->r_offset) = addr + rel->r_addend;
+            *(uint64_t *)relocation_slot = addr + rel->r_addend;
         }
         return 0;
     }
 
     if (type == ARCH_RELOC_TPOFF) {
-        uint64_t *slot = (uint64_t *)(base + rel->r_offset);
+        uint64_t *slot = (uint64_t *)relocation_slot;
         int64_t value = 0;
 
         if (g_debug) {
@@ -7961,18 +9683,27 @@ static int apply_prelinked_runtime_reloc(struct loaded_obj *obj,
         }
 
         if (sidx != 0) {
-            const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
+            const char *name = symbol_name;
             struct loaded_obj *owner = NULL;
             const Elf64_Sym *definition = lookup_relocation_definition(
                 obj, sidx, objs, nobj, 0, &owner);
 
-            if (definition && owner)
-                value = owner->tls.tpoff +
-                        (int64_t)definition->st_value + rel->r_addend;
-            else if (ELF64_ST_BIND(obj->dynsym[sidx].st_info) != STB_WEAK)
+            if (definition && owner) {
+                if (!tls_tpoff_value(&owner->tls, definition->st_value,
+                                     rel->r_addend, &value)) {
+                    ldr_err("TLS TPOFF relocation overflows in", obj->name);
+                    return -1;
+                }
+            } else if (ELF64_ST_BIND(reference->st_info) != STB_WEAK) {
                 ldr_err("unresolved TLS symbol", name);
+                return -1;
+            } else
+                value = rel->r_addend;
         } else {
-            value = obj->tls.tpoff + rel->r_addend;
+            if (!tls_tpoff_value(&obj->tls, 0, rel->r_addend, &value)) {
+                ldr_err("TLS TPOFF relocation overflows in", obj->name);
+                return -1;
+            }
         }
 
         *(int64_t *)slot = value;
@@ -7984,7 +9715,7 @@ static int apply_prelinked_runtime_reloc(struct loaded_obj *obj,
     }
 
     if (type == ARCH_RELOC_DTPMOD) {
-        uint64_t *slot = (uint64_t *)(base + rel->r_offset);
+        uint64_t *slot = (uint64_t *)relocation_slot;
 
         if (g_debug) {
             ldr_msg("[loader] runtime TLS DTPMOD: ");
@@ -7993,14 +9724,18 @@ static int apply_prelinked_runtime_reloc(struct loaded_obj *obj,
         }
 
         if (sidx != 0) {
-            size_t mid = obj->tls.modid ? obj->tls.modid : 1;
             struct loaded_obj *owner = NULL;
+            const Elf64_Sym *definition = lookup_relocation_definition(
+                obj, sidx, objs, nobj, 0, &owner);
 
-            if (lookup_relocation_definition(obj, sidx, objs, nobj, 0,
-                                             &owner) && owner)
-                mid = owner->tls.modid ? owner->tls.modid
-                                       : (size_t)(owner - objs + 1);
-            *slot = mid;
+            if (definition && owner && owner->tls.modid) {
+                *slot = owner->tls.modid;
+            } else if (ELF64_ST_BIND(reference->st_info) != STB_WEAK) {
+                ldr_err("unresolved TLS module symbol", symbol_name);
+                return -1;
+            } else {
+                *slot = 0;
+            }
         } else {
             *slot = obj->tls.modid ? obj->tls.modid : 1;
         }
@@ -8008,7 +9743,7 @@ static int apply_prelinked_runtime_reloc(struct loaded_obj *obj,
     }
 
     if (type == ARCH_RELOC_DTPOFF) {
-        uint64_t *slot = (uint64_t *)(base + rel->r_offset);
+        uint64_t *slot = (uint64_t *)relocation_slot;
 
         if (g_debug) {
             ldr_msg("[loader] runtime TLS DTPOFF: ");
@@ -8017,18 +9752,32 @@ static int apply_prelinked_runtime_reloc(struct loaded_obj *obj,
         }
 
         if (sidx != 0) {
-            uint64_t off = obj->dynsym[sidx].st_value;
+            uint64_t off = reference->st_value;
+            struct loaded_obj *owner = obj;
 
-            if (obj->dynsym[sidx].st_shndx == 0) {
+            if (reference->st_shndx == 0) {
                 const Elf64_Sym *definition = lookup_relocation_definition(
-                    obj, sidx, objs, nobj, 0, NULL);
+                    obj, sidx, objs, nobj, 0, &owner);
 
                 if (definition)
                     off = definition->st_value;
+                else if (ELF64_ST_BIND(reference->st_info) != STB_WEAK) {
+                    ldr_err("unresolved TLS offset symbol", symbol_name);
+                    return -1;
+                } else {
+                    *slot = 0;
+                    return 0;
+                }
             }
-            *slot = off + rel->r_addend;
+            if (!tls_dtpoff_value(&owner->tls, off, rel->r_addend, slot)) {
+                ldr_err("TLS DTPOFF relocation overflows in", obj->name);
+                return -1;
+            }
         } else {
-            *slot = rel->r_addend;
+            if (!tls_dtpoff_value(&obj->tls, 0, rel->r_addend, slot)) {
+                ldr_err("TLS DTPOFF relocation overflows in", obj->name);
+                return -1;
+            }
         }
         return 0;
     }
@@ -8046,51 +9795,47 @@ static int apply_prelinked_runtime_reloc(struct loaded_obj *obj,
     if (sidx == 0)
         return 0;
 
-    uint64_t *slot = (uint64_t *)(base + rel->r_offset);
+    uint64_t *slot = (uint64_t *)relocation_slot;
     const char *required_version = NULL;
     int versioned = relocation_symbol_version(obj, sidx, &required_version);
 
     if (versioned < 0) {
+        if (g_debug) {
+            const Elf64_Sym *reference = loaded_dynsym(obj, sidx);
+            uint16_t raw_version = 0;
+
+            ldr_dbg_hex("[loader] malformed version symbol index=0x", sidx);
+            if (reference) {
+                const char *name = loaded_symbol_name(obj, reference);
+
+                if (name) {
+                    ldr_msg("[loader] malformed version symbol name=");
+                    ldr_msg(name);
+                    ldr_msg("\n");
+                }
+                ldr_dbg_hex("[loader] malformed version shndx=0x",
+                            reference->st_shndx);
+            }
+            if (loaded_versym_value(obj, sidx, &raw_version))
+                ldr_dbg_hex("[loader] malformed version index=0x",
+                            raw_version);
+            ldr_dbg_hex("[loader] verdef count=0x", obj->verdef_count);
+            ldr_dbg_hex("[loader] verneed count=0x", obj->verneed_count);
+        }
         ldr_err("malformed symbol version metadata in", obj->name);
         return -1;
     }
-    (void)required_version;
-
-    if (*slot != 0 && !versioned) {
-        const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
-        if (maybe_runtime_override_name(name)) {
-            uint32_t gh = gnu_hash_calc(name);
-            uint64_t ovr = lookup_special(name, gh);
-            if (ovr) {
-                if (g_debug) {
-                    ldr_msg("GOT patch: ");
-                    ldr_msg(name);
-                    ldr_msg(" in ");
-                    ldr_msg(obj->name);
-                    ldr_msg("\n");
-                }
-                /* GLOB_DAT/JUMP_SLOT: S (no addend per ELF ABI) */
-                *slot = ovr;
-            }
-        }
-        return 0;
-    }
-
     {
-        const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
-        uint32_t gh = gnu_hash_calc(name);
-        uint64_t ovr = lookup_special(name, gh);
-        if (ovr) {
-            *slot = ovr;
-        } else {
-            uint64_t addr = resolve_relocation_symbol(obj, sidx, objs, nobj);
-            if (addr) {
-                *slot = addr;
-            } else if (ELF64_ST_BIND(obj->dynsym[sidx].st_info) != STB_WEAK
-                       && ELF64_ST_TYPE(obj->dynsym[sidx].st_info) == STT_OBJECT
-                       && g_null_page) {
-                *slot = (uint64_t)(uintptr_t)g_null_page;
-            }
+        const char *name = symbol_name;
+        uint64_t addr = 0;
+        int resolved = resolve_relocation_symbol(
+            obj, sidx, objs, nobj, &addr);
+
+        if (resolved) {
+            *slot = addr;
+        } else if (ELF64_ST_BIND(reference->st_info) != STB_WEAK) {
+            ldr_err("unresolved relocation symbol", name);
+            return -1;
         }
     }
     return 0;
@@ -8101,7 +9846,9 @@ static int apply_prelinked_runtime_reloc(struct loaded_obj *obj,
  * runtime-fixup table omitted a relocation. Keep this narrowly focused
  * on override names so the hot prelinked path still avoids a full
  * generic relocation re-scan. */
-static void apply_prelinked_override_fallbacks(struct loaded_obj *obj)
+static int apply_prelinked_override_fallbacks(struct loaded_obj *obj,
+                                               struct loaded_obj *objs,
+                                               int nobj)
 {
     const Elf64_Rela *tabs[] = { obj->rela, obj->jmprel };
     size_t counts[] = { obj->rela_count, obj->jmprel_count };
@@ -8112,28 +9859,29 @@ static void apply_prelinked_override_fallbacks(struct loaded_obj *obj)
             uint32_t type = ELF64_R_TYPE(rel->r_info);
             uint32_t sidx;
             const char *name;
-            uint32_t gh;
             uint64_t ovr;
             uint64_t *slot;
+            const Elf64_Sym *reference;
+            void *relocation_slot;
 
             if (type != ARCH_RELOC_GLOB_DAT &&
                 type != ARCH_RELOC_JUMP_SLOT)
                 continue;
 
             sidx = ELF64_R_SYM(rel->r_info);
-            if (sidx == 0 || sidx >= obj->dynsym_count)
+            if (sidx == 0)
                 continue;
 
-            name = obj->dynstr + obj->dynsym[sidx].st_name;
-            if (!maybe_runtime_override_name(name))
+            if (validate_relocation_record(obj, rel, &reference, &name,
+                                           &relocation_slot) < 0)
+                return -1;
+            if (symbol_must_bind_locally(reference))
                 continue;
-
-            gh = gnu_hash_calc(name);
-            ovr = lookup_special(name, gh);
+            ovr = lookup_relocation_special(obj, sidx, objs, nobj);
             if (!ovr)
                 continue;
 
-            slot = (uint64_t *)(obj->base + rel->r_offset);
+            slot = (uint64_t *)relocation_slot;
             if (*slot != ovr) {
                 if (g_debug) {
                     ldr_msg("GOT fallback patch: ");
@@ -8146,6 +9894,7 @@ static void apply_prelinked_override_fallbacks(struct loaded_obj *obj)
             }
         }
     }
+    return 0;
 }
 
 /* ==== Map one object's PT_LOAD segments ================================ */
@@ -8212,6 +9961,42 @@ static int phdr_prot(const Elf64_Phdr *ph)
     return prot;
 }
 
+static int loaded_obj_pages_covered(const struct loaded_obj *obj,
+                                    uint64_t range_start,
+                                    uint64_t range_end,
+                                    uint32_t required_flags)
+{
+    uint64_t cursor = range_start;
+
+    if (range_start >= range_end ||
+        (range_start & (g_page_size - 1)) != 0 ||
+        (range_end & (g_page_size - 1)) != 0)
+        return 0;
+
+    while (cursor < range_end) {
+        uint64_t covered_end = cursor;
+
+        for (uint16_t i = 0; i < obj->phdr_num; i++) {
+            const Elf64_Phdr *ph = &obj->phdr[i];
+            uint64_t raw_start, raw_end, load_start, load_end;
+
+            if (ph->p_type != PT_LOAD || ph->p_memsz == 0 ||
+                (ph->p_flags & required_flags) != required_flags ||
+                !u64_add_checked(obj->base, ph->p_vaddr, &raw_start) ||
+                !u64_add_checked(raw_start, ph->p_memsz, &raw_end) ||
+                !u64_align_up_checked(raw_end, g_page_size, &load_end))
+                continue;
+            load_start = page_floor(raw_start);
+            if (load_start <= cursor && load_end > covered_end)
+                covered_end = load_end;
+        }
+        if (covered_end == cursor)
+            return 0;
+        cursor = covered_end < range_end ? covered_end : range_end;
+    }
+    return 1;
+}
+
 static int set_segment_protection(uint64_t base, const Elf64_Phdr *ph,
                                   int prot)
 {
@@ -8271,11 +10056,13 @@ static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         /* Lazy dlopen path — reserve the object's address range now */
         uint64_t span = hi - lo + 4 * g_page_size;
         void *m = mmap((void *)(base + lo), span,
-                       PROT_READ | PROT_WRITE,
+                       PROT_NONE,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
                        -1, 0);
         if (m == MAP_FAILED)
             return -1;  /* address collision — do not use MAP_FIXED */
+        obj->runtime_reservation = m;
+        obj->runtime_reservation_size = (size_t)span;
     }
 
     /* Copy/map each PT_LOAD segment from the payload. */
@@ -8345,27 +10132,116 @@ static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
 
 /* ==== Parse PT_DYNAMIC ================================================= */
 
-static void parse_dynamic(struct loaded_obj *obj,
-                           const struct dlfrz_lib_meta *meta)
+static int validate_loaded_verdef(struct loaded_obj *obj)
 {
-    /* Find PT_DYNAMIC in loaded memory */
-    uint64_t base = obj->base;
-    const uint8_t *phdr_start = (const uint8_t *)(base + meta->phdr_off);
-    const Elf64_Phdr *dyn_ph = NULL;
+    uintptr_t cursor = (uintptr_t)obj->verdef;
 
-    for (int i = 0; i < meta->phdr_num; i++) {
-        const Elf64_Phdr *ph = (const Elf64_Phdr *)(phdr_start + i * meta->phdr_entsz);
-        if (ph->p_type == PT_DYNAMIC) { dyn_ph = ph; break; }
+    for (uint32_t i = 0; i < obj->verdef_count; i++) {
+        const Elf64_Verdef *def;
+        uintptr_t aux_cursor;
+
+        if (!loaded_obj_file_contains(obj, cursor, sizeof(*def)))
+            return -1;
+        def = (const Elf64_Verdef *)cursor;
+        if (def->vd_version != VER_DEF_CURRENT || def->vd_cnt == 0 ||
+            def->vd_aux < sizeof(*def) ||
+            !mapped_pointer_add(obj, cursor, def->vd_aux,
+                                sizeof(Elf64_Verdaux), &aux_cursor) ||
+            !loaded_obj_file_contains(obj, aux_cursor,
+                                      sizeof(Elf64_Verdaux)))
+            return -1;
+
+        for (uint16_t a = 0; a < def->vd_cnt; a++) {
+            const Elf64_Verdaux *aux;
+
+            if (!loaded_obj_file_contains(obj, aux_cursor, sizeof(*aux)))
+                return -1;
+            aux = (const Elf64_Verdaux *)aux_cursor;
+            if (!loaded_dynstr_value(obj, aux->vda_name))
+                return -1;
+            if (a + 1 < def->vd_cnt) {
+                if (aux->vda_next < sizeof(*aux) ||
+                    !mapped_pointer_add(obj, aux_cursor, aux->vda_next,
+                                        sizeof(*aux), &aux_cursor))
+                    return -1;
+            } else if (aux->vda_next != 0) {
+                return -1;
+            }
+        }
+
+        if (i + 1 < obj->verdef_count) {
+            if (def->vd_next < sizeof(*def) ||
+                !mapped_pointer_add(obj, cursor, def->vd_next,
+                                    sizeof(*def), &cursor))
+                return -1;
+        } else if (def->vd_next != 0) {
+            return -1;
+        }
     }
-    if (!dyn_ph) return;
+    return 0;
+}
 
-    const Elf64_Dyn *dyn = (const Elf64_Dyn *)(base + dyn_ph->p_vaddr);
-    size_t dyn_count = dyn_ph->p_memsz / sizeof(Elf64_Dyn);
+static int validate_loaded_verneed(struct loaded_obj *obj)
+{
+    uintptr_t cursor = (uintptr_t)obj->verneed;
 
-    uint64_t symtab = 0, strtab = 0, strsz = 0;
-    uint64_t rela = 0, rela_sz = 0, relacount = 0;
-    uint64_t jmprel = 0, pltrelsz = 0;
-    uint64_t relr = 0, relr_sz = 0;
+    for (uint32_t i = 0; i < obj->verneed_count; i++) {
+        const Elf64_Verneed *need;
+        uintptr_t aux_cursor;
+
+        if (!loaded_obj_file_contains(obj, cursor, sizeof(*need)))
+            return -1;
+        need = (const Elf64_Verneed *)cursor;
+        if (need->vn_version != VER_NEED_CURRENT || need->vn_cnt == 0 ||
+            !loaded_dynstr_value(obj, need->vn_file) ||
+            need->vn_aux < sizeof(*need) ||
+            !mapped_pointer_add(obj, cursor, need->vn_aux,
+                                sizeof(Elf64_Vernaux), &aux_cursor) ||
+            !loaded_obj_file_contains(obj, aux_cursor,
+                                      sizeof(Elf64_Vernaux)))
+            return -1;
+
+        for (uint16_t a = 0; a < need->vn_cnt; a++) {
+            const Elf64_Vernaux *aux;
+
+            if (!loaded_obj_file_contains(obj, aux_cursor, sizeof(*aux)))
+                return -1;
+            aux = (const Elf64_Vernaux *)aux_cursor;
+            if (!loaded_dynstr_value(obj, aux->vna_name))
+                return -1;
+            if (a + 1 < need->vn_cnt) {
+                if (aux->vna_next < sizeof(*aux) ||
+                    !mapped_pointer_add(obj, aux_cursor, aux->vna_next,
+                                        sizeof(*aux), &aux_cursor))
+                    return -1;
+            } else if (aux->vna_next != 0) {
+                return -1;
+            }
+        }
+
+        if (i + 1 < obj->verneed_count) {
+            if (need->vn_next < sizeof(*need) ||
+                !mapped_pointer_add(obj, cursor, need->vn_next,
+                                    sizeof(*need), &cursor))
+                return -1;
+        } else if (need->vn_next != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int parse_dynamic(struct loaded_obj *obj,
+                         const struct dlfrz_lib_meta *meta)
+{
+    const Elf64_Phdr *dyn_ph = NULL;
+    const Elf64_Dyn *dyn;
+    size_t dyn_slots;
+    void *pointer;
+    uint64_t symtab = 0, strtab = 0, strsz = 0, syment = 0;
+    uint64_t rela = 0, rela_sz = 0, rela_ent = 0, relacount = 0;
+    uint64_t jmprel = 0, pltrelsz = 0, pltrel = 0;
+    uint64_t relr = 0, relr_sz = 0, relr_ent = 0;
     uint64_t gnu_hash_addr = 0, sysv_hash_addr = 0;
     uint64_t preinit_array = 0, preinit_array_sz = 0;
     uint64_t init = 0, init_array = 0, init_array_sz = 0;
@@ -8373,137 +10249,446 @@ static void parse_dynamic(struct loaded_obj *obj,
     uint64_t versym_addr = 0;
     uint64_t verdef_addr = 0, verdef_num = 0;
     uint64_t verneed_addr = 0, verneed_num = 0;
+    int have_symtab = 0, have_strtab = 0, have_strsz = 0, have_syment = 0;
+    int have_rela = 0, have_relasz = 0, have_relaent = 0;
+    int have_jmprel = 0, have_pltrelsz = 0, have_pltrel = 0;
+    int have_relr = 0, have_relrsz = 0, have_relrent = 0;
+    int have_gnu_hash = 0, have_sysv_hash = 0;
+    int have_preinit_array = 0, have_preinit_array_sz = 0;
+    int have_init_array = 0, have_init_array_sz = 0;
+    int have_fini_array = 0, have_fini_array_sz = 0;
+    int have_init = 0, have_fini = 0, have_versym = 0;
+    int have_verdef = 0, have_verdefnum = 0;
+    int have_verneed = 0, have_verneednum = 0;
+    int have_relacount = 0;
+    int saw_null = 0;
 
-    for (size_t i = 0; i < dyn_count && dyn[i].d_tag != DT_NULL; i++) {
+    obj->entry = (meta->flags & LDR_FLAG_MAIN_EXE)
+                 ? obj->base + meta->entry : 0;
+
+    for (uint16_t i = 0; i < obj->phdr_num; i++) {
+        if (obj->phdr[i].p_type != PT_DYNAMIC)
+            continue;
+        if (dyn_ph)
+            return -1;
+        dyn_ph = &obj->phdr[i];
+    }
+    if (!dyn_ph)
+        return 0;
+    if (dyn_ph->p_filesz == 0 || dyn_ph->p_filesz > dyn_ph->p_memsz ||
+        dyn_ph->p_filesz > SIZE_MAX ||
+        dyn_ph->p_filesz % sizeof(Elf64_Dyn) != 0 ||
+        !loaded_obj_file_vaddr_pointer(obj, dyn_ph->p_vaddr,
+                                       (size_t)dyn_ph->p_filesz, &pointer))
+        return -1;
+
+    dyn = (const Elf64_Dyn *)pointer;
+    dyn_slots = (size_t)dyn_ph->p_filesz / sizeof(Elf64_Dyn);
+
+#define SET_DYNAMIC_VALUE(seen, storage, value) do { \
+        uint64_t _value = (uint64_t)(value); \
+        if ((seen) && (storage) != _value) return -1; \
+        (seen) = 1; \
+        (storage) = _value; \
+    } while (0)
+
+    for (size_t i = 0; i < dyn_slots; i++) {
+        if (dyn[i].d_tag == DT_NULL) {
+            obj->dynamic = dyn;
+            obj->dynamic_count = i + 1;
+            saw_null = 1;
+            break;
+        }
         switch (dyn[i].d_tag) {
-        case DT_SYMTAB:       symtab = dyn[i].d_un.d_ptr;       break;
-        case DT_STRTAB:       strtab = dyn[i].d_un.d_ptr;       break;
-        case DT_STRSZ:        strsz  = dyn[i].d_un.d_val;       break;
-        case DT_RELA:         rela   = dyn[i].d_un.d_ptr;       break;
-        case DT_RELASZ:       rela_sz = dyn[i].d_un.d_val;      break;
-        case DT_JMPREL:       jmprel = dyn[i].d_un.d_ptr;       break;
-        case DT_PLTRELSZ:     pltrelsz = dyn[i].d_un.d_val;     break;
-        case DT_GNU_HASH:     gnu_hash_addr = dyn[i].d_un.d_ptr; break;
-        case DT_HASH:         sysv_hash_addr = dyn[i].d_un.d_ptr; break;
-        case DT_INIT:         init = dyn[i].d_un.d_ptr;         break;
-        case DT_INIT_ARRAY:   init_array = dyn[i].d_un.d_ptr;   break;
-        case DT_INIT_ARRAYSZ: init_array_sz = dyn[i].d_un.d_val; break;
-        case DT_PREINIT_ARRAY: preinit_array = dyn[i].d_un.d_ptr; break;
-        case DT_PREINIT_ARRAYSZ: preinit_array_sz = dyn[i].d_un.d_val; break;
-        case DT_FINI:         fini = dyn[i].d_un.d_ptr;         break;
-        case DT_FINI_ARRAY:   fini_array = dyn[i].d_un.d_ptr;   break;
-        case DT_FINI_ARRAYSZ: fini_array_sz = dyn[i].d_un.d_val; break;
-        case 36: /* DT_RELR */   relr = dyn[i].d_un.d_ptr;      break;
-        case 35: /* DT_RELRSZ */ relr_sz = dyn[i].d_un.d_val;   break;
-        case DT_VERSYM:       versym_addr = dyn[i].d_un.d_ptr;  break;
-        case DT_VERDEF:       verdef_addr = dyn[i].d_un.d_ptr;  break;
-        case DT_VERDEFNUM:    verdef_num = dyn[i].d_un.d_val;   break;
-        case DT_VERNEED:      verneed_addr = dyn[i].d_un.d_ptr; break;
-        case DT_VERNEEDNUM:   verneed_num = dyn[i].d_un.d_val;  break;
-        case DT_RELACOUNT:   relacount = dyn[i].d_un.d_val;    break;
+        case DT_SYMTAB: SET_DYNAMIC_VALUE(have_symtab, symtab, dyn[i].d_un.d_ptr); break;
+        case DT_STRTAB: SET_DYNAMIC_VALUE(have_strtab, strtab, dyn[i].d_un.d_ptr); break;
+        case DT_STRSZ: SET_DYNAMIC_VALUE(have_strsz, strsz, dyn[i].d_un.d_val); break;
+        case DT_SYMENT: SET_DYNAMIC_VALUE(have_syment, syment, dyn[i].d_un.d_val); break;
+        case DT_RELA: SET_DYNAMIC_VALUE(have_rela, rela, dyn[i].d_un.d_ptr); break;
+        case DT_RELASZ: SET_DYNAMIC_VALUE(have_relasz, rela_sz, dyn[i].d_un.d_val); break;
+        case DT_RELAENT: SET_DYNAMIC_VALUE(have_relaent, rela_ent, dyn[i].d_un.d_val); break;
+        case DT_JMPREL: SET_DYNAMIC_VALUE(have_jmprel, jmprel, dyn[i].d_un.d_ptr); break;
+        case DT_PLTRELSZ: SET_DYNAMIC_VALUE(have_pltrelsz, pltrelsz, dyn[i].d_un.d_val); break;
+        case DT_PLTREL: SET_DYNAMIC_VALUE(have_pltrel, pltrel, dyn[i].d_un.d_val); break;
+        case DT_GNU_HASH: SET_DYNAMIC_VALUE(have_gnu_hash, gnu_hash_addr, dyn[i].d_un.d_ptr); break;
+        case DT_HASH: SET_DYNAMIC_VALUE(have_sysv_hash, sysv_hash_addr, dyn[i].d_un.d_ptr); break;
+        case DT_INIT: SET_DYNAMIC_VALUE(have_init, init, dyn[i].d_un.d_ptr); break;
+        case DT_INIT_ARRAY: SET_DYNAMIC_VALUE(have_init_array, init_array, dyn[i].d_un.d_ptr); break;
+        case DT_INIT_ARRAYSZ: SET_DYNAMIC_VALUE(have_init_array_sz, init_array_sz, dyn[i].d_un.d_val); break;
+        case DT_PREINIT_ARRAY: SET_DYNAMIC_VALUE(have_preinit_array, preinit_array, dyn[i].d_un.d_ptr); break;
+        case DT_PREINIT_ARRAYSZ: SET_DYNAMIC_VALUE(have_preinit_array_sz, preinit_array_sz, dyn[i].d_un.d_val); break;
+        case DT_FINI: SET_DYNAMIC_VALUE(have_fini, fini, dyn[i].d_un.d_ptr); break;
+        case DT_FINI_ARRAY: SET_DYNAMIC_VALUE(have_fini_array, fini_array, dyn[i].d_un.d_ptr); break;
+        case DT_FINI_ARRAYSZ: SET_DYNAMIC_VALUE(have_fini_array_sz, fini_array_sz, dyn[i].d_un.d_val); break;
+        case 36: /* DT_RELR */ SET_DYNAMIC_VALUE(have_relr, relr, dyn[i].d_un.d_ptr); break;
+        case 35: /* DT_RELRSZ */ SET_DYNAMIC_VALUE(have_relrsz, relr_sz, dyn[i].d_un.d_val); break;
+        case 37: /* DT_RELRENT */ SET_DYNAMIC_VALUE(have_relrent, relr_ent, dyn[i].d_un.d_val); break;
+        case DT_VERSYM: SET_DYNAMIC_VALUE(have_versym, versym_addr, dyn[i].d_un.d_ptr); break;
+        case DT_VERDEF: SET_DYNAMIC_VALUE(have_verdef, verdef_addr, dyn[i].d_un.d_ptr); break;
+        case DT_VERDEFNUM: SET_DYNAMIC_VALUE(have_verdefnum, verdef_num, dyn[i].d_un.d_val); break;
+        case DT_VERNEED: SET_DYNAMIC_VALUE(have_verneed, verneed_addr, dyn[i].d_un.d_ptr); break;
+        case DT_VERNEEDNUM: SET_DYNAMIC_VALUE(have_verneednum, verneed_num, dyn[i].d_un.d_val); break;
+        case DT_RELACOUNT: SET_DYNAMIC_VALUE(have_relacount, relacount, dyn[i].d_un.d_val); break;
+        case DT_REL:
+        case DT_RELSZ:
+        case DT_RELENT:
+            /* ELF64 x86-64 and AArch64 use RELA.  Silently treating REL as
+             * RELA would reinterpret the table and write arbitrary memory. */
+            if (dyn[i].d_un.d_val != 0)
+                return -1;
+            break;
+        }
+    }
+#undef SET_DYNAMIC_VALUE
+
+    if (!saw_null)
+        return -1;
+
+    if (have_strtab != have_symtab || have_strtab != have_strsz ||
+        have_symtab != have_syment ||
+        (have_symtab && (symtab == 0 || strtab == 0 || strsz == 0 ||
+                         syment != sizeof(Elf64_Sym))))
+        return -1;
+    if ((have_rela || have_relasz) &&
+        (!have_rela || !have_relasz || !have_relaent || rela == 0 ||
+         rela_ent != sizeof(Elf64_Rela) ||
+         rela_sz % sizeof(Elf64_Rela) != 0))
+        return -1;
+    if (have_relaent && rela_ent != sizeof(Elf64_Rela))
+        return -1;
+    if ((have_jmprel || have_pltrelsz) &&
+        (!have_jmprel || !have_pltrelsz || !have_pltrel || jmprel == 0 ||
+         pltrel != DT_RELA || pltrelsz % sizeof(Elf64_Rela) != 0))
+        return -1;
+    if ((have_relr || have_relrsz) &&
+        (!have_relr || !have_relrsz || !have_relrent || relr == 0 ||
+         relr_ent != sizeof(Elf64_Relr) ||
+         relr_sz % sizeof(Elf64_Relr) != 0))
+        return -1;
+    if (have_relrent && relr_ent != sizeof(Elf64_Relr))
+        return -1;
+    if ((have_verdef != have_verdefnum) ||
+        (have_verneed != have_verneednum) ||
+        verdef_num > UINT32_MAX || verneed_num > UINT32_MAX ||
+        (have_gnu_hash && gnu_hash_addr == 0) ||
+        (have_sysv_hash && sysv_hash_addr == 0) ||
+        (have_versym && versym_addr == 0) ||
+        (have_init && init == 0) || (have_fini && fini == 0) ||
+        (have_verdef && (verdef_addr == 0 || verdef_num == 0)) ||
+        (have_verneed && (verneed_addr == 0 || verneed_num == 0)))
+        return -1;
+
+    if (have_strtab) {
+        if (strsz > SIZE_MAX ||
+            !loaded_obj_file_vaddr_pointer(obj, strtab, (size_t)strsz,
+                                           &pointer))
+            return -1;
+        obj->dynstr = (const char *)pointer;
+        obj->dynstr_size = (size_t)strsz;
+    }
+
+    /* Relocation symbol indices are a second exact lower bound for dynsym.
+     * GNU hash deliberately omits undefined imports on some linkers (notably
+     * AArch64 GNU ld), so hash chains alone can under-count the table. */
+    if (have_rela) {
+        if (rela_sz > SIZE_MAX ||
+            !loaded_obj_file_vaddr_pointer(obj, rela, (size_t)rela_sz,
+                                           &pointer))
+            return -1;
+        obj->rela = (const Elf64_Rela *)pointer;
+        obj->rela_count = (size_t)rela_sz / sizeof(Elf64_Rela);
+    }
+    if (relacount > obj->rela_count)
+        return -1;
+    obj->rela_relative_count = (size_t)relacount;
+    for (size_t i = 0; i < obj->rela_relative_count; i++) {
+        if (ELF64_R_TYPE(obj->rela[i].r_info) != ARCH_RELOC_RELATIVE ||
+            ELF64_R_SYM(obj->rela[i].r_info) != 0)
+            return -1;
+    }
+
+    if (have_jmprel) {
+        if (pltrelsz > SIZE_MAX ||
+            !loaded_obj_file_vaddr_pointer(obj, jmprel, (size_t)pltrelsz,
+                                           &pointer))
+            return -1;
+        obj->jmprel = (const Elf64_Rela *)pointer;
+        obj->jmprel_count = (size_t)pltrelsz / sizeof(Elf64_Rela);
+    }
+    {
+        const Elf64_Rela *tables[] = { obj->rela, obj->jmprel };
+        size_t counts[] = { obj->rela_count, obj->jmprel_count };
+
+        for (size_t t = 0; t < sizeof(tables) / sizeof(tables[0]); t++) {
+            for (size_t i = 0; i < counts[t]; i++) {
+                uint32_t sidx = ELF64_R_SYM(tables[t][i].r_info);
+
+                if (sidx == UINT32_MAX)
+                    return -1;
+                if (sidx + 1 > obj->dynsym_count)
+                    obj->dynsym_count = sidx + 1;
+            }
         }
     }
 
-    if (symtab)    obj->dynsym   = (const Elf64_Sym *)(base + symtab);
-    if (strtab)    obj->dynstr   = (const char *)(base + strtab);
-    obj->dynstr_size = strsz;
-    if (gnu_hash_addr)
-        obj->gnu_hash = (const uint32_t *)(base + gnu_hash_addr);
-    if (sysv_hash_addr)
-        obj->sysv_hash = (const uint32_t *)(base + sysv_hash_addr);
-    if (versym_addr) obj->versym  = (const uint16_t *)(base + versym_addr);
-    if (verdef_addr) obj->verdef = (const Elf64_Verdef *)(base + verdef_addr);
-    obj->verdef_count = (uint32_t)verdef_num;
-    if (verneed_addr) obj->verneed = (const Elf64_Verneed *)(base + verneed_addr);
-    obj->verneed_count = (uint32_t)verneed_num;
-
-    /* DT_HASH carries an exact symbol count.  GNU hash omits it, so derive
-     * the count with a bounds-checked chain walk. */
-    if (obj->sysv_hash) {
+    if (sysv_hash_addr) {
         struct sysv_hash_view view;
+        size_t words;
 
-        if (get_sysv_hash_view(obj, &view))
-            obj->dynsym_count = view.nchain;
+        if (!loaded_obj_file_vaddr_pointer(obj, sysv_hash_addr,
+                                           2 * sizeof(uint32_t), &pointer))
+            return -1;
+        obj->sysv_hash = (const uint32_t *)pointer;
+        if (!get_sysv_hash_view(obj, &view))
+            return -1;
+        words = 2 + (size_t)view.nbuckets + (size_t)view.nchain;
+        if (words > SIZE_MAX / sizeof(uint32_t) ||
+            !loaded_obj_file_contains(obj, (uintptr_t)obj->sysv_hash,
+                                      words * sizeof(uint32_t)))
+            return -1;
+        for (uint32_t i = 0; i < view.nbuckets; i++)
+            if (view.buckets[i] >= view.nchain &&
+                view.buckets[i] != STN_UNDEF)
+                return -1;
+        for (uint32_t i = 0; i < view.nchain; i++)
+            if (view.chains[i] >= view.nchain &&
+                view.chains[i] != STN_UNDEF)
+                return -1;
+        if (view.nchain < obj->dynsym_count)
+            return -1;
+        obj->dynsym_count = view.nchain;
     }
-    if (obj->gnu_hash) {
-        uint32_t count = gnu_hash_symbol_count_loaded(obj);
 
+    if (gnu_hash_addr) {
+        struct gnu_hash_view view;
+        uint32_t count;
+        size_t words64, words32, bytes;
+
+        if (!loaded_obj_file_vaddr_pointer(obj, gnu_hash_addr,
+                                           4 * sizeof(uint32_t), &pointer))
+            return -1;
+        obj->gnu_hash = (const uint32_t *)pointer;
+        if (!get_gnu_hash_view(obj, &view))
+            return -1;
+        count = gnu_hash_symbol_count_loaded(obj);
+        if (count == 0 || count < view.symoffset)
+            return -1;
+        words64 = view.bloom_size;
+        words32 = 4 + (size_t)view.nbuckets +
+                  (size_t)(count - view.symoffset);
+        if (words64 > (SIZE_MAX - words32 * sizeof(uint32_t)) /
+                      sizeof(uint64_t))
+            return -1;
+        bytes = words32 * sizeof(uint32_t) + words64 * sizeof(uint64_t);
+        if (!loaded_obj_file_contains(obj, (uintptr_t)obj->gnu_hash, bytes))
+            return -1;
+        for (uint32_t i = 0; i < view.nbuckets; i++)
+            if (view.buckets[i] != STN_UNDEF &&
+                (view.buckets[i] < view.symoffset ||
+                 view.buckets[i] >= count))
+                return -1;
         if (count > obj->dynsym_count)
             obj->dynsym_count = count;
     }
-    if (strsz > 0 && strtab > symtab) {
-        uint64_t span = (strtab - symtab) / sizeof(Elf64_Sym);
-        uint32_t span_count = span > UINT32_MAX
-            ? UINT32_MAX : (uint32_t)span;
 
-        if (span_count > obj->dynsym_count)
-            obj->dynsym_count = span_count;
+    if (have_symtab) {
+        uint64_t span;
+        size_t bytes;
+
+        /* When present, an adjacent DT_STRTAB is a useful upper bound.  It
+         * can include linker padding, so do not mistake it for the exact
+         * symbol count when hashes/relocations already prove what is used. */
+        if (strtab > symtab &&
+            (strtab - symtab) % sizeof(Elf64_Sym) == 0) {
+            span = (strtab - symtab) / sizeof(Elf64_Sym);
+            if (span == 0 || span > UINT32_MAX)
+                return -1;
+            if (!gnu_hash_addr && !sysv_hash_addr)
+                obj->dynsym_count = (uint32_t)span;
+            else if (obj->dynsym_count > span)
+                return -1;
+        }
+        if (obj->dynsym_count == 0)
+            return -1;
+        bytes = (size_t)obj->dynsym_count * sizeof(Elf64_Sym);
+        if (!loaded_obj_file_vaddr_pointer(obj, symtab, bytes, &pointer))
+            return -1;
+        obj->dynsym = (const Elf64_Sym *)pointer;
+        for (uint32_t i = 0; i < obj->dynsym_count; i++) {
+            const Elf64_Sym *sym = loaded_dynsym(obj, i);
+
+            if (!sym || !loaded_symbol_name(obj, sym))
+                return -1;
+        }
+    } else if (gnu_hash_addr || sysv_hash_addr || versym_addr ||
+               have_verdef || have_verneed) {
+        return -1;
     }
 
-    if (rela)       obj->rela       = (const Elf64_Rela *)(base + rela);
-    obj->rela_count   = rela_sz / sizeof(Elf64_Rela);
-    obj->rela_relative_count = relacount;
-    if (jmprel)     obj->jmprel     = (const Elf64_Rela *)(base + jmprel);
-    obj->jmprel_count = pltrelsz / sizeof(Elf64_Rela);
-    if (relr)       obj->relr       = (const Elf64_Relr *)(base + relr);
-    obj->relr_count   = relr_sz / sizeof(Elf64_Relr);
+    if (versym_addr) {
+        size_t bytes;
 
-    if (preinit_array)
-        obj->preinit_array = (void (**)(void))(base + preinit_array);
-    obj->preinit_array_sz = preinit_array_sz / sizeof(void *);
-    if (init)       obj->init_func  = (void (*)(void))(base + init);
-    if (init_array) obj->init_array = (void (**)(void))(base + init_array);
-    obj->init_array_sz = init_array_sz / sizeof(void *);
-    if (fini)       obj->fini_func  = (void (*)(void))(base + fini);
-    if (fini_array) obj->fini_array = (void (**)(void))(base + fini_array);
-    obj->fini_array_sz = fini_array_sz / sizeof(void *);
+        if (!obj->dynsym)
+            return -1;
+        bytes = (size_t)obj->dynsym_count * sizeof(uint16_t);
+        if (!loaded_obj_file_vaddr_pointer(obj, versym_addr, bytes, &pointer))
+            return -1;
+        obj->versym = (const uint16_t *)pointer;
+    }
+    if (have_verdef) {
+        if (!loaded_obj_file_vaddr_pointer(obj, verdef_addr,
+                                           sizeof(Elf64_Verdef), &pointer))
+            return -1;
+        obj->verdef = (const Elf64_Verdef *)pointer;
+        obj->verdef_count = (uint32_t)verdef_num;
+        if (validate_loaded_verdef(obj) < 0)
+            return -1;
+    }
+    if (have_verneed) {
+        if (!loaded_obj_file_vaddr_pointer(obj, verneed_addr,
+                                           sizeof(Elf64_Verneed), &pointer))
+            return -1;
+        obj->verneed = (const Elf64_Verneed *)pointer;
+        obj->verneed_count = (uint32_t)verneed_num;
+        if (validate_loaded_verneed(obj) < 0)
+            return -1;
+    }
+    if (obj->versym) {
+        for (uint32_t i = 0; i < obj->dynsym_count; i++) {
+            const char *version;
 
-    obj->entry = (meta->flags & LDR_FLAG_MAIN_EXE)
-                 ? base + meta->entry : 0;
+            if (symbol_version_name(obj, i, &version) < 0)
+                return -1;
+        }
+    }
+
+    if (have_relr) {
+        if (relr_sz > SIZE_MAX ||
+            !loaded_obj_file_vaddr_pointer(obj, relr, (size_t)relr_sz,
+                                           &pointer))
+            return -1;
+        obj->relr = (const Elf64_Relr *)pointer;
+        obj->relr_count = (size_t)relr_sz / sizeof(Elf64_Relr);
+    }
+
+#define SET_DYNAMIC_ARRAY(have_ptr, address, have_size, byte_size, field, count_field) do { \
+        if ((have_ptr) != (have_size) || (byte_size) % sizeof(void *) != 0 || \
+            ((have_ptr) && ((address) == 0 || (byte_size) > SIZE_MAX || \
+             !loaded_obj_vaddr_pointer(obj, (address), (size_t)(byte_size), \
+                                       0, &pointer)))) \
+            return -1; \
+        if (have_ptr) { \
+            obj->field = (void (**)(void))pointer; \
+            obj->count_field = (size_t)(byte_size) / sizeof(void *); \
+        } \
+    } while (0)
+    SET_DYNAMIC_ARRAY(have_preinit_array, preinit_array,
+                      have_preinit_array_sz, preinit_array_sz,
+                      preinit_array, preinit_array_sz);
+    SET_DYNAMIC_ARRAY(have_init_array, init_array,
+                      have_init_array_sz, init_array_sz,
+                      init_array, init_array_sz);
+    SET_DYNAMIC_ARRAY(have_fini_array, fini_array,
+                      have_fini_array_sz, fini_array_sz,
+                      fini_array, fini_array_sz);
+#undef SET_DYNAMIC_ARRAY
+
+    if (init) {
+        if (!loaded_obj_vaddr_pointer(obj, init, 1, PF_X, &pointer))
+            return -1;
+        obj->init_func = (void (*)(void))pointer;
+    }
+    if (fini) {
+        if (!loaded_obj_vaddr_pointer(obj, fini, 1, PF_X, &pointer))
+            return -1;
+        obj->fini_func = (void (*)(void))pointer;
+    }
+
+    /* Every dynamic string reference that later drives dependency loading
+     * must be a complete string inside DT_STRTAB. */
+    for (size_t i = 0; i < obj->dynamic_count; i++) {
+        switch (obj->dynamic[i].d_tag) {
+        case DT_NEEDED:
+        case DT_SONAME:
+        case DT_RPATH:
+        case DT_RUNPATH:
+            if (obj->dynamic[i].d_un.d_val > UINT32_MAX ||
+                !loaded_dynstr_value(obj,
+                    (uint32_t)obj->dynamic[i].d_un.d_val))
+                return -1;
+            break;
+        }
+    }
+    return 0;
 }
 
 /* ==== Apply relocations ================================================ */
 
-/* pass: 0 = all except IRELATIVE/COPY, 1 = only IRELATIVE, 2 = only COPY */
+/* Ordinary symbol relocations and those resolving IFUNC are deliberately
+ * separate graph-wide phases.  This keeps every resolver behind relocation
+ * of all TLS templates and other ordinary data. */
 static int apply_relocs_rela(struct loaded_obj *obj,
                               const Elf64_Rela *rtab, size_t count,
                               struct loaded_obj *all, int nobj,
-                              int pass)
+                              enum relocation_pass pass)
 {
     uint64_t base = obj->base;
     for (size_t i = 0; i < count; i++) {
         const Elf64_Rela *r = &rtab[i];
-        uint64_t *slot = (uint64_t *)(base + r->r_offset);
         uint32_t type  = ELF64_R_TYPE(r->r_info);
         uint32_t sidx  = ELF64_R_SYM(r->r_info);
+        const Elf64_Sym *reference;
+        const char *symbol_name;
+        void *relocation_slot;
+        uint64_t *slot;
+        int symbolic_ifunc;
+
+        if (validate_relocation_record(obj, r, &reference, &symbol_name,
+                                       &relocation_slot) < 0) {
+            ldr_err("malformed relocation in", obj->name);
+            return -1;
+        }
+        slot = (uint64_t *)relocation_slot;
 
         if (type == ARCH_RELOC_IRELATIVE) {
-            if (pass != 1) continue;  /* run exactly once in the IFUNC pass */
+            if (pass != RELOC_PASS_IRELATIVE)
+                continue;
             typedef uint64_t (*ifunc_t)(void);
             ifunc_t resolver = (ifunc_t)(base + r->r_addend);
+            if (relocation_destination_overlaps_tls(
+                    obj, r->r_offset, sizeof(uint64_t))) {
+                ldr_err("IFUNC relocation into PT_TLS is unsupported in",
+                        obj->name);
+                return -1;
+            }
             *slot = resolver();
             continue;
         }
         if (type == ARCH_RELOC_COPY) {
-            if (pass != 2) continue;
+            if (pass != RELOC_PASS_COPY)
+                continue;
 
             /* Copy relocations must wait until source DSOs have already
              * applied their own RELATIVE/RELR relocations. */
-            uint64_t src_size = obj->dynsym[sidx].st_size;
-            struct loaded_obj *owner = NULL;
-            const Elf64_Sym *definition = lookup_relocation_definition(
-                obj, sidx, all, nobj, 1, &owner);
-
-            if (definition && owner) {
-                uint64_t src = owner->base + definition->st_value;
-                uint64_t sz = src_size && src_size < definition->st_size
-                    ? src_size : definition->st_size;
-
-                memcpy((void *)(base + r->r_offset), (void *)src, sz);
-            }
+            if (apply_copy_relocation(obj, all, nobj, r, reference,
+                                      symbol_name) < 0)
+                return -1;
             continue;
         }
-        if (pass != 0) continue;
+        if (pass != RELOC_PASS_ORDINARY && pass != RELOC_PASS_IFUNC)
+            continue;
+        symbolic_ifunc =
+            (type == ARCH_RELOC_ABS || type == ARCH_RELOC_GLOB_DAT ||
+             type == ARCH_RELOC_JUMP_SLOT) &&
+            relocation_symbol_is_ifunc(obj, sidx, all, nobj);
+        if ((pass == RELOC_PASS_IFUNC) != symbolic_ifunc)
+            continue;
+        if (symbolic_ifunc && relocation_destination_overlaps_tls(
+                obj, r->r_offset, sizeof(uint64_t))) {
+            ldr_err("IFUNC relocation into PT_TLS is unsupported in",
+                    obj->name);
+            return -1;
+        }
 
         switch (type) {
         case 0: /* R_X86_64_NONE / R_AARCH64_NONE */
@@ -8516,22 +10701,14 @@ static int apply_relocs_rela(struct loaded_obj *obj,
         case ARCH_RELOC_GLOB_DAT:
         case ARCH_RELOC_JUMP_SLOT:
         case ARCH_RELOC_ABS: {
-            const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
-            uint64_t addr = resolve_relocation_symbol(obj, sidx, all, nobj);
-            if (!addr && ELF64_ST_BIND(obj->dynsym[sidx].st_info) != STB_WEAK) {
-                /* Not fatal — symbol may come from ld.so which we don't load.
-                 * Point OBJECT symbols at a safe zero page to prevent NULL
-                 * dereference in IFUNC resolvers.  FUNC symbols get 0. */
-                if (ELF64_ST_TYPE(obj->dynsym[sidx].st_info) == STT_OBJECT
-                    && g_null_page)
-                    addr = (uint64_t)(uintptr_t)g_null_page;
-                else if (g_debug) {
-                    ldr_dbg("[loader] unresolved: ");
-                    ldr_dbg(name);
-                    ldr_dbg(" in ");
-                    ldr_dbg(obj->name);
-                    ldr_dbg("\n");
-                }
+            const char *name = symbol_name ? symbol_name : "";
+            uint64_t addr = 0;
+            int resolved = resolve_relocation_symbol(
+                obj, sidx, all, nobj, &addr);
+            if (reference && !resolved &&
+                ELF64_ST_BIND(reference->st_info) != STB_WEAK) {
+                ldr_err("unresolved relocation symbol", name);
+                return -1;
             }
             /* GLOB_DAT and JUMP_SLOT: result = S (no addend per ELF ABI).
              * ABS (R_X86_64_64): result = S + A.
@@ -8546,19 +10723,36 @@ static int apply_relocs_rela(struct loaded_obj *obj,
 
         case ARCH_RELOC_TPOFF: {
             if (sidx != 0) {
-                const char *name = obj->dynstr + obj->dynsym[sidx].st_name;
+                const char *name = symbol_name;
                 struct loaded_obj *owner = NULL;
                 const Elf64_Sym *definition = lookup_relocation_definition(
                     obj, sidx, all, nobj, 0, &owner);
 
-                if (definition && owner)
-                    *(int64_t *)slot = owner->tls.tpoff +
-                                       (int64_t)definition->st_value +
-                                       r->r_addend;
-                else if (ELF64_ST_BIND(obj->dynsym[sidx].st_info) != STB_WEAK)
+                if (definition && owner) {
+                    int64_t value;
+
+                    if (!tls_tpoff_value(&owner->tls,
+                                         definition->st_value,
+                                         r->r_addend, &value)) {
+                        ldr_err("TLS TPOFF relocation overflows in",
+                                obj->name);
+                        return -1;
+                    }
+                    *(int64_t *)slot = value;
+                } else if (ELF64_ST_BIND(reference->st_info) != STB_WEAK) {
                     ldr_err("unresolved TLS symbol", name);
+                    return -1;
+                } else {
+                    *(int64_t *)slot = r->r_addend;
+                }
             } else {
-                *(int64_t *)slot = obj->tls.tpoff + r->r_addend;
+                int64_t value;
+
+                if (!tls_tpoff_value(&obj->tls, 0, r->r_addend, &value)) {
+                    ldr_err("TLS TPOFF relocation overflows in", obj->name);
+                    return -1;
+                }
+                *(int64_t *)slot = value;
             }
             break;
         }
@@ -8568,14 +10762,18 @@ static int apply_relocs_rela(struct loaded_obj *obj,
              * so __tls_get_addr indexes the right DTV slot. */
             if (sidx != 0) {
                 /* Find the defining object's module ID */
-                size_t mid = obj->tls.modid ? obj->tls.modid : 1;
                 struct loaded_obj *owner = NULL;
+                const Elf64_Sym *definition = lookup_relocation_definition(
+                    obj, sidx, all, nobj, 0, &owner);
 
-                if (lookup_relocation_definition(obj, sidx, all, nobj, 0,
-                                                 &owner) && owner)
-                    mid = owner->tls.modid ? owner->tls.modid
-                                           : (size_t)(owner - all + 1);
-                *slot = mid;
+                if (definition && owner && owner->tls.modid) {
+                    *slot = owner->tls.modid;
+                } else if (ELF64_ST_BIND(reference->st_info) != STB_WEAK) {
+                    ldr_err("unresolved TLS module symbol", symbol_name);
+                    return -1;
+                } else {
+                    *slot = 0;
+                }
             } else {
                 *slot = obj->tls.modid ? obj->tls.modid : 1;
             }
@@ -8585,17 +10783,32 @@ static int apply_relocs_rela(struct loaded_obj *obj,
             if (sidx != 0) {
                 /* If the symbol is undefined locally (imported), look it
                  * up in the defining library to get the correct TLS offset. */
-                uint64_t off = obj->dynsym[sidx].st_value;
-                if (obj->dynsym[sidx].st_shndx == 0) {
+                uint64_t off = reference->st_value;
+                struct loaded_obj *owner = obj;
+                if (reference->st_shndx == 0) {
                     const Elf64_Sym *definition = lookup_relocation_definition(
-                        obj, sidx, all, nobj, 0, NULL);
+                        obj, sidx, all, nobj, 0, &owner);
 
                     if (definition)
                         off = definition->st_value;
+                    else if (ELF64_ST_BIND(reference->st_info) != STB_WEAK) {
+                        ldr_err("unresolved TLS offset symbol", symbol_name);
+                        return -1;
+                    } else {
+                        *slot = 0;
+                        break;
+                    }
                 }
-                *slot = off + r->r_addend;
-            } else
-                *slot = r->r_addend;
+                if (!tls_dtpoff_value(&owner->tls, off, r->r_addend,
+                                      slot)) {
+                    ldr_err("TLS DTPOFF relocation overflows in", obj->name);
+                    return -1;
+                }
+            } else if (!tls_dtpoff_value(&obj->tls, 0, r->r_addend,
+                                         slot)) {
+                ldr_err("TLS DTPOFF relocation overflows in", obj->name);
+                return -1;
+            }
             break;
 
 #if defined(__aarch64__)
@@ -8620,26 +10833,74 @@ static int apply_relocs_rela(struct loaded_obj *obj,
     return 0;
 }
 
-static void apply_relr(struct loaded_obj *obj)
+static int walk_relr(struct loaded_obj *obj, int apply)
 {
-    if (!obj->relr || obj->relr_count == 0) return;
+    uint64_t where_offset = 0;
+    int have_where = 0;
+
+    if (!obj->relr || obj->relr_count == 0)
+        return 0;
     uint64_t base = obj->base;
-    uint64_t *where = NULL;
 
     for (size_t i = 0; i < obj->relr_count; i++) {
         Elf64_Relr entry = obj->relr[i];
         if ((entry & 1) == 0) {
-            where = (uint64_t *)(base + entry);
-            *where += base;
-            where++;
+            uint64_t *where;
+
+            if (!loaded_obj_vaddr_pointer(obj, entry, sizeof(*where), PF_W,
+                                          (void **)&where))
+                return -1;
+            if (apply)
+                *where += base;
+            if (entry > UINT64_MAX - sizeof(*where))
+                return -1;
+            where_offset = entry + sizeof(*where);
+            have_where = 1;
         } else {
             uint64_t bitmap = entry >> 1;
-            for (int j = 0; bitmap; j++, bitmap >>= 1) {
-                if (bitmap & 1) where[j] += base;
+
+            if (!have_where)
+                return -1;
+            for (unsigned int j = 0; bitmap; j++, bitmap >>= 1) {
+                uint64_t offset;
+                uint64_t *where;
+
+                if (!(bitmap & 1))
+                    continue;
+                if (where_offset > UINT64_MAX -
+                                   (uint64_t)j * sizeof(*where))
+                    return -1;
+                offset = where_offset + (uint64_t)j * sizeof(*where);
+                if (!loaded_obj_vaddr_pointer(obj, offset, sizeof(*where),
+                                              PF_W,
+                                              (void **)&where))
+                    return -1;
+                if (apply)
+                    *where += base;
             }
-            where += 63;
+            if (where_offset > UINT64_MAX - 63 * sizeof(uint64_t))
+                return -1;
+            where_offset += 63 * sizeof(uint64_t);
         }
     }
+    return 0;
+}
+
+static int validate_object_relocations(struct loaded_obj *obj)
+{
+    const Elf64_Rela *tables[] = { obj->rela, obj->jmprel };
+    size_t counts[] = { obj->rela_count, obj->jmprel_count };
+
+    if (walk_relr(obj, 0) < 0)
+        return -1;
+    for (size_t t = 0; t < sizeof(tables) / sizeof(tables[0]); t++) {
+        for (size_t i = 0; i < counts[t]; i++) {
+            if (validate_relocation_record(obj, &tables[t][i], NULL, NULL,
+                                           NULL) < 0)
+                return -1;
+        }
+    }
+    return 0;
 }
 
 /*
@@ -8652,10 +10913,9 @@ static void apply_relr(struct loaded_obj *obj)
  * runtime-fixup pass reaches the symbol.  This pre-pass ensures those
  * startup-critical GOT slots are already populated.
  */
-static void preseed_rtld_got(struct loaded_obj *obj)
+static int preseed_rtld_got(struct loaded_obj *obj,
+                            struct loaded_obj *objs, int nobj)
 {
-    uint64_t base = obj->base;
-
     const Elf64_Rela *tabs[] = { obj->rela, obj->jmprel };
     size_t counts[] = { obj->rela_count, obj->jmprel_count };
     for (int t = 0; t < 2; t++) {
@@ -8665,23 +10925,28 @@ static void preseed_rtld_got(struct loaded_obj *obj)
             uint32_t sidx;
             const char *name;
             uint64_t addr = 0;
+            const Elf64_Sym *reference;
+            void *relocation_slot;
 
             if (type != ARCH_RELOC_GLOB_DAT && type != ARCH_RELOC_JUMP_SLOT)
                 continue;
             sidx = ELF64_R_SYM(r->r_info);
-            if (sidx >= obj->dynsym_count)
+            if (sidx == 0)
                 continue;
-            name = obj->dynstr + obj->dynsym[sidx].st_name;
+            if (validate_relocation_record(obj, r, &reference, &name,
+                                           &relocation_slot) < 0)
+                return -1;
+            (void)reference;
             if (name[0] != '_')
                 continue;
 
-            if (name[1] == 'r')
-                addr = lookup_fake_object(name);
-            else if (name[1] == '_' && name[2] == 'r')
-                addr = lookup_special(name, gnu_hash_calc(name));
+            if (lookup_fake_object(name))
+                addr = lookup_relocation_special(obj, sidx, objs, nobj);
 
             if (addr) {
-                *(uint64_t *)(base + r->r_offset) = addr + r->r_addend;
+                /* GLOB_DAT/JUMP_SLOT compute S, never S+A.  Some glibc PLT
+                 * entries carry a nonzero stub addend that must be ignored. */
+                *(uint64_t *)relocation_slot = addr;
                 if (g_debug) {
                     ldr_msg("GOT preseed: ");
                     ldr_msg(name);
@@ -8692,18 +10957,19 @@ static void preseed_rtld_got(struct loaded_obj *obj)
             }
         }
     }
+    return 0;
 }
 
-/* pass: 0 = everything except IRELATIVE/COPY,
- *       1 = only IRELATIVE,
- *       2 = only COPY */
 static int apply_all_relocs(struct loaded_obj *obj,
                              struct loaded_obj *all, int nobj,
-                             int pass)
+                             enum relocation_pass pass)
 {
-    if (pass == 0) {
+    if (pass == RELOC_PASS_ORDINARY) {
         /* RELR first (all relative, no symbols) */
-        apply_relr(obj);
+        if (walk_relr(obj, 1) < 0) {
+            ldr_err("malformed RELR relocation in", obj->name);
+            return -1;
+        }
     }
 
     /* RELA (.rela.dyn) */
@@ -8723,12 +10989,6 @@ static int apply_all_relocs(struct loaded_obj *obj,
 
 /* ==== Minimal libc process initialization ============================= */
 
-#define MUSL_ENVIRON_TO_LIBC_OFF_OLD         0x24e0
-#define MUSL_ENVIRON_TO_SYSINFO_OFF          0x30
-#define MUSL_ENVIRON_TO_HWCAP_OFF            0x48
-#define MUSL_LIBC_GLOBAL_LOCALE_OFF          0x38
-#define MUSL_THREAD_SIZE_GUESS               0x100
-
 struct musl_tls_module_state {
     struct musl_tls_module_state *next;
     void *image;
@@ -8738,87 +10998,17 @@ struct musl_tls_module_state {
     size_t offset;
 };
 
-struct musl_libc_state {
-    char can_do_threads;
-    char threaded;
-    char secure;
-    signed char need_locks;
-    int threads_minus_1;
-    size_t *auxv;
-    void *tls_head;
-    size_t tls_size;
-    size_t tls_align;
-    size_t tls_cnt;
-    size_t page_size;
-};
-
 static uintptr_t get_auxval(char **envp, unsigned long type);
 static Elf64_auxv_t *get_auxv_ptr(char **envp);
 static const Elf64_Sym *lookup_linear(const struct loaded_obj *obj,
                                       const char *name);
 static struct musl_tls_module_state g_musl_tls_modules[MAX_TOTAL_OBJS];
 
-static uint64_t detect_musl_libc_state_addr(const struct loaded_obj *libc_obj,
-                                            uint64_t env_addr,
-                                            uint64_t prog_addr)
-{
-    uint64_t libc_addr;
-    uint64_t prog_full_addr;
-
-    libc_addr = musl_defined_symbol_addr(libc_obj, "__libc");
-    if (libc_addr)
-        return libc_addr;
-
-    prog_full_addr = musl_defined_symbol_addr(libc_obj, "__progname_full");
-    if (env_addr && prog_addr && prog_full_addr &&
-        prog_addr > env_addr && prog_full_addr > env_addr) {
-        uint64_t first = prog_addr < prog_full_addr ? prog_addr : prog_full_addr;
-        uint64_t second = prog_addr < prog_full_addr ? prog_full_addr : prog_addr;
-
-        if (second - first == sizeof(uintptr_t) &&
-            first - env_addr >= MUSL_PROGNAME_NEAR_ENVIRON_MAX)
-            return second + 2 * sizeof(uintptr_t);
-    }
-
-    if (env_addr >= MUSL_ENVIRON_TO_LIBC_OFF_OLD)
-        return env_addr - MUSL_ENVIRON_TO_LIBC_OFF_OLD;
-    return 0;
-}
-
-static uint64_t detect_musl_global_locale_addr(const struct loaded_obj *libc_obj,
-                                               uint64_t libc_addr)
-{
-    static const char *const names[] = {
-        "__global_locale",
-        "global_locale",
-        "c_locale",
-        "C_locale",
-    };
-
-    for (size_t i = 0; i < sizeof(names)/sizeof(names[0]); i++) {
-        uint64_t addr = musl_defined_symbol_addr(libc_obj, names[i]);
-
-        if (addr && loaded_obj_contains(libc_obj, (uintptr_t)addr, sizeof(uintptr_t)))
-            return addr;
-    }
-
-    if (libc_addr && loaded_obj_contains(libc_obj,
-                                         (uintptr_t)(libc_addr + MUSL_LIBC_GLOBAL_LOCALE_OFF),
-                                         sizeof(uintptr_t)))
-        return libc_addr + MUSL_LIBC_GLOBAL_LOCALE_OFF;
-    return 0;
-}
-
 static void init_musl_process_state(struct loaded_obj *objs, int nobj,
                                     char **envp)
 {
     const struct loaded_obj *libc_obj;
-    uint64_t env_addr;
-    uint64_t prog_addr;
     Elf64_auxv_t *auxv;
-    struct musl_libc_state *libc;
-    uint64_t libc_addr;
-    uint64_t locale_addr;
     uintptr_t hwcap = 0;
     uintptr_t sysinfo = 0;
     uintptr_t pagesz = 4096;
@@ -8827,21 +11017,17 @@ static void init_musl_process_state(struct loaded_obj *objs, int nobj,
     uintptr_t tp = 0;
     int secure = 0;
     size_t max_modid = 0;
-    size_t max_offset = 0;
+    size_t tls_span = 0;
     size_t max_align = sizeof(uintptr_t);
+    uint64_t tls_size_sum;
+    uint64_t tls_size;
 
     if (!g_is_musl_runtime)
         return;
 
     libc_obj = find_musl_libc(objs, nobj);
-    if (!libc_obj)
-        return;
-
-    env_addr = musl_defined_symbol_addr(libc_obj, "__environ");
-    prog_addr = musl_defined_symbol_addr(libc_obj, "__progname");
-    libc_addr = detect_musl_libc_state_addr(libc_obj, env_addr, prog_addr);
-    if (!env_addr || !prog_addr || !libc_addr)
-        return;
+    if (!libc_obj || !g_musl_layout || !g_musl_libc_addr)
+        _exit(127);
 
     auxv = get_auxv_ptr(envp);
     for (Elf64_auxv_t *entry = auxv; entry->a_type != AT_NULL; entry++) {
@@ -8872,12 +11058,6 @@ static void init_musl_process_state(struct loaded_obj *objs, int nobj,
         secure = (uid != euid) || (gid != egid);
     }
 
-    libc = (struct musl_libc_state *)(uintptr_t)libc_addr;
-    if (!loaded_obj_contains(libc_obj, (uintptr_t)libc, sizeof(*libc))) {
-        if (g_debug)
-            ldr_dbg("[loader] musl libc state probe failed: outside map\n");
-        return;
-    }
     memset(g_musl_tls_modules, 0, sizeof(g_musl_tls_modules));
     for (int i = 0; i < nobj; i++) {
         if (objs[i].tls.memsz == 0)
@@ -8902,30 +11082,60 @@ static void init_musl_process_state(struct loaded_obj *objs, int nobj,
                 ? (size_t)objs[i].tls.tpoff
                 : (size_t)(-(objs[i].tls.tpoff));
 
-            mod->image = (void *)(uintptr_t)(objs[i].base + objs[i].tls.vaddr);
+            if (objs[i].tls.filesz != 0) {
+                mod->image = (void *)(uintptr_t)(objs[i].base +
+                                                  objs[i].tls.vaddr);
+            }
             mod->len = objs[i].tls.filesz;
             mod->size = objs[i].tls.memsz;
             mod->align = objs[i].tls.align ? (size_t)objs[i].tls.align : 1;
             mod->offset = offset;
-            if (offset > max_offset)
-                max_offset = offset;
+            if (musl_tls_above_tp()) {
+                if (mod->size > SIZE_MAX - offset)
+                    _exit(127);
+                if (offset + mod->size > tls_span)
+                    tls_span = offset + mod->size;
+            } else if (offset > tls_span) {
+                tls_span = offset;
+            }
             break;
         }
         if (mod->align > max_align)
             max_align = mod->align;
     }
 
-    libc->can_do_threads = 1;
-    libc->tls_head = max_modid ? &g_musl_tls_modules[0] : NULL;
-    libc->tls_cnt = max_modid;
-    libc->tls_align = max_align;
-    libc->tls_size = ALIGN_UP((max_modid + 1) * sizeof(uintptr_t)
-                              + max_offset + MUSL_THREAD_SIZE_GUESS
-                              + max_align * 2,
-                              max_align);
-    libc->auxv = (size_t *)auxv;
-    libc->page_size = pagesz;
-    libc->secure = secure;
+    if (!u64_add_checked((uint64_t)(max_modid + 1) * sizeof(uintptr_t),
+                         tls_span, &tls_size_sum) ||
+        !u64_add_checked(tls_size_sum, g_musl_layout->pthread_size,
+                         &tls_size_sum) ||
+        max_align > UINT64_MAX / 2 ||
+        !u64_add_checked(tls_size_sum, (uint64_t)max_align * 2,
+                         &tls_size_sum) ||
+        !u64_align_up_checked(tls_size_sum, max_align, &tls_size) ||
+        tls_size > SIZE_MAX)
+        _exit(127);
+
+    if (g_musl_layout->libc_flag_width == 1) {
+        *(uint8_t *)(g_musl_libc_addr +
+                     g_musl_layout->libc_can_do_threads) = 1;
+        *(uint8_t *)(g_musl_libc_addr + g_musl_layout->libc_secure) =
+            secure != 0;
+    } else {
+        *(int *)(g_musl_libc_addr +
+                 g_musl_layout->libc_can_do_threads) = 1;
+        *(int *)(g_musl_libc_addr + g_musl_layout->libc_secure) = secure;
+    }
+    *(size_t **)(g_musl_libc_addr + g_musl_layout->libc_auxv) =
+        (size_t *)auxv;
+    *(void **)(g_musl_libc_addr + g_musl_layout->libc_tls_head) =
+        max_modid ? &g_musl_tls_modules[0] : NULL;
+    *(size_t *)(g_musl_libc_addr + g_musl_layout->libc_tls_size) =
+        (size_t)tls_size;
+    *(size_t *)(g_musl_libc_addr + g_musl_layout->libc_tls_align) =
+        max_align;
+    *(size_t *)(g_musl_libc_addr + g_musl_layout->libc_tls_cnt) =
+        max_modid;
+    *(size_t *)(g_musl_libc_addr + g_musl_layout->libc_page_size) = pagesz;
 
     tp = arch_get_tp();
     if (tp) {
@@ -8934,27 +11144,39 @@ static void init_musl_process_state(struct loaded_obj *objs, int nobj,
         *(uintptr_t *)(self + MUSL_THREAD_PREV_OFF) = self;
         *(uintptr_t *)(self + MUSL_THREAD_NEXT_OFF) = self;
         *(uintptr_t *)(self + MUSL_THREAD_SYSINFO_OFF) = sysinfo;
-        *(int *)(self + MUSL_THREAD_TID_OFF) = (int)syscall(SYS_gettid);
-        *(int *)(self + MUSL_THREAD_ERRNO_OFF) = 0;
-        *(int *)(self + MUSL_THREAD_DETACH_STATE_OFF) = 2;
+        if (g_musl_target_tid_known)
+            *(int *)(self + MUSL_THREAD_TID_OFF) = (int)syscall(SYS_gettid);
+        if (g_musl_target_errno_known)
+            *(int *)(self + MUSL_THREAD_ERRNO_OFF) = 0;
+        if (g_musl_target_detach_known)
+            *(int *)(self + MUSL_THREAD_DETACH_STATE_OFF) =
+                g_musl_target_detach_value;
         *(uintptr_t *)(self + MUSL_THREAD_ROBUST_HEAD_OFF) =
             self + MUSL_THREAD_ROBUST_HEAD_OFF;
-        locale_addr = detect_musl_global_locale_addr(libc_obj, libc_addr);
-        if (locale_addr)
-            *(uintptr_t *)(self + MUSL_THREAD_LOCALE_OFF) = (uintptr_t)locale_addr;
+        *(uintptr_t *)(self + MUSL_THREAD_LOCALE_OFF) =
+            g_musl_libc_addr + g_musl_layout->libc_global_locale;
     }
 
     sysinfo_addr = musl_defined_symbol_addr(libc_obj, "__sysinfo");
-    if (!sysinfo_addr)
-        sysinfo_addr = env_addr + MUSL_ENVIRON_TO_SYSINFO_OFF;
-    if (loaded_obj_contains(libc_obj, (uintptr_t)sysinfo_addr, sizeof(uintptr_t)))
+    if (sysinfo_addr &&
+        loaded_obj_contains(libc_obj, (uintptr_t)sysinfo_addr, sizeof(uintptr_t)))
         *(uintptr_t *)(uintptr_t)sysinfo_addr = sysinfo;
 
     hwcap_addr = musl_defined_symbol_addr(libc_obj, "__hwcap");
-    if (!hwcap_addr)
-        hwcap_addr = env_addr + MUSL_ENVIRON_TO_HWCAP_OFF;
-    if (loaded_obj_contains(libc_obj, (uintptr_t)hwcap_addr, sizeof(uintptr_t)))
+    if (hwcap_addr &&
+        loaded_obj_contains(libc_obj, (uintptr_t)hwcap_addr, sizeof(uintptr_t)))
         *(uintptr_t *)(uintptr_t)hwcap_addr = hwcap;
+
+    {
+        uint64_t guard_addr = musl_defined_symbol_addr(
+            libc_obj, "__stack_chk_guard");
+
+        if (guard_addr &&
+            loaded_obj_contains(libc_obj, (uintptr_t)guard_addr,
+                                sizeof(uintptr_t))) {
+            *(uintptr_t *)(uintptr_t)guard_addr = g_musl_stack_guard;
+        }
+    }
 }
 
 static void init_libc_process_state(struct loaded_obj *objs, int nobj,
@@ -9009,6 +11231,8 @@ static void init_libc_process_state(struct loaded_obj *objs, int nobj,
     if (addr) *(void **)(uintptr_t)addr = (void *)&argv[-1];
 
     init_musl_process_state(objs, nobj, auxv_envp);
+    if (g_is_musl_runtime)
+        return;
 
     /* glibc stdio exposes both FILE objects and pointer aliases. */
     uint64_t io_stdin  = resolve_sym(objs, nobj, "_IO_2_1_stdin_");
@@ -9062,32 +11286,12 @@ static void init_libc_process_state(struct loaded_obj *objs, int nobj,
      * normal glibc initialization path — no manual tcache setup needed.
      */
 
-    /* Detect glibc version and set version-dependent offsets in the fake
-     * _rtld_global/_rtld_global_ro structs.  Must happen BEFORE
-     * __libc_early_init which reads _dl_tls_static_align (divides by it).
-     *
-     * Primary detection happens earlier via detect_glibc_offsets_from_interp()
-     * which parses ld-linux.so's symbol table.  This fallback handles the
-     * case where the INTERP entry was missing or unparseable. */
+    /* The private layout was validated before object mapping.  Never revive
+     * the former numeric-version fallback here: a minor version does not
+     * identify glibc's private rtld structs. */
     if (!g_glibc_rtld_fixed) {
-        const struct glibc_ver_offsets *glibc_off = DEFAULT_GLIBC_OFFSETS;
-        addr = resolve_sym(objs, nobj, "gnu_get_libc_version");
-        if (addr) {
-            const char *ver = ((const char *(*)(void))(uintptr_t)addr)();
-            if (ver && ver[0] == '2' && ver[1] == '.') {
-                int minor = 0;
-                for (int i = 2; ver[i] >= '0' && ver[i] <= '9'; i++)
-                    minor = minor * 10 + (ver[i] - '0');
-                g_glibc_minor = minor;
-                glibc_off = fallback_glibc_offsets_for_minor(minor);
-                ldr_dbg("[loader] fallback: glibc version-based offset selection\n");
-            }
-        }
-        fixup_rtld_for_glibc(glibc_off);
-        debug_dump_glibc_offsets("gnu_get_libc_version-fallback", 0,
-                                 g_glibc_minor, 0, 0, glibc_off);
-        g_glibc_off = glibc_off;
-        g_glibc_rtld_fixed = 1;
+        ldr_err("glibc private rtld layout was not validated", NULL);
+        _exit(127);
     }
 
     /* Pre-initialize __curbrk in the mapped libc so that sbrk() has
@@ -9128,35 +11332,27 @@ static int protect_object(struct loaded_obj *obj,
     for (int i = 0; i < meta->phdr_num; i++) {
         const Elf64_Phdr *relro =
             (const Elf64_Phdr *)(phdr_start + i * meta->phdr_entsz);
-        uint64_t relro_start, relro_end;
-        int prot = 0;
+        uint64_t raw_start, raw_end, relro_start, relro_end;
 
         if (relro->p_type != PT_GNU_RELRO || relro->p_memsz == 0)
             continue;
 
-        relro_start = page_floor(obj->base + relro->p_vaddr);
-        relro_end = ALIGN_UP(obj->base + relro->p_vaddr + relro->p_memsz,
-                             g_page_size);
-
-        for (int p = 0; p < meta->phdr_num; p++) {
-            const Elf64_Phdr *load =
-                (const Elf64_Phdr *)(phdr_start + p * meta->phdr_entsz);
-            uint64_t load_start, load_end;
-
-            if (load->p_type != PT_LOAD)
-                continue;
-            load_start = page_floor(obj->base + load->p_vaddr);
-            load_end = ALIGN_UP(obj->base + load->p_vaddr + load->p_memsz,
-                                g_page_size);
-            if (relro_start < load_end && relro_end > load_start)
-                prot |= phdr_prot(load);
-        }
-
-        if (prot == 0)
+        if (relro->p_memsz > SIZE_MAX ||
+            !loaded_obj_vaddr_pointer(obj, relro->p_vaddr,
+                                      (size_t)relro->p_memsz, PF_R, NULL) ||
+            !u64_add_checked(obj->base, relro->p_vaddr, &raw_start) ||
+            !u64_add_checked(raw_start, relro->p_memsz, &raw_end) ||
+            !u64_align_up_checked(raw_end, g_page_size, &relro_end))
             return -1;
-        prot &= ~PROT_WRITE;
+        relro_start = page_floor(raw_start);
+        if (relro_end - relro_start > SIZE_MAX ||
+            !loaded_obj_pages_covered(obj, relro_start, relro_end, PF_R))
+            return -1;
+
+        /* RELRO contains data, never executable code.  Using a union of
+         * overlapping segment flags here can accidentally restore PF_X. */
         if (mprotect((void *)(uintptr_t)relro_start,
-                     relro_end - relro_start, prot) < 0)
+                     (size_t)(relro_end - relro_start), PROT_READ) < 0)
             return -1;
     }
     return 0;
@@ -9194,10 +11390,16 @@ static int dl_is_virtual_runtime_object(const char *name)
     if (!name || !name[0])
         return 0;
     base = dl_basename(name);
-    return strncmp(base, "linux-vdso", 10) == 0 ||
-           strncmp(base, "linux-gate", 10) == 0 ||
-           strncmp(base, "ld-linux", 8) == 0 ||
-           strncmp(base, "ld-musl", 7) == 0;
+    if (strcmp(base, "linux-vdso.so.1") == 0 ||
+        strcmp(base, "linux-gate.so.1") == 0)
+        return 1;
+#if defined(__x86_64__)
+    return strcmp(base, "ld-linux-x86-64.so.2") == 0 ||
+           strcmp(base, "ld-musl-x86_64.so.1") == 0;
+#elif defined(__aarch64__)
+    return strcmp(base, "ld-linux-aarch64.so.1") == 0 ||
+           strcmp(base, "ld-musl-aarch64.so.1") == 0;
+#endif
 }
 
 static const char *dl_store_name(const char *s)
@@ -9205,7 +11407,8 @@ static const char *dl_store_name(const char *s)
     size_t n = 0;
     while (s[n]) n++;
     n++;  /* include NUL */
-    if (g_dl_strbuf_used + n > sizeof(g_dl_strbuf)) return "?";
+    if (n > sizeof(g_dl_strbuf) - g_dl_strbuf_used)
+        return NULL;
     char *d = g_dl_strbuf + g_dl_strbuf_used;
     memcpy(d, s, n);
     g_dl_strbuf_used += n;
@@ -9222,11 +11425,121 @@ static void dl_set_error(const char *a, const char *b)
     g_dlerror_valid = 1;
 }
 
-/* Forward declarations — recursive loading between these functions */
-static struct loaded_obj *load_elf_from_file(const char *path);
-static struct loaded_obj *load_embedded_object(uint32_t mi);
+struct dl_rpath_scope {
+    const char *path;
+    const struct loaded_obj *owner;
+    const struct dl_rpath_scope *parent;
+};
 
-/* file_has_static_tls — peek at an ELF file on disk and report whether
+/* Forward declarations — recursive loading between these functions */
+static struct loaded_obj *load_elf_from_file(
+    const char *path, const struct dl_rpath_scope *inherited_rpath);
+static struct loaded_obj *load_elf_from_file_fd(
+    const char *path, int fd,
+    const struct dl_rpath_scope *inherited_rpath);
+static struct loaded_obj *load_embedded_object(
+    uint32_t mi, const struct dl_rpath_scope *inherited_rpath);
+
+static int read_runtime_dso_headers(int fd, Elf64_Ehdr *eh,
+                                    Elf64_Phdr *ph, size_t ph_capacity,
+                                    uint64_t *file_size_out)
+{
+    struct stat st;
+    uint64_t phdr_bytes;
+    const Elf64_Phdr *dynamic = NULL;
+    unsigned int dynamic_count = 0;
+    unsigned int load_count = 0;
+
+    if (fstat(fd, &st) < 0 || st.st_size < (off_t)sizeof(*eh) ||
+        pread(fd, eh, sizeof(*eh), 0) != (ssize_t)sizeof(*eh))
+        return -1;
+    *file_size_out = (uint64_t)st.st_size;
+    if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0 ||
+        eh->e_ident[EI_CLASS] != ELFCLASS64 ||
+        eh->e_ident[EI_DATA] != ELFDATA2LSB ||
+        eh->e_ident[EI_VERSION] != EV_CURRENT ||
+        eh->e_version != EV_CURRENT || eh->e_ehsize != sizeof(*eh) ||
+        eh->e_type != ET_DYN || eh->e_machine != ARCH_ELF_MACHINE ||
+        eh->e_phnum == 0 || eh->e_phnum > ph_capacity ||
+        eh->e_phentsize != sizeof(Elf64_Phdr) ||
+        !u64_mul_checked(eh->e_phnum, sizeof(Elf64_Phdr), &phdr_bytes) ||
+        eh->e_phoff > *file_size_out ||
+        phdr_bytes > *file_size_out - eh->e_phoff ||
+        eh->e_phoff > (uint64_t)INT64_MAX || phdr_bytes > SSIZE_MAX ||
+        pread(fd, ph, (size_t)phdr_bytes, (off_t)eh->e_phoff) !=
+            (ssize_t)phdr_bytes)
+        return -1;
+
+    for (uint16_t i = 0; i < eh->e_phnum; i++) {
+        const Elf64_Phdr *header = &ph[i];
+
+        if (header->p_offset > *file_size_out ||
+            header->p_filesz > *file_size_out - header->p_offset ||
+            header->p_vaddr > UINT64_MAX - header->p_memsz ||
+            header->p_offset > (uint64_t)INT64_MAX ||
+            header->p_filesz > SSIZE_MAX)
+            return -1;
+        if (header->p_type == PT_LOAD || header->p_type == PT_DYNAMIC ||
+            header->p_type == PT_TLS) {
+            if (header->p_filesz > header->p_memsz ||
+                (header->p_align > 1 &&
+                 ((header->p_align & (header->p_align - 1)) != 0 ||
+                  (header->p_vaddr & (header->p_align - 1)) !=
+                    (header->p_offset & (header->p_align - 1)))))
+                return -1;
+        }
+        if (header->p_type == PT_LOAD && header->p_memsz != 0)
+            load_count++;
+        if (header->p_type == PT_DYNAMIC) {
+            dynamic = header;
+            dynamic_count++;
+        }
+    }
+    if (load_count == 0 || dynamic_count != 1 || !dynamic ||
+        dynamic->p_filesz == 0 ||
+        dynamic->p_filesz % sizeof(Elf64_Dyn) != 0)
+        return -1;
+
+    for (uint16_t i = 0; i < eh->e_phnum; i++) {
+        const Elf64_Phdr *load = &ph[i];
+        uint64_t delta;
+
+        if (load->p_type != PT_LOAD ||
+            dynamic->p_vaddr < load->p_vaddr ||
+            dynamic->p_offset < load->p_offset)
+            continue;
+        delta = dynamic->p_vaddr - load->p_vaddr;
+        if (dynamic->p_offset - load->p_offset == delta &&
+            delta <= load->p_memsz &&
+            dynamic->p_memsz <= load->p_memsz - delta &&
+            delta <= load->p_filesz &&
+            dynamic->p_filesz <= load->p_filesz - delta)
+            return 0;
+    }
+    return -1;
+}
+
+/* Search paths may contain a DSO for another ABI before the usable one.
+ * Distinguish that normal mismatch from malformed metadata: searched ABI
+ * mismatches are skipped, while an explicit path and malformed files fail. */
+static int runtime_dso_fd_compatible(int fd)
+{
+    Elf64_Ehdr eh;
+
+    if (pread(fd, &eh, sizeof(eh), 0) != (ssize_t)sizeof(eh))
+        return -1;
+    if (memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0)
+        return -1;
+    if (eh.e_ident[EI_CLASS] != ELFCLASS64 ||
+        eh.e_ident[EI_DATA] != ELFDATA2LSB ||
+        eh.e_ident[EI_VERSION] != EV_CURRENT ||
+        eh.e_version != EV_CURRENT || eh.e_type != ET_DYN ||
+        eh.e_machine != ARCH_ELF_MACHINE)
+        return 0;
+    return 1;
+}
+
+/* dynamic_has_static_tls — inspect an already validated ELF file and report
  * its dynamic section sets DF_STATIC_TLS.  Such objects expect their
  * TLS block to live at a fixed negative TPOFF inside the main thread's
  * static TLS area.  glibc's real rtld refuses to dlopen them after
@@ -9242,160 +11555,1204 @@ static struct loaded_obj *load_embedded_object(uint32_t mi);
  * Returning 1 here lets my_dlopen turn the request into a graceful
  * NULL+dlerror, mirroring glibc's "cannot allocate memory in static
  * TLS block" failure mode that callers already handle. */
-static int file_has_static_tls(const char *path)
+static int dynamic_has_static_tls(int fd, const Elf64_Phdr *ph,
+                                  uint16_t phnum)
 {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return 0;
-
-    Elf64_Ehdr eh;
-    if (read(fd, &eh, sizeof(eh)) != (ssize_t)sizeof(eh)) {
-        close(fd);
-        return 0;
-    }
-    if (memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0 ||
-        eh.e_ident[EI_CLASS] != ELFCLASS64 ||
-        eh.e_type != ET_DYN ||
-        eh.e_phnum == 0 || eh.e_phnum > 64) {
-        close(fd);
-        return 0;
-    }
-
-    Elf64_Phdr ph[64];
-    size_t phsz = (size_t)eh.e_phnum * eh.e_phentsize;
-    if (phsz > sizeof(ph) ||
-        pread(fd, ph, phsz, eh.e_phoff) != (ssize_t)phsz) {
-        close(fd);
-        return 0;
-    }
-
     /* Locate PT_DYNAMIC and PT_TLS.  DF_STATIC_TLS is only meaningful
      * if the object actually has a non-empty TLS template — many glibc
      * libs (e.g. libm.so.6) carry the flag for legacy reasons but
      * declare zero TLS, so loading them is harmless. */
     const Elf64_Phdr *dyn_ph = NULL;
     uint64_t tls_memsz = 0;
-    for (int i = 0; i < eh.e_phnum; i++) {
+    for (uint16_t i = 0; i < phnum; i++) {
         if (ph[i].p_type == PT_DYNAMIC) dyn_ph = &ph[i];
         else if (ph[i].p_type == PT_TLS) tls_memsz = ph[i].p_memsz;
     }
-    if (!dyn_ph || dyn_ph->p_filesz == 0 ||
-        dyn_ph->p_filesz > 64 * 1024 ||
-        tls_memsz == 0) {
-        close(fd);
+    if (!dyn_ph || tls_memsz == 0) {
         return 0;
     }
 
     Elf64_Dyn dyn[4096];
     if (dyn_ph->p_filesz > sizeof(dyn)) {
-        close(fd);
-        return 0;
+        return -1;
     }
     if (pread(fd, dyn, dyn_ph->p_filesz, dyn_ph->p_offset) !=
         (ssize_t)dyn_ph->p_filesz) {
-        close(fd);
-        return 0;
+        return -1;
     }
-    close(fd);
 
     int found = 0;
     size_t n = dyn_ph->p_filesz / sizeof(Elf64_Dyn);
-    for (size_t i = 0; i < n && dyn[i].d_tag != DT_NULL; i++) {
+    int saw_null = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (dyn[i].d_tag == DT_NULL) {
+            saw_null = 1;
+            break;
+        }
         if (dyn[i].d_tag == DT_FLAGS &&
             (dyn[i].d_un.d_val & 0x10 /* DF_STATIC_TLS */)) {
             found = 1;
+        }
+    }
+    return saw_null ? found : -1;
+}
+
+/* Apply the same static-TLS admission rule after an object has been parsed.
+ * The relocation scan is intentional: malformed or non-GNU-produced DSOs
+ * are not allowed to evade DF_STATIC_TLS simply by omitting the flag. */
+static int dl_lazy_static_tls_admitted(const struct loaded_obj *obj,
+                                       const char *name)
+{
+    int requires_static_tls = 0;
+
+    if (!obj || obj->tls.memsz == 0)
+        return 0;
+    for (size_t i = 0; i < obj->dynamic_count; i++) {
+        if (obj->dynamic[i].d_tag == DT_FLAGS &&
+            (obj->dynamic[i].d_un.d_val & 0x10 /* DF_STATIC_TLS */)) {
+            requires_static_tls = 1;
             break;
         }
     }
-    return found;
+    if (!requires_static_tls) {
+        const Elf64_Rela *tables[] = { obj->rela, obj->jmprel };
+        size_t counts[] = { obj->rela_count, obj->jmprel_count };
+
+        for (size_t t = 0; t < sizeof(tables) / sizeof(tables[0]) &&
+                           !requires_static_tls; t++) {
+            for (size_t i = 0; i < counts[t]; i++) {
+                if (ELF64_R_TYPE(tables[t][i].r_info) == ARCH_RELOC_TPOFF) {
+                    requires_static_tls = 1;
+                    break;
+                }
+            }
+        }
+    }
+    if (!requires_static_tls)
+        return 0;
+
+    dl_set_error(name,
+        ": cannot dlopen static-TLS library after startup "
+        "(would clobber main thread TLS)");
+    if (g_debug) {
+        ldr_msg("[loader] refusing dlopen of static-TLS lib: ");
+        ldr_msg(name);
+        ldr_msg("\n");
+    }
+    return -1;
 }
 
+#define DL_SEARCH_PATH_BYTES_MAX 16384U
+#define DL_SEARCH_COMPONENTS_MAX 128U
+
+#if defined(__x86_64__)
 static const char *g_runtime_search_dirs[] = {
-    "/lib",
-    "/lib64",
-    "/usr/lib",
-    "/usr/lib64",
     "/lib/x86_64-linux-gnu",
     "/usr/lib/x86_64-linux-gnu",
-    "/lib/aarch64-linux-gnu",
-    "/usr/lib/aarch64-linux-gnu",
+    "/lib64",
+    "/usr/lib64",
+    "/usr/local/lib",
+    "/lib",
+    "/usr/lib",
     NULL
 };
+#elif defined(__aarch64__)
+static const char *g_runtime_search_dirs[] = {
+    "/lib/aarch64-linux-gnu",
+    "/usr/lib/aarch64-linux-gnu",
+    "/lib64",
+    "/usr/lib64",
+    "/usr/local/lib",
+    "/lib",
+    "/usr/lib",
+    NULL
+};
+#endif
 
-static struct loaded_obj *load_needed_from_filesystem(const char *needed)
+static int dl_path_has_slash(const char *path)
 {
-    char path[PATH_MAX];
+    return path && strchr(path, '/') != NULL;
+}
 
-    if (!needed || !needed[0])
+static int dl_dependency_name_matches(const char *loaded,
+                                      const char *needed)
+{
+    if (dl_path_has_slash(needed))
+        return loaded && strcmp(loaded, needed) == 0;
+    return loaded && strcmp(dl_basename(loaded), needed) == 0;
+}
+
+static const char *dl_object_soname(const struct loaded_obj *obj)
+{
+    if (!obj || !obj->dynamic)
         return NULL;
-    if (dl_is_virtual_runtime_object(needed))
-        return NULL;
-
-    if (needed[0] == '/') {
-        int fd = open(needed, O_RDONLY);
-
-        if (fd < 0)
+    for (size_t i = 0; i < obj->dynamic_count; i++) {
+        if (obj->dynamic[i].d_tag != DT_SONAME)
+            continue;
+        if (obj->dynamic[i].d_un.d_val > UINT32_MAX)
             return NULL;
-        close(fd);
-        return load_elf_from_file(needed);
+        return loaded_dynstr_value(
+            obj, (uint32_t)obj->dynamic[i].d_un.d_val);
     }
-
-    for (const char **dir = g_runtime_search_dirs; *dir; dir++) {
-        int fd;
-
-        if (snprintf(path, sizeof(path), "%s/%s", *dir, needed) >=
-            (int)sizeof(path))
-            continue;
-
-        fd = open(path, O_RDONLY);
-        if (fd < 0)
-            continue;
-        close(fd);
-        return load_elf_from_file(path);
-    }
-
     return NULL;
 }
 
-/*
- * Load DT_NEEDED dependencies of a just-loaded object.
- * Searches /usr/lib/ and /lib/ for each needed library.
- * Recursive: loading a dependency may trigger loading its own deps.
- */
-static void dl_load_needed(struct loaded_obj *obj,
-                            const struct dlfrz_lib_meta *meta)
+static int dl_loaded_dependency_matches(const struct loaded_obj *obj,
+                                        const char *needed)
 {
-    /* Find PT_DYNAMIC in loaded memory */
-    const uint8_t *phdr_start = (const uint8_t *)(obj->base + meta->phdr_off);
-    const Elf64_Phdr *dyn_ph = NULL;
-    for (int i = 0; i < meta->phdr_num; i++) {
-        const Elf64_Phdr *ph = (const Elf64_Phdr *)(phdr_start + i * meta->phdr_entsz);
-        if (ph->p_type == PT_DYNAMIC) { dyn_ph = ph; break; }
+    const char *soname;
+
+    if (!obj || !obj->name || !needed)
+        return 0;
+    if (dl_path_has_slash(needed))
+        return strcmp(obj->name, needed) == 0;
+    soname = dl_object_soname(obj);
+    return (soname && strcmp(soname, needed) == 0) ||
+           strcmp(dl_basename(obj->name), needed) == 0;
+}
+
+static int dl_initialize_startup_lookup_scopes(struct loaded_obj *objs,
+                                               int nobj)
+{
+    int main_index = -1;
+
+    if (objs != g_all_objs || nobj <= 0 || nobj > MAX_TOTAL_OBJS)
+        return -1;
+    g_global_scope_root = -1;
+    g_global_scope_count = 0;
+    for (int i = 0; i < nobj; i++) {
+        struct loaded_obj *obj = &objs[i];
+
+        obj->needed_count = 0;
+        obj->lookup_scope_count = 0;
+        obj->lookup_scope_valid = 0;
+        if (obj->flags & LDR_FLAG_MAIN_EXE) {
+            if (main_index >= 0)
+                return -1;
+            main_index = i;
+        }
     }
-    if (!dyn_ph || !obj->dynstr) return;
+    if (main_index < 0)
+        return -1;
 
-    const Elf64_Dyn *dyn = (const Elf64_Dyn *)(obj->base + dyn_ph->p_vaddr);
-    size_t dyn_count = dyn_ph->p_memsz / sizeof(Elf64_Dyn);
+    for (int i = 0; i < nobj; i++) {
+        struct loaded_obj *obj = &objs[i];
 
-    for (size_t i = 0; i < dyn_count && dyn[i].d_tag != DT_NULL; i++) {
-        if (dyn[i].d_tag != DT_NEEDED) continue;
-        const char *needed = obj->dynstr + dyn[i].d_un.d_val;
+        if (!obj->dynamic || !obj->dynstr)
+            continue;
+        for (size_t d = 0; d < obj->dynamic_count; d++) {
+            const char *needed;
+            struct loaded_obj *dependency = NULL;
 
+            if (obj->dynamic[d].d_tag != DT_NEEDED)
+                continue;
+            if (obj->dynamic[d].d_un.d_val > UINT32_MAX)
+                return -1;
+            needed = loaded_dynstr_value(
+                obj, (uint32_t)obj->dynamic[d].d_un.d_val);
+            if (!needed || !needed[0])
+                return -1;
+            if (dl_is_virtual_runtime_object(needed))
+                continue;
+            for (int j = 0; j < nobj; j++) {
+                if (dl_loaded_dependency_matches(&objs[j], needed)) {
+                    dependency = &objs[j];
+                    break;
+                }
+            }
+            if (!dependency ||
+                dl_add_dependency_edge(obj, dependency, nobj) < 0)
+                return -1;
+        }
+    }
+
+    g_global_scope_root = main_index;
+    for (int i = 0; i < nobj; i++)
+        if (dl_set_relocation_scope_root(&objs[i], main_index, nobj) < 0)
+            return -1;
+    if (dl_append_lookup_scope_to_global(&objs[main_index], nobj) < 0)
+        return -1;
+
+    /* Keep any packed startup object not reachable from the main object's
+     * DT_NEEDED graph globally visible in its prior table order. */
+    for (int i = 0; i < nobj; i++)
+        if (dl_append_index_to_global((uint16_t)i, nobj) < 0)
+            return -1;
+    return 0;
+}
+
+static const struct loaded_obj *dl_main_object(void)
+{
+    for (int i = 0; i < g_nobj; i++)
+        if (g_all_objs[i].flags & LDR_FLAG_MAIN_EXE)
+            return &g_all_objs[i];
+    return NULL;
+}
+
+static int dl_object_origin(const struct loaded_obj *obj,
+                            char *origin, size_t origin_size)
+{
+    const char *name;
+    const char *slash;
+    size_t length;
+
+    if (!obj)
+        obj = dl_main_object();
+    if (!obj || !obj->name || !obj->name[0] || origin_size < 2)
+        return -1;
+    name = obj->name;
+    slash = strrchr(name, '/');
+    if (!slash) {
+        origin[0] = '.';
+        origin[1] = '\0';
+        return 0;
+    }
+    length = slash == name ? 1 : (size_t)(slash - name);
+    if (length >= origin_size)
+        return -1;
+    memcpy(origin, name, length);
+    origin[length] = '\0';
+    return 0;
+}
+
+static int dl_expand_search_component(const char *component, size_t length,
+                                      const struct loaded_obj *owner,
+                                      char *expanded, size_t expanded_size)
+{
+    char origin[PATH_MAX];
+    size_t input = 0;
+    size_t output = 0;
+    int have_origin = 0;
+
+    if (length == 0) {
+        if (expanded_size < 2)
+            return -1;
+        expanded[0] = '.';
+        expanded[1] = '\0';
+        return 0;
+    }
+
+    while (input < length) {
+        size_t token_length = 0;
+
+        if (component[input] == '$') {
+            if (length - input >= sizeof("${ORIGIN}") - 1 &&
+                memcmp(component + input, "${ORIGIN}",
+                       sizeof("${ORIGIN}") - 1) == 0) {
+                token_length = sizeof("${ORIGIN}") - 1;
+            } else if (length - input >= sizeof("$ORIGIN") - 1 &&
+                       memcmp(component + input, "$ORIGIN",
+                              sizeof("$ORIGIN") - 1) == 0 &&
+                       (length - input == sizeof("$ORIGIN") - 1 ||
+                        component[input + sizeof("$ORIGIN") - 1] == '/')) {
+                token_length = sizeof("$ORIGIN") - 1;
+            } else {
+                return -1;
+            }
+        }
+
+        if (token_length) {
+            size_t origin_length;
+
+            if (!have_origin) {
+                if (dl_object_origin(owner, origin, sizeof(origin)) < 0)
+                    return -1;
+                have_origin = 1;
+            }
+            origin_length = strlen(origin);
+            if (origin_length > expanded_size - 1 - output)
+                return -1;
+            memcpy(expanded + output, origin, origin_length);
+            output += origin_length;
+            input += token_length;
+            continue;
+        }
+
+        if (output + 1 >= expanded_size)
+            return -1;
+        expanded[output++] = component[input++];
+    }
+    expanded[output] = '\0';
+    return 0;
+}
+
+static int dl_try_runtime_candidate(
+    const char *path, const struct dl_rpath_scope *child_inherited,
+    struct loaded_obj **result)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    int compatible;
+
+    if (fd < 0) {
+        if (errno == ENOENT || errno == ENOTDIR)
+            return 0;
+        dl_set_error(path, ": cannot open");
+        return -1;
+    }
+    compatible = runtime_dso_fd_compatible(fd);
+    if (compatible == 0) {
+        close(fd);
+        return 0;
+    }
+    if (compatible < 0) {
+        close(fd);
+        dl_set_error(path, ": malformed shared object candidate");
+        return -1;
+    }
+    *result = load_elf_from_file_fd(path, fd, child_inherited);
+    return *result ? 1 : -1;
+}
+
+static int dl_search_path_list(
+    const char *list, const struct loaded_obj *owner, const char *needed,
+    int allow_semicolon,
+    const struct dl_rpath_scope *child_inherited,
+    struct loaded_obj **result)
+{
+    size_t list_length;
+    size_t start = 0;
+    unsigned int components = 0;
+
+    if (!list)
+        return 0;
+    list_length = strnlen(list, DL_SEARCH_PATH_BYTES_MAX + 1);
+    if (list_length > DL_SEARCH_PATH_BYTES_MAX) {
+        dl_set_error("library search path is too long", NULL);
+        return -1;
+    }
+
+    for (;;) {
+        const char *colon;
+        const char *semicolon;
+        const char *separator;
+        size_t length;
+        char directory[PATH_MAX];
+        char candidate[PATH_MAX];
+        int rc;
+
+        if (++components > DL_SEARCH_COMPONENTS_MAX) {
+            dl_set_error("too many library search path components", NULL);
+            return -1;
+        }
+        colon = memchr(list + start, ':', list_length - start);
+        semicolon = allow_semicolon
+            ? memchr(list + start, ';', list_length - start) : NULL;
+        separator = !colon ? semicolon
+                           : (!semicolon || colon < semicolon
+                                  ? colon : semicolon);
+        length = separator ? (size_t)(separator - (list + start))
+                           : list_length - start;
+        if (dl_expand_search_component(list + start, length, owner,
+                                       directory, sizeof(directory)) < 0) {
+            dl_set_error("invalid dynamic library search path", NULL);
+            return -1;
+        }
+        rc = snprintf(candidate, sizeof(candidate), "%s/%s",
+                      directory, needed);
+        if (rc < 0 || (size_t)rc >= sizeof(candidate)) {
+            dl_set_error("dynamic library candidate path is too long", NULL);
+            return -1;
+        }
+        rc = dl_try_runtime_candidate(candidate, child_inherited, result);
+        if (rc != 0)
+            return rc;
+        if (!separator)
+            return 0;
+        start = (size_t)(separator - list) + 1;
+    }
+}
+
+static int dl_object_search_paths(const struct loaded_obj *obj,
+                                  const char **rpath_out,
+                                  const char **runpath_out)
+{
+    const char *rpath = NULL;
+    const char *runpath = NULL;
+
+    if (obj && obj->dynamic) {
+        for (size_t i = 0; i < obj->dynamic_count; i++) {
+            const char **slot;
+            const char *value;
+
+            if (obj->dynamic[i].d_tag == DT_RPATH)
+                slot = &rpath;
+            else if (obj->dynamic[i].d_tag == DT_RUNPATH)
+                slot = &runpath;
+            else
+                continue;
+            if (obj->dynamic[i].d_un.d_val > UINT32_MAX)
+                return -1;
+            value = loaded_dynstr_value(
+                obj, (uint32_t)obj->dynamic[i].d_un.d_val);
+            if (!value || (*slot && strcmp(*slot, value) != 0))
+                return -1;
+            *slot = value;
+        }
+    }
+    *rpath_out = rpath;
+    *runpath_out = runpath;
+    return 0;
+}
+
+static int dl_object_flags_1(const struct loaded_obj *obj,
+                             uint64_t *flags_out)
+{
+    uint64_t flags = 0;
+    int seen = 0;
+
+    if (obj && obj->dynamic) {
+        for (size_t i = 0; i < obj->dynamic_count; i++) {
+            if (obj->dynamic[i].d_tag != DT_FLAGS_1)
+                continue;
+            if (seen && flags != obj->dynamic[i].d_un.d_val)
+                return -1;
+            flags = obj->dynamic[i].d_un.d_val;
+            seen = 1;
+        }
+    }
+    *flags_out = flags;
+    return 0;
+}
+
+static int dl_lazy_dynamic_flags_admitted(const struct loaded_obj *obj,
+                                          const char *name)
+{
+    uint64_t flags;
+
+    if (dl_object_flags_1(obj, &flags) < 0) {
+        dl_set_error(name, ": malformed DT_FLAGS_1 metadata");
+        return -1;
+    }
+    if (flags & DF_1_PIE) {
+        dl_set_error(name, ": PIE executable cannot be loaded with dlopen");
+        return -1;
+    }
+    if (flags & DF_1_NOOPEN) {
+        dl_set_error(name, ": DF_1_NOOPEN object cannot be loaded");
+        return -1;
+    }
+    return 0;
+}
+
+static int load_needed_from_filesystem(
+    const struct loaded_obj *requester,
+    const struct dl_rpath_scope *inherited_rpath,
+    const struct dl_rpath_scope *child_inherited,
+    const char *needed, struct loaded_obj **result)
+{
+    const char *rpath = NULL;
+    const char *runpath = NULL;
+    uint64_t flags_1 = 0;
+    int rc;
+
+    *result = NULL;
+    if (!needed || !needed[0]) {
+        dl_set_error("empty DT_NEEDED name", NULL);
+        return -1;
+    }
+    if (strchr(needed, '$')) {
+        dl_set_error("dynamic string tokens in library filenames are "
+                     "unsupported", NULL);
+        return -1;
+    }
+    if (dl_path_has_slash(needed)) {
+        *result = load_elf_from_file(needed, child_inherited);
+        return *result ? 1 : -1;
+    }
+    if (dl_object_search_paths(requester, &rpath, &runpath) < 0 ||
+        dl_object_flags_1(requester, &flags_1) < 0) {
+        dl_set_error("malformed dynamic library search metadata", NULL);
+        return -1;
+    }
+
+    /* DT_RPATH is used only in the absence of DT_RUNPATH and is inherited
+     * down the dependency chain. */
+    if (!runpath && rpath) {
+        rc = dl_search_path_list(rpath, requester, needed, 0,
+                                 child_inherited, result);
+        if (rc != 0)
+            return rc;
+    }
+    /* A requester's RUNPATH suppresses only that object's RPATH.  RPATH
+     * scopes inherited from loader ancestors remain applicable. */
+    for (const struct dl_rpath_scope *scope = inherited_rpath;
+         scope; scope = scope->parent) {
+        rc = dl_search_path_list(scope->path, scope->owner, needed, 0,
+                                 child_inherited, result);
+        if (rc != 0)
+            return rc;
+    }
+
+    if (!g_fake_libc_enable_secure) {
+        const char *library_path =
+            vfs_find_env_value(g_envp, "LD_LIBRARY_PATH");
+
+        if (library_path) {
+            /* glibc accepts both ':' and ';' here, while musl treats ';'
+             * as an ordinary filename byte.  Preserve the selected target
+             * runtime's grammar instead of imposing the bootstrap libc's. */
+            rc = dl_search_path_list(library_path, NULL, needed,
+                                     !g_is_musl_runtime,
+                                     child_inherited, result);
+            if (rc != 0)
+                return rc;
+        }
+    }
+
+    if (runpath) {
+        rc = dl_search_path_list(runpath, requester, needed, 0,
+                                 child_inherited, result);
+        if (rc != 0)
+            return rc;
+    }
+
+    if (flags_1 & DF_1_NODEFLIB)
+        return 0;
+
+    for (const char **dir = g_runtime_search_dirs; *dir; dir++) {
+        char candidate[PATH_MAX];
+
+        rc = snprintf(candidate, sizeof(candidate), "%s/%s", *dir, needed);
+        if (rc < 0 || (size_t)rc >= sizeof(candidate))
+            continue;
+        rc = dl_try_runtime_candidate(candidate, child_inherited, result);
+        if (rc != 0)
+            return rc;
+    }
+    return 0;
+}
+
+static int dl_load_needed(struct loaded_obj *obj,
+                          const struct dlfrz_lib_meta *meta,
+                          const struct dl_rpath_scope *inherited_rpath)
+{
+    const char *rpath = NULL;
+    const char *runpath = NULL;
+    struct dl_rpath_scope own_rpath;
+    const struct dl_rpath_scope *child_inherited = inherited_rpath;
+
+    (void)meta;
+    if (!obj->dynamic || !obj->dynstr)
+        return 0;
+    if (dl_object_search_paths(obj, &rpath, &runpath) < 0) {
+        dl_set_error(obj->name, ": malformed library search metadata");
+        return -1;
+    }
+    if (!runpath && rpath) {
+        own_rpath.path = rpath;
+        own_rpath.owner = obj;
+        own_rpath.parent = inherited_rpath;
+        child_inherited = &own_rpath;
+    }
+
+    for (size_t i = 0; i < obj->dynamic_count; i++) {
+        const char *needed;
+        struct loaded_obj *dependency = NULL;
+        int found = 0;
+
+        if (obj->dynamic[i].d_tag != DT_NEEDED)
+            continue;
+        if (obj->dynamic[i].d_un.d_val > UINT32_MAX) {
+            dl_set_error(obj->name, ": malformed DT_NEEDED offset");
+            return -1;
+        }
+        needed = loaded_dynstr_value(
+            obj, (uint32_t)obj->dynamic[i].d_un.d_val);
+        if (!needed || !needed[0]) {
+            dl_set_error(obj->name, ": malformed DT_NEEDED name");
+            return -1;
+        }
         if (dl_is_virtual_runtime_object(needed))
             continue;
 
-        /* Skip if already loaded (basename match) */
-        int found = 0;
         for (int j = 0; j < g_nobj; j++) {
-            if (!g_all_objs[j].name) continue;
-            if (dl_name_matches(g_all_objs[j].name, needed)) {
+            if (dl_loaded_dependency_matches(&g_all_objs[j], needed)) {
+                dependency = &g_all_objs[j];
                 found = 1;
                 break;
             }
         }
-        if (found) continue;
+        if (found) {
+            if (dl_add_dependency_edge(obj, dependency, g_nobj) < 0) {
+                dl_set_error(obj->name,
+                             ": invalid or excessive DT_NEEDED graph");
+                return -1;
+            }
+            continue;
+        }
 
-        load_needed_from_filesystem(needed);
+        if (g_frozen_metas) {
+            for (uint32_t fi = 0; fi < g_frozen_num_entries; fi++) {
+                const char *frozen_name;
+
+                if (g_frozen_metas[fi].flags &
+                    (LDR_FLAG_INTERP | LDR_FLAG_DATA))
+                    continue;
+                if (!(g_frozen_metas[fi].flags & LDR_FLAG_SHLIB))
+                    continue;
+                frozen_name = g_frozen_strtab +
+                    g_frozen_entries[fi].name_offset;
+                if (!dl_dependency_name_matches(frozen_name, needed))
+                    continue;
+                dependency = load_embedded_object(fi, child_inherited);
+                if (!dependency)
+                    return -1;
+                found = 1;
+                break;
+            }
+        }
+        if (found) {
+            if (dl_add_dependency_edge(obj, dependency, g_nobj) < 0) {
+                dl_set_error(obj->name,
+                             ": invalid or excessive DT_NEEDED graph");
+                return -1;
+            }
+            continue;
+        }
+
+        int rc = load_needed_from_filesystem(
+            obj, inherited_rpath, child_inherited, needed, &dependency);
+        if (rc < 0)
+            return -1;
+        if (rc == 0 || !dependency) {
+            dl_set_error(needed, ": required shared object was not found");
+            return -1;
+        }
+        if (dl_add_dependency_edge(obj, dependency, g_nobj) < 0) {
+            dl_set_error(obj->name,
+                         ": invalid or excessive DT_NEEDED graph");
+            return -1;
+        }
     }
+    return 0;
+}
+
+static void dl_transaction_begin(void)
+{
+    memset(&g_dl_transaction, 0, sizeof(g_dl_transaction));
+    g_dl_transaction.active = 1;
+    g_dl_transaction.start_nobj = g_nobj;
+    g_dl_transaction.high_water = g_nobj;
+    g_dl_transaction.start_strbuf_used = g_dl_strbuf_used;
+    g_dl_transaction.start_init_order_count = g_init_order_count;
+    g_dl_transaction.start_global_scope_count = g_global_scope_count;
+#if defined(__aarch64__)
+    g_dl_transaction.start_tlsdesc_page = g_aarch64_tlsdesc_pages;
+    if (g_aarch64_tlsdesc_pages)
+        g_dl_transaction.start_tlsdesc_used =
+            g_aarch64_tlsdesc_pages->used;
+#elif defined(__x86_64__)
+    g_dl_transaction.start_tlsdesc_page = g_x86_64_tlsdesc_pages;
+    if (g_x86_64_tlsdesc_pages)
+        g_dl_transaction.start_tlsdesc_used =
+            g_x86_64_tlsdesc_pages->used;
+#endif
+}
+
+static int dl_assign_new_object_scope(struct loaded_obj *obj)
+{
+    int index;
+    int root;
+
+    if (!dl_object_table_index(obj, g_nobj, &index))
+        return -1;
+    if (g_dl_transaction.active) {
+        if (!g_dl_transaction.scope_root_valid) {
+            g_dl_transaction.scope_root = index;
+            g_dl_transaction.scope_root_valid = 1;
+        }
+        root = g_dl_transaction.scope_root;
+    } else {
+        root = index;
+    }
+    return dl_set_relocation_scope_root(obj, root, g_nobj);
+}
+
+static int dl_transaction_finalize_lookup_scope(void)
+{
+    struct loaded_obj *root;
+    uint8_t reachable[MAX_TOTAL_OBJS];
+
+    if (!g_dl_transaction.active ||
+        !g_dl_transaction.scope_root_valid ||
+        g_dl_transaction.scope_root < g_dl_transaction.start_nobj ||
+        g_dl_transaction.scope_root >= g_nobj)
+        return -1;
+    root = &g_all_objs[g_dl_transaction.scope_root];
+    if (dl_build_lookup_scope(root, g_nobj) < 0)
+        return -1;
+    memset(reachable, 0, sizeof(reachable));
+    for (uint16_t i = 0; i < root->lookup_scope_count; i++) {
+        uint16_t index = root->lookup_scope_indices[i];
+
+        if (index >= g_nobj)
+            return -1;
+        reachable[index] = 1;
+    }
+    for (int i = g_dl_transaction.start_nobj; i < g_nobj; i++) {
+        if (!reachable[i] ||
+            dl_set_relocation_scope_root(
+                &g_all_objs[i], g_dl_transaction.scope_root, g_nobj) < 0)
+            return -1;
+    }
+    return 0;
+}
+
+static void dl_transaction_note_mapping(int index)
+{
+    if (g_dl_transaction.active &&
+        index + 1 > g_dl_transaction.high_water)
+        g_dl_transaction.high_water = index + 1;
+}
+
+static int dl_transaction_stage_tls_block(struct loaded_obj *obj,
+                                          uintptr_t *tls_base_out)
+{
+    ptrdiff_t index;
+    size_t slot;
+    uintptr_t tls_base;
+
+    if (!g_dl_transaction.active || !obj)
+        return 0;
+    index = obj - g_all_objs;
+    if (index < g_dl_transaction.start_nobj || index < 0 ||
+        index >= MAX_TOTAL_OBJS)
+        return 0;
+    if (!runtime_tls_template_valid(obj) || obj->tls.memsz == 0 ||
+        obj->tls.modid == 0 || obj->tls.modid > MAX_TOTAL_OBJS)
+        return -1;
+    if (g_dl_transaction.tls_bases[obj->tls.modid]) {
+        *tls_base_out = g_dl_transaction.tls_bases[obj->tls.modid];
+        return 1;
+    }
+    slot = g_dl_transaction.tls_map_count;
+    if (slot >= MAX_TOTAL_OBJS ||
+        allocate_runtime_tls_block(
+            obj, &g_dl_transaction.tls_maps[slot],
+            &g_dl_transaction.tls_map_lengths[slot], &tls_base) < 0)
+        return -1;
+    g_dl_transaction.tls_bases[obj->tls.modid] = tls_base;
+    g_dl_transaction.tls_map_count++;
+    *tls_base_out = tls_base;
+    return 1;
+}
+
+static int dl_transaction_tls_address(uintptr_t tp, unsigned long modid,
+                                      unsigned long ti_offset,
+                                      void **address_out)
+{
+    struct loaded_obj *obj = NULL;
+    uintptr_t tls_base;
+    int staged;
+
+    if (!g_dl_transaction.active)
+        return 0;
+    if (tp != arch_get_tp())
+        return -1;
+    for (int i = g_dl_transaction.start_nobj; i < g_nobj; i++) {
+        if (g_all_objs[i].tls.modid == modid &&
+            g_all_objs[i].tls.memsz != 0) {
+            obj = &g_all_objs[i];
+            break;
+        }
+    }
+    if (!obj)
+        return 0;
+    staged = dl_transaction_stage_tls_block(obj, &tls_base);
+    if (staged <= 0 ||
+        !runtime_tls_address(obj, tls_base, ti_offset, address_out))
+        return -1;
+    return 1;
+}
+
+static int dl_transaction_queue_init(struct loaded_obj *obj)
+{
+    if (!g_dl_transaction.active)
+        return -1;
+    if (g_dl_transaction.pending_init_count >= MAX_TOTAL_OBJS) {
+        dl_set_error("too many pending dlopen constructors", NULL);
+        return -1;
+    }
+    g_dl_transaction.pending_init[
+        g_dl_transaction.pending_init_count++] = obj;
+    return 0;
+}
+
+static void dl_transaction_unmap_tls_blocks(void **maps,
+                                            const size_t *map_lengths,
+                                            size_t count);
+
+static void dl_release_runtime_mapping(struct loaded_obj *obj)
+{
+    if (obj && obj->runtime_reservation && obj->runtime_reservation_size)
+        munmap(obj->runtime_reservation, obj->runtime_reservation_size);
+    if (obj) {
+        obj->runtime_reservation = NULL;
+        obj->runtime_reservation_size = 0;
+    }
+}
+
+static void dl_transaction_rollback(void)
+{
+    int high_water = g_dl_transaction.high_water;
+    int start = g_dl_transaction.start_nobj;
+
+    if (!g_dl_transaction.active)
+        return;
+    dl_transaction_unmap_tls_blocks(
+        g_dl_transaction.tls_maps,
+        g_dl_transaction.tls_map_lengths,
+        g_dl_transaction.tls_map_count);
+#if defined(__aarch64__)
+    while (g_aarch64_tlsdesc_pages && g_aarch64_tlsdesc_pages !=
+           g_dl_transaction.start_tlsdesc_page) {
+        struct aarch64_tlsdesc_page *page = g_aarch64_tlsdesc_pages;
+
+        g_aarch64_tlsdesc_pages = page->next;
+        munmap(page, 4096);
+    }
+    if (g_aarch64_tlsdesc_pages)
+        g_aarch64_tlsdesc_pages->used =
+            g_dl_transaction.start_tlsdesc_used;
+#elif defined(__x86_64__)
+    while (g_x86_64_tlsdesc_pages && g_x86_64_tlsdesc_pages !=
+           g_dl_transaction.start_tlsdesc_page) {
+        struct x86_64_tlsdesc_page *page = g_x86_64_tlsdesc_pages;
+
+        g_x86_64_tlsdesc_pages = page->next;
+        munmap(page, 4096);
+    }
+    if (g_x86_64_tlsdesc_pages)
+        g_x86_64_tlsdesc_pages->used =
+            g_dl_transaction.start_tlsdesc_used;
+#endif
+    if (high_water > MAX_TOTAL_OBJS)
+        high_water = MAX_TOTAL_OBJS;
+    for (int i = high_water - 1; i >= start; i--) {
+        struct loaded_obj *obj = &g_all_objs[i];
+
+        dl_release_runtime_mapping(obj);
+        memset(obj, 0, sizeof(*obj));
+        memset(&g_dl_metas[i], 0, sizeof(g_dl_metas[i]));
+    }
+    g_nobj = start;
+    g_dl_strbuf_used = g_dl_transaction.start_strbuf_used;
+    g_init_order_count = g_dl_transaction.start_init_order_count;
+    g_global_scope_count = g_dl_transaction.start_global_scope_count;
+    memset(&g_dl_transaction, 0, sizeof(g_dl_transaction));
+    clear_resolution_caches();
+}
+
+static void dl_transaction_unmap_tls_blocks(void **maps,
+                                            const size_t *map_lengths,
+                                            size_t count)
+{
+    while (count > 0) {
+        count--;
+        if (maps[count] && map_lengths[count])
+            munmap(maps[count], map_lengths[count]);
+    }
+}
+
+static int dl_transaction_publish_musl_tls(struct loaded_obj **objects,
+                                           size_t count)
+{
+    uintptr_t *old_dtv;
+    uintptr_t *new_dtv;
+    uintptr_t tp;
+    size_t old_slots = 0;
+    size_t new_slots = 0;
+    uint64_t words;
+    uint64_t bytes_u64;
+    size_t bytes;
+
+    for (size_t i = 0; i < count; i++) {
+        struct loaded_obj *obj = objects[i];
+
+        if (obj->tls.memsz == 0)
+            continue;
+        if (!runtime_tls_template_valid(obj) || obj->tls.modid == 0 ||
+            obj->tls.modid > MAX_TOTAL_OBJS)
+            return -1;
+        if (obj->tls.modid > new_slots)
+            new_slots = obj->tls.modid;
+    }
+    if (new_slots == 0)
+        return 0;
+
+    tp = arch_get_tp();
+    if (!tp)
+        return -1;
+    old_dtv = *(uintptr_t **)musl_thread_dtv_slot(tp);
+    if (old_dtv) {
+        old_slots = old_dtv[0];
+        if (old_slots > MAX_TOTAL_OBJS)
+            return -1;
+        if (old_slots > new_slots)
+            new_slots = old_slots;
+    }
+    if (!u64_add_checked(new_slots, 1, &words) ||
+        !u64_mul_checked(words, sizeof(uintptr_t), &words) ||
+        !u64_align_up_checked(words, g_page_size, &bytes_u64) ||
+        bytes_u64 == 0 || bytes_u64 > SIZE_MAX)
+        return -1;
+    bytes = (size_t)bytes_u64;
+    new_dtv = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (new_dtv == MAP_FAILED)
+        return -1;
+    if (old_dtv)
+        memcpy(new_dtv, old_dtv,
+               (old_slots + 1) * sizeof(uintptr_t));
+    new_dtv[0] = new_slots;
+
+    for (size_t i = 0; i < count; i++) {
+        struct loaded_obj *obj = objects[i];
+        uintptr_t tls_base;
+
+        if (obj->tls.memsz == 0)
+            continue;
+        if (old_dtv && obj->tls.modid <= old_slots &&
+            old_dtv[obj->tls.modid]) {
+            if (g_dl_transaction.tls_bases[obj->tls.modid]) {
+                munmap(new_dtv, bytes);
+                return -1;
+            }
+            continue;
+        }
+        if (dl_transaction_stage_tls_block(obj, &tls_base) <= 0) {
+            munmap(new_dtv, bytes);
+            return -1;
+        }
+        new_dtv[obj->tls.modid] = tls_base;
+    }
+
+    /* This is the transaction's sole publication point.  No target-visible
+     * DTV slot changes until every allocation above has succeeded. */
+    *(uintptr_t **)musl_thread_dtv_slot(tp) = new_dtv;
+    return 0;
+}
+
+static int dl_transaction_publish_glibc_tls(struct loaded_obj **objects,
+                                            size_t count)
+{
+    uintptr_t *old_dtv;
+    uintptr_t *new_raw;
+    uintptr_t *new_dtv;
+    uintptr_t tp;
+    size_t old_capacity = 0;
+    size_t new_capacity = 0;
+    size_t static_capacity = 0;
+    size_t map_size;
+
+    for (size_t i = 0; i < count; i++) {
+        struct loaded_obj *obj = objects[i];
+
+        if (obj->tls.memsz == 0)
+            continue;
+        if (!runtime_tls_template_valid(obj) || obj->tls.modid == 0 ||
+            obj->tls.modid > MAX_TOTAL_OBJS)
+            return -1;
+        if (obj->tls.modid > new_capacity)
+            new_capacity = obj->tls.modid;
+    }
+    if (new_capacity == 0)
+        return 0;
+
+    tp = arch_get_tp();
+    if (!tp)
+        return -1;
+    old_dtv = *(uintptr_t **)(tp + TCB_OFF_DTV);
+    if (!glibc_dtv_capacity(old_dtv, &old_capacity) ||
+        !glibc_static_tls_capacity(&static_capacity))
+        return -1;
+    if (old_capacity > new_capacity)
+        new_capacity = old_capacity;
+    if (static_capacity > new_capacity)
+        new_capacity = static_capacity;
+    if (!glibc_dtv_map_size(new_capacity, &map_size))
+        return -1;
+    new_raw = mmap(NULL, map_size, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (new_raw == MAP_FAILED)
+        return -1;
+    new_dtv = new_raw + 2;
+    if (old_dtv) {
+        uint64_t entries;
+        uint64_t words;
+        uint64_t copy_bytes;
+
+        if (!u64_add_checked(old_capacity, 1, &entries) ||
+            !u64_mul_checked(entries, 2, &words) ||
+            !u64_add_checked(words, 2, &words) ||
+            !u64_mul_checked(words, sizeof(uintptr_t), &copy_bytes) ||
+            copy_bytes > map_size) {
+            munmap(new_raw, map_size);
+            return -1;
+        }
+        memcpy(new_raw, old_dtv - 2, (size_t)copy_bytes);
+    }
+    new_raw[0] = new_capacity;
+    if (!old_dtv)
+        new_raw[1] = 0;
+    new_dtv[0] = 1;
+    if (!old_dtv)
+        new_dtv[1] = 0;
+    if (!glibc_seed_static_tls_slots(tp, new_dtv, new_capacity)) {
+        munmap(new_raw, map_size);
+        return -1;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        struct loaded_obj *obj = objects[i];
+        uintptr_t tls_base;
+
+        if (obj->tls.memsz == 0)
+            continue;
+        if (old_dtv && obj->tls.modid <= old_capacity &&
+            glibc_tls_slot_allocated(old_dtv[obj->tls.modid * 2])) {
+            if (g_dl_transaction.tls_bases[obj->tls.modid]) {
+                munmap(new_raw, map_size);
+                return -1;
+            }
+            continue;
+        }
+        if (dl_transaction_stage_tls_block(obj, &tls_base) <= 0) {
+            munmap(new_raw, map_size);
+            return -1;
+        }
+        new_dtv[obj->tls.modid * 2] = tls_base;
+        new_dtv[obj->tls.modid * 2 + 1] = 0;
+    }
+
+    /* Publish the completely populated replacement DTV atomically. */
+    *(uintptr_t **)(tp + TCB_OFF_DTV) = new_dtv;
+    return 0;
+}
+
+static int dl_transaction_commit(void)
+{
+    struct loaded_obj *pending[MAX_TOTAL_OBJS];
+    size_t count;
+
+    if (!g_dl_transaction.active)
+        return -1;
+    if (dl_transaction_finalize_lookup_scope() < 0) {
+        dl_set_error("dlopen dependency graph",
+                     ": cannot establish lookup scope");
+        return -1;
+    }
+    count = g_dl_transaction.pending_init_count;
+    memcpy(pending, g_dl_transaction.pending_init,
+           count * sizeof(pending[0]));
+
+    /* Dependency discovery deliberately maps the complete graph before any
+     * relocation.  A dependency may resolve an undefined symbol from a
+     * later sibling in the requester's DT_NEEDED list. */
+    clear_resolution_caches();
+    if (preflight_resolver_relocation_destinations(
+            g_all_objs + g_dl_transaction.start_nobj,
+            g_nobj - g_dl_transaction.start_nobj,
+            g_all_objs, g_nobj) < 0) {
+        dl_set_error("dlopen dependency graph",
+                     ": resolver relocation targets PT_TLS");
+        return -1;
+    }
+    for (size_t i = 0; i < count; i++) {
+        struct loaded_obj *obj = pending[i];
+
+        if (preseed_rtld_got(obj, g_all_objs, g_nobj) < 0) {
+            dl_set_error(obj->name ? obj->name : "dlopen object",
+                         ": malformed relocation metadata");
+            return -1;
+        }
+    }
+    /* Filesystem probing above uses bootstrap-libc errno state.  Restore the
+     * target libc guard before any phase can invoke target code. */
+    restore_ptr_guard();
+    for (size_t i = 0; i < count; i++) {
+        struct loaded_obj *obj = pending[i];
+
+        if (apply_all_relocs(obj, g_all_objs, g_nobj,
+                             RELOC_PASS_ORDINARY) < 0) {
+            dl_set_error(obj->name ? obj->name : "dlopen object",
+                         ": relocation failed");
+            return -1;
+        }
+    }
+    for (size_t i = 0; i < count; i++) {
+        struct loaded_obj *obj = pending[i];
+
+        if (apply_all_relocs(obj, g_all_objs, g_nobj,
+                             RELOC_PASS_COPY) < 0) {
+            dl_set_error(obj->name ? obj->name : "dlopen object",
+                         ": COPY relocation failed");
+            return -1;
+        }
+    }
+    for (size_t i = 0; i < count; i++) {
+        struct loaded_obj *obj = pending[i];
+
+        if (apply_all_relocs(obj, g_all_objs, g_nobj,
+                             RELOC_PASS_IFUNC) < 0) {
+            dl_set_error(obj->name ? obj->name : "dlopen object",
+                         ": IFUNC relocation failed");
+            return -1;
+        }
+    }
+    for (size_t i = 0; i < count; i++) {
+        struct loaded_obj *obj = pending[i];
+
+        if (apply_all_relocs(obj, g_all_objs, g_nobj,
+                             RELOC_PASS_IRELATIVE) < 0) {
+            dl_set_error(obj->name ? obj->name : "dlopen object",
+                         ": IRELATIVE failed");
+            return -1;
+        }
+    }
+    for (size_t i = 0; i < count; i++) {
+        struct loaded_obj *obj = pending[i];
+        ptrdiff_t index = obj - g_all_objs;
+
+        if (index < g_dl_transaction.start_nobj || index < 0 ||
+            index >= g_nobj || protect_object(obj, &g_dl_metas[index]) < 0) {
+            dl_set_error(obj->name ? obj->name : "dlopen object",
+                         ": cannot set final memory protections");
+            return -1;
+        }
+    }
+
+    if (dl_append_lookup_scope_to_global(
+            &g_all_objs[g_dl_transaction.scope_root], g_nobj) < 0) {
+        dl_set_error("dlopen dependency graph",
+                     ": cannot publish lookup scope");
+        return -1;
+    }
+
+    /* Build a replacement DTV and all dynamic TLS blocks privately, then
+     * publish one pointer only after every allocation succeeds. */
+    if ((g_is_musl_runtime
+             ? dl_transaction_publish_musl_tls(pending, count)
+             : dl_transaction_publish_glibc_tls(pending, count)) < 0) {
+        dl_set_error("dlopen dependency graph", ": TLS setup failed");
+        return -1;
+    }
+
+    /* Mark the transaction committed before invoking user constructors so a
+     * constructor may itself start an independent recursive dlopen. */
+    memset(&g_dl_transaction, 0, sizeof(g_dl_transaction));
+    restore_ptr_guard();
+    for (size_t i = 0; i < count; i++) {
+        struct loaded_obj *obj = pending[i];
+        typedef void (*init_fn_t)(int, char **, char **);
+
+        record_object_init(obj);
+        if (obj->init_func)
+            ((init_fn_t)obj->init_func)(g_argc, g_argv, g_envp);
+        for (size_t j = 0; j < obj->init_array_sz; j++)
+            ((init_fn_t)obj->init_array[j])(g_argc, g_argv, g_envp);
+    }
+    return 0;
 }
 
 /*
@@ -9403,20 +12760,80 @@ static void dl_load_needed(struct loaded_obj *obj,
  * Maps PT_LOAD segments, resolves symbols, applies relocations,
  * calls init functions.  Returns pointer to loaded_obj or NULL.
  */
-static struct loaded_obj *load_elf_from_file(const char *path)
+static struct loaded_obj *load_elf_from_file(
+    const char *path, const struct dl_rpath_scope *inherited_rpath)
 {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+
+    if (fd < 0) {
+        dl_set_error(path, ": cannot open");
+        return NULL;
+    }
+    return load_elf_from_file_fd(path, fd, inherited_rpath);
+}
+
+static struct loaded_obj *load_elf_from_file_fd(
+    const char *path, int fd,
+    const struct dl_rpath_scope *inherited_rpath)
+{
+    struct stat identity;
     int idx = g_nobj;
+
+    if (fstat(fd, &identity) < 0) {
+        close(fd);
+        dl_set_error(path, ": cannot identify shared object");
+        return NULL;
+    }
+    for (int i = 0; i < g_nobj; i++) {
+        struct loaded_obj *existing = &g_all_objs[i];
+
+        if (existing->runtime_identity_valid &&
+            existing->runtime_dev == (uint64_t)identity.st_dev &&
+            existing->runtime_ino == (uint64_t)identity.st_ino) {
+            close(fd);
+            return existing;
+        }
+    }
     if (idx >= MAX_TOTAL_OBJS) {
+        close(fd);
         dl_set_error("too many loaded objects", NULL);
         return NULL;
     }
 
+    Elf64_Ehdr ehdr;
+    Elf64_Phdr phdr_buf[64];
+    uint64_t file_size;
+
+    if (read_runtime_dso_headers(fd, &ehdr, phdr_buf,
+                                 sizeof(phdr_buf) / sizeof(phdr_buf[0]),
+                                 &file_size) < 0) {
+        close(fd);
+        dl_set_error(path, ": malformed ELF program headers");
+        return NULL;
+    }
+    (void)file_size;
+    for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
+        if (phdr_buf[i].p_type == PT_INTERP) {
+            close(fd);
+            dl_set_error(path,
+                         ": PT_INTERP executable cannot be loaded with "
+                         "dlopen");
+            return NULL;
+        }
+    }
+
     /* Refuse libraries built with DF_STATIC_TLS — they cannot be loaded
      * after startup without overwriting the calling thread's static TLS
-     * area (see file_has_static_tls comment).  Surface this as a normal
-     * dlopen failure so callers fall back to alternative ICDs / plugins
-     * instead of taking down the process. */
-    if (file_has_static_tls(path)) {
+     * area.  Surface this as a normal dlopen failure so callers can fall
+     * back to alternative plugins instead of corrupting process TLS. */
+    int static_tls = dynamic_has_static_tls(fd, phdr_buf, ehdr.e_phnum);
+    if (static_tls < 0) {
+        close(fd);
+        dl_set_error(path, ": malformed dynamic section");
+        return NULL;
+    }
+    if (static_tls) {
+        close(fd);
         dl_set_error(path,
             ": cannot dlopen DF_STATIC_TLS library after startup "
             "(would clobber main thread TLS)");
@@ -9427,53 +12844,16 @@ static struct loaded_obj *load_elf_from_file(const char *path)
         }
         return NULL;
     }
-
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        dl_set_error(path, ": cannot open");
-        return NULL;
-    }
-
-    /* Read ELF header */
-    Elf64_Ehdr ehdr;
-    if (read(fd, &ehdr, sizeof(ehdr)) != (ssize_t)sizeof(ehdr)) {
-        close(fd);
-        dl_set_error(path, ": cannot read ELF header");
-        return NULL;
-    }
-
-    if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0 ||
-        ehdr.e_ident[EI_CLASS] != ELFCLASS64 ||
-        ehdr.e_type != ET_DYN) {
-        close(fd);
-        dl_set_error(path, ": not a 64-bit shared object");
-        return NULL;
-    }
-    if (ehdr.e_machine != ARCH_ELF_MACHINE) {
-        close(fd);
-        dl_set_error(path, ": wrong architecture");
-        return NULL;
-    }
-
-    /* Read program headers */
-    Elf64_Phdr phdr_buf[64];
-    if (ehdr.e_phnum > 64) {
-        close(fd);
-        dl_set_error(path, ": too many program headers");
-        return NULL;
-    }
-    size_t phdr_size = (size_t)ehdr.e_phnum * ehdr.e_phentsize;
-    if (pread(fd, phdr_buf, phdr_size, ehdr.e_phoff) != (ssize_t)phdr_size) {
-        close(fd);
-        dl_set_error(path, ": cannot read program headers");
-        return NULL;
-    }
+    size_t phdr_size = (size_t)ehdr.e_phnum * sizeof(Elf64_Phdr);
 
     /* Determine vaddr range from PT_LOAD segments */
     uint64_t lo = UINT64_MAX, hi = 0, phdr_vaddr = UINT64_MAX;
+    uint64_t max_load_align = g_page_size;
     uint64_t phdr_file_end = ehdr.e_phoff + phdr_size;
     for (int i = 0; i < ehdr.e_phnum; i++) {
         if (phdr_buf[i].p_type != PT_LOAD) continue;
+        if (phdr_buf[i].p_align > max_load_align)
+            max_load_align = phdr_buf[i].p_align;
         if (phdr_buf[i].p_vaddr < lo) lo = phdr_buf[i].p_vaddr;
         uint64_t end = phdr_buf[i].p_vaddr + phdr_buf[i].p_memsz;
         if (end > hi) hi = end;
@@ -9491,19 +12871,47 @@ static struct loaded_obj *load_elf_from_file(const char *path)
     }
 
     lo = page_floor(lo);
-    hi = ALIGN_UP(hi, g_page_size);
+    if (!u64_align_up_checked(hi, g_page_size, &hi) || hi <= lo ||
+        g_page_size > UINT64_MAX / 4 ||
+        hi - lo > UINT64_MAX - 4 * g_page_size) {
+        close(fd);
+        dl_set_error(path, ": invalid PT_LOAD address range");
+        return NULL;
+    }
     uint64_t span = hi - lo + 4 * g_page_size;  /* + guard pages */
+    uint64_t reservation_len;
+    if (span > SIZE_MAX || max_load_align > UINT64_MAX - span) {
+        close(fd);
+        dl_set_error(path, ": PT_LOAD address range is too large");
+        return NULL;
+    }
+    reservation_len = span + max_load_align;
+    if (reservation_len > SIZE_MAX) {
+        close(fd);
+        dl_set_error(path, ": PT_LOAD alignment range is too large");
+        return NULL;
+    }
 
     /* Reserve the whole range, but leave holes and guard pages inaccessible. */
-    void *mapped = mmap(NULL, span, PROT_NONE,
-                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (mapped == MAP_FAILED) {
+    void *reservation = mmap(NULL, (size_t)reservation_len, PROT_NONE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (reservation == MAP_FAILED) {
         close(fd);
         dl_set_error(path, ": mmap failed");
         return NULL;
     }
 
-    uint64_t base = (uint64_t)mapped - lo;
+    uint64_t reservation_addr = (uint64_t)(uintptr_t)reservation;
+    uint64_t base;
+    if (reservation_addr < lo ||
+        !u64_align_up_checked(reservation_addr - lo, max_load_align, &base) ||
+        base > UINT64_MAX - lo || base + lo < reservation_addr ||
+        base + lo - reservation_addr > reservation_len - span) {
+        munmap(reservation, (size_t)reservation_len);
+        close(fd);
+        dl_set_error(path, ": cannot align PT_LOAD base address");
+        return NULL;
+    }
 
     /* Map/copy each PT_LOAD segment from the file */
     for (int i = 0; i < ehdr.e_phnum; i++) {
@@ -9514,10 +12922,21 @@ static struct loaded_obj *load_elf_from_file(const char *path)
             uint64_t seg_lo  = page_floor(phdr_buf[i].p_vaddr);
             uint64_t seg_off = page_floor(phdr_buf[i].p_offset);
             uint64_t delta   = phdr_buf[i].p_vaddr - seg_lo;
-            uint64_t map_len = ALIGN_UP(delta + phdr_buf[i].p_filesz,
-                                        g_page_size);
+            uint64_t map_input;
+            uint64_t map_len;
 
-            void *m = mmap((void *)(base + seg_lo), map_len,
+            if (!u64_add_checked(delta, phdr_buf[i].p_filesz,
+                                 &map_input) ||
+                !u64_align_up_checked(map_input, g_page_size, &map_len) ||
+                map_len > SIZE_MAX || seg_lo < lo || seg_lo > hi ||
+                map_len > hi - seg_lo) {
+                munmap(reservation, (size_t)reservation_len);
+                close(fd);
+                dl_set_error(path, ": invalid PT_LOAD mapping range");
+                return NULL;
+            }
+
+            void *m = mmap((void *)(base + seg_lo), (size_t)map_len,
                            phdr_prot(&phdr_buf[i]),
                            MAP_PRIVATE | MAP_FIXED, fd, seg_off);
             if (m == MAP_FAILED) {
@@ -9525,7 +12944,7 @@ static struct loaded_obj *load_elf_from_file(const char *path)
                     pread(fd, (void *)(base + phdr_buf[i].p_vaddr),
                           phdr_buf[i].p_filesz, phdr_buf[i].p_offset) !=
                         (ssize_t)phdr_buf[i].p_filesz) {
-                    munmap(mapped, span);
+                    munmap(reservation, (size_t)reservation_len);
                     close(fd);
                     dl_set_error(path, ": cannot map segment");
                     return NULL;
@@ -9536,14 +12955,14 @@ static struct loaded_obj *load_elf_from_file(const char *path)
                 pread(fd, (void *)(base + phdr_buf[i].p_vaddr),
                       phdr_buf[i].p_filesz, phdr_buf[i].p_offset) !=
                     (ssize_t)phdr_buf[i].p_filesz) {
-                munmap(mapped, span);
+                munmap(reservation, (size_t)reservation_len);
                 close(fd);
                 dl_set_error(path, ": cannot read segment");
                 return NULL;
             }
         }
         if (zero_segment_bss_tail(base, &phdr_buf[i]) < 0) {
-            munmap(mapped, span);
+            munmap(reservation, (size_t)reservation_len);
             close(fd);
             dl_set_error(path, ": cannot zero segment tail");
             return NULL;
@@ -9554,7 +12973,7 @@ static struct loaded_obj *load_elf_from_file(const char *path)
         if (phdr_buf[i].p_type == PT_LOAD &&
             set_segment_protection(base, &phdr_buf[i],
                                    phdr_prot(&phdr_buf[i])) < 0) {
-            munmap(mapped, span);
+            munmap(reservation, (size_t)reservation_len);
             close(fd);
             dl_set_error(path, ": cannot protect segment");
             return NULL;
@@ -9568,18 +12987,27 @@ static struct loaded_obj *load_elf_from_file(const char *path)
     memset(obj, 0, sizeof(*obj));
     obj->base  = base;
     obj->name  = dl_store_name(path);
+    if (!obj->name) {
+        dl_set_error(path, ": dlopen name storage exhausted");
+        munmap(reservation, (size_t)reservation_len);
+        memset(obj, 0, sizeof(*obj));
+        return NULL;
+    }
     obj->flags = LDR_FLAG_SHLIB;
     obj->phdr  = (const Elf64_Phdr *)(base + phdr_vaddr);
     obj->phdr_num  = ehdr.e_phnum;
     obj->map_start = base + lo;
     obj->map_end   = base + hi;
-    /* Find PT_GNU_EH_FRAME */
-    obj->eh_frame_hdr = NULL;
-    for (int p = 0; p < ehdr.e_phnum; p++) {
-        if (phdr_buf[p].p_type == PT_GNU_EH_FRAME) {
-            obj->eh_frame_hdr = (const void *)(base + phdr_buf[p].p_vaddr);
-            break;
-        }
+    obj->runtime_reservation = reservation;
+    obj->runtime_reservation_size = (size_t)reservation_len;
+    obj->runtime_dev = (uint64_t)identity.st_dev;
+    obj->runtime_ino = (uint64_t)identity.st_ino;
+    obj->runtime_identity_valid = 1;
+    dl_transaction_note_mapping(idx);
+    if (discover_eh_frame_header(obj) < 0) {
+        dl_release_runtime_mapping(obj);
+        dl_set_error(path, ": malformed PT_GNU_EH_FRAME");
+        return NULL;
     }
 
     /* Build metadata for parse_dynamic / protect_object */
@@ -9593,44 +13021,106 @@ static struct loaded_obj *load_elf_from_file(const char *path)
     meta->phdr_entsz = ehdr.e_phentsize;
     meta->flags      = LDR_FLAG_SHLIB;
 
-    parse_dynamic(obj, meta);
-    discover_tls_template(obj, phdr_buf, ehdr.e_phnum);
-    if (obj->tls.memsz != 0)
-        obj->tls.modid = next_tls_modid();
+    if (parse_dynamic(obj, meta) < 0) {
+        dl_set_error(path, ": malformed dynamic metadata");
+        dl_release_runtime_mapping(obj);
+        return NULL;
+    }
+    if (dl_lazy_dynamic_flags_admitted(obj, path) < 0) {
+        dl_release_runtime_mapping(obj);
+        return NULL;
+    }
+    if (validate_object_relocations(obj) < 0) {
+        dl_set_error(path, ": malformed relocation metadata");
+        dl_release_runtime_mapping(obj);
+        return NULL;
+    }
+    if (discover_tls_template(obj, phdr_buf, ehdr.e_phnum) < 0) {
+        dl_set_error(path, ": malformed TLS program header");
+        dl_release_runtime_mapping(obj);
+        return NULL;
+    }
+    if (dl_lazy_static_tls_admitted(obj, path) < 0) {
+        dl_release_runtime_mapping(obj);
+        return NULL;
+    }
+    if (obj->tls.memsz != 0 && next_tls_modid(&obj->tls.modid) < 0) {
+        dl_set_error(path, ": too many TLS modules");
+        dl_release_runtime_mapping(obj);
+        return NULL;
+    }
 
     /* Bump count so symbol resolution includes this object */
     g_nobj = idx + 1;
+    if (dl_assign_new_object_scope(obj) < 0) {
+        dl_set_error(path, ": cannot establish dependency lookup scope");
+        g_nobj = idx;
+        return NULL;
+    }
 
     /* Load DT_NEEDED dependencies before applying relocations.
      * This may recursively call load_elf_from_file and increase g_nobj. */
-    dl_load_needed(obj, meta);
+    if (dl_load_needed(obj, meta, inherited_rpath) < 0) {
+        g_nobj = idx;
+        return NULL;
+    }
+
+    /* A dlopen transaction first discovers and maps the entire dependency
+     * graph.  Relocation, final protections, TLS publication, and
+     * constructors are committed only after every edge has succeeded. */
+    if (g_dl_transaction.active) {
+        if (dl_transaction_queue_init(obj) < 0) {
+            g_nobj = idx;
+            return NULL;
+        }
+        return obj;
+    }
 
     /* Clear cached misses — new objects may provide symbols
      * that were previously unresolvable. */
     clear_resolution_caches();
 
     /* Apply relocations */
-    preseed_rtld_got(obj);
-    if (apply_all_relocs(obj, g_all_objs, g_nobj, 0) < 0) {
+    if (preseed_rtld_got(obj, g_all_objs, g_nobj) < 0) {
+        dl_set_error(path, ": malformed relocation metadata");
+        g_nobj = idx;
+        return NULL;
+    }
+    if (apply_all_relocs(obj, g_all_objs, g_nobj,
+                         RELOC_PASS_ORDINARY) < 0) {
         dl_set_error(path, ": relocation failed");
         g_nobj = idx;  /* roll back */
         return NULL;
     }
-    if (apply_all_relocs(obj, g_all_objs, g_nobj, 1) < 0) {
+    if (apply_all_relocs(obj, g_all_objs, g_nobj,
+                         RELOC_PASS_COPY) < 0) {
+        dl_set_error(path, ": COPY relocation failed");
+        g_nobj = idx;
+        return NULL;
+    }
+    if (apply_all_relocs(obj, g_all_objs, g_nobj,
+                         RELOC_PASS_IFUNC) < 0) {
+        dl_set_error(path, ": IFUNC relocation failed");
+        g_nobj = idx;
+        return NULL;
+    }
+    if (apply_all_relocs(obj, g_all_objs, g_nobj,
+                         RELOC_PASS_IRELATIVE) < 0) {
         dl_set_error(path, ": IRELATIVE failed");
         g_nobj = idx;
         return NULL;
     }
-
-    if (install_musl_dlopen_tls(obj) < 0) {
-        dl_set_error(path, ": musl TLS setup failed");
-        g_nobj = idx;
-        return NULL;
-    }
-    if (install_glibc_dlopen_tls(obj) < 0) {
-        dl_set_error(path, ": glibc TLS setup failed");
-        g_nobj = idx;
-        return NULL;
+    if (!g_dl_transaction.active) {
+        if (install_musl_dlopen_tls(obj) < 0) {
+            dl_set_error(path, ": musl TLS setup failed");
+            g_nobj = idx;
+            return NULL;
+        }
+        if (install_glibc_dlopen_tls(obj) < 0) {
+            dl_set_error(path, ": glibc TLS setup failed");
+            g_nobj = idx;
+            return NULL;
+        }
     }
 
     /* Set final memory protections */
@@ -9640,17 +13130,23 @@ static struct loaded_obj *load_elf_from_file(const char *path)
         return NULL;
     }
 
-    /* Restore pointer_guard before calling init functions — the bootstrap
-     * libc may have corrupted it via errno writes during open/mmap. */
-    restore_ptr_guard();
+    if (g_dl_transaction.active) {
+        if (dl_transaction_queue_init(obj) < 0) {
+            g_nobj = idx;
+            return NULL;
+        }
+    } else {
+        /* Restore pointer_guard before calling init functions — the
+         * bootstrap libc may have corrupted it via errno writes. */
+        typedef void (*init_fn_t)(int, char **, char **);
 
-    /* Application constructors run with the application's signal handlers. */
-    typedef void (*init_fn_t)(int, char **, char **);
-    record_object_init(obj);
-    if (obj->init_func)
-        ((init_fn_t)obj->init_func)(g_argc, g_argv, g_envp);
-    for (size_t j = 0; j < obj->init_array_sz; j++)
-        ((init_fn_t)obj->init_array[j])(g_argc, g_argv, g_envp);
+        restore_ptr_guard();
+        record_object_init(obj);
+        if (obj->init_func)
+            ((init_fn_t)obj->init_func)(g_argc, g_argv, g_envp);
+        for (size_t j = 0; j < obj->init_array_sz; j++)
+            ((init_fn_t)obj->init_array[j])(g_argc, g_argv, g_envp);
+    }
 
     ldr_dbg("[loader] dlopen: ");
     ldr_dbg(dl_basename(path));
@@ -9667,7 +13163,8 @@ static struct loaded_obj *load_elf_from_file(const char *path)
  * Uses the same map/parse/relocate/init flow as load_elf_from_file but
  * reads data from the frozen payload instead of the filesystem.
  */
-static struct loaded_obj *load_embedded_object(uint32_t mi)
+static struct loaded_obj *load_embedded_object(
+    uint32_t mi, const struct dl_rpath_scope *inherited_rpath)
 {
     int idx = g_nobj;
     if (idx >= MAX_TOTAL_OBJS) {
@@ -9686,8 +13183,13 @@ static struct loaded_obj *load_embedded_object(uint32_t mi)
     if (map_object(g_frozen_mem, g_frozen_mem_foff, g_frozen_srcfd,
                    emeta, eent, obj, 0) < 0) {
         dl_set_error(ename, ": mmap failed");
+        if (obj->runtime_reservation && obj->runtime_reservation_size)
+            munmap(obj->runtime_reservation,
+                   obj->runtime_reservation_size);
+        memset(obj, 0, sizeof(*obj));
         return NULL;
     }
+    dl_transaction_note_mapping(idx);
 
     obj->name     = ename;
     obj->flags    = emeta->flags;
@@ -9696,100 +13198,112 @@ static struct loaded_obj *load_embedded_object(uint32_t mi)
     obj->map_start = obj->base + emeta->vaddr_lo;
     obj->map_end   = obj->base + emeta->vaddr_hi;
 
-    /* Find PT_GNU_EH_FRAME */
-    for (int p = 0; p < obj->phdr_num; p++) {
-        if (obj->phdr[p].p_type == PT_GNU_EH_FRAME) {
-            obj->eh_frame_hdr = (const void *)(obj->base + obj->phdr[p].p_vaddr);
-            break;
+    for (uint16_t i = 0; i < obj->phdr_num; i++) {
+        if (obj->phdr[i].p_type == PT_INTERP) {
+            dl_set_error(ename,
+                         ": PT_INTERP executable cannot be loaded with "
+                         "dlopen");
+            return NULL;
         }
+    }
+
+    if (discover_eh_frame_header(obj) < 0) {
+        dl_set_error(ename, ": malformed PT_GNU_EH_FRAME");
+        return NULL;
     }
 
     /* Store metadata for protect_object */
     struct dlfrz_lib_meta *meta = &g_dl_metas[idx];
     *meta = *emeta;
 
-    parse_dynamic(obj, meta);
-    discover_tls_template(obj, obj->phdr, obj->phdr_num);
-    if (obj->tls.memsz != 0)
-        obj->tls.modid = next_tls_modid();
+    if (parse_dynamic(obj, meta) < 0) {
+        dl_set_error(ename, ": malformed dynamic metadata");
+        return NULL;
+    }
+    if (dl_lazy_dynamic_flags_admitted(obj, ename) < 0)
+        return NULL;
+    if (validate_object_relocations(obj) < 0) {
+        dl_set_error(ename, ": malformed relocation metadata");
+        return NULL;
+    }
+    if (discover_tls_template(obj, obj->phdr, obj->phdr_num) < 0) {
+        dl_set_error(ename, ": malformed TLS program header");
+        return NULL;
+    }
+    if (dl_lazy_static_tls_admitted(obj, ename) < 0)
+        return NULL;
+    if (obj->tls.memsz != 0 && next_tls_modid(&obj->tls.modid) < 0) {
+        dl_set_error(ename, ": too many TLS modules");
+        return NULL;
+    }
 
     /* Bump count so symbol resolution includes this object */
     g_nobj = idx + 1;
+    if (dl_assign_new_object_scope(obj) < 0) {
+        dl_set_error(ename, ": cannot establish dependency lookup scope");
+        g_nobj = idx;
+        return NULL;
+    }
 
-    /* Load DT_NEEDED dependencies from frozen image (or filesystem) */
-    if (obj->dynstr) {
-        const Elf64_Phdr *dyn_ph = NULL;
-        for (int p = 0; p < obj->phdr_num; p++) {
-            if (obj->phdr[p].p_type == PT_DYNAMIC) { dyn_ph = &obj->phdr[p]; break; }
+    /* A matching embedded dependency counts only after its recursive load
+     * succeeds.  Any missing edge aborts the entire dlopen transaction. */
+    if (dl_load_needed(obj, meta, inherited_rpath) < 0) {
+        g_nobj = idx;
+        return NULL;
+    }
+
+    if (g_dl_transaction.active) {
+        if (dl_transaction_queue_init(obj) < 0) {
+            g_nobj = idx;
+            return NULL;
         }
-        if (dyn_ph) {
-            const Elf64_Dyn *dyn = (const Elf64_Dyn *)(obj->base + dyn_ph->p_vaddr);
-            size_t dc = dyn_ph->p_memsz / sizeof(Elf64_Dyn);
-            for (size_t di = 0; di < dc && dyn[di].d_tag != DT_NULL; di++) {
-                if (dyn[di].d_tag != DT_NEEDED) continue;
-                const char *needed = obj->dynstr + dyn[di].d_un.d_val;
-
-                if (dl_is_virtual_runtime_object(needed))
-                    continue;
-
-                /* Skip if already loaded */
-                int found = 0;
-                for (int j = 0; j < g_nobj; j++) {
-                    if (!g_all_objs[j].name && !g_all_objs[j].base) continue;
-                    if (g_all_objs[j].name &&
-                        dl_name_matches(g_all_objs[j].name, needed)) {
-                        found = 1; break;
-                    }
-                }
-                if (found) continue;
-                /* Try to find in frozen image (skip INTERP — the dynamic
-                 * linker is never needed in direct-load mode and its
-                 * pre-assigned address may overlap other objects). */
-                int dep_found = 0;
-                for (uint32_t fi = 0; fi < g_frozen_num_entries; fi++) {
-                    if (g_frozen_metas[fi].flags & LDR_FLAG_INTERP) continue;
-                    if (g_frozen_metas[fi].flags & LDR_FLAG_DATA) continue;
-                    if (!(g_frozen_metas[fi].flags & LDR_FLAG_SHLIB)) continue;
-                    const char *fn = g_frozen_strtab + g_frozen_entries[fi].name_offset;
-                    if (dl_name_matches(fn, needed)) {
-                        load_embedded_object(fi);
-                        dep_found = 1;
-                        break;
-                    }
-                }
-                if (!dep_found) {
-                    /* Try filesystem */
-                    load_needed_from_filesystem(needed);
-                }
-            }
-        }
+        return obj;
     }
 
     /* Clear cached misses — new objects may provide previously-missing symbols */
     clear_resolution_caches();
 
     /* Apply relocations */
-    preseed_rtld_got(obj);
-    if (apply_all_relocs(obj, g_all_objs, g_nobj, 0) < 0) {
+    if (preseed_rtld_got(obj, g_all_objs, g_nobj) < 0) {
+        dl_set_error(ename, ": malformed relocation metadata");
+        g_nobj = idx;
+        return NULL;
+    }
+    if (apply_all_relocs(obj, g_all_objs, g_nobj,
+                         RELOC_PASS_ORDINARY) < 0) {
         dl_set_error(ename, ": relocation failed");
         g_nobj = idx;
         return NULL;
     }
-    if (apply_all_relocs(obj, g_all_objs, g_nobj, 1) < 0) {
+    if (apply_all_relocs(obj, g_all_objs, g_nobj,
+                         RELOC_PASS_COPY) < 0) {
+        dl_set_error(ename, ": COPY relocation failed");
+        g_nobj = idx;
+        return NULL;
+    }
+    if (apply_all_relocs(obj, g_all_objs, g_nobj,
+                         RELOC_PASS_IFUNC) < 0) {
+        dl_set_error(ename, ": IFUNC relocation failed");
+        g_nobj = idx;
+        return NULL;
+    }
+    if (apply_all_relocs(obj, g_all_objs, g_nobj,
+                         RELOC_PASS_IRELATIVE) < 0) {
         dl_set_error(ename, ": IRELATIVE failed");
         g_nobj = idx;
         return NULL;
     }
-
-    if (install_musl_dlopen_tls(obj) < 0) {
-        dl_set_error(ename, ": musl TLS setup failed");
-        g_nobj = idx;
-        return NULL;
-    }
-    if (install_glibc_dlopen_tls(obj) < 0) {
-        dl_set_error(ename, ": glibc TLS setup failed");
-        g_nobj = idx;
-        return NULL;
+    if (!g_dl_transaction.active) {
+        if (install_musl_dlopen_tls(obj) < 0) {
+            dl_set_error(ename, ": musl TLS setup failed");
+            g_nobj = idx;
+            return NULL;
+        }
+        if (install_glibc_dlopen_tls(obj) < 0) {
+            dl_set_error(ename, ": glibc TLS setup failed");
+            g_nobj = idx;
+            return NULL;
+        }
     }
 
     /* Set final memory protections */
@@ -9799,17 +13313,21 @@ static struct loaded_obj *load_embedded_object(uint32_t mi)
         return NULL;
     }
 
-    /* Restore pointer_guard before init functions — bootstrap libc errno
-     * writes from dependency loading may have corrupted it. */
-    restore_ptr_guard();
+    if (g_dl_transaction.active) {
+        if (dl_transaction_queue_init(obj) < 0) {
+            g_nobj = idx;
+            return NULL;
+        }
+    } else {
+        typedef void (*init_fn_t)(int, char **, char **);
 
-    /* Application constructors run with the application's signal handlers. */
-    typedef void (*init_fn_t)(int, char **, char **);
-    record_object_init(obj);
-    if (obj->init_func)
-        ((init_fn_t)obj->init_func)(g_argc, g_argv, g_envp);
-    for (size_t j = 0; j < obj->init_array_sz; j++)
-        ((init_fn_t)obj->init_array[j])(g_argc, g_argv, g_envp);
+        restore_ptr_guard();
+        record_object_init(obj);
+        if (obj->init_func)
+            ((init_fn_t)obj->init_func)(g_argc, g_argv, g_envp);
+        for (size_t j = 0; j < obj->init_array_sz; j++)
+            ((init_fn_t)obj->init_array[j])(g_argc, g_argv, g_envp);
+    }
 
     ldr_dbg("[loader] dlopen (embedded): ");
     ldr_dbg(dl_basename(ename));
@@ -9818,24 +13336,65 @@ static struct loaded_obj *load_embedded_object(uint32_t mi)
     return obj;
 }
 
+static struct loaded_obj *dl_object_for_address(void *return_address)
+{
+    uintptr_t address = (uintptr_t)return_address;
+
+    for (int i = 0; i < g_nobj; i++)
+        if (loaded_obj_contains(&g_all_objs[i], address, 1))
+            return &g_all_objs[i];
+    return NULL;
+}
+
 static void *my_dlopen(const char *path, int flags)
 {
+    struct loaded_obj *caller;
+    struct loaded_obj *ret = NULL;
+    struct dl_rpath_scope caller_rpath;
+    const struct dl_rpath_scope *top_inherited = NULL;
+    const char *rpath = NULL;
+    const char *runpath = NULL;
+    void *return_address;
+
     (void)flags;
     g_dlerror_valid = 0;
 
     if (!path)
         return DL_GLOBAL_HANDLE;
+    if (g_dl_transaction.active) {
+        dl_set_error("recursive dlopen during dependency relocation is "
+                     "unsupported", NULL);
+        return NULL;
+    }
+    if (strchr(path, '$')) {
+        dl_set_error("dynamic string tokens in dlopen filenames are "
+                     "unsupported", NULL);
+        return NULL;
+    }
 
-    /* Check if already loaded (basename match) */
     const char *bn = dl_basename(path);
 
     if (dl_is_virtual_runtime_object(bn))
         return DL_GLOBAL_HANDLE;
 
     for (int i = 0; i < g_nobj; i++) {
-        if (!g_all_objs[i].name) continue;
-        if (dl_name_matches(g_all_objs[i].name, bn))
+        if (dl_loaded_dependency_matches(&g_all_objs[i], path))
             return &g_all_objs[i];
+    }
+
+    return_address =
+        __builtin_extract_return_addr(__builtin_return_address(0));
+    caller = dl_object_for_address(return_address);
+    if (dl_object_search_paths(caller, &rpath, &runpath) < 0) {
+        dl_set_error("dlopen caller has malformed library search metadata",
+                     NULL);
+        return NULL;
+    }
+    if (!runpath && rpath) {
+        caller_rpath.path = rpath;
+        caller_rpath.owner = caller;
+        caller_rpath.parent = NULL;
+        top_inherited = &caller_rpath;
     }
 
     /* Check embedded DLOPEN objects in the frozen image */
@@ -9845,14 +13404,18 @@ static void *my_dlopen(const char *path, int flags)
             if (g_frozen_metas[i].flags & LDR_FLAG_INTERP) continue;
             if (g_frozen_metas[i].flags & LDR_FLAG_DATA) continue;
             const char *ename = g_frozen_strtab + g_frozen_entries[i].name_offset;
-            if (dl_name_matches(ename, bn)) {
-                struct loaded_obj *obj = load_embedded_object(i);
-                if (obj) {
+            if (dl_dependency_name_matches(ename, path)) {
+                dl_transaction_begin();
+                ret = load_embedded_object(i, top_inherited);
+                if (ret && dl_transaction_commit() == 0) {
                     restore_ptr_guard();
-                    return obj;
+                    return ret;
                 }
-                /* Fall through to filesystem on error */
-                break;
+                dl_transaction_rollback();
+                if (!g_dlerror_valid)
+                    dl_set_error(path, ": embedded object load failed");
+                restore_ptr_guard();
+                return NULL;
             }
         }
     }
@@ -9862,22 +13425,26 @@ static void *my_dlopen(const char *path, int flags)
      *     (absolute or relative to the current working directory);
      *   - otherwise it is treated as a bare soname and resolved against
      *     the standard runtime library directories. */
-    void *ret;
-    int has_slash = 0;
-    for (const char *p = path; *p; p++) {
-        if (*p == '/') { has_slash = 1; break; }
+    dl_transaction_begin();
+    if (dl_path_has_slash(path)) {
+        ret = load_elf_from_file(path, top_inherited);
+    } else {
+        int rc = load_needed_from_filesystem(
+            caller, NULL, top_inherited, path, &ret);
+
+        if (rc == 0 && !ret)
+            dl_set_error(path, ": cannot open shared object file");
     }
-    if (has_slash)
-        ret = load_elf_from_file(path);
-    else
-        ret = load_needed_from_filesystem(path);
-    if (ret) {
+    if (ret && dl_transaction_commit() == 0) {
         /* Loaded from disk — this library should have been captured */
         ldr_msg("dlfreeze: warning: dlopen loading '");
         ldr_msg(bn);
         ldr_msg("' from disk (not in frozen image)\n");
     } else {
-        dl_set_error(path, ": cannot open shared object file");
+        ret = NULL;
+        dl_transaction_rollback();
+        if (!g_dlerror_valid)
+            dl_set_error(path, ": cannot open shared object file");
     }
     restore_ptr_guard();
     return ret;
@@ -9898,14 +13465,36 @@ static struct loaded_obj *dl_object_from_handle(void *handle)
     return &g_all_objs[delta / sizeof(g_all_objs[0])];
 }
 
-static int dl_scope_after_caller(void *return_address)
+static int dl_next_lookup_scope(void *return_address,
+                                uint16_t *order,
+                                uint16_t *count_out,
+                                uint16_t *first_out)
 {
     uintptr_t address = (uintptr_t)return_address;
+    int caller_index = -1;
+    int scoped;
 
     for (int i = 0; i < g_nobj; i++)
-        if (address >= g_all_objs[i].map_start &&
-            address < g_all_objs[i].map_end)
-            return i + 1;
+        if (loaded_obj_contains(&g_all_objs[i], address, 1)) {
+            caller_index = i;
+            break;
+        }
+    if (caller_index < 0)
+        return -1;
+
+    scoped = dl_build_global_lookup_order(g_nobj, order, count_out);
+    if (scoped < 0)
+        return -1;
+    if (scoped == 0) {
+        *count_out = (uint16_t)g_nobj;
+        for (int i = 0; i < g_nobj; i++)
+            order[i] = (uint16_t)i;
+    }
+    for (uint16_t i = 0; i < *count_out; i++)
+        if (order[i] == (uint16_t)caller_index) {
+            *first_out = i + 1;
+            return 0;
+        }
     return -1;
 }
 
@@ -9922,6 +13511,51 @@ static void *my_dlmopen(long /*Lmid_t*/ lmid, const char *path, int flags)
     return NULL;
 }
 
+static int dl_lookup_handle_symbol(struct loaded_obj *root,
+                                   const char *symbol,
+                                   const char *version,
+                                   uint64_t *address_out)
+{
+    uint32_t gh = gnu_hash_calc(symbol);
+
+    if (!root->lookup_scope_valid &&
+        dl_build_lookup_scope(root, g_nobj) < 0)
+        return -1;
+    for (uint16_t i = 0; i < root->lookup_scope_count; i++) {
+        uint16_t index = root->lookup_scope_indices[i];
+        const Elf64_Sym *sym;
+
+        if (index >= g_nobj)
+            return -1;
+        sym = version
+            ? lookup_versioned_symbol(&g_all_objs[index], symbol, version)
+            : lookup_object_symbol(&g_all_objs[index], symbol, gh);
+        if (sym) {
+            uint64_t special = lookup_api_special(
+                symbol, version, 1);
+
+            if (special) {
+                *address_out = special;
+                return 1;
+            }
+            if (resolve_defined_symbol_address(
+                    &g_all_objs[index], sym, address_out, NULL))
+                return 1;
+        }
+    }
+    {
+        uint64_t special = lookup_api_special(symbol, version, 0);
+
+        /* The interpreter is an implicit member of every handle's loader
+         * scope even though it is not represented in g_all_objs. */
+        if (special) {
+            *address_out = special;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static void *my_dlsym(void *handle, const char *symbol)
 {
     g_dlerror_valid = 0;
@@ -9932,26 +13566,34 @@ static void *my_dlsym(void *handle, const char *symbol)
     }
 
     if (handle == (void *)(uintptr_t)-1L /* RTLD_NEXT */) {
-        int first = dl_scope_after_caller(
-            __builtin_extract_return_addr(__builtin_return_address(0)));
+        uint16_t order[MAX_TOTAL_OBJS];
+        uint16_t count;
+        uint16_t first;
 
-        if (first < 0) {
+        if (dl_next_lookup_scope(
+                __builtin_extract_return_addr(__builtin_return_address(0)),
+                order, &count, &first) < 0) {
             dl_set_error("dlsym: RTLD_NEXT caller is not a loaded object",
                          NULL);
             return NULL;
         }
-        for (int i = first; i < g_nobj; i++) {
+        for (uint16_t position = first; position < count; position++) {
+            uint16_t i = order[position];
             uint32_t gh = gnu_hash_calc(symbol);
             const Elf64_Sym *sym = lookup_object_symbol(
                 &g_all_objs[i], symbol, gh);
+            uint64_t addr;
 
-            if (sym && sym->st_value) {
-                uint64_t addr = g_all_objs[i].base + sym->st_value;
-                if (ELF64_ST_TYPE(sym->st_info) == STT_GNU_IFUNC) {
-                    typedef uint64_t (*ifunc_t)(void);
-                    addr = ((ifunc_t)addr)();
-                }
-                return (void *)(uintptr_t)addr;
+            if (sym) {
+                uint64_t special = lookup_api_special(symbol, NULL, 1);
+
+                /* RTLD_NEXT still selects the first provider after the
+                 * caller; only the returned implementation is interposed. */
+                if (special)
+                    return (void *)(uintptr_t)special;
+                if (resolve_defined_symbol_address(
+                        &g_all_objs[i], sym, &addr, NULL))
+                    return (void *)(uintptr_t)addr;
             }
         }
         dl_set_error("undefined symbol after caller: ", symbol);
@@ -9962,29 +13604,33 @@ static void *my_dlsym(void *handle, const char *symbol)
         return NULL;
     }
 
-    /* Handle-specific lookup: search the specific object first */
+    /* A real handle searches only that object's breadth-first dependency
+     * closure.  It must not fall through to unrelated loaded objects. */
     if (handle && handle != DL_GLOBAL_HANDLE &&
         handle != (void *)(uintptr_t)-1L /* RTLD_NEXT */) {
         struct loaded_obj *obj = dl_object_from_handle(handle);
+        uint64_t addr;
+        int found;
+
         if (!obj) {
             dl_set_error("dlsym: invalid handle", NULL);
             return NULL;
         }
-        uint32_t gh = gnu_hash_calc(symbol);
-        const Elf64_Sym *sym = lookup_object_symbol(obj, symbol, gh);
-        if (sym && sym->st_value) {
-            uint64_t addr = obj->base + sym->st_value;
-            if (ELF64_ST_TYPE(sym->st_info) == STT_GNU_IFUNC) {
-                typedef uint64_t (*ifunc_t)(void);
-                addr = ((ifunc_t)addr)();
-            }
+        found = dl_lookup_handle_symbol(obj, symbol, NULL, &addr);
+        if (found > 0)
             return (void *)(uintptr_t)addr;
-        }
+        if (found < 0)
+            dl_set_error("dlsym: malformed handle dependency scope", NULL);
+        else
+            dl_set_error("undefined symbol: ", symbol);
+        return NULL;
     }
 
-    /* Fallback: search all loaded objects */
-    uint64_t addr = resolve_sym(g_all_objs, g_nobj, symbol);
-    if (addr) return (void *)(uintptr_t)addr;
+    /* Fallback: search all loaded objects.  Keep success separate from the
+     * address because a valid SHN_ABS definition may have value zero. */
+    uint64_t addr = 0;
+    if (resolve_sym_address(g_all_objs, g_nobj, symbol, &addr))
+        return (void *)(uintptr_t)addr;
 
     dl_set_error("undefined symbol: ", symbol);
     return NULL;
@@ -9993,9 +13639,6 @@ static void *my_dlsym(void *handle, const char *symbol)
 /* dlvsym(handle, name, version) — exact GNU symbol-version lookup. */
 static void *my_dlvsym(void *handle, const char *symbol, const char *version)
 {
-    int first = 0;
-    int last = g_nobj;
-
     g_dlerror_valid = 0;
     if (!symbol || !version) {
         dl_set_error("dlvsym: invalid symbol or version", NULL);
@@ -10003,13 +13646,36 @@ static void *my_dlvsym(void *handle, const char *symbol, const char *version)
     }
 
     if (handle == (void *)(uintptr_t)-1L /* RTLD_NEXT */) {
-        first = dl_scope_after_caller(
-            __builtin_extract_return_addr(__builtin_return_address(0)));
-        if (first < 0) {
+        uint16_t order[MAX_TOTAL_OBJS];
+        uint16_t count;
+        uint16_t first;
+
+        if (dl_next_lookup_scope(
+                __builtin_extract_return_addr(__builtin_return_address(0)),
+                order, &count, &first) < 0) {
             dl_set_error("dlvsym: RTLD_NEXT caller is not a loaded object",
                          NULL);
             return NULL;
         }
+        for (uint16_t position = first; position < count; position++) {
+            uint16_t index = order[position];
+            const Elf64_Sym *sym = lookup_versioned_symbol(
+                &g_all_objs[index], symbol, version);
+            uint64_t addr;
+
+            if (sym) {
+                uint64_t special = lookup_api_special(
+                    symbol, version, 1);
+
+                if (special)
+                    return (void *)(uintptr_t)special;
+                if (resolve_defined_symbol_address(
+                        &g_all_objs[index], sym, &addr, NULL))
+                    return (void *)(uintptr_t)addr;
+            }
+        }
+        dl_set_error("undefined versioned symbol after caller: ", symbol);
+        return NULL;
     } else if (handle == (void *)(uintptr_t)-2L) {
         dl_set_error("dlvsym: invalid handle", NULL);
         return NULL;
@@ -10017,37 +13683,140 @@ static void *my_dlvsym(void *handle, const char *symbol, const char *version)
 
     if (handle && handle != DL_GLOBAL_HANDLE &&
         handle != (void *)(uintptr_t)-1L /* RTLD_NEXT */) {
-        uintptr_t handle_addr = (uintptr_t)handle;
-        uintptr_t table_addr = (uintptr_t)g_all_objs;
-        uintptr_t table_end = table_addr +
-                              (size_t)g_nobj * sizeof(g_all_objs[0]);
+        struct loaded_obj *obj = dl_object_from_handle(handle);
+        uint64_t addr;
+        int found;
 
-        if (handle_addr < table_addr || handle_addr >= table_end ||
-            (handle_addr - table_addr) % sizeof(g_all_objs[0]) != 0) {
+        if (!obj) {
             dl_set_error("dlvsym: invalid handle", NULL);
             return NULL;
         }
-        first = (int)((handle_addr - table_addr) / sizeof(g_all_objs[0]));
-        last = first + 1;
+        found = dl_lookup_handle_symbol(obj, symbol, version, &addr);
+        if (found > 0)
+            return (void *)(uintptr_t)addr;
+        if (found < 0)
+            dl_set_error("dlvsym: malformed handle dependency scope", NULL);
+        else
+            dl_set_error("undefined versioned symbol: ", symbol);
+        return NULL;
     }
 
-    for (int i = first; i < last; i++) {
+    if (handle != (void *)(uintptr_t)-1L /* RTLD_NEXT */) {
+        uint16_t order[MAX_TOTAL_OBJS];
+        uint16_t count = 0;
+        int scoped = dl_build_global_lookup_order(
+            g_nobj, order, &count);
+        uint64_t special = lookup_api_special(symbol, version, 0);
+
+        /* The interpreter is globally resident conceptually, but is not
+         * represented in g_all_objs. */
+        if (special)
+            return (void *)(uintptr_t)special;
+
+        if (scoped < 0) {
+            dl_set_error("dlvsym: malformed global lookup scope", NULL);
+            return NULL;
+        }
+        if (scoped > 0) {
+            for (uint16_t position = 0; position < count; position++) {
+                uint16_t index = order[position];
+                const Elf64_Sym *sym = lookup_versioned_symbol(
+                    &g_all_objs[index], symbol, version);
+                uint64_t addr;
+
+                if (sym) {
+                    special = lookup_api_special(symbol, version, 1);
+                    if (special)
+                        return (void *)(uintptr_t)special;
+                    if (resolve_defined_symbol_address(
+                            &g_all_objs[index], sym, &addr, NULL))
+                        return (void *)(uintptr_t)addr;
+                }
+            }
+            dl_set_error("undefined versioned symbol: ", symbol);
+            return NULL;
+        }
+    }
+
+    for (int i = 0; i < g_nobj; i++) {
         const Elf64_Sym *sym =
             lookup_versioned_symbol(&g_all_objs[i], symbol, version);
+        uint64_t addr;
 
         if (sym) {
-            uint64_t addr = g_all_objs[i].base + sym->st_value;
+            uint64_t special = lookup_api_special(symbol, version, 1);
 
-            if (ELF64_ST_TYPE(sym->st_info) == STT_GNU_IFUNC) {
-                typedef uint64_t (*ifunc_t)(void);
-                addr = ((ifunc_t)addr)();
-            }
-            return (void *)(uintptr_t)addr;
+            if (special)
+                return (void *)(uintptr_t)special;
+            if (resolve_defined_symbol_address(
+                    &g_all_objs[i], sym, &addr, NULL))
+                return (void *)(uintptr_t)addr;
         }
     }
 
     dl_set_error("undefined versioned symbol: ", symbol);
     return NULL;
+}
+
+/* Bounded dladdr over the loader's mapped-object table.  The dynamic symbol
+ * table is sufficient for the public contract; dladdr1's link_map and
+ * section-index extensions are intentionally not synthesized. */
+static int my_dladdr(const void *address_ptr, Dl_info *info)
+{
+    uintptr_t address = (uintptr_t)address_ptr;
+    struct loaded_obj *obj = NULL;
+    const char *best_name = NULL;
+    uintptr_t best_address = 0;
+
+    if (!info)
+        return 0;
+    memset(info, 0, sizeof(*info));
+    for (int i = 0; i < g_nobj; i++) {
+        if (loaded_obj_contains(&g_all_objs[i], address, 1)) {
+            obj = &g_all_objs[i];
+            break;
+        }
+    }
+    if (!obj)
+        return 0;
+
+    for (uint32_t i = 1; i < obj->dynsym_count; i++) {
+        const Elf64_Sym *sym = loaded_dynsym(obj, i);
+        const char *name;
+        unsigned int type;
+        uintptr_t candidate;
+        void *pointer;
+
+        if (!sym || sym->st_shndx == SHN_UNDEF)
+            continue;
+        type = ELF64_ST_TYPE(sym->st_info);
+        if (type == STT_TLS || type == STT_SECTION || type == STT_FILE)
+            continue;
+        name = loaded_symbol_name(obj, sym);
+        if (!name || !name[0])
+            continue;
+        if (sym->st_shndx == SHN_ABS) {
+            if (sym->st_value != address)
+                continue;
+            candidate = (uintptr_t)sym->st_value;
+        } else {
+            if (sym->st_shndx >= SHN_LORESERVE ||
+                !loaded_obj_vaddr_pointer(obj, sym->st_value, 1, 0,
+                                          &pointer))
+                continue;
+            candidate = (uintptr_t)pointer;
+        }
+        if (candidate > address || (best_name && candidate <= best_address))
+            continue;
+        best_address = candidate;
+        best_name = name;
+    }
+
+    info->dli_fname = obj->name ? obj->name : "";
+    info->dli_fbase = (void *)(uintptr_t)obj->base;
+    info->dli_sname = best_name;
+    info->dli_saddr = best_name ? (void *)best_address : NULL;
+    return 1;
 }
 
 static int my_dlclose(void *handle)
@@ -10263,15 +14032,8 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
                             int *idx_map, int num_entries __attribute__((unused)),
                             uintptr_t at_random)
 {
-    uintptr_t old_tp = 0;
-    uintptr_t old_self = 0;
-    size_t bootstrap_self_to_tp = 0;
     uint64_t max_tls_align = 1;
     int64_t min_static_tpoff = 0;
-#if defined(__aarch64__)
-    (void)at_random;
-#endif
-
     /* Discover PT_TLS for each object and compute total static TLS size.
      * x86-64 uses Variant II: TLS blocks at negative TP offsets.
      * Layout: [TLS block N ... TLS block 1] [TCB]
@@ -10290,14 +14052,46 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
         for (int j = 0; j < metas[mi].phdr_num; j++) {
             if (phdrs[j].p_type != PT_TLS) continue;
             uint64_t align = phdrs[j].p_align ? phdrs[j].p_align : 1;
+            uint64_t next_tls;
+
+            if ((align & (align - 1)) != 0 ||
+                phdrs[j].p_filesz > phdrs[j].p_memsz ||
+                phdrs[j].p_memsz > SIZE_MAX ||
+                phdrs[j].p_vaddr > UINT64_MAX - phdrs[j].p_memsz ||
+                (phdrs[j].p_vaddr & (align - 1)) !=
+                    (phdrs[j].p_offset & (align - 1)) ||
+                (phdrs[j].p_filesz != 0 &&
+                 !loaded_obj_file_vaddr_pointer(&objs[oi],
+                                                phdrs[j].p_vaddr,
+                                                (size_t)phdrs[j].p_filesz,
+                                                NULL))) {
+                ldr_err("invalid PT_TLS program header in", objs[oi].name);
+                return 0;
+            }
             if (align > max_tls_align)
                 max_tls_align = align;
             if (tls_above_tp) {
-                total_tls = ALIGN_UP(total_tls, align);
+                if (!u64_align_up_checked(total_tls, align, &next_tls) ||
+                    next_tls > INT64_MAX) {
+                    ldr_err("static TLS layout overflows for", objs[oi].name);
+                    return 0;
+                }
+                total_tls = next_tls;
                 objs[oi].tls.tpoff = (int64_t)total_tls;
-                total_tls += phdrs[j].p_memsz;
+                if (!u64_add_checked(total_tls, phdrs[j].p_memsz,
+                                     &total_tls) ||
+                    total_tls > INT64_MAX) {
+                    ldr_err("static TLS layout overflows for", objs[oi].name);
+                    return 0;
+                }
             } else {
-                total_tls = ALIGN_UP(total_tls + phdrs[j].p_memsz, align);
+                if (!u64_add_checked(total_tls, phdrs[j].p_memsz,
+                                     &next_tls) ||
+                    !u64_align_up_checked(next_tls, align, &total_tls) ||
+                    total_tls > INT64_MAX) {
+                    ldr_err("static TLS layout overflows for", objs[oi].name);
+                    return 0;
+                }
                 objs[oi].tls.tpoff  = -(int64_t)total_tls;
                 if (objs[oi].tls.tpoff < min_static_tpoff)
                     min_static_tpoff = objs[oi].tls.tpoff;
@@ -10317,27 +14111,41 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
      * sizeof(struct pthread) ≈ 2304 (0x900) on glibc 2.43 x86-64.
      * TLS_STATIC_SURPLUS ≈ 1664.  We use 0x1800 as a safe combined margin. */
     {
-        size_t tls_static = ALIGN_UP(total_tls + 0x1800, 64);
-        size_t tls_align = max_tls_align < 0x40 ? 0x40 : max_tls_align;
+        uint64_t tls_static_u64;
+        uint64_t tls_static_sum;
+        uint64_t tls_align_u64 = max_tls_align < 0x40
+                               ? 0x40 : max_tls_align;
+
+        if (!u64_add_checked(total_tls, 0x1800, &tls_static_sum) ||
+            !u64_align_up_checked(tls_static_sum, 64, &tls_static_u64) ||
+            tls_static_u64 > SIZE_MAX || tls_align_u64 > SIZE_MAX) {
+            ldr_err("static TLS allocation size overflows", NULL);
+            return 0;
+        }
+        size_t tls_static = (size_t)tls_static_u64;
+        size_t tls_align = (size_t)tls_align_u64;
 
         g_tls_static_size = tls_static;
         g_tls_static_align = tls_align;
 
-        /* In glibc ≥ 2.34, the TLS static size field is in _rtld_global_ro.
-         * In glibc < 2.34, it's in _rtld_global (sentinel: glro_tls… = -1). */
-        if (g_glibc_off->glro_tls_static_size >= 0)
-            *(size_t *)(g_fake_rtld_global_ro + g_glibc_off->glro_tls_static_size)
-                = tls_static;
-        else if (g_glibc_off->gl_tls_static_size >= 0)
-            *(size_t *)(g_fake_rtld_global + g_glibc_off->gl_tls_static_size)
-                = tls_static;
+        if (!g_is_musl_runtime) {
+            /* In glibc ≥ 2.34, the TLS static size field is in
+             * _rtld_global_ro.  In glibc < 2.34, it is in _rtld_global
+             * (sentinel: glro_tls… = -1).  Musl has neither structure. */
+            if (g_glibc_off->glro_tls_static_size >= 0)
+                *(size_t *)(g_fake_rtld_global_ro +
+                            g_glibc_off->glro_tls_static_size) = tls_static;
+            else if (g_glibc_off->gl_tls_static_size >= 0)
+                *(size_t *)(g_fake_rtld_global +
+                            g_glibc_off->gl_tls_static_size) = tls_static;
 
-        if (g_glibc_off->glro_tls_static_align >= 0)
-            *(size_t *)(g_fake_rtld_global_ro + g_glibc_off->glro_tls_static_align)
-                = tls_align;
-        else if (g_glibc_off->gl_tls_static_align >= 0)
-            *(size_t *)(g_fake_rtld_global + g_glibc_off->gl_tls_static_align)
-                = tls_align;
+            if (g_glibc_off->glro_tls_static_align >= 0)
+                *(size_t *)(g_fake_rtld_global_ro +
+                            g_glibc_off->glro_tls_static_align) = tls_align;
+            else if (g_glibc_off->gl_tls_static_align >= 0)
+                *(size_t *)(g_fake_rtld_global +
+                            g_glibc_off->gl_tls_static_align) = tls_align;
+        }
     }
 
 #if defined(__aarch64__)
@@ -10365,59 +14173,88 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
     }
 #endif
 
-    if (g_is_musl_runtime) {
-        old_tp = arch_get_tp_syscall();
-        old_self = (uintptr_t)pthread_self();
-        if (old_tp >= old_self) {
-            bootstrap_self_to_tp = old_tp - old_self;
-            g_musl_tp_self_delta = bootstrap_self_to_tp;
-        }
-        probe_musl_thread_layout(old_self, old_tp);
-        probe_musl_thread_layout_from_target(find_musl_libc(objs, nobj));
-    }
-
     /* Allocate TLS block + TCB */
     size_t alloc;
     uintptr_t tp;
     void *block;
+    uint64_t alloc_u64;
+    uint64_t tp_input;
+    uint64_t tp_u64;
 
     if (g_is_musl_runtime && musl_tls_above_tp()) {
-        alloc = g_musl_tp_self_delta + total_tls + max_tls_align;
+        if (!u64_add_checked(g_musl_tp_self_delta, total_tls, &alloc_u64) ||
+            !u64_add_checked(alloc_u64, max_tls_align - 1, &alloc_u64) ||
+            alloc_u64 == 0 || alloc_u64 > SIZE_MAX) {
+            ldr_err("TLS allocation size overflows", NULL);
+            return 0;
+        }
+        alloc = (size_t)alloc_u64;
         block = mmap(NULL, alloc, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (block == MAP_FAILED) {
             ldr_err("TLS mmap failed", NULL);
             return 0;
         }
-        tp = ALIGN_UP((uintptr_t)block + g_musl_tp_self_delta, max_tls_align);
+        if (!u64_add_checked((uintptr_t)block, g_musl_tp_self_delta,
+                             &tp_input) ||
+            !u64_align_up_checked(tp_input, max_tls_align, &tp_u64)) {
+            munmap(block, alloc);
+            ldr_err("TLS thread-pointer alignment overflows", NULL);
+            return 0;
+        }
+        tp = (uintptr_t)tp_u64;
     }
 #if defined(__aarch64__)
     else if (glibc_tls_above_tp()) {
-        size_t tls_aligned = ALIGN_UP(total_tls, 64);
-        size_t pthread_size = glibc_aarch64_pthread_size();
+        uint64_t tls_aligned;
+        uint64_t pthread_size = glibc_aarch64_pthread_size();
 
-        alloc = pthread_size + tls_aligned + max_tls_align;
+        if (!u64_align_up_checked(total_tls, 64, &tls_aligned) ||
+            !u64_add_checked(pthread_size, tls_aligned, &alloc_u64) ||
+            !u64_add_checked(alloc_u64, max_tls_align - 1, &alloc_u64) ||
+            alloc_u64 == 0 || alloc_u64 > SIZE_MAX) {
+            ldr_err("TLS allocation size overflows", NULL);
+            return 0;
+        }
+        alloc = (size_t)alloc_u64;
         block = mmap(NULL, alloc, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (block == MAP_FAILED) {
             ldr_err("TLS mmap failed", NULL);
             return 0;
         }
-        tp = ALIGN_UP((uintptr_t)block + pthread_size,
-                      max_tls_align);
+        if (!u64_add_checked((uintptr_t)block, pthread_size, &tp_input) ||
+            !u64_align_up_checked(tp_input, max_tls_align, &tp_u64)) {
+            munmap(block, alloc);
+            ldr_err("TLS thread-pointer alignment overflows", NULL);
+            return 0;
+        }
+        tp = (uintptr_t)tp_u64;
     }
 #endif
     else {
-        size_t tls_aligned = ALIGN_UP(total_tls, 64);
+        uint64_t tp_align = max_tls_align < 64 ? 64 : max_tls_align;
 
-        alloc = tls_aligned + TCB_ALLOC;
+        if (!u64_add_checked(total_tls, TCB_ALLOC, &alloc_u64) ||
+            !u64_add_checked(alloc_u64, tp_align - 1, &alloc_u64) ||
+            alloc_u64 == 0 || alloc_u64 > SIZE_MAX) {
+            ldr_err("TLS allocation size overflows", NULL);
+            return 0;
+        }
+        alloc = (size_t)alloc_u64;
         block = mmap(NULL, alloc, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (block == MAP_FAILED) {
             ldr_err("TLS mmap failed", NULL);
             return 0;
         }
-        tp = (uintptr_t)block + tls_aligned;
+        if (!u64_add_checked((uintptr_t)block, total_tls, &tp_input) ||
+            !u64_align_up_checked(tp_input, tp_align, &tp_u64)) {
+            munmap(block, alloc);
+            ldr_err("TLS thread-pointer alignment overflows", NULL);
+            return 0;
+        }
+        tp = (uintptr_t)tp_u64;
     }
 
     if (!g_is_musl_runtime) {
@@ -10436,45 +14273,56 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
                 dtv_slots = objs[oi].tls.modid + 1;
         }
 
-        size_t musl_dtv_bytes = ALIGN_UP(dtv_slots * sizeof(uintptr_t),
-                                         g_page_size);
+        uint64_t musl_dtv_raw;
+        uint64_t musl_dtv_bytes_u64;
+
+        if (!u64_mul_checked(dtv_slots, sizeof(uintptr_t), &musl_dtv_raw)) {
+            munmap(block, alloc);
+            ldr_err("musl DTV allocation size overflows", NULL);
+            return 0;
+        }
+        if (!u64_align_up_checked(musl_dtv_raw, g_page_size,
+                                  &musl_dtv_bytes_u64) ||
+            musl_dtv_bytes_u64 == 0 || musl_dtv_bytes_u64 > SIZE_MAX) {
+            munmap(block, alloc);
+            ldr_err("musl DTV allocation size overflows", NULL);
+            return 0;
+        }
+        size_t musl_dtv_bytes = (size_t)musl_dtv_bytes_u64;
         uintptr_t *musl_dtv = mmap(NULL, musl_dtv_bytes,
                                    PROT_READ | PROT_WRITE,
                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (bootstrap_self_to_tp != 0 && old_self) {
-            size_t preserve_len = bootstrap_self_to_tp;
-
-            if (preserve_len > g_musl_tp_self_delta)
-                preserve_len = g_musl_tp_self_delta;
-            if (preserve_len)
-                memcpy((void *)self, (void *)old_self, preserve_len);
-        } else if (old_tp)
-            /* Preserve the bootstrap musl main thread state beyond the
-             * ABI header. This carries over initialized locale/pthread
-             * fields that direct-loaded musl code may read via %fs. */
-            memcpy((void *)(tp + MUSL_TCB_PRESERVE_OFF),
-                   (void *)(old_tp + MUSL_TCB_PRESERVE_OFF),
-                   MUSL_TCB_PRESERVE_LEN);
-
+        if (musl_dtv == MAP_FAILED) {
+            munmap(block, alloc);
+            ldr_err("musl DTV mmap failed", NULL);
+            return 0;
+        }
         *(uintptr_t *)(self + 0) = self;
         *(uintptr_t *)(self + MUSL_THREAD_PREV_OFF) = self;
         *(uintptr_t *)(self + MUSL_THREAD_NEXT_OFF) = self;
         *(uintptr_t *)(self + MUSL_THREAD_ROBUST_HEAD_OFF) =
             self + MUSL_THREAD_ROBUST_HEAD_OFF;
-        *(int *)(self + MUSL_THREAD_TID_OFF) = (int)syscall(SYS_gettid);
-        *(int *)(self + MUSL_THREAD_ERRNO_OFF) = 0;
+        if (g_musl_target_tid_known)
+            *(int *)(self + MUSL_THREAD_TID_OFF) = (int)syscall(SYS_gettid);
+        if (g_musl_target_errno_known)
+            *(int *)(self + MUSL_THREAD_ERRNO_OFF) = 0;
+        if (g_musl_target_detach_known)
+            *(int *)(self + MUSL_THREAD_DETACH_STATE_OFF) =
+                g_musl_target_detach_value;
+        *(uintptr_t *)(self + MUSL_THREAD_LOCALE_OFF) =
+            g_musl_libc_addr + g_musl_layout->libc_global_locale;
+        (void)at_random;
+        *(uintptr_t *)(self + g_musl_layout->thread_canary) =
+            g_musl_stack_guard;
 
-        if (musl_dtv != MAP_FAILED) {
-            musl_dtv[0] = dtv_slots - 1;
-            for (int oi = 0; oi < nobj; oi++) {
-                if (objs[oi].tls.memsz == 0)
-                    continue;
-                musl_dtv[objs[oi].tls.modid] = tp + (uintptr_t)objs[oi].tls.tpoff;
-            }
-            *(uintptr_t *)musl_thread_dtv_slot(tp) = (uintptr_t)musl_dtv;
-        } else {
-            *(uintptr_t *)musl_thread_dtv_slot(tp) = 0;
+        musl_dtv[0] = dtv_slots - 1;
+        for (int oi = 0; oi < nobj; oi++) {
+            if (objs[oi].tls.memsz == 0)
+                continue;
+            musl_dtv[objs[oi].tls.modid] =
+                tp + (uintptr_t)objs[oi].tls.tpoff;
         }
+        *(uintptr_t *)musl_thread_dtv_slot(tp) = (uintptr_t)musl_dtv;
     }
 
     /* glibc stores the current TID in the TCB header; musl keeps it in
@@ -10498,19 +14346,12 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
         }
     }
 
-    /*
-     * Minimal DTV (Dynamic Thread Vector).
-     * glibc expects tcb->dtv to be non-NULL.  Layout:
-     *   dtv[0].counter = generation (size_t)
-     *   dtv[1].pointer.val = pointer to TLS block for module 1
-     *   dtv[1].pointer.to_free = NULL
-     * We allocate a small array.  Module 1 = libc's TLS block.
-     */
     /* Minimal DTV (Dynamic Thread Vector).
      * glibc convention: tcbhead.dtv points to raw_dtv[1] (offset by one
-     * dtv_t entry = 16 bytes), so that dtv[-1].counter = generation.
-     *   raw_dtv[0].counter = generation
+     * dtv_t entry = 16 bytes), so that dtv[-1].counter is the capacity.
+     *   raw_dtv[0].counter = capacity
      *   dtv = raw_dtv + 1 (in dtv_t units)
+     *   dtv[0].counter = generation
      *   dtv[modid] = {val, to_free} for TLS module modid (1-indexed)
      */
     if (!g_is_musl_runtime) {
@@ -10522,32 +14363,50 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
                 max_modid = objs[oi].tls.modid;
         }
 
-        size_t dtv_slots = 2 + max_modid;
-        size_t raw_dtv_bytes = (1 + dtv_slots) * 2 * sizeof(uintptr_t);
-        uintptr_t *raw_dtv = (uintptr_t *)mmap(NULL,
-                                               ALIGN_UP(raw_dtv_bytes,
-                                                        g_page_size),
-            PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (raw_dtv != MAP_FAILED) {
-            /* raw_dtv[0] = generation counter (accessed as dtv[-1]) */
-            raw_dtv[0] = 1;   /* generation */
-            raw_dtv[1] = 0;
-            /* dtv = raw_dtv + one dtv_t entry (2 uintptr_t's) */
-            uintptr_t *dtv = raw_dtv + 2;
-            /* dtv[modid] for each TLS module: .val = tp + tpoff, .to_free = NULL
-             * glibc uses 1-indexed modules, dtv[1] = module 1, etc. */
-            for (int oi = 0; oi < nobj; oi++) {
-                if (objs[oi].tls.memsz == 0) continue;
-                size_t slot = objs[oi].tls.modid;
-                if (slot < dtv_slots) {
-                    dtv[slot * 2]     = tp + (uintptr_t)objs[oi].tls.tpoff;
-                    dtv[slot * 2 + 1] = 0;  /* to_free = NULL */
-                }
-            }
-            *(uintptr_t *)(tp + TCB_OFF_DTV) = (uintptr_t)dtv;
-        } else {
-            *(uintptr_t *)(tp + TCB_OFF_DTV) = 0;
+        uint64_t dtv_slots;
+        uint64_t raw_dtv_words;
+        uint64_t raw_dtv_bytes;
+        uint64_t raw_dtv_map_bytes;
+
+        if (!u64_add_checked(1, max_modid, &dtv_slots) ||
+            !u64_add_checked(1, dtv_slots, &raw_dtv_words) ||
+            !u64_mul_checked(raw_dtv_words, 2, &raw_dtv_words) ||
+            !u64_mul_checked(raw_dtv_words, sizeof(uintptr_t),
+                             &raw_dtv_bytes) ||
+            !u64_align_up_checked(raw_dtv_bytes, g_page_size,
+                                  &raw_dtv_map_bytes) ||
+            raw_dtv_map_bytes == 0 || raw_dtv_map_bytes > SIZE_MAX) {
+            munmap(block, alloc);
+            ldr_err("glibc DTV allocation size overflows", NULL);
+            return 0;
         }
+        uintptr_t *raw_dtv = (uintptr_t *)mmap(NULL,
+                                               (size_t)raw_dtv_map_bytes,
+            PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (raw_dtv == MAP_FAILED) {
+            munmap(block, alloc);
+            ldr_err("glibc DTV mmap failed", NULL);
+            return 0;
+        }
+        /* dtv[-1].counter is allocation capacity; dtv[0].counter is the
+         * generation compared against the fake rtld TLS generation. */
+        raw_dtv[0] = max_modid;
+        raw_dtv[1] = 0;
+        /* dtv = raw_dtv + one dtv_t entry (2 uintptr_t's) */
+        uintptr_t *dtv = raw_dtv + 2;
+        dtv[0] = 1;
+        dtv[1] = 0;
+        /* dtv[modid] for each TLS module: .val = tp + tpoff, to_free = NULL.
+         * glibc uses 1-indexed modules, dtv[1] = module 1, etc. */
+        for (int oi = 0; oi < nobj; oi++) {
+            if (objs[oi].tls.memsz == 0) continue;
+            size_t slot = objs[oi].tls.modid;
+            if (slot < dtv_slots) {
+                dtv[slot * 2]     = tp + (uintptr_t)objs[oi].tls.tpoff;
+                dtv[slot * 2 + 1] = 0;  /* to_free = NULL */
+            }
+        }
+        *(uintptr_t *)(tp + TCB_OFF_DTV) = (uintptr_t)dtv;
     }
 
     if (!g_is_musl_runtime) {
@@ -10611,9 +14470,15 @@ static void copy_tdata(struct loaded_obj *objs, int nobj, uintptr_t tp)
     for (int oi = 0; oi < nobj; oi++) {
         if (objs[oi].tls.memsz == 0) continue;
         uint8_t *dst = (uint8_t *)(tp + objs[oi].tls.tpoff);
-        const uint8_t *src = (const uint8_t *)(objs[oi].base + objs[oi].tls.vaddr);
-        memcpy(dst, src, objs[oi].tls.filesz);
-        /* .tbss already zero from mmap */
+        if (objs[oi].tls.filesz != 0) {
+            const uint8_t *src = (const uint8_t *)(objs[oi].base +
+                                                   objs[oi].tls.vaddr);
+            memcpy(dst, src, objs[oi].tls.filesz);
+        }
+        if (objs[oi].tls.memsz > objs[oi].tls.filesz) {
+            memset(dst + objs[oi].tls.filesz, 0,
+                   objs[oi].tls.memsz - objs[oi].tls.filesz);
+        }
     }
 }
 
@@ -10730,14 +14595,18 @@ static void topo_visit_init(int idx, struct loaded_obj *objs, int nobj,
     if (state[idx] != 0) return;
     state[idx] = 1;
     struct loaded_obj *obj = &objs[idx];
-    if (obj->phdr && obj->dynstr) {
-        for (int p = 0; p < obj->phdr_num; p++) {
-            if (obj->phdr[p].p_type != PT_DYNAMIC) continue;
-            const Elf64_Dyn *dyn = (const Elf64_Dyn *)
-                (obj->base + obj->phdr[p].p_vaddr);
-            for (int d = 0; dyn[d].d_tag != DT_NULL; d++) {
-                if (dyn[d].d_tag != DT_NEEDED) continue;
-                const char *needed = obj->dynstr + dyn[d].d_un.d_val;
+    if (obj->dynamic && obj->dynstr) {
+        for (size_t d = 0; d < obj->dynamic_count; d++) {
+                const char *needed;
+
+                if (obj->dynamic[d].d_tag != DT_NEEDED)
+                    continue;
+                if (obj->dynamic[d].d_un.d_val > UINT32_MAX)
+                    continue;
+                needed = loaded_dynstr_value(
+                    obj, (uint32_t)obj->dynamic[d].d_un.d_val);
+                if (!needed)
+                    continue;
                 for (int j = 0; j < nobj; j++) {
                     if (j == idx) continue;
                     if (state[j] != 0) continue; /* done or cycle */
@@ -10747,8 +14616,6 @@ static void topo_visit_init(int idx, struct loaded_obj *objs, int nobj,
                         break;
                     }
                 }
-            }
-            break;
         }
     }
     state[idx] = 2;
@@ -10756,6 +14623,18 @@ static void topo_visit_init(int idx, struct loaded_obj *objs, int nobj,
 }
 
 /* ==== Main entry point ================================================= */
+
+static void notify_terminal_refusal(int handoff_fd)
+{
+    const char marker = DLFRZ_HANDOFF_TERMINAL_REFUSAL;
+    ssize_t written;
+
+    if (handoff_fd < 0)
+        return;
+    do {
+        written = write(handoff_fd, &marker, sizeof(marker));
+    } while (written < 0 && errno == EINTR);
+}
 
 int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
                const struct dlfrz_lib_meta *metas,
@@ -10782,10 +14661,54 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
             (page_size & (page_size - 1)) == 0)
             g_page_size = page_size;
     }
+    g_fake_dl_argv = argv;
+    g_fake_libc_enable_secure = get_auxval(envp, AT_SECURE) != 0;
+    {
+        uintptr_t random = get_auxval(envp, AT_RANDOM);
+
+        g_fake_stack_chk_guard = 0;
+        g_fake_pointer_chk_guard = 0;
+        if (random) {
+            memcpy(&g_fake_stack_chk_guard, (const void *)random,
+                   sizeof(g_fake_stack_chk_guard));
+            g_fake_stack_chk_guard &= ~(uintptr_t)0xff;
+            memcpy(&g_fake_pointer_chk_guard,
+                   (const void *)(random + sizeof(uintptr_t)),
+                   sizeof(g_fake_pointer_chk_guard));
+        }
+    }
 
     clear_resolution_caches();
+    g_global_scope_root = -1;
+    g_global_scope_count = 0;
     g_init_order_count = 0;
     g_fini_running = 0;
+    g_glibc_off = NULL;
+    g_glibc_rtld_fixed = 0;
+    g_musl_layout = NULL;
+    g_musl_libc_addr = 0;
+
+    int prelinked = -1;
+    for (uint32_t i = 0; i < num_entries; i++) {
+        int object_prelinked;
+
+        if (metas[i].flags & (LDR_FLAG_INTERP | LDR_FLAG_DLOPEN |
+                              LDR_FLAG_DATA))
+            continue;
+        object_prelinked =
+            (metas[i].flags & LDR_FLAG_PRELINKED) != 0;
+        if (prelinked < 0)
+            prelinked = object_prelinked;
+        else if (prelinked != object_prelinked) {
+            notify_terminal_refusal(handoff_fd);
+            ldr_err("mixed pre-linked object metadata", NULL);
+            return -1;
+        }
+    }
+    if (prelinked < 0) {
+        ldr_err("no startup objects in direct metadata", NULL);
+        return -1;
+    }
 
     enum frozen_runtime runtime =
         detect_frozen_runtime(metas, entries, strtab, num_entries);
@@ -10796,6 +14719,49 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     }
     int is_musl_runtime = runtime == FROZEN_RUNTIME_MUSL;
     g_is_musl_runtime = is_musl_runtime;
+    const struct glibc_ver_offsets *glibc_off = NULL;
+
+    /* Private glibc layouts must be positively identified before mapping any
+     * target object.  A stale prelinked artifact is terminally refused here;
+     * clean runtime-relocation payloads may still use extraction fallback. */
+    if (runtime == FROZEN_RUNTIME_GLIBC) {
+        glibc_off = detect_glibc_offsets_from_interp(mem, mem_foff, entries,
+                                                     metas, num_entries);
+        if (!glibc_off) {
+            if (prelinked)
+                notify_terminal_refusal(handoff_fd);
+            ldr_msg("dlfreeze: direct-load artifact is incompatible with "
+                    "this glibc private rtld layout\n");
+            return -1;
+        }
+    } else {
+        g_musl_layout = detect_musl_layout_from_interp(
+            mem, mem_foff, entries, metas, num_entries);
+        if (!g_musl_layout || !__copy_tls) {
+            if (prelinked)
+                notify_terminal_refusal(handoff_fd);
+            ldr_msg("dlfreeze: direct-load artifact is incompatible with "
+                    "this musl private runtime layout\n");
+            return -1;
+        }
+        g_musl_tp_self_delta = g_musl_layout->tp_self_delta;
+        if (&__stack_chk_guard) {
+            g_musl_stack_guard = __stack_chk_guard;
+        } else {
+            uintptr_t random = get_auxval(envp, AT_RANDOM);
+
+            if (!random) {
+                ldr_msg("dlfreeze: musl bootstrap has no stack-guard "
+                        "entropy\n");
+                return -1;
+            }
+            memcpy(&g_musl_stack_guard, (const void *)random,
+                   sizeof(g_musl_stack_guard));
+            if (g_musl_layout->canary_zero_second_byte)
+                ((unsigned char *)&g_musl_stack_guard)[1] = 0;
+        }
+        select_musl_thread_layout(g_musl_layout);
+    }
 
     struct sigaction startup_crash_handlers[CRASH_SIGNAL_COUNT];
     capture_crash_handlers(startup_crash_handlers);
@@ -10811,30 +14777,13 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     /* Install crash handlers for debugging */
     install_crash_handlers();
 
-    /* 1. Count non-INTERP libraries and build object array */
-    /* Allocate a zero-filled page for unresolved OBJECT symbols */
-    g_null_page = mmap(NULL, 65536, PROT_READ | PROT_WRITE,
-                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-
     /* Allocate fake _rtld_global / _rtld_global_ro for libc */
     if (init_fake_rtld() < 0) return -1;
 
-    /* Detect glibc struct layout from the embedded ld-linux.so and set
-     * all version-dependent fields.  Must happen before any libc code
-     * that reads _rtld_global{,_ro} (especially __libc_early_init). */
-    {
-        const struct glibc_ver_offsets *off =
-            detect_glibc_offsets_from_interp(mem, mem_foff, entries, metas,
-                                              num_entries);
-        if (off) {
-            g_glibc_off = off;
-            fixup_rtld_for_glibc(off);
-            g_glibc_rtld_fixed = 1;
-        }
-        /* If detection failed (e.g. musl binary, no INTERP), the
-         * version-dependent fields remain unset.  For musl this is fine
-         * (they're not referenced).  For glibc, init_libc_process_state()
-         * will retry with gnu_get_libc_version() as a fallback. */
+    if (glibc_off) {
+        g_glibc_off = glibc_off;
+        fixup_rtld_for_glibc(glibc_off);
+        g_glibc_rtld_fixed = 1;
     }
 
     /* Save frozen image context early so VFS lookup repair can fall back
@@ -10909,13 +14858,9 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         objs[i].phdr_num  = metas[mi].phdr_num;
         objs[i].map_start = objs[i].base + metas[mi].vaddr_lo;
         objs[i].map_end   = objs[i].base + metas[mi].vaddr_hi;
-        /* Find PT_GNU_EH_FRAME for DWARF unwinder */
-        objs[i].eh_frame_hdr = NULL;
-        for (int p = 0; p < objs[i].phdr_num; p++) {
-            if (objs[i].phdr[p].p_type == PT_GNU_EH_FRAME) {
-                objs[i].eh_frame_hdr = (const void *)(objs[i].base + objs[i].phdr[p].p_vaddr);
-                break;
-            }
+        if (discover_eh_frame_header(&objs[i]) < 0) {
+            ldr_err("malformed PT_GNU_EH_FRAME in", objs[i].name);
+            return -1;
         }
         ldr_dbg("  ");
         ldr_dbg(objs[i].name);
@@ -10924,8 +14869,59 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
 
     /* 3. Parse PT_DYNAMIC for each object */
     ldr_dbg("[loader] parsing dynamic sections...\n");
-    for (int i = 0; i < nobj; i++)
-        parse_dynamic(&objs[i], &metas[idx_map[i]]);
+    for (int i = 0; i < nobj; i++) {
+        if (parse_dynamic(&objs[i], &metas[idx_map[i]]) < 0) {
+            ldr_err("malformed dynamic metadata in", objs[i].name);
+            return -1;
+        }
+        if (validate_object_relocations(&objs[i]) < 0) {
+            ldr_err("malformed relocation metadata in", objs[i].name);
+            return -1;
+        }
+    }
+    if (dl_initialize_startup_lookup_scopes(objs, nobj) < 0) {
+        ldr_err("malformed startup dependency graph", NULL);
+        return -1;
+    }
+
+    if (is_musl_runtime &&
+        !validate_musl_layout_from_target(find_musl_libc(objs, nobj))) {
+        if (prelinked)
+            notify_terminal_refusal(handoff_fd);
+        ldr_msg("dlfreeze: direct-load artifact failed target musl "
+                "private-layout validation\n");
+        return -1;
+    }
+    if (prelinked) {
+        for (int i = 0; i < nobj; i++) {
+            uint32_t off = metas[idx_map[i]].runtime_fixup_off;
+            uint32_t count = metas[idx_map[i]].runtime_fixup_count;
+
+            if (count == 0)
+                continue;
+            if (!runtime_fixups || off > runtime_fixup_count ||
+                count > runtime_fixup_count - off)
+                return -1;
+            for (uint32_t f = 0; f < count; f++) {
+                uint32_t encoded = runtime_fixups[off + f];
+                uint32_t index = encoded & ~LDR_PRELINK_FIXUP_JMPREL;
+                size_t table_count =
+                    (encoded & LDR_PRELINK_FIXUP_JMPREL)
+                    ? objs[i].jmprel_count : objs[i].rela_count;
+
+                if (index >= table_count) {
+                    ldr_err("invalid pre-linked runtime fixup in",
+                            objs[i].name);
+                    return -1;
+                }
+            }
+        }
+    }
+    if (preflight_resolver_relocation_destinations(
+            objs, nobj, objs, nobj) < 0) {
+        ldr_err("resolver relocation preflight failed", NULL);
+        return -1;
+    }
 
     /* 4. Set up TLS (must happen before relocations that reference TLS,
      *    and definitely before calling any IRELATIVE resolvers that might
@@ -10949,7 +14945,7 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
      * handoff: loader crash diagnostics must never own application signals. */
     restore_crash_handlers(startup_crash_handlers);
     if (handoff_fd >= 0) {
-        char marker = '1';
+        char marker = DLFRZ_HANDOFF_APPLICATION_STARTED;
         long written;
 
         do {
@@ -10972,8 +14968,6 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
      *    resolved relocations.  We only need to patch GOT entries for
      *    runtime-only symbols (overrides like dlopen, __tls_get_addr,
      *    and the fake _rtld_global/_rtld_global_ro). */
-    int prelinked = (metas[idx_map[0]].flags & LDR_FLAG_PRELINKED) != 0;
-
     if (prelinked) {
         ldr_dbg("[loader] pre-linked: patching overrides...\n");
 
@@ -11061,77 +15055,98 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
          * OTHER objects (e.g. libc) that reads _rtld_global_ro through
          * that object's GOT, so we must patch all GOTs up front.
          * Only scan objects flagged as importing these symbols. */
-        for (int i = 0; i < nobj; i++)
-            if (objs[i].flags & LDR_FLAG_NEEDS_RTLD)
-                preseed_rtld_got(&objs[i]);
-
-        /* Single merged pass: patch overrides + resolve IRELATIVE.
-         * Skip leading RELATIVE entries in .rela.dyn (DT_RELACOUNT tells
-         * us how many there are) — they were applied at pre-link time. */
         for (int i = 0; i < nobj; i++) {
-            const uint32_t *obj_fixups = NULL;
-            uint32_t obj_fixup_count = 0;
+            if ((objs[i].flags & LDR_FLAG_NEEDS_RTLD) &&
+                preseed_rtld_got(&objs[i], objs, nobj) < 0)
+                _exit(127);
+        }
 
-            if (runtime_fixups != NULL &&
-                metas[idx_map[i]].runtime_fixup_count != 0) {
-                uint32_t off = metas[idx_map[i]].runtime_fixup_off;
-                uint32_t count = metas[idx_map[i]].runtime_fixup_count;
-                if (off <= runtime_fixup_count &&
-                    count <= runtime_fixup_count - off) {
-                    obj_fixups = runtime_fixups + off;
-                    obj_fixup_count = count;
-                }
-            }
+        /* Runtime fixups use the same graph-wide ordering as a normal load.
+         * The packer never invokes IFUNC, so every target resolver remains
+         * deferred until all ordinary fixups and relocated TLS templates are
+         * visible. */
+        for (int phase = RELOC_PASS_ORDINARY;
+             phase <= RELOC_PASS_IRELATIVE; phase++) {
+            enum relocation_pass pass = (enum relocation_pass)phase;
 
-            if (g_debug && obj_fixup_count != 0) {
-                ldr_msg("[loader] runtime fixups: ");
-                ldr_msg(objs[i].name);
-                ldr_dbg_hex(" count=0x", obj_fixup_count);
-            }
+            for (int i = 0; i < nobj; i++) {
+                const uint32_t *obj_fixups = NULL;
+                uint32_t obj_fixup_count = 0;
 
-            if (obj_fixups != NULL) {
-                for (uint32_t f = 0; f < obj_fixup_count; f++) {
-                    uint32_t encoded = obj_fixups[f];
-                    const Elf64_Rela *tab;
-                    size_t count;
-                    uint32_t idx = encoded & ~LDR_PRELINK_FIXUP_JMPREL;
-
-                    if (encoded & LDR_PRELINK_FIXUP_JMPREL) {
-                        tab = objs[i].jmprel;
-                        count = objs[i].jmprel_count;
-                    } else {
-                        tab = objs[i].rela;
-                        count = objs[i].rela_count;
+                if (runtime_fixups != NULL &&
+                    metas[idx_map[i]].runtime_fixup_count != 0) {
+                    uint32_t off = metas[idx_map[i]].runtime_fixup_off;
+                    uint32_t count = metas[idx_map[i]].runtime_fixup_count;
+                    if (off <= runtime_fixup_count &&
+                        count <= runtime_fixup_count - off) {
+                        obj_fixups = runtime_fixups + off;
+                        obj_fixup_count = count;
                     }
-                    if (idx >= count)
-                        continue;
-
-                    if (apply_prelinked_runtime_reloc(&objs[i], objs, nobj,
-                                                      &tab[idx]) < 0)
-                        _exit(127);
                 }
 
-                apply_prelinked_override_fallbacks(&objs[i]);
-                continue;
-            }
+                if (pass == RELOC_PASS_ORDINARY && g_debug &&
+                    obj_fixup_count != 0) {
+                    ldr_msg("[loader] runtime fixups: ");
+                    ldr_msg(objs[i].name);
+                    ldr_dbg_hex(" count=0x", obj_fixup_count);
+                }
 
-            if (!(objs[i].flags & LDR_FLAG_RUNTIME_SCAN))
-                continue;
+                if (obj_fixups != NULL) {
+                    for (uint32_t f = 0; f < obj_fixup_count; f++) {
+                        uint32_t encoded = obj_fixups[f];
+                        const Elf64_Rela *tab;
+                        size_t count;
+                        uint32_t idx =
+                            encoded & ~LDR_PRELINK_FIXUP_JMPREL;
 
-            {
-                const Elf64_Rela *tabs[] = { objs[i].rela, objs[i].jmprel };
-                size_t counts[] = { objs[i].rela_count, objs[i].jmprel_count };
-                size_t starts[] = { objs[i].rela_relative_count, 0 };
-                for (int t = 0; t < 2; t++) {
-                    for (size_t r = starts[t]; r < counts[t]; r++) {
-                        if (apply_prelinked_runtime_reloc(&objs[i], objs, nobj,
-                                                          &tabs[t][r]) < 0)
+                        if (encoded & LDR_PRELINK_FIXUP_JMPREL) {
+                            tab = objs[i].jmprel;
+                            count = objs[i].jmprel_count;
+                        } else {
+                            tab = objs[i].rela;
+                            count = objs[i].rela_count;
+                        }
+                        if (!tab || idx >= count) {
+                            ldr_err("invalid pre-linked runtime fixup in",
+                                    objs[i].name);
+                            _exit(127);
+                        }
+
+                        if (apply_prelinked_runtime_reloc(
+                                &objs[i], objs, nobj, &tab[idx], pass) < 0)
                             _exit(127);
                     }
+
+                } else if (objs[i].flags & LDR_FLAG_RUNTIME_SCAN) {
+                    const Elf64_Rela *tabs[] = {
+                        objs[i].rela, objs[i].jmprel
+                    };
+                    size_t counts[] = {
+                        objs[i].rela_count, objs[i].jmprel_count
+                    };
+                    size_t starts[] = { objs[i].rela_relative_count, 0 };
+
+                    for (int t = 0; t < 2; t++) {
+                        for (size_t r = starts[t]; r < counts[t]; r++) {
+                            if (apply_prelinked_runtime_reloc(
+                                    &objs[i], objs, nobj, &tabs[t][r],
+                                    pass) < 0)
+                                _exit(127);
+                        }
+                    }
                 }
+
+                /* This narrow exact-name scan is deliberately unconditional.
+                 * The packer's compact fixup table must not duplicate or
+                 * approximate the loader's evolving special-symbol set. */
+                if (pass == RELOC_PASS_ORDINARY &&
+                    apply_prelinked_override_fallbacks(&objs[i], objs,
+                                                       nobj) < 0)
+                    _exit(127);
             }
 
-            apply_prelinked_override_fallbacks(&objs[i]);
+            if (pass == RELOC_PASS_COPY && tp)
+                copy_tdata(objs, nobj, tp);
         }
     } else {
         ldr_dbg("[loader] applying relocations...\n");
@@ -11140,12 +15155,15 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
 
         /* Pre-seed _rtld_global/_rtld_global_ro GOT entries so IFUNC
          * resolvers called during GLOB_DAT processing work correctly. */
-        for (int i = 0; i < nobj; i++)
-            if (objs[i].flags & LDR_FLAG_NEEDS_RTLD)
-                preseed_rtld_got(&objs[i]);
+        for (int i = 0; i < nobj; i++) {
+            if ((objs[i].flags & LDR_FLAG_NEEDS_RTLD) &&
+                preseed_rtld_got(&objs[i], objs, nobj) < 0)
+                _exit(127);
+        }
 
         for (int i = 0; i < nobj; i++) {
-            if (apply_all_relocs(&objs[i], objs, nobj, 0) < 0) {
+            if (apply_all_relocs(&objs[i], objs, nobj,
+                                 RELOC_PASS_ORDINARY) < 0) {
                 ldr_msg("dlfreeze-loader: relocation failed for ");
                 ldr_msg(objs[i].name);
                 ldr_msg("\n");
@@ -11153,27 +15171,36 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
             }
         }
         for (int i = 0; i < nobj; i++) {
-            if (apply_all_relocs(&objs[i], objs, nobj, 1) < 0) {
-                ldr_msg("dlfreeze-loader: IRELATIVE failed for ");
-                ldr_msg(objs[i].name);
-                ldr_msg("\n");
-                _exit(127);
-            }
-        }
-        for (int i = 0; i < nobj; i++) {
-            if (apply_all_relocs(&objs[i], objs, nobj, 2) < 0) {
+            if (apply_all_relocs(&objs[i], objs, nobj,
+                                 RELOC_PASS_COPY) < 0) {
                 ldr_msg("dlfreeze-loader: copy relocation failed for ");
                 ldr_msg(objs[i].name);
                 ldr_msg("\n");
                 _exit(127);
             }
         }
-    }
-
-    /* 5b. Copy .tdata AFTER relocations — the TLS template contains
-     *     pointers that need RELATIVE/RELR relocation first. */
-    if (tp) {
-        copy_tdata(objs, nobj, tp);
+        /* Initial TLS becomes visible only after every ordinary and COPY
+         * relocation is complete, and before any target resolver runs. */
+        if (tp)
+            copy_tdata(objs, nobj, tp);
+        for (int i = 0; i < nobj; i++) {
+            if (apply_all_relocs(&objs[i], objs, nobj,
+                                 RELOC_PASS_IFUNC) < 0) {
+                ldr_msg("dlfreeze-loader: IFUNC relocation failed for ");
+                ldr_msg(objs[i].name);
+                ldr_msg("\n");
+                _exit(127);
+            }
+        }
+        for (int i = 0; i < nobj; i++) {
+            if (apply_all_relocs(&objs[i], objs, nobj,
+                                 RELOC_PASS_IRELATIVE) < 0) {
+                ldr_msg("dlfreeze-loader: IRELATIVE failed for ");
+                ldr_msg(objs[i].name);
+                ldr_msg("\n");
+                _exit(127);
+            }
+        }
     }
 
     /* 6. Set final memory protections.
@@ -11293,13 +15320,17 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
      * may call PTR_MANGLE-using functions like __cxa_atexit. */
     restore_ptr_guard();
 
-    /* The executable's preinit array precedes every dependency constructor
-     * in ELF startup order.  Shared objects are not permitted to own one. */
-    for (int i = 0; i < nobj; i++) {
-        if (!(objs[i].flags & LDR_FLAG_MAIN_EXE))
-            continue;
-        for (size_t j = 0; j < objs[i].preinit_array_sz; j++)
-            ((init_fn_t)objs[i].preinit_array[j])(argc, argv, runtime_envp);
+    /* Glibc executes the main object's preinit array before dependency
+     * constructors.  Musl's dynamic linker deliberately does not process
+     * DT_PREINIT_ARRAY, so preserve that runtime's native behaviour. */
+    if (!is_musl_runtime) {
+        for (int i = 0; i < nobj; i++) {
+            if (!(objs[i].flags & LDR_FLAG_MAIN_EXE))
+                continue;
+            for (size_t j = 0; j < objs[i].preinit_array_sz; j++)
+                ((init_fn_t)objs[i].preinit_array[j])(
+                    argc, argv, runtime_envp);
+        }
     }
 
     /* Topologically sort objects so dependencies init before dependents.
@@ -11412,8 +15443,6 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
 
     /* Fallback: transfer control via _start → __libc_start_main. */
     ldr_dbg("[loader] transferring to _start...\n");
-    if (is_musl_runtime)
-        seed_musl_startup_globals(objs, nobj);
     restore_ptr_guard();
     transfer_to_entry(entry, argc, argv, envp,
                       exe_phdr, exe_phnum, at_base, entry, at_random,

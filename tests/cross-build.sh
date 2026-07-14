@@ -68,6 +68,15 @@ resolve_ruby_elf() {
     return 1
 }
 
+link_musl_gcc_to_host_cc() {
+    host_cc=$(command -v gcc 2>/dev/null || true)
+    if [ -z "$host_cc" ]; then
+        echo "ERROR: cannot create musl-gcc fallback: gcc is not installed" >&2
+        return 1
+    fi
+    ln -sf "$host_cc" /usr/local/bin/musl-gcc
+}
+
 # Fetch a modern UPX from GitHub when the distro lacks one (Fedora has
 # no upx in core repos) or ships one too old to compress our binaries
 # (older Debian/Ubuntu).  No-op when a sufficiently new UPX is present.
@@ -93,12 +102,15 @@ fetch_upx_from_github() {
     else
         wget -q "$url" -O /tmp/upx.tar.xz || { echo "WARNING: UPX download failed"; return 1; }
     fi
-    tar -xJf /tmp/upx.tar.xz -C /tmp \
-        && cp "/tmp/upx-4.2.4-${upx_arch}_linux/upx" /usr/local/bin/upx \
-        && chmod +x /usr/local/bin/upx \
-        && ln -sf /usr/local/bin/upx /usr/bin/upx \
-        && echo "Installed UPX $(/usr/local/bin/upx --version 2>/dev/null | head -1)" \
-        || { echo "WARNING: failed to install UPX"; return 1; }
+    if tar -xJf /tmp/upx.tar.xz -C /tmp &&
+       cp "/tmp/upx-4.2.4-${upx_arch}_linux/upx" /usr/local/bin/upx &&
+       chmod +x /usr/local/bin/upx &&
+       ln -sf /usr/local/bin/upx /usr/bin/upx; then
+        echo "Installed UPX $(/usr/local/bin/upx --version 2>/dev/null | head -1)"
+    else
+        echo "WARNING: failed to install UPX"
+        return 1
+    fi
 }
 
 echo "========================================================"
@@ -115,7 +127,7 @@ if [ -f /etc/alpine-release ]; then
     # Alpine's gcc IS musl-gcc; create symlink so tests that check
     # for the musl-gcc command still work.
     if ! command -v musl-gcc >/dev/null 2>&1; then
-        ln -sf "$(command -v gcc)" /usr/local/bin/musl-gcc
+        link_musl_gcc_to_host_cc
     fi
 elif [ -f /etc/arch-release ]; then
     # Arch is a rolling distro and forbids partial upgrades.  Using
@@ -124,21 +136,40 @@ elif [ -f /etc/arch-release ]; then
     # (e.g. `rl_completion_rewrite_hook`) that the image's older
     # readline does not yet provide, breaking /bin/sh for the rest
     # of the script.  Always do a full `-Syu` first.
-    pacman -Syu --noconfirm --needed \
+    # New pacman versions sandbox downloads with Landlock/seccomp.  Those
+    # syscalls may be unavailable when the container runs through qemu-user;
+    # use pacman's supported opt-out in this already-isolated CI container.
+    pacman_sandbox_opt=
+    if pacman -S --help 2>&1 | grep -q -- '--disable-sandbox'; then
+        pacman_sandbox_opt=--disable-sandbox
+    fi
+    pacman_log=/tmp/dlfreeze-pacman.log
+    if ! pacman $pacman_sandbox_opt -Syu --noconfirm --needed \
         gcc musl make bash python file binutils strace diffutils \
-        git openssl sqlite 2>&1 | tail -3
-    pacman -S --noconfirm --needed upx 2>/dev/null || true
-    pacman -S --noconfirm --needed ruby 2>/dev/null || true
+        git openssl sqlite >"$pacman_log" 2>&1; then
+        echo "ERROR: required package installation failed" >&2
+        tail -50 "$pacman_log" >&2
+        exit 1
+    fi
+    tail -3 "$pacman_log"
+    pacman $pacman_sandbox_opt -S --noconfirm --needed upx 2>/dev/null || true
+    pacman $pacman_sandbox_opt -S --noconfirm --needed ruby 2>/dev/null || true
     # Arch ships musl as a separate package providing /usr/bin/musl-gcc
     if ! command -v musl-gcc >/dev/null 2>&1; then
         # fall back to plain gcc; static-musl link will be dropped
-        ln -sf "$(command -v gcc)" /usr/local/bin/musl-gcc
+        link_musl_gcc_to_host_cc
     fi
 elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
     PKG=$(command -v dnf || command -v yum)
-    "$PKG" install -y -q \
+    pkg_log=/tmp/dlfreeze-rpm-install.log
+    if ! "$PKG" install -y -q \
         gcc gcc-c++ make bash python3 file binutils diffutils glibc-static \
-        git openssl sqlite 2>&1 | tail -3
+        git openssl sqlite >"$pkg_log" 2>&1; then
+        echo "ERROR: required package installation failed" >&2
+        tail -50 "$pkg_log" >&2
+        exit 1
+    fi
+    tail -3 "$pkg_log"
     "$PKG" install -y -q strace 2>/dev/null || true
     "$PKG" install -y -q ruby 2>/dev/null || true
     # Fedora's core repos do not include UPX, so the package install is
@@ -150,7 +181,7 @@ elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
     # The Makefile uses musl-gcc for the static bootstrap; on glibc-only
     # systems we link statically against glibc instead.
     if ! command -v musl-gcc >/dev/null 2>&1; then
-        ln -sf "$(command -v gcc)" /usr/local/bin/musl-gcc
+        link_musl_gcc_to_host_cc
     fi
 elif [ -f /etc/debian_version ]; then
     export DEBIAN_FRONTEND=noninteractive
@@ -160,8 +191,14 @@ elif [ -f /etc/debian_version ]; then
         sed -i 's|security.ubuntu.com|old-releases.ubuntu.com|g' /etc/apt/sources.list
         apt-get update -qq
     fi
-    apt-get install -y -qq gcc g++ musl-tools make bash file binutils diffutils \
-        git openssl sqlite3 2>&1 | tail -1
+    apt_log=/tmp/dlfreeze-apt-install.log
+    if ! apt-get install -y -qq gcc g++ musl-tools make bash file binutils diffutils \
+        git openssl sqlite3 >"$apt_log" 2>&1; then
+        echo "ERROR: required package installation failed" >&2
+        tail -50 "$apt_log" >&2
+        exit 1
+    fi
+    tail -1 "$apt_log"
     apt-get install -y -qq strace 2>/dev/null || true
     apt-get install -y -qq python3 2>/dev/null || true
     apt-get install -y -qq ruby 2>/dev/null || true
@@ -193,6 +230,14 @@ echo ""
 echo "--- Test suite ---"
 # The test suite skips tests whose prerequisites are missing (Docker,
 # specific relocation types, etc.), but real failures must fail the build.
+# Development-snapshot libc jobs intentionally exercise the extraction
+# admission path.  Every stable matrix image must prove that at least one
+# fixture actually contained and executed direct-load metadata.
+case "$(distro_name)" in
+    *Rawhide*|*rawhide*) DLFREEZE_REQUIRE_DIRECT=0 ;;
+    *)                   DLFREEZE_REQUIRE_DIRECT=1 ;;
+esac
+export DLFREEZE_REQUIRE_DIRECT
 if run_suite bash tests/run_tests.sh build; then
     echo "Test suite: all passed"
 else
