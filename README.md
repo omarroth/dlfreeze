@@ -49,6 +49,18 @@ resource files:
 ./myapp.frozen --self-test
 ```
 
+Interactive targets inherit dlfreeze's controlling terminal during tracing.
+Exercise the interactive path, then exit it normally so packing can finish.
+For example, this captures the Python standard-library files and extension
+modules used to start a REPL, without any Python-specific loader behavior:
+
+```bash
+stdlib=$(python3 -I -c 'import sysconfig; print(sysconfig.get_path("stdlib"))')
+./build/dlfreeze -d -t -f "$stdlib/*" -o python-repl.frozen -- python3 -I -q
+# A trace-time prompt appears here. Exit it after exercising desired paths.
+./python-repl.frozen -I -q
+```
+
 ## How it works
 
 1. **Dependency resolution** — BFS walk over `DT_NEEDED` entries, with ABI validation, ldconfig cache lookup, musl path-file lookup, and `$ORIGIN`/`DT_RPATH`/`DT_RUNPATH` expansion. Missing or incompatible required libraries are fatal.
@@ -67,13 +79,17 @@ dlfreeze [options] [--] <executable> [args...]
 Options:
   -o <path>   Output file  (default: <name>.frozen)
   -d          Request experimental direct-load mode
-  -t          Trace dlopen calls by running the program
+  -t          Trace runtime loading by running the program (TTY preserved)
   -f <glob>   Embed data files matching glob (requires -t, repeatable)
   -v          Verbose
   -h          Help
 ```
 
-When `-t` is used, `[args...]` are passed to the traced run so the program exercises the code paths that trigger `dlopen()`.
+When `-t` is used, `[args...]` are passed to the traced run so the program
+exercises the code paths that trigger `dlopen()` and resource access. The
+traced process remains in the foreground terminal process group, so prompts,
+line editing, Ctrl-C, and shell stop/continue job control retain their normal
+semantics.
 
 ## Building
 

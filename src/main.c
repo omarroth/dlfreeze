@@ -33,6 +33,142 @@
 
 extern char **environ;
 
+/* A traced target shares dlfreeze's foreground process group so terminal
+ * input and job control behave as they do when the target is run directly.
+ * Keep the packer alive for terminal-generated signals that the target has
+ * already received, while still forwarding process-directed signals sent to
+ * the packer itself. */
+static volatile pid_t g_trace_child = -1;
+
+static const int g_trace_forward_signals[] = {
+    SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGUSR1, SIGUSR2,
+    SIGPIPE, SIGALRM, SIGCONT, SIGTSTP, SIGTTIN, SIGTTOU
+};
+
+#define TRACE_FORWARD_SIGNAL_COUNT \
+    (sizeof(g_trace_forward_signals) / \
+     sizeof(g_trace_forward_signals[0]))
+
+static void trace_forward_signal(int sig, siginfo_t *info, void *context)
+{
+    int saved_errno = errno;
+
+    (void)context;
+
+    /* The terminal driver targets the entire foreground process group, so a
+     * SI_KERNEL signal has already reached the trace child. */
+    if (g_trace_child > 0 && (!info || info->si_code != SI_KERNEL))
+        kill(g_trace_child, sig);
+    errno = saved_errno;
+}
+
+static void build_trace_signal_set(sigset_t *set)
+{
+    sigemptyset(set);
+    for (size_t i = 0; i < TRACE_FORWARD_SIGNAL_COUNT; i++)
+        sigaddset(set, g_trace_forward_signals[i]);
+}
+
+static int install_trace_signal_handlers(struct sigaction *old_actions)
+{
+    struct sigaction action;
+    size_t installed = 0;
+
+    memset(&action, 0, sizeof(action));
+    action.sa_sigaction = trace_forward_signal;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = SA_RESTART | SA_SIGINFO;
+
+    for (; installed < TRACE_FORWARD_SIGNAL_COUNT; installed++) {
+        if (sigaction(g_trace_forward_signals[installed], &action,
+                      &old_actions[installed]) < 0)
+            break;
+    }
+    if (installed == TRACE_FORWARD_SIGNAL_COUNT)
+        return 0;
+    while (installed > 0) {
+        installed--;
+        sigaction(g_trace_forward_signals[installed],
+                  &old_actions[installed], NULL);
+    }
+    return -1;
+}
+
+static void restore_trace_signal_handlers(
+    const struct sigaction *old_actions)
+{
+    for (size_t i = 0; i < TRACE_FORWARD_SIGNAL_COUNT; i++)
+        sigaction(g_trace_forward_signals[i], &old_actions[i], NULL);
+}
+
+static int supervise_trace_child(pid_t child, const sigset_t *forward_set,
+                                 const sigset_t *old_mask, int *status_out)
+{
+    struct sigaction old_actions[TRACE_FORWARD_SIGNAL_COUNT];
+    int wait_failed = 0;
+
+    g_trace_child = child;
+    if (install_trace_signal_handlers(old_actions) < 0) {
+        int saved_errno = errno;
+
+        sigprocmask(SIG_SETMASK, old_mask, NULL);
+        kill(child, SIGKILL);
+        while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
+        g_trace_child = -1;
+        errno = saved_errno;
+        return -1;
+    }
+    if (sigprocmask(SIG_SETMASK, old_mask, NULL) < 0) {
+        int saved_errno = errno;
+
+        kill(child, SIGKILL);
+        while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
+        g_trace_child = -1;
+        restore_trace_signal_handlers(old_actions);
+        errno = saved_errno;
+        return -1;
+    }
+
+    for (;;) {
+        int status;
+        pid_t waited = waitpid(child, &status, WUNTRACED | WCONTINUED);
+
+        if (waited < 0) {
+            if (errno == EINTR)
+                continue;
+            wait_failed = 1;
+            break;
+        }
+        if (WIFSTOPPED(status)) {
+            if (kill(getpid(), SIGSTOP) < 0) {
+                wait_failed = 1;
+                break;
+            }
+            continue;
+        }
+        if (WIFCONTINUED(status))
+            continue;
+        *status_out = status;
+        break;
+    }
+
+    if (wait_failed) {
+        (void)kill(child, SIGKILL);
+        while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
+    }
+
+    {
+        int saved_errno = errno;
+
+        sigprocmask(SIG_BLOCK, forward_set, NULL);
+        g_trace_child = -1;
+        restore_trace_signal_handlers(old_actions);
+        sigprocmask(SIG_SETMASK, old_mask, NULL);
+        errno = saved_errno;
+    }
+    return wait_failed ? -1 : 0;
+}
+
 static int prepend_ld_preload(const char *preload)
 {
     const char *old = getenv("LD_PRELOAD");
@@ -62,7 +198,7 @@ static void usage(const char *prog)
         "Options:\n"
         "  -o <path>   Output file  (default: <name>.frozen)\n"
         "  -d          Direct-load mode (in-process loader, no tmpdir)\n"
-        "  -t          Trace dlopen calls by running the program\n"
+        "  -t          Trace runtime loading by running the program (TTY preserved)\n"
         "  -f <glob>   Embed data files matching glob (requires -t, repeatable)\n"
         "  -v          Verbose\n"
         "  -h          Help\n\n"
@@ -473,16 +609,32 @@ static int capture_data_files(const char *exe_path, int argc, char **argv,
            have_preload ? "dlopen calls and file access"
                         : "file access");
 
+    sigset_t forward_set, old_mask;
+    build_trace_signal_set(&forward_set);
+    if (sigprocmask(SIG_BLOCK, &forward_set, &old_mask) < 0) {
+        perror("sigprocmask");
+        unlink(tracef);
+        if (have_preload) unlink(dlopen_tracef);
+        if (!have_preload) unlink(elf_tracef);
+        return -1;
+    }
+
     pid_t pid = fork();
     if (pid < 0) {
+        sigprocmask(SIG_SETMASK, &old_mask, NULL);
         perror("fork"); unlink(tracef);
         if (have_preload) unlink(dlopen_tracef);
+        if (!have_preload) unlink(elf_tracef);
         return -1;
     }
 
     if (pid == 0) {
-        /* New process group so we can SIGTERM the whole tree on timeout. */
-        setpgid(0, 0);
+        sigprocmask(SIG_SETMASK, &old_mask, NULL);
+        /* Keep the traced program in the packer's foreground process group.
+         * Splitting it into a new group without also transferring the
+         * controlling terminal makes an interactive target a background
+         * reader: its first read is stopped by SIGTTIN while the parent waits
+         * forever.  No trace timeout relies on a private process group. */
         int tstart = optind_val + 1;  /* args after the executable */
 
         if (have_preload) {
@@ -523,7 +675,7 @@ static int capture_data_files(const char *exe_path, int argc, char **argv,
     }
 
     int st;
-    if (waitpid(pid, &st, 0) < 0) {
+    if (supervise_trace_child(pid, &forward_set, &old_mask, &st) < 0) {
         perror("waitpid");
         unlink(tracef);
         if (have_preload) unlink(dlopen_tracef);
@@ -715,52 +867,76 @@ int main(int argc, char **argv)
                 close(tfd);
                 printf("Tracing dlopen calls …\n");
 
-                pid_t pid = fork();
-                if (pid == 0) {
-                    setpgid(0, 0);
-                    if (prepend_ld_preload(preload) < 0)
-                        _exit(127);
-                    setenv("DLFREEZE_TRACE_FILE", tracef, 1);
+                sigset_t forward_set, old_mask;
+                build_trace_signal_set(&forward_set);
+                if (sigprocmask(SIG_BLOCK, &forward_set, &old_mask) < 0) {
+                    perror("sigprocmask");
+                    trace_failed = 1;
+                } else {
+                    pid_t pid = fork();
 
-                    int tstart = optind + 1;  /* args after the executable */
-                    int nargs = 1 + (argc - tstart);
-                    char **tav = calloc(nargs + 1, sizeof(char *));
-                    tav[0] = (char *)requested_exe;
-                    for (int i = tstart; i < argc; i++)
-                        tav[1 + i - tstart] = argv[i];
-                    tav[nargs] = NULL;
-                    execve(exe_path, tav, environ);
-                    _exit(127);
-                }
-                if (pid > 0) {
-                    int st;
-                    waitpid(pid, &st, 0);
-                    if (verbose)
-                        printf("trace exit status: %d\n",
-                               WIFEXITED(st) ? WEXITSTATUS(st) : -1);
-                    if (verbose) {
-                        FILE *tf = fopen(tracef, "r");
-                        if (tf) {
-                            char ln[1024];
-                            printf("traced:\n");
-                            while (fgets(ln, sizeof(ln), tf))
-                                printf("  %s", ln);
-                            fclose(tf);
+                    if (pid == 0) {
+                        sigprocmask(SIG_SETMASK, &old_mask, NULL);
+                        /* Preserve foreground terminal ownership for traced
+                         * interactive programs; see capture_data_files(). */
+                        if (prepend_ld_preload(preload) < 0)
+                            _exit(127);
+                        setenv("DLFREEZE_TRACE_FILE", tracef, 1);
+
+                        int tstart = optind + 1;  /* args after executable */
+                        int nargs = 1 + (argc - tstart);
+                        char **tav = calloc(nargs + 1, sizeof(char *));
+                        tav[0] = (char *)requested_exe;
+                        for (int i = tstart; i < argc; i++)
+                            tav[1 + i - tstart] = argv[i];
+                        tav[nargs] = NULL;
+                        execve(exe_path, tav, environ);
+                        _exit(127);
+                    }
+                    if (pid < 0) {
+                        sigprocmask(SIG_SETMASK, &old_mask, NULL);
+                        perror("fork");
+                        trace_failed = 1;
+                    } else {
+                        int st;
+
+                        if (supervise_trace_child(pid, &forward_set,
+                                                  &old_mask, &st) < 0) {
+                            perror("waitpid");
+                            trace_failed = 1;
+                        } else {
+                            if (verbose)
+                                printf("trace exit status: %d\n",
+                                       WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+                            if (verbose) {
+                                FILE *tf = fopen(tracef, "r");
+                                if (tf) {
+                                    char ln[1024];
+                                    printf("traced:\n");
+                                    while (fgets(ln, sizeof(ln), tf))
+                                        printf("  %s", ln);
+                                    fclose(tf);
+                                }
+                            }
+                            if (!WIFEXITED(st) ||
+                                !preload_trace_ready(tracef)) {
+                                fprintf(stderr,
+                                        "dlfreeze: trace helper is "
+                                        "incompatible with the target runtime\n");
+                                trace_failed = 1;
+                            } else if (dep_add_dlopen_libs(&deps, tracef) < 0) {
+                                trace_failed = 1;
+                            }
+                            if (verbose) {
+                                printf("libraries after trace: %d\n",
+                                       deps.count);
+                                for (int i = 0; i < deps.count; i++)
+                                    if (deps.libs[i].from_dlopen)
+                                        printf("  (dlopen) %-30s → %s\n",
+                                               deps.libs[i].name,
+                                               deps.libs[i].path);
+                            }
                         }
-                    }
-                    if (!preload_trace_ready(tracef)) {
-                        fprintf(stderr, "dlfreeze: trace helper is incompatible "
-                                "with the target runtime\n");
-                        trace_failed = 1;
-                    } else if (dep_add_dlopen_libs(&deps, tracef) < 0) {
-                        trace_failed = 1;
-                    }
-                    if (verbose) {
-                        printf("libraries after trace: %d\n", deps.count);
-                        for (int i = 0; i < deps.count; i++)
-                            if (deps.libs[i].from_dlopen)
-                                printf("  (dlopen) %-30s → %s\n",
-                                       deps.libs[i].name, deps.libs[i].path);
                     }
                 }
                 unlink(tracef);

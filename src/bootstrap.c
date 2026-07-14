@@ -75,9 +75,30 @@ static int ensure_parent_dirs(const char *path)
 }
 
 /* ---- signal forwarding ------------------------------------------- */
-static void fwd_signal(int sig) {
-    g_forwarded_signal = sig;
-    if (g_child > 0) kill(g_child, sig);
+static int is_job_control_signal(int sig)
+{
+    return sig == SIGCONT || sig == SIGTSTP ||
+           sig == SIGTTIN || sig == SIGTTOU;
+}
+
+static void fwd_signal(int sig, siginfo_t *info, void *context)
+{
+    int saved_errno = errno;
+
+    (void)context;
+
+    /* A stop/continue cycle is not an interrupted direct-load attempt. */
+    if (!is_job_control_signal(sig))
+        g_forwarded_signal = sig;
+
+    /* The terminal driver sends job-control and interrupt signals to the
+     * entire foreground process group.  The application shares that group
+     * with this supervisor and has therefore already received a kernel-
+     * generated signal.  Forward only process-directed signals; otherwise a
+     * handled SIGINT/SIGQUIT can be observed twice by the application. */
+    if (g_child > 0 && (!info || info->si_code != SI_KERNEL))
+        kill(g_child, sig);
+    errno = saved_errno;
 }
 
 static void build_forward_signal_set(sigset_t *set)
@@ -93,9 +114,9 @@ static int install_forward_signal_handlers(struct sigaction *old_actions)
     size_t installed = 0;
 
     memset(&action, 0, sizeof(action));
-    action.sa_handler = fwd_signal;
+    action.sa_sigaction = fwd_signal;
     sigemptyset(&action.sa_mask);
-    action.sa_flags = SA_RESTART;
+    action.sa_flags = SA_RESTART | SA_SIGINFO;
 
     for (; installed < FORWARD_SIGNAL_COUNT; installed++) {
         if (sigaction(g_forward_signals[installed], &action,
@@ -110,6 +131,40 @@ static int install_forward_signal_handlers(struct sigaction *old_actions)
                   NULL);
     }
     return -1;
+}
+
+/* Wait for a supervised application without breaking shell job control.
+ * The wrapper and application intentionally remain in the same process group
+ * so they share the controlling terminal.  The wrapper catches stop signals
+ * in order to forward process-directed delivery, but it must not remain alive
+ * while the application is stopped: wait for proof of the child stop, then
+ * stop ourselves.  The shell's later SIGCONT resumes the whole group. */
+static int wait_for_supervised_child(pid_t child, int *status_out)
+{
+    for (;;) {
+        int status;
+        pid_t waited = waitpid(child, &status, WUNTRACED | WCONTINUED);
+
+        if (waited < 0) {
+            if (errno == EINTR)
+                continue;
+            (void)kill(child, SIGKILL);
+            while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
+            return -1;
+        }
+        if (WIFSTOPPED(status)) {
+            if (kill(getpid(), SIGSTOP) < 0) {
+                (void)kill(child, SIGKILL);
+                while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
+                return -1;
+            }
+            continue;
+        }
+        if (WIFCONTINUED(status))
+            continue;
+        *status_out = status;
+        return 0;
+    }
 }
 
 static void restore_forward_signal_handlers(
@@ -909,14 +964,22 @@ int main(int argc, char **argv)
         sigprocmask(SIG_SETMASK, &old_mask, NULL);
 
         int lst = 0;
-        while (waitpid(lpid, &lst, 0) < 0)
-            if (errno != EINTR) break;
+        int wait_failed = wait_for_supervised_child(lpid, &lst) < 0;
 
         sigprocmask(SIG_BLOCK, &forward_set, NULL);
         int direct_interrupted = g_forwarded_signal != 0;
         g_child = -1;
         restore_forward_signal_handlers(old_forward_actions);
         sigprocmask(SIG_SETMASK, &old_mask, NULL);
+
+        if (wait_failed) {
+            perror("waitpid");
+            close(handoff_pipe[0]);
+            if (from_memory == 0 && ldr_mem_foff == 0 && ldr_mem)
+                munmap((void *)ldr_mem, st.st_size);
+            free(metas); free(ent); free(strtab); close(sfd);
+            return 127;
+        }
 
         char handoff_marker;
         ssize_t handoff_len;
@@ -1136,25 +1199,30 @@ int main(int argc, char **argv)
     setenv("DLFREEZE_TMPDIR", g_tmpdir, 1);
     setenv("DLFREEZE_EXTRACT_ROOT", g_tmpdir, 1);
 
-    /* 10. fork→exec, parent waits + cleans up. */
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = fwd_signal;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESTART;
-    int sigs[] = { SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGUSR1, SIGUSR2,
-                   SIGPIPE, SIGALRM, SIGCONT, SIGTSTP, SIGTTIN, SIGTTOU, 0 };
-    for (int i = 0; sigs[i]; i++) sigaction(sigs[i], &sa, NULL);
-
+    /* 10. fork→exec, parent waits + cleans up.  Block forwarded signals
+     * across fork so only the parent installs the supervisor handlers; caught
+     * dispositions inherited before exec would otherwise consume a terminal
+     * stop in the child during the fork/exec window. */
+    sigset_t forward_set, old_mask;
+    struct sigaction old_forward_actions[FORWARD_SIGNAL_COUNT];
+    build_forward_signal_set(&forward_set);
+    if (sigprocmask(SIG_BLOCK, &forward_set, &old_mask) < 0) {
+        perror("sigprocmask");
+        rmtree(g_tmpdir);
+        free(direct_nav); free(launcher_nav);
+        return 127;
+    }
     int status = 0;
     g_child = fork();
     if (g_child < 0) {
+        sigprocmask(SIG_SETMASK, &old_mask, NULL);
         perror("fork"); rmtree(g_tmpdir);
         free(direct_nav); free(launcher_nav);
         return 127;
     }
 
     if (g_child == 0) {
+        sigprocmask(SIG_SETMASK, &old_mask, NULL);
         if (use_interp_launcher)
             execve(interp_path, nav, environ);
         else
@@ -1163,12 +1231,35 @@ int main(int argc, char **argv)
         _exit(127);
     }
 
-    while (waitpid(g_child, &status, 0) < 0)
-        if (errno != EINTR) break;
+    pid_t child = g_child;
+    g_forwarded_signal = 0;
+    if (install_forward_signal_handlers(old_forward_actions) < 0) {
+        perror("sigaction");
+        kill(child, SIGKILL);
+        while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
+        g_child = -1;
+        sigprocmask(SIG_SETMASK, &old_mask, NULL);
+        rmtree(g_tmpdir);
+        free(direct_nav); free(launcher_nav);
+        return 127;
+    }
+    sigprocmask(SIG_SETMASK, &old_mask, NULL);
+
+    int wait_failed = wait_for_supervised_child(child, &status) < 0;
+
+    sigprocmask(SIG_BLOCK, &forward_set, NULL);
+    g_child = -1;
+    restore_forward_signal_handlers(old_forward_actions);
+    sigprocmask(SIG_SETMASK, &old_mask, NULL);
 
     rmtree(g_tmpdir);
     free(direct_nav);
     free(launcher_nav);
+
+    if (wait_failed) {
+        perror("waitpid");
+        return 127;
+    }
 
     if (WIFEXITED(status))
         return WEXITSTATUS(status);

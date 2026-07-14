@@ -1116,6 +1116,89 @@ C
 }
 
 # ===================================================================
+# Test 2c2: controlling-terminal I/O and job-control signals survive
+# both the direct supervisor and the strict in-process path.
+# ===================================================================
+test_direct_pty_interaction() {
+    echo "--- direct controlling-PTY interaction ---"
+    local helper="$BUILD/pty_interaction_gate"
+    local out="$BUILD/pty_interaction.frozen"
+    local pack_log="$BUILD/pty_interaction.pack.log"
+    local native_log="$BUILD/pty_interaction.native.log"
+    local supervised_log="$BUILD/pty_interaction.supervised.log"
+    local strict_log="$BUILD/pty_interaction.strict.log"
+    local trace_out="$BUILD/pty_interaction.trace.frozen"
+    local trace_log="$BUILD/pty_interaction.trace.log"
+    local freeze_rc=0
+
+    rm -f "$helper" "$out" "$pack_log" "$native_log" \
+        "$supervised_log" "$strict_log" "$trace_out" "$trace_log"
+    if ! gcc -Wall -Wextra -Werror -D_GNU_SOURCE \
+            -o "$helper" tests/pty_interaction_gate.c; then
+        fail "direct PTY interaction" "PTY helper compile failed"
+        return
+    fi
+
+    if ! "$helper" --run -- "$helper" --target >"$native_log" 2>&1; then
+        if grep -q 'could not create controlling PTY' "$native_log"; then
+            skip "direct PTY interaction" \
+                "controlling PTYs are unavailable in this environment"
+            skip "interactive PTY trace packaging" \
+                "controlling PTYs are unavailable in this environment"
+        else
+            fail "native PTY interaction control" "PTY protocol failed"
+            tail -n 80 "$native_log" || true
+        fi
+        rm -f "$helper" "$out" "$pack_log" "$native_log" \
+            "$supervised_log" "$strict_log" "$trace_out" "$trace_log"
+        return
+    fi
+    pass "native PTY interaction control"
+
+    freeze_require_direct "direct PTY interaction" "$pack_log" "$out" \
+        "$helper" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "supervised direct PTY interaction" "$DIRECT_FREEZE_REASON"
+        skip "strict direct PTY interaction" "$DIRECT_FREEZE_REASON"
+    elif [ "$freeze_rc" -eq 0 ]; then
+        if "$helper" --run -- env -u DLFREEZE_NO_FORK \
+                "$out" --target >"$supervised_log" 2>&1; then
+            pass "supervised direct PTY interaction"
+        else
+            fail "supervised direct PTY interaction" \
+                "terminal protocol failed"
+            tail -n 80 "$supervised_log" || true
+        fi
+
+        if "$helper" --run -- env DLFREEZE_NO_FORK=1 \
+                "$out" --target >"$strict_log" 2>&1; then
+            pass "strict direct PTY interaction"
+        else
+            fail "strict direct PTY interaction" "terminal protocol failed"
+            tail -n 80 "$strict_log" || true
+        fi
+    fi
+
+    # -f selects the combined file/dlopen tracer, whose child must retain
+    # foreground-terminal ownership while it reads the protocol input.  The
+    # deliberately unmatched glob keeps this a terminal test, not a VFS test.
+    if run_freeze env -u DLFREEZE_NO_FORK PTY_GATE_TIMEOUT_MS=60000 \
+            "$helper" --run -- "$DLFREEZE" -t \
+            -f "$BUILD/.dlfreeze-pty-no-match/*" -o "$trace_out" -- \
+            "$helper" --target >"$trace_log" 2>&1 &&
+       [ -x "$trace_out" ]; then
+        pass "interactive PTY trace packaging"
+    else
+        fail "interactive PTY trace packaging" \
+            "TTY-reading trace target did not package successfully"
+        tail -n 80 "$trace_log" || true
+    fi
+
+    rm -f "$helper" "$out" "$pack_log" "$native_log" \
+        "$supervised_log" "$strict_log" "$trace_out" "$trace_log"
+}
+
+# ===================================================================
 # Test 2d: direct-load preserves glibc's main-thread fork invariants
 # ===================================================================
 test_direct_fork_lifecycle() {
@@ -3763,6 +3846,49 @@ test_python3_direct() {
     rm -f "$out" "$log"
 }
 
+test_python_repl_pty_direct() {
+    echo "--- python3 interactive PTY direct-load ---"
+    if ! command -v python3 >/dev/null 2>&1; then
+        skip "Python REPL PTY direct-load" "python3 not installed"
+        return
+    fi
+    if ! python3 -c \
+            'import os,pty; master,slave=pty.openpty(); os.close(master); os.close(slave)' \
+            >/dev/null 2>&1; then
+        skip "Python REPL PTY direct-load" \
+            "Python cannot create a PTY in this environment"
+        return
+    fi
+    if [ ! -r tests/python_repl_pty.py ]; then
+        fail "Python REPL PTY direct-load" "PTY test driver is missing"
+        return
+    fi
+
+    local python work="$BUILD/python-repl-pty-work"
+    local log="$BUILD/python-repl-pty.log"
+    local total_timeout
+    python=$(readlink -f "$(command -v python3)")
+    total_timeout=$((TEST_FREEZE_TIMEOUT + 2 * TEST_RUN_TIMEOUT + 30))
+    rm -rf "$work"
+    rm -f "$log"
+
+    if run_with_timeout_seconds "$total_timeout" env -u DLFREEZE_NO_FORK \
+            "$python" tests/python_repl_pty.py \
+            --dlfreeze "$DLFREEZE" --python "$python" \
+            --work-dir "$work" \
+            --freeze-timeout "$TEST_FREEZE_TIMEOUT" \
+            --run-timeout "$TEST_RUN_TIMEOUT" >"$log" 2>&1; then
+        pass "Python REPL PTY direct-load"
+    else
+        fail "Python REPL PTY direct-load" \
+            "interactive trace or frozen REPL protocol failed"
+        tail -n 100 "$log" || true
+    fi
+
+    rm -rf "$work"
+    rm -f "$log"
+}
+
 # ===================================================================
 # Test 12: glibc direct-load keeps rseq below static TLS for threads
 # ===================================================================
@@ -6007,6 +6133,7 @@ test_glibc_private_exception_direct
 test_exit_code
 test_direct_handoff_once
 test_direct_signal_forwarding
+test_direct_pty_interaction
 test_direct_fork_lifecycle
 test_direct_exit_lifecycle
 test_direct_constructor_signal
@@ -6038,6 +6165,7 @@ test_direct_dlopen_admission_flags
 test_direct_dlopen_embedded_static_tls
 test_direct_dlopen_fallback
 test_python3_direct
+test_python_repl_pty_direct
 test_glibc_tls_dtor_direct
 test_ruby_direct_host_run
 test_dlopen_soname_direct
