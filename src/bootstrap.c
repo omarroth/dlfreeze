@@ -440,7 +440,11 @@ static int manifest_is_valid(const struct dlfrz_footer *footer,
             return 0;
         name = strtab + entries[i].name_offset;
         if (!memchr(name, '\0', footer->strtab_size - entries[i].name_offset) ||
-            !embedded_name_valid(name) ||
+            !name[0] ||
+            ((entries[i].flags & DLFRZ_FLAG_DATA_NEGATIVE) != 0 &&
+             name[0] != '/') ||
+            ((entries[i].flags & DLFRZ_FLAG_DATA_NEGATIVE) == 0 &&
+             !embedded_name_valid(name)) ||
             (!(entries[i].flags & (DLFRZ_FLAG_DATA_VIRTUAL |
                                     DLFRZ_FLAG_DATA_NEGATIVE)) &&
              !payload_range_valid(entries[i].data_offset,

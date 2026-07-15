@@ -2138,7 +2138,85 @@ test_cat() {
 }
 
 # ===================================================================
-# Test 4a: packer proves direct-main ownership or falls back cleanly
+# Test 4a: negative VFS entries may retain safe, non-extractable dot paths
+# ===================================================================
+test_negative_dot_path_manifest() {
+    echo "--- negative dotted VFS path ---"
+    local root="$BUILD/vfs_negative_dot"
+    local existing="$root/existing"
+    local missing="$root/missing.txt"
+    local probe="$existing/../missing.txt"
+    local src="$BUILD/vfs_negative_dot.c"
+    local bin="$BUILD/vfs_negative_dot"
+    local out="$BUILD/vfs_negative_dot.frozen"
+    local log="$BUILD/vfs_negative_dot.log"
+    local actual rc=0 freeze_rc=0
+
+    rm -rf "$root"
+    rm -f "$src" "$bin" "$out" "$log"
+    mkdir -p "$existing"
+    cat > "$src" <<'C'
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+    int fd;
+
+    if (argc != 2)
+        return 2;
+    fd = open(argv[1], O_RDONLY);
+    if (fd >= 0) {
+        close(fd);
+        puts("unexpected-present");
+        return 3;
+    }
+    if (errno != ENOENT && errno != ENOTDIR) {
+        perror("open");
+        return 4;
+    }
+    puts("negative-dot-ok");
+    return 0;
+}
+C
+
+    if ! gcc -o "$bin" "$src"; then
+        fail "negative dotted VFS path" "fixture compile failed"
+        rm -rf "$root"
+        rm -f "$src" "$bin" "$out" "$log"
+        return
+    fi
+
+    freeze_require_direct "negative dotted VFS path" "$log" "$out" \
+        -t -f "$root/*" "$bin" "$probe" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "negative dotted VFS path" "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        rm -f "$src" "$bin" "$out" "$log"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        rm -f "$src" "$bin" "$out" "$log"
+        return
+    fi
+
+    printf '%s\n' 'host file must stay hidden' > "$missing"
+    capture_output actual "$out" "$probe" || rc=$?
+    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+    if [ "$rc" -eq 0 ] && [ "$actual" = "negative-dot-ok" ]; then
+        pass "negative dotted VFS path"
+    else
+        fail "negative dotted VFS path" "exit=$rc output=$actual"
+    fi
+
+    rm -rf "$root"
+    rm -f "$src" "$bin" "$out" "$log"
+}
+
+# ===================================================================
+# Test 4b: packer proves direct-main ownership or falls back cleanly
 # ===================================================================
 test_packer_main_detection() {
     echo "--- packer main detection ---"
@@ -6483,6 +6561,7 @@ test_nobits_tls_outside_load_direct
 test_dependency_abi_validation
 test_ls
 test_cat
+test_negative_dot_path_manifest
 test_packer_main_detection
 test_program_smoke_matrix
 test_symlink_exe_identity_direct
