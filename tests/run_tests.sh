@@ -2142,15 +2142,18 @@ test_cat() {
 # ===================================================================
 test_negative_dot_path_manifest() {
     echo "--- negative dotted VFS path ---"
-    local root="$BUILD/vfs_negative_dot"
-    local existing="$root/existing"
-    local missing="$root/missing.txt"
-    local probe="$existing/../missing.txt"
-    local src="$BUILD/vfs_negative_dot.c"
-    local bin="$BUILD/vfs_negative_dot"
-    local out="$BUILD/vfs_negative_dot.frozen"
-    local log="$BUILD/vfs_negative_dot.log"
+    local build_abs root existing missing probe src bin out log
     local actual rc=0 freeze_rc=0
+
+    build_abs=$(cd "$BUILD" && pwd -P)
+    root="$build_abs/vfs_negative_dot_root"
+    existing="$root/existing"
+    missing="$root/missing.txt"
+    probe="$existing/../missing.txt"
+    src="$build_abs/vfs_negative_dot.c"
+    bin="$build_abs/vfs_negative_dot"
+    out="$build_abs/vfs_negative_dot.frozen"
+    log="$build_abs/vfs_negative_dot.log"
 
     rm -rf "$root"
     rm -f "$src" "$bin" "$out" "$log"
@@ -2216,7 +2219,362 @@ C
 }
 
 # ===================================================================
-# Test 4b: packer proves direct-main ownership or falls back cleanly
+# Test 4b: startup ELFs remain readable through a sealed data-file VFS
+# ===================================================================
+test_direct_startup_elf_vfs() {
+    echo "--- direct startup ELF VFS visibility ---"
+    local build_abs root lib_src lib src bin data out log
+    local actual rc=0 freeze_rc=0
+
+    build_abs=$(cd "$BUILD" && pwd -P)
+    root="$build_abs/vfs_startup_elf_root"
+    lib_src="$root/libprobe.c"
+    lib="$root/libvfs_startup_probe.so"
+    src="$root/main.c"
+    bin="$root/main"
+    data="$root/data.txt"
+    out="$root/main.frozen"
+    log="$root/main.log"
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    cat > "$lib_src" <<'C'
+int vfs_startup_probe(void) { return 41; }
+C
+    cat > "$src" <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/prctl.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#ifndef F_GET_SEALS
+#define F_GET_SEALS 1034
+#endif
+#ifndef F_SEAL_WRITE
+#define F_SEAL_WRITE 0x0008
+#endif
+
+static int deny_add_seals(void) {
+    struct sock_filter filter[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_fcntl, 0, 3),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, args[1])),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, F_ADD_SEALS, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_fprog program = {
+        .len = (unsigned short)(sizeof(filter) / sizeof(filter[0])),
+        .filter = filter,
+    };
+
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
+        return -1;
+    return prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program);
+}
+
+extern int vfs_startup_probe(void);
+
+int main(int argc, char **argv) {
+    unsigned char magic[4];
+    char data_byte;
+    struct stat st;
+    FILE *stream;
+    int frozen_check;
+    int fd;
+
+    frozen_check = argc == 4 && strcmp(argv[3], "frozen") == 0;
+    if ((argc != 3 && !frozen_check) || vfs_startup_probe() != 41)
+        return 2;
+    fd = open(argv[1], O_RDONLY);
+    if (fd < 0 || read(fd, &data_byte, 1) != 1 || data_byte != 'd')
+        return 3;
+    close(fd);
+
+    fd = open(argv[2], O_RDONLY);
+    if (fd < 0 || read(fd, magic, sizeof(magic)) != (ssize_t)sizeof(magic))
+        return 4;
+    if (memcmp(magic, "\177ELF", sizeof(magic)) != 0)
+        return 5;
+    if (!frozen_check) {
+        close(fd);
+        puts("startup-elf-vfs-trace-ok");
+        return 0;
+    }
+    if ((fcntl(fd, F_GET_SEALS) & F_SEAL_WRITE) == 0)
+        return 6;
+    close(fd);
+
+    errno = 0;
+    fd = open(argv[2], O_RDWR);
+    if (fd >= 0 || errno != EROFS)
+        return 7;
+
+    errno = 0;
+    fd = open(argv[2], O_RDONLY | O_DIRECTORY);
+    if (fd >= 0 || errno != ENOTDIR)
+        return 8;
+
+    fd = open(argv[2], O_RDONLY | O_CLOEXEC);
+    if (fd < 0 || (fcntl(fd, F_GETFD) & FD_CLOEXEC) == 0 ||
+        (fcntl(fd, F_GETFL) & O_ACCMODE) != O_RDONLY)
+        return 9;
+    close(fd);
+
+#ifdef O_PATH
+    fd = open(argv[2], O_PATH | O_CLOEXEC);
+    if (fd < 0 || (fcntl(fd, F_GETFD) & FD_CLOEXEC) == 0 ||
+        (fcntl(fd, F_GETFL) & O_PATH) == 0)
+        return 10;
+    errno = 0;
+    if (read(fd, magic, sizeof(magic)) >= 0 || errno != EBADF)
+        return 11;
+    close(fd);
+#endif
+
+    stream = fopen(argv[2], "re");
+    if (!stream || (fcntl(fileno(stream), F_GETFD) & FD_CLOEXEC) == 0)
+        return 12;
+    fclose(stream);
+
+    if (stat(argv[1], &st) < 0 || (st.st_mode & 0777) != 0444 ||
+        access(argv[1], R_OK) != 0)
+        return 13;
+    errno = 0;
+    if (access(argv[1], W_OK) == 0 || errno != EROFS)
+        return 14;
+    errno = 0;
+    if (access(argv[1], X_OK) == 0 || errno != EACCES)
+        return 15;
+
+    if (stat(argv[2], &st) < 0 || (st.st_mode & 0777) != 0555 ||
+        access(argv[2], R_OK | X_OK) != 0)
+        return 16;
+    errno = 0;
+    if (faccessat(AT_FDCWD, argv[2], W_OK, 0) == 0 || errno != EROFS)
+        return 17;
+
+    if (deny_add_seals() < 0) {
+        puts("startup-elf-vfs-ok:seccomp-unavailable");
+        return 0;
+    }
+    errno = 0;
+    fd = open(argv[1], O_RDONLY);
+    if (fd >= 0 || errno != EPERM)
+        return 18;
+    puts("startup-elf-vfs-ok:fail-closed");
+    return 0;
+}
+C
+    printf '%s\n' 'data-file' > "$data"
+
+    if ! gcc -shared -fPIC -Wl,-soname,libvfs_startup_probe.so \
+            -o "$lib" "$lib_src" ||
+       ! gcc -Wl,-rpath,'$ORIGIN' -L"$root" -o "$bin" "$src" \
+            -lvfs_startup_probe; then
+        fail "direct startup ELF VFS visibility" "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+
+    freeze_require_direct "direct startup ELF VFS visibility" "$log" "$out" \
+        -t -f "$root/*" "$bin" "$data" "$lib" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "direct startup ELF VFS visibility" "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+
+    mv "$lib" "${lib}.bak"
+    mv "$data" "${data}.bak"
+    printf '%s\n' 'host-replacement' > "$data"
+    capture_output actual "$out" "$data" "$lib" frozen || rc=$?
+    mv "${lib}.bak" "$lib"
+    rm -f "$data"
+    mv "${data}.bak" "$data"
+    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+    if [ "$rc" -eq 0 ] && [ "$actual" = "startup-elf-vfs-ok:fail-closed" ]; then
+        pass "direct startup ELF VFS visibility"
+        pass "VFS sealing failure is fail-closed"
+    elif [ "$rc" -eq 0 ] &&
+         [ "$actual" = "startup-elf-vfs-ok:seccomp-unavailable" ]; then
+        pass "direct startup ELF VFS visibility"
+        skip "VFS sealing failure is fail-closed" "seccomp unavailable"
+    else
+        fail "direct startup ELF VFS visibility" "exit=$rc output=$actual"
+    fi
+    rm -rf "$root"
+}
+
+# ===================================================================
+# Test 4c: a forked child cannot remove its parent's linker overlay
+# ===================================================================
+test_vfs_overlay_fork_lifetime() {
+    echo "--- VFS linker-overlay fork lifetime ---"
+    local build_abs root src bin script out log
+    local actual rc=0 freeze_rc=0
+
+    build_abs=$(cd "$BUILD" && pwd -P)
+    root="$build_abs/vfs_overlay_fork_root"
+    src="$root/main.c"
+    bin="$root/main"
+    script="$root/libcaptured-script.so"
+    out="$root/main.frozen"
+    log="$root/main.log"
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    cat > "$src" <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static int raw_exists(const char *path) {
+    struct stat st;
+    return syscall(SYS_newfstatat, AT_FDCWD, path, &st, 0) == 0;
+}
+
+static void cleanup_overlay(char *dir, size_t root_len) {
+    size_t len = strlen(dir);
+
+    while (len >= root_len) {
+        (void)rmdir(dir);
+        if (len == root_len)
+            break;
+        while (len > root_len && dir[len - 1] != '/')
+            len--;
+        if (len > root_len)
+            dir[--len] = '\0';
+    }
+}
+
+int main(int argc, char **argv) {
+    char directory[PATH_MAX];
+    char overlay_file[PATH_MAX];
+    const char *library_path;
+    const char *colon;
+    const char *base;
+    const char *source_slash;
+    size_t directory_len;
+    size_t source_dir_len;
+    size_t root_len;
+    pid_t child;
+    int status;
+
+    if (argc != 2)
+        return 2;
+
+    /* The native trace sees the source file.  The frozen run does not and
+     * must instead see the private overlay through LIBRARY_PATH. */
+    if (raw_exists(argv[1])) {
+        int fd = open(argv[1], O_RDONLY);
+
+        if (fd < 0)
+            return 11;
+        close(fd);
+        puts("overlay-fork-ok");
+        return 0;
+    }
+
+    library_path = getenv("LIBRARY_PATH");
+    base = strrchr(argv[1], '/');
+    source_slash = base;
+    if (!library_path || !base || !source_slash)
+        return 3;
+    base++;
+    colon = strchr(library_path, ':');
+    directory_len = colon ? (size_t)(colon - library_path)
+                          : strlen(library_path);
+    if (directory_len == 0 || directory_len >= sizeof(directory))
+        return 4;
+    memcpy(directory, library_path, directory_len);
+    directory[directory_len] = '\0';
+    if (snprintf(overlay_file, sizeof(overlay_file), "%s/%s",
+                 directory, base) >= (int)sizeof(overlay_file) ||
+        !raw_exists(overlay_file))
+        return 5;
+
+    child = fork();
+    if (child < 0)
+        return 6;
+    if (child == 0)
+        exit(0);
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
+        WEXITSTATUS(status) != 0)
+        return 7;
+    if (!raw_exists(overlay_file))
+        return 8;
+
+    source_dir_len = (size_t)(source_slash - argv[1]);
+    if (directory_len <= source_dir_len ||
+        strncmp(directory + directory_len - source_dir_len,
+                argv[1], source_dir_len) != 0 ||
+        strncmp(directory, "/tmp/dlfreeze-vfs-", 18) != 0)
+        return 9;
+    root_len = directory_len - source_dir_len;
+    if (unlink(overlay_file) < 0)
+        return 10;
+    cleanup_overlay(directory, root_len);
+    puts("overlay-fork-ok");
+    return 0;
+}
+C
+    printf '%s\n' 'GROUP ( /does/not/matter.so )' > "$script"
+
+    if ! gcc -o "$bin" "$src"; then
+        fail "VFS linker-overlay fork lifetime" "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+
+    freeze_require_direct "VFS linker-overlay fork lifetime" "$log" "$out" \
+        -t -f "$root/*" "$bin" "$script" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "VFS linker-overlay fork lifetime" "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+
+    mv "$script" "${script}.bak"
+    capture_output actual "$out" "$script" || rc=$?
+    mv "${script}.bak" "$script"
+    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+    if [ "$rc" -eq 0 ] && [ "$actual" = "overlay-fork-ok" ]; then
+        pass "VFS linker-overlay fork lifetime"
+    else
+        fail "VFS linker-overlay fork lifetime" "exit=$rc output=$actual"
+    fi
+    rm -rf "$root"
+}
+
+# ===================================================================
+# Test 4d: packer proves direct-main ownership or falls back cleanly
 # ===================================================================
 test_packer_main_detection() {
     echo "--- packer main detection ---"
@@ -6562,6 +6920,8 @@ test_dependency_abi_validation
 test_ls
 test_cat
 test_negative_dot_path_manifest
+test_direct_startup_elf_vfs
+test_vfs_overlay_fork_lifetime
 test_packer_main_detection
 test_program_smoke_matrix
 test_symlink_exe_identity_direct

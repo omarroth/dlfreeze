@@ -47,6 +47,20 @@ static int expect_prefixes_rejected(const char *label, const uint32_t *code,
     return 1;
 }
 
+static int expect_gpr_writes(const char *label, uint32_t instruction,
+                             uint32_t expected)
+{
+    uint32_t writes = 0;
+
+    if (!aarch64_musl_gpr_writes(instruction, &writes) ||
+        writes != expected) {
+        fprintf(stderr, "%s: writes=%#x expected=%#x\n",
+                label, writes, expected);
+        return 0;
+    }
+    return 1;
+}
+
 int main(void)
 {
     static const uint32_t direct_store[] = {
@@ -87,6 +101,53 @@ int main(void)
         0x7100085f, /* cmp   w2, #2 */
         0x54ffff80, /* b.eq  ... */
     };
+    /* Ubuntu 24.04 arm64 musl 1.2.4-2: stack protector plus pointer
+     * authentication precede the argument-derived detach-state address. */
+    static const uint32_t ubuntu_pac[] = {
+        0xd503233f, /* paciasp */
+        0xd100c3ff, /* sub   sp, sp, #0x30 */
+        0xb0000302, /* adrp  x2, ... */
+        0xf947c042, /* ldr   x2, [x2, ...] */
+        0x9100a001, /* add   x1, x0, #0x28 */
+        0xa9017bfd, /* stp   x29, x30, [sp, #16] */
+        0x910043fd, /* add   x29, sp, #0x10 */
+        0x52800063, /* mov   w3, #3 */
+        0xf90013f3, /* str   x19, [sp, #32] */
+        0xaa0003f3, /* mov   x19, x0 */
+        0xf9400040, /* ldr   x0, [x2] */
+        0xf90007e0, /* str   x0, [sp, #8] */
+        0xd2800000, /* mov   x0, #0 */
+        0x14000003, /* b     ... */
+        0x8802fc23, /* stlxr w2, w3, [x1] */
+        0x340001c2, /* cbz   w2, ... */
+        0x885ffc22, /* ldaxr w2, [x1] */
+        0x7100085f, /* cmp   w2, #2 */
+        0x54ffff80, /* b.eq  ... */
+    };
+    /* A BTI-enabled build may place its landing pad before the same PAC
+     * prologue.  The landing pad carries no argument provenance itself. */
+    static const uint32_t ubuntu_pac_bti[] = {
+        0xd503245f, /* bti   c */
+        0xd503233f, /* paciasp */
+        0xd100c3ff, /* sub   sp, sp, #0x30 */
+        0xb0000302, /* adrp  x2, ... */
+        0xf947c042, /* ldr   x2, [x2, ...] */
+        0x9100a001, /* add   x1, x0, #0x28 */
+        0xa9017bfd, /* stp   x29, x30, [sp, #16] */
+        0x910043fd, /* add   x29, sp, #0x10 */
+        0x52800063, /* mov   w3, #3 */
+        0xf90013f3, /* str   x19, [sp, #32] */
+        0xaa0003f3, /* mov   x19, x0 */
+        0xf9400040, /* ldr   x0, [x2] */
+        0xf90007e0, /* str   x0, [sp, #8] */
+        0xd2800000, /* mov   x0, #0 */
+        0x14000003, /* b     ... */
+        0x8802fc23, /* stlxr w2, w3, [x1] */
+        0x340001c2, /* cbz   w2, ... */
+        0x885ffc22, /* ldaxr w2, [x1] */
+        0x7100085f, /* cmp   w2, #2 */
+        0x54ffff80, /* b.eq  ... */
+    };
     /* Arch Linux ARM (GCC 16): the argument and detached value are both
      * preserved before the stack-canary prologue finishes. */
     static const uint32_t preserved_arg[] = {
@@ -108,6 +169,8 @@ int main(void)
     uint32_t mutated[sizeof(hardened) / sizeof(hardened[0])];
     uint32_t preserved_mutated[
         sizeof(preserved_arg) / sizeof(preserved_arg[0])];
+    uint32_t hardened_prefix_mutated[
+        sizeof(ubuntu_pac_bti) / sizeof(ubuntu_pac_bti[0])];
     uint32_t direct_mutated[3];
 
     if (!expect_detach_layout(
@@ -117,6 +180,12 @@ int main(void)
                               sizeof(compact) / sizeof(compact[0]), 1, 2) ||
         !expect_detach_layout("hardened", hardened,
                               sizeof(hardened) / sizeof(hardened[0]), 1, 2) ||
+        !expect_detach_layout("Ubuntu PAC", ubuntu_pac,
+                              sizeof(ubuntu_pac) / sizeof(ubuntu_pac[0]),
+                              1, 2) ||
+        !expect_detach_layout(
+            "Ubuntu PAC+BTI", ubuntu_pac_bti,
+            sizeof(ubuntu_pac_bti) / sizeof(ubuntu_pac_bti[0]), 1, 2) ||
         !expect_detach_layout(
             "preserved argument", preserved_arg,
             sizeof(preserved_arg) / sizeof(preserved_arg[0]), 1, 2))
@@ -131,8 +200,44 @@ int main(void)
             "hardened", hardened,
             sizeof(hardened) / sizeof(hardened[0])) ||
         !expect_prefixes_rejected(
+            "Ubuntu PAC", ubuntu_pac,
+            sizeof(ubuntu_pac) / sizeof(ubuntu_pac[0])) ||
+        !expect_prefixes_rejected(
+            "Ubuntu PAC+BTI", ubuntu_pac_bti,
+            sizeof(ubuntu_pac_bti) / sizeof(ubuntu_pac_bti[0])) ||
+        !expect_prefixes_rejected(
             "preserved argument", preserved_arg,
             sizeof(preserved_arg) / sizeof(preserved_arg[0])))
+        return 1;
+
+    if (!expect_gpr_writes("PACIASP", 0xd503233f, 1u << 30) ||
+        !expect_gpr_writes("PACIBSP", 0xd503237f, 1u << 30) ||
+        !expect_gpr_writes("AUTIASP", 0xd50323bf, 1u << 30) ||
+        !expect_gpr_writes("AUTIBSP", 0xd50323ff, 1u << 30) ||
+        !expect_gpr_writes("BTI", 0xd503241f, 0) ||
+        !expect_gpr_writes("BTI c", 0xd503245f, 0) ||
+        !expect_gpr_writes("BTI j", 0xd503249f, 0) ||
+        !expect_gpr_writes("BTI jc", 0xd50324df, 0))
+        return 1;
+
+    memcpy(hardened_prefix_mutated, ubuntu_pac_bti,
+           sizeof(hardened_prefix_mutated));
+    hardened_prefix_mutated[0] = 0xaa0103e0; /* mov x0, x1 */
+    if (!expect_detach_layout(
+            "BTI replaced by argument clobber", hardened_prefix_mutated,
+            sizeof(hardened_prefix_mutated) /
+                sizeof(hardened_prefix_mutated[0]),
+            0, -1))
+        return 1;
+
+    memcpy(hardened_prefix_mutated, ubuntu_pac_bti,
+           sizeof(hardened_prefix_mutated));
+    hardened_prefix_mutated[1] = 0xffffffff; /* unknown prefix instruction */
+    if (!expect_detach_layout(
+            "unknown PAC replacement", hardened_prefix_mutated,
+            sizeof(hardened_prefix_mutated) /
+                sizeof(hardened_prefix_mutated[0]),
+            0, -1))
         return 1;
 
     memcpy(mutated, hardened, sizeof(mutated));

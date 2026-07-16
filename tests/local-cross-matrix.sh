@@ -5,6 +5,7 @@
 set -euo pipefail
 
 ARCH="${ARCH:-}"
+ENV_FILTER="${ENV_FILTER:-}"
 DO_BUILD=1
 DO_RUN=1
 
@@ -14,6 +15,7 @@ Usage: tests/local-cross-matrix.sh [options]
 
 Options:
   --arch ARCH            Target architecture for Docker platform (amd64|arm64)
+  --env NAME             Run one CI environment (for example arch-latest)
   --build-only           Only build artifacts in each distro image
   --run-only             Only run cross-run matrix (expects frozen-all populated)
   -h, --help             Show this help
@@ -21,22 +23,30 @@ Options:
 Examples:
   tests/local-cross-matrix.sh
   tests/local-cross-matrix.sh --arch arm64
+  tests/local-cross-matrix.sh --arch arm64 --env arch-latest --build-only
+  FROZEN_ROOT=/tmp/dlfreeze-artifacts tests/local-cross-matrix.sh --run-only
   tests/local-cross-matrix.sh --build-only
 EOF
 }
 
-if [[ -z "$ARCH" ]]; then
-    case "$(uname -m)" in
-        x86_64) ARCH="amd64" ;;
-        aarch64|arm64) ARCH="arm64" ;;
-        *) echo "Unsupported host arch: $(uname -m). Use --arch." >&2; exit 2 ;;
-    esac
-fi
-
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --arch)
+            if [[ $# -lt 2 ]]; then
+                echo "--arch requires a value" >&2
+                usage >&2
+                exit 2
+            fi
             ARCH="$2"
+            shift 2
+            ;;
+        --env)
+            if [[ $# -lt 2 ]]; then
+                echo "--env requires a value" >&2
+                usage >&2
+                exit 2
+            fi
+            ENV_FILTER="$2"
             shift 2
             ;;
         --build-only)
@@ -61,6 +71,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ -z "$ARCH" ]]; then
+    case "$(uname -m)" in
+        x86_64) ARCH="amd64" ;;
+        aarch64|arm64) ARCH="arm64" ;;
+        *) echo "Unsupported host arch: $(uname -m). Use --arch." >&2; exit 2 ;;
+    esac
+fi
+
 case "$ARCH" in
     amd64|arm64) ;;
     *) echo "Unsupported arch: $ARCH (expected amd64|arm64)" >&2; exit 2 ;;
@@ -72,8 +90,9 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-FROZEN_ROOT="$ROOT/frozen-all"
+FROZEN_ROOT="${FROZEN_ROOT:-$ROOT/frozen-all}"
 mkdir -p "$FROZEN_ROOT"
+FROZEN_ROOT="$(cd "$FROZEN_ROOT" && pwd -P)"
 
 # Keep names aligned with CI workflow naming.
 ENVS=(
@@ -93,12 +112,32 @@ else
     ENVS+=("arch-latest|archlinux:latest")
 fi
 
+if [[ -n "$ENV_FILTER" ]]; then
+    FILTERED_ENVS=()
+    for pair in "${ENVS[@]}"; do
+        if [[ "${pair%%|*}" == "$ENV_FILTER" ]]; then
+            FILTERED_ENVS+=("$pair")
+        fi
+    done
+    if [[ "${#FILTERED_ENVS[@]}" -eq 0 ]]; then
+        echo "Unknown environment: $ENV_FILTER" >&2
+        printf 'Available:' >&2
+        for pair in "${ENVS[@]}"; do
+            printf ' %s' "${pair%%|*}" >&2
+        done
+        printf '\n' >&2
+        exit 2
+    fi
+    ENVS=("${FILTERED_ENVS[@]}")
+fi
+
 run_in_image() {
     local image="$1"
     local cmd="$2"
 
     docker run --rm --platform "linux/$ARCH" \
         -v "$ROOT":/work -w /work \
+        -v "$FROZEN_ROOT":/frozen-all \
         "$image" \
         sh -lc "$cmd"
 }
@@ -108,7 +147,7 @@ if [[ "$DO_BUILD" -eq 1 ]]; then
     for pair in "${ENVS[@]}"; do
         name="${pair%%|*}"
         image="${pair##*|}"
-        out_dir="/work/frozen-all/frozen-${name}-${ARCH}"
+        out_dir="/frozen-all/frozen-${name}-${ARCH}"
         host_out="$FROZEN_ROOT/frozen-${name}-${ARCH}"
 
         rm -rf "$host_out"
@@ -125,7 +164,7 @@ if [[ "$DO_RUN" -eq 1 ]]; then
         name="${pair%%|*}"
         image="${pair##*|}"
         echo "[cross-matrix] run on $image against all frozen-*-${ARCH}"
-        run_in_image "$image" "FROZEN_DIR=/work/frozen-all FROZEN_GLOB='/work/frozen-all/frozen-*-${ARCH}' sh /work/tests/cross-run.sh"
+        run_in_image "$image" "FROZEN_DIR=/frozen-all FROZEN_GLOB='/frozen-all/frozen-*-${ARCH}' sh /work/tests/cross-run.sh"
     done
 fi
 

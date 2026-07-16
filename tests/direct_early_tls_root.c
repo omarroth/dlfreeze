@@ -16,13 +16,21 @@ static int direct_early_local_implementation(void)
     return 73;
 }
 
+static int direct_early_premature_implementation(void)
+{
+    return 74;
+}
+
 static int (*direct_early_local_resolver(void))(void)
 {
-    /* Native rtld invokes this while servicing dlopen, after main has set
-     * the readiness marker.  Running it while merely reserving startup TLS
-     * would expose promoted objects before their semantic load point. */
-    record_event(direct_early_ifunc_ready ? 'I' : 'X');
-    return direct_early_local_implementation;
+    /* IFUNC resolvers must not call through the PLT: some native rtlds have
+     * not made those call sites usable yet, and may invoke a resolver more
+     * than once.  Select an implementation using already-resolved data
+     * instead.  main() checks for 73 after dlopen, so resolving this while a
+     * dormant object is merely being reserved still fails deterministically. */
+    return direct_early_ifunc_ready
+        ? direct_early_local_implementation
+        : direct_early_premature_implementation;
 }
 
 static int direct_early_local_ifunc(void)

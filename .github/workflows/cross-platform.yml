@@ -15,7 +15,7 @@ jobs:
   # ── Build dlfreeze, run test suite, freeze cross-test programs ────
   build-and-test:
     name: build (${{ matrix.env }}, ${{ matrix.arch }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -30,7 +30,7 @@ jobs:
           - { env: fedora-41,     image: "fedora:41",         arch: amd64 }
           - { env: fedora-rawhide,image: "fedora:rawhide",    arch: amd64 }
           - { env: arch-latest,   image: "archlinux:latest",  arch: amd64 }
-          # aarch64 (via QEMU)
+          # aarch64 (native GitHub-hosted arm64 runner)
           - { env: ubuntu-18.04,  image: "ubuntu:18.04",      arch: arm64 }
           - { env: ubuntu-20.04,  image: "ubuntu:20.04",      arch: arm64 }
           - { env: ubuntu-24.04,  image: "ubuntu:24.04",      arch: arm64 }
@@ -44,10 +44,6 @@ jobs:
           - { env: arch-latest,   image: "menci/archlinuxarm:base", arch: arm64 }
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-        if: matrix.arch == 'arm64'
 
       - name: Build, test, and freeze
         run: |
@@ -66,7 +62,8 @@ jobs:
   cross-run:
     name: run (${{ matrix.env }}, ${{ matrix.arch }})
     needs: build-and-test
-    runs-on: ubuntu-latest
+    if: ${{ !cancelled() }}
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -93,10 +90,6 @@ jobs:
           - { env: arch-latest,   image: "menci/archlinuxarm:base", arch: arm64 }
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-        if: matrix.arch == 'arm64'
 
       - name: Download frozen artifacts
         uses: actions/download-artifact@v4

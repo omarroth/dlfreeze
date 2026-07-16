@@ -59,6 +59,25 @@ typedef Elf64_Xword Elf64_Relr;
 #define MAP_FIXED_NOREPLACE 0x100000
 #endif
 
+#ifndef MFD_ALLOW_SEALING
+#define MFD_ALLOW_SEALING 0x0002U
+#endif
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
+#endif
+#ifndef O_PATH
+#define O_PATH 010000000
+#endif
+#ifndef F_ADD_SEALS
+#define F_ADD_SEALS 1033
+#endif
+#ifndef F_SEAL_SEAL
+#define F_SEAL_SEAL   0x0001
+#define F_SEAL_SHRINK 0x0002
+#define F_SEAL_GROW   0x0004
+#define F_SEAL_WRITE  0x0008
+#endif
+
 #ifndef DF_1_NOOPEN
 #define DF_1_NOOPEN 0x00000040
 #endif
@@ -4268,14 +4287,27 @@ static int aarch64_musl_gpr_writes(uint32_t insn, uint32_t *writes_out)
             writes |= 1u << record_reg;                                     \
     } while (0)
 
-    /* Direct and conditional branches, compare-and-branch, and barriers. */
+    /* Direct and conditional branches, compare-and-branch, barriers, and
+     * exact branch-target-identification landing pads do not write a GPR. */
     if ((insn & 0xfc000000u) == 0x14000000u ||
         (insn & 0xff000010u) == 0x54000000u ||
         (insn & 0x7e000000u) == 0x34000000u ||
         (insn & 0x7e000000u) == 0x36000000u ||
         (insn & 0xfffffc1fu) == 0xd65f0000u ||
-        insn == 0xd503201fu || insn == 0xd5033bbfu) {
+        insn == 0xd503201fu || insn == 0xd5033bbfu ||
+        insn == 0xd503241fu || insn == 0xd503245fu ||
+        insn == 0xd503249fu || insn == 0xd50324dfu) {
         *writes_out = 0;
+        return 1;
+    }
+
+    /* The stack pointer-authentication prologue/epilogue forms update LR.
+     * Classify only their exact encodings so an unknown HINT remains a
+     * fail-closed provenance boundary. */
+    if (insn == 0xd503233fu || insn == 0xd503237fu ||
+        insn == 0xd50323bfu || insn == 0xd50323ffu) {
+        RECORD_WRITE(30);
+        *writes_out = writes;
         return 1;
     }
 
@@ -6429,6 +6461,13 @@ static inline void sync_glibc_errno_value(int err)
         *g_real_errno_location() = err;
 }
 
+static inline int loader_errno_value(void)
+{
+    if (g_real_errno_location)
+        return *g_real_errno_location();
+    return errno;
+}
+
 static inline void set_loader_errno(int err)
 {
     errno = err;
@@ -6490,7 +6529,7 @@ static uint32_t vfs_hash(const char *s)
 static void vfs_init_dirs(void);
 static int vfs_dir_exists(const char *path);
 static const struct vfs_entry *vfs_lookup(const char *path);
-static int frozen_dlopen_find(const char *path);
+static int frozen_elf_find(const char *path);
 
 /* ---- VFS sealing ----------------------------------------------------- */
 /*
@@ -6513,7 +6552,7 @@ static int vfs_path_is_sealed_miss(const char *path)
         return 0;
     if (vfs_lookup(path)) return 0;
     if (vfs_dir_exists(path)) return 0;
-    if (frozen_dlopen_find(path) >= 0) return 0;
+    if (frozen_elf_find(path) >= 0) return 0;
     /* Compute parent directory length (offset of last '/'). */
     const char *slash = NULL;
     for (const char *p = path; *p; p++)
@@ -6628,6 +6667,12 @@ static char g_vfs_library_path[16384];
 static char **g_vfs_child_envp;
 static int g_vfs_overlay_attempted;
 static int g_vfs_overlay_ready;
+
+/* The private overlay intentionally has no process-local exit cleanup.
+ * LIBRARY_PATH is inherited across fork/exec, and a child may outlive the
+ * process that created it; deleting the tree from either process would race
+ * legitimate linker reads in the other.  The randomized 0700 tree is left
+ * to the host's normal temporary-directory lifetime policy. */
 
 static uint32_t vfs_hash_n(const char *s, int n)
 {
@@ -6753,11 +6798,13 @@ static int vfs_affects_library_path(const char *path)
 
     if (strcmp(base, ".dir") == 0)
         return 0;
-    /* Materialize linker input files consumed by child processes, which
-     * cannot see this process's in-memory VFS.  Runtime shared objects are
-     * served by the loader and do not need a second on-disk copy. */
+    /* Materialize linker inputs consumed by child processes, which cannot
+     * see this process's in-memory VFS.  A .so may be a textual linker
+     * script rather than an ELF shared object; traced ELF objects themselves
+     * live in the manifest instead of the data VFS. */
     return vfs_path_has_suffix(base, ".a") ||
-           vfs_path_has_suffix(base, ".o");
+           vfs_path_has_suffix(base, ".o") ||
+           vfs_path_has_suffix(base, ".so");
 }
 
 static int vfs_append_decimal(char *buf, size_t buf_size,
@@ -6786,25 +6833,88 @@ static int vfs_append_decimal(char *buf, size_t buf_size,
     return 0;
 }
 
+static int vfs_append_hex64(char *buf, size_t buf_size,
+                            size_t *pos, uint64_t value)
+{
+    static const char digits[] = "0123456789abcdef";
+
+    if (*pos + 17 > buf_size)
+        return -1;
+    for (int shift = 60; shift >= 0; shift -= 4)
+        buf[(*pos)++] = digits[(value >> shift) & 0xfu];
+    buf[*pos] = '\0';
+    return 0;
+}
+
+static int vfs_random_nonce(uint64_t *nonce)
+{
+#ifdef SYS_getrandom
+    size_t done = 0;
+    unsigned char *dst = (unsigned char *)nonce;
+
+    while (done < sizeof(*nonce)) {
+        long rc = VFS_SYSCALL(SYS_getrandom, dst + done,
+                              sizeof(*nonce) - done, 0);
+
+        if (rc < 0 && loader_errno_value() == EINTR)
+            continue;
+        if (rc <= 0)
+            return -1;
+        done += (size_t)rc;
+    }
+    return 0;
+#else
+    (void)nonce;
+    return -1;
+#endif
+}
+
 static int vfs_init_overlay_root(void)
 {
     const char prefix[] = "/tmp/dlfreeze-vfs-";
-    size_t pos = 0;
 
     if (g_vfs_overlay_root[0])
         return 0;
 
     if (sizeof(prefix) > sizeof(g_vfs_overlay_root))
         return -1;
-    memcpy(g_vfs_overlay_root, prefix, sizeof(prefix) - 1);
-    pos = sizeof(prefix) - 1;
-    if (vfs_append_decimal(g_vfs_overlay_root, sizeof(g_vfs_overlay_root),
-                           &pos, (unsigned long)syscall(SYS_getpid)) < 0)
-        return -1;
-    if (VFS_SYSCALL(SYS_mkdirat, AT_FDCWD, g_vfs_overlay_root, 0700) < 0 &&
-        errno != EEXIST)
-        return -1;
-    return 0;
+
+    for (int attempt = 0; attempt < 8; attempt++) {
+        uint64_t nonce;
+        size_t pos = sizeof(prefix) - 1;
+
+        if (vfs_random_nonce(&nonce) < 0)
+            break;
+        memcpy(g_vfs_overlay_root, prefix, sizeof(prefix) - 1);
+        if (vfs_append_decimal(g_vfs_overlay_root,
+                               sizeof(g_vfs_overlay_root), &pos,
+                               (unsigned long)syscall(SYS_getpid)) < 0 ||
+            pos + 2 > sizeof(g_vfs_overlay_root))
+            break;
+        g_vfs_overlay_root[pos++] = '-';
+        g_vfs_overlay_root[pos] = '\0';
+        if (vfs_append_hex64(g_vfs_overlay_root,
+                             sizeof(g_vfs_overlay_root), &pos, nonce) < 0)
+            break;
+        if (VFS_SYSCALL(SYS_mkdirat, AT_FDCWD,
+                        g_vfs_overlay_root, 0700) == 0)
+            return 0;
+        if (loader_errno_value() != EEXIST)
+            break;
+    }
+
+    g_vfs_overlay_root[0] = '\0';
+    return -1;
+}
+
+static int vfs_overlay_source_path_safe(const char *path)
+{
+    if (!path || path[0] != '/')
+        return 0;
+    for (const char *p = path; *p; p++)
+        if (*p == ':' || *p == '\n' || *p == '\r')
+            return 0;
+    return 1;
 }
 
 static int vfs_make_overlay_path(const char *path, char *out, size_t out_size)
@@ -6812,6 +6922,8 @@ static int vfs_make_overlay_path(const char *path, char *out, size_t out_size)
     size_t root_len = strlen(g_vfs_overlay_root);
     size_t path_len = strlen(path);
 
+    if (!vfs_overlay_source_path_safe(path))
+        return -1;
     if (root_len + path_len + 1 > out_size)
         return -1;
     memcpy(out, g_vfs_overlay_root, root_len);
@@ -6827,7 +6939,8 @@ static int vfs_mkdir_parents(char *path)
         if (*p != '/')
             continue;
         *p = '\0';
-        if (VFS_SYSCALL(SYS_mkdirat, AT_FDCWD, path, 0700) < 0 && errno != EEXIST) {
+        if (VFS_SYSCALL(SYS_mkdirat, AT_FDCWD, path, 0700) < 0 &&
+            loader_errno_value() != EEXIST) {
             *p = '/';
             return -1;
         }
@@ -6920,7 +7033,8 @@ static int vfs_prepare_library_overlay(void)
             continue;
 
         fd = (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, overlay_path,
-                              O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+                              O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW |
+                                  O_CLOEXEC,
                               0644);
         if (fd < 0)
             continue;
@@ -6930,6 +7044,8 @@ static int vfs_prepare_library_overlay(void)
         while (rem > 0) {
             long w = VFS_SYSCALL(SYS_write, fd, p, rem);
 
+            if (w < 0 && loader_errno_value() == EINTR)
+                continue;
             if (w <= 0) {
                 VFS_SYSCALL(SYS_close, fd);
                 fd = -1;
@@ -7546,29 +7662,119 @@ static int vfs_dirfd(void *dirp)
     return h->fd_compat;
 }
 
-/* Helper: create a memfd serving embedded VFS data for a file entry */
-static int vfs_serve_memfd(const struct vfs_entry *ve, const char *path);
-static int frozen_dlopen_serve_memfd(const char *path);
+/* Helper: create a sealed descriptor serving an embedded regular file. */
+static int vfs_serve_memfd(const struct vfs_entry *ve, const char *path,
+                           int flags);
+static int frozen_elf_serve_memfd(const char *path, int flags);
 
-static int vfs_serve_memfd(const struct vfs_entry *ve, const char *path)
+static int vfs_seal_memfd(int fd)
 {
-    int fd = (int)VFS_SYSCALL(SYS_memfd_create, "dlfrz-vfs", 0);
-    if (fd < 0) return -1;
-    const uint8_t *p = ve->data;
-    uint64_t rem = ve->size;
+    const int seals = F_SEAL_SEAL | F_SEAL_SHRINK |
+                      F_SEAL_GROW | F_SEAL_WRITE;
+
+    if (VFS_SYSCALL(SYS_fcntl, fd, F_ADD_SEALS, seals) < 0) {
+        int saved_errno = loader_errno_value();
+
+        VFS_SYSCALL(SYS_close, fd);
+        set_loader_errno(saved_errno);
+        return -1;
+    }
+    return 0;
+}
+
+static int vfs_reopen_memfd(int fd, int flags)
+{
+    const char prefix[] = "/proc/self/fd/";
+    char path[64];
+    size_t pos = sizeof(prefix) - 1;
+    int reopen_flags;
+    int result;
+    int saved_errno;
+
+    memcpy(path, prefix, sizeof(prefix) - 1);
+    if (vfs_append_decimal(path, sizeof(path), &pos,
+                           (unsigned long)fd) < 0) {
+        VFS_SYSCALL(SYS_close, fd);
+        set_loader_errno(ENAMETOOLONG);
+        return -1;
+    }
+
+    reopen_flags = (flags & O_PATH) ? O_PATH : O_RDONLY;
+    reopen_flags |= flags & (O_CLOEXEC | O_NONBLOCK);
+    result = (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, path,
+                              reopen_flags, 0);
+    if (result < 0) {
+        saved_errno = loader_errno_value();
+        VFS_SYSCALL(SYS_close, fd);
+        set_loader_errno(saved_errno);
+        return -1;
+    }
+    VFS_SYSCALL(SYS_close, fd);
+    return result;
+}
+
+static int vfs_serve_bytes(const char *name, const uint8_t *data,
+                           uint64_t size, int flags, mode_t mode)
+{
+    int fd = (int)VFS_SYSCALL(SYS_memfd_create, name,
+                              MFD_ALLOW_SEALING | MFD_CLOEXEC);
+    const uint8_t *p = data;
+    uint64_t rem = size;
+
+    if (fd < 0)
+        return -1;
     while (rem > 0) {
         long w = VFS_SYSCALL(SYS_write, fd, p, rem);
-        if (w <= 0) { VFS_SYSCALL(SYS_close, fd); return -1; }
+
+        if (w < 0 && loader_errno_value() == EINTR)
+            continue;
+        if (w <= 0) {
+            int saved_errno = w < 0 ? loader_errno_value() : EIO;
+
+            VFS_SYSCALL(SYS_close, fd);
+            set_loader_errno(saved_errno);
+            return -1;
+        }
         p   += w;
-        rem -= w;
+        rem -= (uint64_t)w;
     }
-    VFS_SYSCALL(SYS_lseek, fd, (off_t)0, 0 /* SEEK_SET */);
-    if (g_debug) {
+    if (VFS_SYSCALL(SYS_fchmod, fd, mode) < 0) {
+        int saved_errno = loader_errno_value();
+
+        VFS_SYSCALL(SYS_close, fd);
+        set_loader_errno(saved_errno);
+        return -1;
+    }
+    if (vfs_seal_memfd(fd) < 0)
+        return -1;
+    return vfs_reopen_memfd(fd, flags);
+}
+
+static int vfs_serve_memfd(const struct vfs_entry *ve, const char *path,
+                           int flags)
+{
+    int fd = vfs_serve_bytes("dlfrz-vfs", ve->data, ve->size,
+                             flags, 0444);
+
+    if (fd >= 0 && g_debug) {
         ldr_msg("vfs: serving ");
         ldr_msg(path);
         ldr_msg("\n");
     }
     return fd;
+}
+
+static int vfs_regular_open_error(int flags)
+{
+    if (flags & O_DIRECTORY)
+        return ENOTDIR;
+    if (flags & O_PATH)
+        return 0;
+    if ((flags & O_CREAT) && (flags & O_EXCL))
+        return EEXIST;
+    if ((flags & O_ACCMODE) != O_RDONLY || (flags & O_TRUNC))
+        return EROFS;
+    return 0;
 }
 
 static int vfs_open(const char *path, int flags, int mode)
@@ -7601,14 +7807,26 @@ static int vfs_open(const char *path, int flags, int mode)
             return -1;
         }
         if (ve && !vfs_is_virtual_entry(ve)) {
-            if (is_write) {
-                vfs_dbg_op("open", path, "write-refused");
-                set_loader_errno(EROFS);
+            int open_error = vfs_regular_open_error(flags);
+
+            if (open_error) {
+                vfs_dbg_op("open", path, "regular-file-refused");
+                set_loader_errno(open_error);
                 return -1;
             }
             vfs_dbg_op("open", path, "file");
-            int fd = vfs_serve_memfd(ve, path);
-            if (fd >= 0) return fd;
+            return vfs_serve_memfd(ve, path, flags);
+        }
+        if (frozen_elf_find(path) >= 0) {
+            int open_error = vfs_regular_open_error(flags);
+
+            if (open_error) {
+                vfs_dbg_op("open", path, "elf-refused");
+                set_loader_errno(open_error);
+                return -1;
+            }
+            vfs_dbg_op("open", path, "elf");
+            return frozen_elf_serve_memfd(path, flags);
         }
         /* Sealed mount: refuse host fall-through for paths that match a
          * frozen-mount glob but were not captured.  Applies to writes too,
@@ -7620,15 +7838,7 @@ static int vfs_open(const char *path, int flags, int mode)
             return -1;
         }
         if (!is_write) {
-            int ret = (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, path, flags, mode);
-            if (ret >= 0) return ret;
-            /* Probe-open for a DLOPEN ELF before dlopen is reached. */
-            int fd = frozen_dlopen_serve_memfd(path);
-            if (fd >= 0) {
-                vfs_dbg_op("open", path, "dlopen-elf");
-                return fd;
-            }
-            return ret;
+            return (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, path, flags, mode);
         }
     }
     return (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, path, flags, mode);
@@ -7638,9 +7848,6 @@ static int vfs_openat(int dirfd, const char *path, int flags, int mode)
 {
     char resolved[PATH_MAX];
     const char *lookup_path = path;
-    int real_fd;
-    (void)real_fd;
-
     if (path && path[0] != '/' &&
         resolve_vfs_path_at(dirfd, path, resolved, sizeof(resolved)))
         lookup_path = resolved;
@@ -7670,14 +7877,27 @@ static int vfs_openat(int dirfd, const char *path, int flags, int mode)
             return -1;
         }
         if (ve && !vfs_is_virtual_entry(ve)) {
-            if (is_write) {
-                vfs_dbg_op("openat", lookup_path, "write-refused");
-                set_loader_errno(EROFS);
+            int open_error = vfs_regular_open_error(flags);
+
+            if (open_error) {
+                vfs_dbg_op("openat", lookup_path,
+                           "regular-file-refused");
+                set_loader_errno(open_error);
                 return -1;
             }
             vfs_dbg_op("openat", lookup_path, "file");
-            int fd = vfs_serve_memfd(ve, lookup_path);
-            if (fd >= 0) return fd;
+            return vfs_serve_memfd(ve, lookup_path, flags);
+        }
+        if (frozen_elf_find(lookup_path) >= 0) {
+            int open_error = vfs_regular_open_error(flags);
+
+            if (open_error) {
+                vfs_dbg_op("openat", lookup_path, "elf-refused");
+                set_loader_errno(open_error);
+                return -1;
+            }
+            vfs_dbg_op("openat", lookup_path, "elf");
+            return frozen_elf_serve_memfd(lookup_path, flags);
         }
         /* Sealed mount: refuse host fall-through for matching misses.
          * Applies to writes too so .pyc cache writes etc. don't leak. */
@@ -7687,15 +7907,7 @@ static int vfs_openat(int dirfd, const char *path, int flags, int mode)
             return -1;
         }
         if (!is_write) {
-            /* Fallback: probe-open for a DLOPEN ELF path not in VFS data */
-            int ret = (int)VFS_SYSCALL(SYS_openat, dirfd, path, flags, mode);
-            if (ret >= 0) return ret;
-            int fd = frozen_dlopen_serve_memfd(lookup_path);
-            if (fd >= 0) {
-                vfs_dbg_op("openat", lookup_path, "dlopen-elf");
-                return fd;
-            }
-            return ret;
+            return (int)VFS_SYSCALL(SYS_openat, dirfd, path, flags, mode);
         }
         vfs_dbg_op("openat", lookup_path, "syscall");
     }
@@ -7707,23 +7919,73 @@ static int vfs_openat(int dirfd, const char *path, int flags, int mode)
  * Falls through to real glibc fopen for non-VFS files. */
 static void *vfs_fopen(const char *path, const char *mode)
 {
-    if (path && path[0] == '/' && mode && mode[0] == 'r') {
+    if (path && path[0] == '/' && mode) {
+        int is_write = mode[0] != 'r' || strchr(mode, '+') != NULL;
+        int open_flags = O_RDONLY |
+            (strchr(mode, 'e') != NULL ? O_CLOEXEC : 0);
         const struct vfs_entry *ve = vfs_lookup(path);
         if (ve && vfs_is_negative_entry(ve)) {
             vfs_dbg_op("fopen", path, "negative");
             set_loader_errno(ENOENT);
             return (void *)0;
         }
+        if (ve && is_write) {
+            vfs_dbg_op("fopen", path, "write-refused");
+            set_loader_errno(EROFS);
+            return (void *)0;
+        }
         if (ve && !vfs_is_virtual_entry(ve)) {
+            int fd;
+            void *stream;
+
             vfs_dbg_op("fopen", path, "file");
-            int fd = vfs_serve_memfd(ve, path);
-            if (fd >= 0 && g_real_fdopen)
-                return g_real_fdopen(fd, mode);
-            if (fd >= 0) VFS_SYSCALL(SYS_close, fd);
+            fd = vfs_serve_memfd(ve, path, open_flags);
+            if (fd < 0)
+                return (void *)0;
+            if (!g_real_fdopen) {
+                VFS_SYSCALL(SYS_close, fd);
+                set_loader_errno(ENOSYS);
+                return (void *)0;
+            }
+            stream = g_real_fdopen(fd, mode);
+            if (!stream) {
+                int saved_errno = loader_errno_value();
+
+                VFS_SYSCALL(SYS_close, fd);
+                set_loader_errno(saved_errno);
+            }
+            return stream;
+        }
+        if (frozen_elf_find(path) >= 0) {
+            int fd;
+            void *stream;
+
+            if (is_write) {
+                vfs_dbg_op("fopen", path, "elf-write-refused");
+                set_loader_errno(EROFS);
+                return (void *)0;
+            }
+            vfs_dbg_op("fopen", path, "elf");
+            fd = frozen_elf_serve_memfd(path, open_flags);
+            if (fd < 0)
+                return (void *)0;
+            if (!g_real_fdopen) {
+                VFS_SYSCALL(SYS_close, fd);
+                set_loader_errno(ENOSYS);
+                return (void *)0;
+            }
+            stream = g_real_fdopen(fd, mode);
+            if (!stream) {
+                int saved_errno = loader_errno_value();
+
+                VFS_SYSCALL(SYS_close, fd);
+                set_loader_errno(saved_errno);
+            }
+            return stream;
         }
         if (vfs_path_is_sealed_miss(path)) {
             vfs_seal_log("fopen", path);
-            set_loader_errno(ENOENT);
+            set_loader_errno(is_write ? EROFS : ENOENT);
             return (void *)0;
         }
         vfs_dbg_op("fopen", path, "syscall");
@@ -7740,20 +8002,21 @@ static void *vfs_fopen(const char *path, const char *mode)
 }
 
 /*
- * Helpers to make VFS stat/open/access wrappers aware of DLOPEN-captured ELFs.
- * When a frozen binary is run on a different distro, the original absolute
- * paths for extension modules/plugins may not exist on the host.  Without
- * these helpers, openat/stat probes return ENOENT before dlopen is reached.
+ * Make VFS stat/open/access wrappers aware of every embedded ELF.  An ELF
+ * that is already mapped by the in-process loader is still an ordinary file
+ * from the application's point of view: compilers and in-process linkers may
+ * open libc or another startup DSO as linker input.  Serving the manifest
+ * bytes also avoids silently consulting a same-named host file.
  */
 
 /* Return the frozen ELF index for path, or -1 if not found. */
-static int frozen_dlopen_find(const char *path)
+static int frozen_elf_find(const char *path)
 {
     if (!g_frozen_metas || !g_frozen_entries || !g_frozen_strtab)
         return -1;
     for (uint32_t i = 0; i < g_frozen_num_entries; i++) {
-        if (!(g_frozen_metas[i].flags & LDR_FLAG_DLOPEN)) continue;
-        if (g_frozen_metas[i].flags & LDR_FLAG_INTERP)   continue;
+        if (g_frozen_metas[i].flags & LDR_FLAG_DATA)
+            continue;
         const char *ename = g_frozen_strtab + g_frozen_entries[i].name_offset;
         if (strcmp(ename, path) == 0)
             return (int)i;
@@ -7761,36 +8024,27 @@ static int frozen_dlopen_find(const char *path)
     return -1;
 }
 
-/* Returns file size >= 0 if path is a frozen DLOPEN ELF, else -1. */
-static int64_t frozen_dlopen_elf_size(const char *path)
+/* Returns file size >= 0 if path is a frozen ELF, else -1. */
+static int64_t frozen_elf_size(const char *path)
 {
-    int idx = frozen_dlopen_find(path);
+    int idx = frozen_elf_find(path);
     if (idx < 0) return -1;
     return (int64_t)g_frozen_entries[idx].data_size;
 }
 
-/* Open a frozen DLOPEN ELF as a memfd so probe-opens succeed even when the
- * original path doesn't exist on the host filesystem. */
-static int frozen_dlopen_serve_memfd(const char *path)
+/* Open a frozen ELF as a memfd so readers see the captured object even when
+ * the original path is absent or names a different host file. */
+static int frozen_elf_serve_memfd(const char *path, int flags)
 {
-    int idx = frozen_dlopen_find(path);
+    int idx = frozen_elf_find(path);
     if (idx < 0) return -1;
     const uint8_t *data = g_frozen_mem +
         (g_frozen_entries[idx].data_offset - g_frozen_mem_foff);
     uint64_t size = g_frozen_entries[idx].data_size;
-    int fd = (int)VFS_SYSCALL(SYS_memfd_create, "dlfrz-elf", 0);
-    if (fd < 0) return -1;
-    const uint8_t *p = data;
-    uint64_t rem = size;
-    while (rem > 0) {
-        long w = VFS_SYSCALL(SYS_write, fd, p, rem);
-        if (w <= 0) { VFS_SYSCALL(SYS_close, fd); return -1; }
-        p   += w;
-        rem -= (uint64_t)w;
-    }
-    VFS_SYSCALL(SYS_lseek, fd, (off_t)0, 0 /* SEEK_SET */);
-    if (g_debug) {
-        ldr_msg("vfs: serving dlopen-elf ");
+    int fd = vfs_serve_bytes("dlfrz-elf", data, size, flags, 0555);
+
+    if (fd >= 0 && g_debug) {
+        ldr_msg("vfs: serving elf ");
         ldr_msg(path);
         ldr_msg("\n");
     }
@@ -7816,11 +8070,11 @@ static int vfs_stat(const char *path, struct stat *buf)
         if (ve && !(vfs_is_virtual_entry(ve) && vfs_is_dir_marker_path(path))) {
             vfs_dbg_op("stat", path, "file");
             /* Virtual entries have no embedded data (size=0); fall through
-             * so the real FS or frozen_dlopen_elf_size provides the correct size. */
+             * so the real FS or frozen_elf_size provides the correct size. */
             if (vfs_is_virtual_entry(ve))
                 goto vfs_stat_fallthrough;
             __builtin_memset(buf, 0, sizeof(*buf));
-            buf->st_mode  = 0100644;  /* regular file, rw-r--r-- */
+            buf->st_mode  = 0100444;  /* immutable regular file */
             buf->st_nlink = 1;
             buf->st_size  = ve->size;
             buf->st_blksize = (blksize_t)g_page_size;
@@ -7840,19 +8094,19 @@ vfs_stat_fallthrough:;
     if (path && path[0] == '/' && vfs_dir_exists(path)) {
         vfs_dbg_op("stat", path, "dir");
         __builtin_memset(buf, 0, sizeof(*buf));
-        buf->st_mode  = 040755;  /* directory, rwxr-xr-x */
+        buf->st_mode  = 040555;  /* immutable directory */
         buf->st_nlink = 2;
         buf->st_blksize = (blksize_t)g_page_size;
         return 0;
     }
-    /* Frozen DLOPEN ELFs: synthesise so we never touch the host FS
+    /* Frozen ELFs: synthesise so we never touch the host FS
      * even when a same-named .so happens to exist there. */
     if (path && path[0] == '/') {
-        int64_t elf_sz = frozen_dlopen_elf_size(path);
+        int64_t elf_sz = frozen_elf_size(path);
         if (elf_sz >= 0) {
-            vfs_dbg_op("stat", path, "dlopen-elf");
+            vfs_dbg_op("stat", path, "elf");
             __builtin_memset(buf, 0, sizeof(*buf));
-            buf->st_mode  = 0100644;
+            buf->st_mode  = 0100555;
             buf->st_nlink = 1;
             buf->st_size  = (off_t)elf_sz;
             buf->st_blksize = (blksize_t)g_page_size;
@@ -7885,7 +8139,7 @@ static int vfs_fstatat(int dirfd, const char *path, struct stat *buf, int flag)
             if (vfs_is_virtual_entry(ve))
                 goto vfs_fstatat_fallthrough;
             __builtin_memset(buf, 0, sizeof(*buf));
-            buf->st_mode  = 0100644;
+            buf->st_mode  = 0100444;
             buf->st_nlink = 1;
             buf->st_size  = ve->size;
             buf->st_blksize = (blksize_t)g_page_size;
@@ -7902,19 +8156,19 @@ vfs_fstatat_fallthrough:;
     if (lookup_path && lookup_path[0] == '/' && vfs_dir_exists(lookup_path)) {
         vfs_dbg_op("fstatat", lookup_path, "dir");
         __builtin_memset(buf, 0, sizeof(*buf));
-        buf->st_mode  = 040755;
+        buf->st_mode  = 040555;
         buf->st_nlink = 2;
         buf->st_blksize = (blksize_t)g_page_size;
         return 0;
     }
-    /* Frozen DLOPEN ELFs: synthesise so we never touch the host FS
+    /* Frozen ELFs: synthesise so we never touch the host FS
      * even when a same-named .so happens to exist there. */
     if (lookup_path && lookup_path[0] == '/') {
-        int64_t elf_sz = frozen_dlopen_elf_size(lookup_path);
+        int64_t elf_sz = frozen_elf_size(lookup_path);
         if (elf_sz >= 0) {
-            vfs_dbg_op("fstatat", lookup_path, "dlopen-elf");
+            vfs_dbg_op("fstatat", lookup_path, "elf");
             __builtin_memset(buf, 0, sizeof(*buf));
-            buf->st_mode  = 0100644;
+            buf->st_mode  = 0100555;
             buf->st_nlink = 1;
             buf->st_size  = (off_t)elf_sz;
             buf->st_blksize = (blksize_t)g_page_size;
@@ -7923,6 +8177,23 @@ vfs_fstatat_fallthrough:;
         }
     }
     return (int)VFS_SYSCALL(SYS_newfstatat, dirfd, path, buf, flag);
+}
+
+static int vfs_regular_access(int amode, int executable)
+{
+    if (amode & ~(R_OK | W_OK | X_OK)) {
+        set_loader_errno(EINVAL);
+        return -1;
+    }
+    if (amode & W_OK) {
+        set_loader_errno(EROFS);
+        return -1;
+    }
+    if ((amode & X_OK) && !executable) {
+        set_loader_errno(EACCES);
+        return -1;
+    }
+    return 0;
 }
 
 /* vfs_access / vfs_faccessat — keep existence probes inside the frozen image. */
@@ -7935,9 +8206,9 @@ static int vfs_access(const char *path, int amode)
             set_loader_errno(ENOENT);
             return -1;
         }
-        if (ve && !(vfs_is_virtual_entry(ve) && vfs_is_dir_marker_path(path))) {
+        if (ve && !vfs_is_virtual_entry(ve)) {
             vfs_dbg_op("access", path, "file");
-            return 0;
+            return vfs_regular_access(amode, 0);
         }
     }
     if (vfs_path_is_sealed_miss(path)) {
@@ -7947,12 +8218,12 @@ static int vfs_access(const char *path, int amode)
     }
     if (path && path[0] == '/' && vfs_dir_exists(path)) {
         vfs_dbg_op("access", path, "dir");
-        return 0;
+        return vfs_regular_access(amode, 1);
     }
     if (path && path[0] == '/' &&
-        frozen_dlopen_elf_size(path) >= 0) {
-        vfs_dbg_op("access", path, "dlopen-elf");
-        return 0;
+        frozen_elf_size(path) >= 0) {
+        vfs_dbg_op("access", path, "elf");
+        return vfs_regular_access(amode, 1);
     }
     return (int)VFS_SYSCALL(SYS_faccessat, AT_FDCWD, path, amode, 0);
 }
@@ -7973,9 +8244,9 @@ static int vfs_faccessat(int dirfd, const char *path, int amode, int flag)
             set_loader_errno(ENOENT);
             return -1;
         }
-        if (ve && !(vfs_is_virtual_entry(ve) && vfs_is_dir_marker_path(lookup_path))) {
+        if (ve && !vfs_is_virtual_entry(ve)) {
             vfs_dbg_op("faccessat", lookup_path, "file");
-            return 0;
+            return vfs_regular_access(amode, 0);
         }
     }
     if (vfs_path_is_sealed_miss(lookup_path)) {
@@ -7985,12 +8256,12 @@ static int vfs_faccessat(int dirfd, const char *path, int amode, int flag)
     }
     if (lookup_path && lookup_path[0] == '/' && vfs_dir_exists(lookup_path)) {
         vfs_dbg_op("faccessat", lookup_path, "dir");
-        return 0;
+        return vfs_regular_access(amode, 1);
     }
     if (lookup_path && lookup_path[0] == '/' &&
-        frozen_dlopen_elf_size(lookup_path) >= 0) {
-        vfs_dbg_op("faccessat", lookup_path, "dlopen-elf");
-        return 0;
+        frozen_elf_size(lookup_path) >= 0) {
+        vfs_dbg_op("faccessat", lookup_path, "elf");
+        return vfs_regular_access(amode, 1);
     }
     return (int)VFS_SYSCALL(SYS_faccessat, dirfd, path, amode, flag);
 }
@@ -8034,7 +8305,7 @@ static char *vfs_realpath(const char *path, char *resolved)
 
         if ((ve && !vfs_is_negative_entry(ve)) ||
             vfs_dir_exists(path) ||
-            frozen_dlopen_elf_size(path) >= 0 ||
+            frozen_elf_size(path) >= 0 ||
             path_exists) {
             size_t len = strlen(path) + 1;
 

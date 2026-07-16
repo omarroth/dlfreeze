@@ -34,13 +34,8 @@
 #define DIRECT_EARLY_HAVE_IFUNC 0
 #endif
 
-#if DIRECT_EARLY_HAVE_IFUNC
-#define ROOT_A_EVENTS "IDA"
-#define ROOT_B_EVENTS "IDAIB"
-#else
 #define ROOT_A_EVENTS "DA"
 #define ROOT_B_EVENTS "DAB"
-#endif
 
 static char events[16];
 static size_t event_count;
