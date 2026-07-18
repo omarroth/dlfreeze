@@ -134,12 +134,23 @@ fi
 run_in_image() {
     local image="$1"
     local cmd="$2"
+    local host_uid host_gid
+    host_uid=$(id -u)
+    host_gid=$(id -g)
 
     docker run --rm --platform "linux/$ARCH" \
         -v "$ROOT":/work -w /work \
         -v "$FROZEN_ROOT":/frozen-all \
+        -e DLFREEZE_HOST_UID="$host_uid" \
+        -e DLFREEZE_HOST_GID="$host_gid" \
         "$image" \
-        sh -lc "$cmd"
+        sh -lc '
+            status=0
+            sh -lc "$1" || status=$?
+            chown -R "$DLFREEZE_HOST_UID:$DLFREEZE_HOST_GID" \
+                /work/build /frozen-all 2>/dev/null || true
+            exit "$status"
+        ' sh "$cmd"
 }
 
 if [[ "$DO_BUILD" -eq 1 ]]; then

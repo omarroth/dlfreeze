@@ -101,5 +101,6 @@ jobs:
         run: |
           docker run --rm --platform linux/${{ matrix.arch }} \
             -v "$PWD":/work -w /work \
+            -e DLFREEZE_REQUIRE_RUNTIME_ARTIFACTS=1 \
             ${{ matrix.image }} \
             sh /work/tests/cross-run.sh

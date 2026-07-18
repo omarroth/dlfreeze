@@ -27,6 +27,35 @@
 #include "common.h"
 #include "loader.h"
 
+/*
+ * Reserve one program-header slot for the packer to turn into the payload
+ * PT_LOAD.  Do not rely on a toolchain-provided build-id or property note:
+ * several perfectly valid static musl linkers emit neither.  The reference
+ * from main keeps this allocatable note alive under --gc-sections.
+ *
+ * The descriptor is intentionally a private marker rather than runtime
+ * metadata.  It remains covered by the bootstrap's ordinary read-only LOAD;
+ * only its PT_NOTE program header is repurposed in the frozen output.
+ */
+extern const unsigned char dlfrz_payload_note[];
+__asm__(
+#if defined(__aarch64__)
+    ".pushsection .note.dlfreeze.payload,\"a\",%note\n"
+#else
+    ".pushsection .note.dlfreeze.payload,\"a\",@note\n"
+#endif
+    ".balign 4\n"
+    ".global dlfrz_payload_note\n"
+    "dlfrz_payload_note:\n"
+    ".long 8\n"                 /* n_namesz */
+    ".long 8\n"                 /* n_descsz */
+    ".long 0x44504c44\n"        /* private note type: DPLD */
+    ".ascii \"DLFREEZE\"\n"    /* note owner */
+    ".balign 4\n"
+    ".ascii \"DLFRZPLD\"\n"    /* descriptor / packer marker */
+    ".balign 4\n"
+    ".popsection\n");
+
 /* Packer scans the binary for this sentinel and patches it. */
 static volatile struct dlfrz_loader_info g_loader_info
     __attribute__((used, section(".data")))
@@ -707,6 +736,9 @@ extern char **environ;
 
 int main(int argc, char **argv)
 {
+    /* Force a relocation from live code to the reserved payload note. */
+    __asm__ volatile("" : : "r"(dlfrz_payload_note) : "memory");
+
     /* 1. open our own executable */
     char self[PATH_MAX];
     ssize_t sl = readlink("/proc/self/exe", self, sizeof(self)-1);
@@ -1050,7 +1082,8 @@ int main(int argc, char **argv)
     int has_data_entries = 0;
 
     for (uint32_t i = 0; i < ft.num_entries; i++) {
-        if ((ent[i].flags & DLFRZ_FLAG_DATA) != 0) {
+        if ((ent[i].flags & DLFRZ_FLAG_DATA) != 0 &&
+            (ent[i].flags & DLFRZ_FLAG_DATA_NEGATIVE) == 0) {
             has_data_entries = 1;
             break;
         }
@@ -1186,7 +1219,15 @@ int main(int argc, char **argv)
         rmtree(g_tmpdir);
         return 127;
     }
-    direct_nav[0] = exe_identity[0] ? exe_identity : exe_path;
+    /* With captured data, the extracted executable and resource tree form a
+     * coherent private prefix.  Keep argv[0] inside that prefix as well: many
+     * runtimes derive their resource root from the invoked executable path.
+     * This must not depend on whether the host happens to have a byte-identical
+     * PT_INTERP, which only changes how the kernel reaches this branch.
+     * Preserve the requested identity for data-free/multicall programs. */
+    direct_nav[0] = has_data_entries
+        ? exe_path
+        : (exe_identity[0] ? exe_identity : exe_path);
     for (int i = 1; i < argc; i++)
         direct_nav[i] = argv[i];
 

@@ -119,6 +119,42 @@ if [ ! -d "$FROZEN_DIR" ]; then
     exit 1
 fi
 
+# CI may allow individual producers to omit application artifacts when that
+# exact runtime cannot be direct-loaded.  Still require the aggregate matrix
+# to retain representative strict-direct coverage on each architecture, so a
+# broad admission regression cannot turn every Python/Ruby test into a skip.
+if [ "${DLFREEZE_REQUIRE_RUNTIME_ARTIFACTS:-0}" = 1 ]; then
+    have_python=0
+    have_python_upx=0
+    have_ruby=0
+    have_ruby_upx=0
+    for src_dir in $FROZEN_GLOB; do
+        [ -d "$src_dir" ] || continue
+        if [ -f "$src_dir/python3.frozen" ] &&
+           [ -f "$src_dir/python3.expected" ]; then
+            have_python=1
+        fi
+        if [ -f "$src_dir/python3.upx.frozen" ] &&
+           [ -f "$src_dir/python3.expected" ]; then
+            have_python_upx=1
+        fi
+        if [ -f "$src_dir/ruby.frozen" ] &&
+           [ -f "$src_dir/ruby.expected" ]; then
+            have_ruby=1
+        fi
+        if [ -f "$src_dir/ruby.upx.frozen" ] &&
+           [ -f "$src_dir/ruby.expected" ]; then
+            have_ruby_upx=1
+        fi
+    done
+    if [ "$have_python" -ne 1 ] || [ "$have_python_upx" -ne 1 ] ||
+       [ "$have_ruby" -ne 1 ] || [ "$have_ruby_upx" -ne 1 ]; then
+        echo "ERROR: aggregate artifacts lack required Python/Ruby plain+UPX coverage"
+        echo "  python=$have_python python_upx=$have_python_upx ruby=$have_ruby ruby_upx=$have_ruby_upx"
+        exit 1
+    fi
+fi
+
 # ── Iterate over each source environment's frozen artifacts ────────
 for src_dir in $FROZEN_GLOB; do
     [ -d "$src_dir" ] || continue

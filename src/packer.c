@@ -1755,6 +1755,57 @@ static int prelink_objects(const char *output_path,
 }
 
 /* ---- ELF patching for UPX compatibility -------------------------- */
+static int phdr_has_payload_note(const uint8_t *image, size_t image_size,
+                                 const Elf64_Phdr *ph)
+{
+    static const unsigned char owner[] = "DLFREEZE";
+    static const unsigned char descriptor[] = "DLFRZPLD";
+    const uint32_t payload_note_type = 0x44504c44; /* DPLD */
+
+    if (ph->p_type != PT_NOTE ||
+        ph->p_offset > image_size ||
+        ph->p_filesz > image_size - (size_t)ph->p_offset)
+        return 0;
+
+    size_t pos = (size_t)ph->p_offset;
+    size_t end = pos + (size_t)ph->p_filesz;
+    while (pos <= end && end - pos >= sizeof(Elf64_Nhdr)) {
+        Elf64_Nhdr note;
+        size_t name_off, desc_off;
+
+        memcpy(&note, image + pos, sizeof(note));
+        pos += sizeof(note);
+        name_off = pos;
+        if (note.n_namesz > end - pos)
+            return 0;
+        pos += note.n_namesz;
+        if (pos > SIZE_MAX - 3)
+            return 0;
+        pos = (pos + 3) & ~(size_t)3;
+        if (pos > end)
+            return 0;
+
+        desc_off = pos;
+        if (note.n_descsz > end - pos)
+            return 0;
+        pos += note.n_descsz;
+        if (pos > SIZE_MAX - 3)
+            return 0;
+        pos = (pos + 3) & ~(size_t)3;
+        if (pos > end)
+            return 0;
+
+        if (note.n_type == payload_note_type &&
+            note.n_namesz == sizeof(owner) - 1 &&
+            note.n_descsz == sizeof(descriptor) - 1 &&
+            memcmp(image + name_off, owner, sizeof(owner) - 1) == 0 &&
+            memcmp(image + desc_off, descriptor,
+                   sizeof(descriptor) - 1) == 0)
+            return 1;
+    }
+    return 0;
+}
+
 /*
  * After writing the frozen binary (bootstrap + payload), we patch the
  * ELF headers so that:
@@ -1763,10 +1814,13 @@ static int prelink_objects(const char *output_path,
  *     and size.  This survives UPX decompression because it lives in a
  *     PT_LOAD segment.
  *
- *  2. A non-runtime PT_NOTE entry is converted into a PT_LOAD that maps the
- *     payload region.  PT_GNU_STACK is deliberately preserved so the frozen
- *     executable retains the bootstrap's non-executable-stack policy.  UPX
- *     compresses all PT_LOAD segments and restores them at runtime.
+ *  2. The bootstrap's reserved .note.dlfreeze.payload PT_NOTE entry is
+ *     converted into a PT_LOAD that maps the payload region.  This is an
+ *     explicit part of the bootstrap/packer ABI; it does not depend on a
+ *     linker happening to emit a build-id or GNU property note.  PT_GNU_STACK
+ *     is deliberately preserved so the frozen executable retains the
+ *     bootstrap's non-executable-stack policy.  UPX compresses all PT_LOAD
+ *     segments and restores them at runtime.
  *
  *  3. Section-header metadata is zeroed out (UPX strips it anyway).
  */
@@ -1785,26 +1839,62 @@ static int patch_elf_for_upx(const char *path, size_t bootstrap_sz,
     }
 
     Elf64_Ehdr *ehdr = (Elf64_Ehdr *)hdr;
+    if (bootstrap_sz < sizeof(*ehdr) ||
+        memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0 ||
+        ehdr->e_ident[EI_CLASS] != ELFCLASS64 ||
+        ehdr->e_ident[EI_DATA] != ELFDATA2LSB ||
+        ehdr->e_ident[EI_VERSION] != EV_CURRENT ||
+        ehdr->e_version != EV_CURRENT ||
+        ehdr->e_type != ET_EXEC ||
+        (ehdr->e_machine != EM_X86_64 && ehdr->e_machine != EM_AARCH64) ||
+        ehdr->e_ehsize != sizeof(Elf64_Ehdr) ||
+        ehdr->e_phentsize != sizeof(Elf64_Phdr) ||
+        ehdr->e_phnum == 0 ||
+        ehdr->e_phoff > bootstrap_sz ||
+        (size_t)ehdr->e_phnum >
+            (bootstrap_sz - (size_t)ehdr->e_phoff) / sizeof(Elf64_Phdr)) {
+        fprintf(stderr, "dlfreeze: invalid bootstrap ELF header\n");
+        free(hdr); fclose(f); return -1;
+    }
 
     /* --- Find the highest VA used by existing PT_LOAD segments --- */
+    if (total_sz < payload_off || payload_off < bootstrap_sz ||
+        (payload_off & (PAYLOAD_ALIGN - 1)) != 0) {
+        fprintf(stderr, "dlfreeze: invalid bootstrap payload layout\n");
+        free(hdr); fclose(f); return -1;
+    }
+
     uint64_t max_va = 0;
+    int found_load = 0;
     for (int i = 0; i < ehdr->e_phnum; i++) {
         Elf64_Phdr *ph = (Elf64_Phdr *)(hdr + ehdr->e_phoff + i * ehdr->e_phentsize);
         if (ph->p_type == PT_LOAD) {
+            if (ph->p_filesz > ph->p_memsz ||
+                ph->p_offset > bootstrap_sz ||
+                ph->p_filesz > bootstrap_sz - (size_t)ph->p_offset ||
+                ph->p_vaddr > UINT64_MAX - ph->p_memsz) {
+                fprintf(stderr, "dlfreeze: invalid bootstrap PT_LOAD range\n");
+                free(hdr); fclose(f); return -1;
+            }
+            found_load = 1;
             uint64_t end = ph->p_vaddr + ph->p_memsz;
             if (end > max_va) max_va = end;
         }
     }
 
     /* Payload VA: next page-aligned address after the last PT_LOAD */
+    if (!found_load || max_va > UINT64_MAX - (PAYLOAD_ALIGN - 1)) {
+        fprintf(stderr, "dlfreeze: bootstrap address space is exhausted\n");
+        free(hdr); fclose(f); return -1;
+    }
     uint64_t payload_vaddr = ALIGN_UP(max_va, PAYLOAD_ALIGN);
     size_t payload_filesz = total_sz - payload_off;
 
-    /* --- Find and repurpose a non-runtime PT_NOTE for the payload. --- */
+    /* --- Find and repurpose our reserved PT_NOTE for the payload. --- */
     int found_payload_slot = 0;
     for (int i = 0; i < ehdr->e_phnum; i++) {
         Elf64_Phdr *ph = (Elf64_Phdr *)(hdr + ehdr->e_phoff + i * ehdr->e_phentsize);
-        if (ph->p_type == PT_NOTE) {
+        if (phdr_has_payload_note(hdr, bootstrap_sz, ph)) {
             ph->p_type   = PT_LOAD;
             ph->p_flags  = PF_R;
             ph->p_offset = payload_off;
@@ -1819,9 +1909,9 @@ static int patch_elf_for_upx(const char *path, size_t bootstrap_sz,
     }
     if (!found_payload_slot) {
         fprintf(stderr,
-                "dlfreeze: warning: no spare PT_NOTE; UPX compatibility "
-                "is disabled for this output\n");
-        /* Normal EOF-based payload discovery remains fully functional. */
+                "dlfreeze: reserved payload PT_NOTE is missing from the "
+                "bootstrap\n");
+        free(hdr); fclose(f); return -1;
     }
 
     /* --- Zero section-header table if not already set by symtab --- */
@@ -1858,7 +1948,8 @@ static int patch_elf_for_upx(const char *path, size_t bootstrap_sz,
         }
     }
     if (!patched) {
-        fprintf(stderr, "dlfreeze: warning: DLFRZLDR sentinel not found\n");
+        fprintf(stderr, "dlfreeze: DLFRZLDR sentinel not found\n");
+        free(hdr); fclose(f); return -1;
     }
 
     /* --- Write modified header back --- */
@@ -2961,6 +3052,7 @@ int pack_frozen(const struct pack_options *opts)
     if (patch_elf_for_upx(opts->output_path, bootstrap_sz,
                            payload_off, total_sz) < 0) {
         fprintf(stderr, "dlfreeze: ELF patching failed\n");
+        unlink(opts->output_path);
         return -1;
     }
 

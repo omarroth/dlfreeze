@@ -985,6 +985,194 @@ C
 }
 
 # ===================================================================
+# Test 2a: the bootstrap reserves and requires an UPX payload mapping
+# ===================================================================
+test_upx_payload_mapping() {
+    echo "--- UPX payload mapping ---"
+    local src="$BUILD/upx_payload.c" bin="$BUILD/upx_payload"
+    local out="$BUILD/upx_payload.frozen" packed="$BUILD/upx_payload.upx"
+    local log="$BUILD/upx_payload.log" expect actual rc_e=0 rc_a=0
+    local bad_dir="$BUILD/upx-no-note" bad_out="$BUILD/upx_no_note.frozen"
+
+    cat > "$src" <<'C'
+#include <stdio.h>
+int main(int argc, char **argv) {
+    printf("upx-payload:%s\n", argc > 1 ? argv[1] : "missing");
+    return argc > 1 ? 0 : 9;
+}
+C
+    if ! gcc -o "$bin" "$src"; then
+        fail "UPX payload mapping" "fixture compile failed"
+        rm -f "$src" "$bin"
+        return
+    fi
+
+    rm -f "$out" "$packed" "$log"
+    if ! run_freeze "$DLFREEZE" -o "$out" "$bin" >"$log" 2>&1; then
+        fail "UPX payload mapping" "dlfreeze failed"
+    elif ! command -v upx >/dev/null 2>&1; then
+        skip "UPX payload mapping" "upx not installed"
+    elif ! upx --best -q -o "$packed" "$out" >/dev/null 2>&1; then
+        fail "UPX payload mapping" "UPX rejected frozen artifact"
+    else
+        capture_output expect "$bin" marker || rc_e=$?
+        capture_output actual "$packed" marker || rc_a=$?
+        if [ "$rc_e" -eq 0 ] && [ "$rc_a" -eq 0 ] &&
+           [ "$actual" = "$expect" ] && [ "$actual" = "upx-payload:marker" ]; then
+            pass "UPX payload mapping"
+        else
+            fail "UPX payload mapping" \
+                "output or exit code differs (exit $rc_e vs $rc_a)"
+        fi
+    fi
+
+    if ! command -v objcopy >/dev/null 2>&1; then
+        skip "missing reserved payload note is fatal" "objcopy not installed"
+    else
+        rm -rf "$bad_dir"
+        rm -f "$bad_out"
+        mkdir -p "$bad_dir"
+        cp "$DLFREEZE" "$bad_dir/dlfreeze"
+        cp "$BUILD/dlfreeze-bootstrap" "$bad_dir/dlfreeze-bootstrap"
+        if ! objcopy --remove-section=.note.dlfreeze.payload \
+                "$bad_dir/dlfreeze-bootstrap" >/dev/null 2>&1; then
+            skip "missing reserved payload note is fatal" \
+                "objcopy cannot remove the reservation"
+        elif run_freeze "$bad_dir/dlfreeze" -o "$bad_out" "$bin" \
+                >"$bad_dir/pack.log" 2>&1; then
+            fail "missing reserved payload note is fatal" \
+                "packer accepted a bootstrap without its reservation"
+        elif [ ! -e "$bad_out" ] &&
+             grep -q 'reserved payload PT_NOTE is missing' \
+                "$bad_dir/pack.log"; then
+            pass "missing reserved payload note is fatal"
+        else
+            fail "missing reserved payload note is fatal" \
+                "packer failed for an unrelated reason or left an output"
+        fi
+    fi
+
+    rm -rf "$bad_dir"
+    rm -f "$src" "$bin" "$out" "$packed" "$log" "$bad_out"
+}
+
+# ===================================================================
+# Test 2aa: extracted argv[0] shares the captured resource root
+# ===================================================================
+test_extraction_argv0_resource_root() {
+    echo "--- extraction argv[0] resource root ---"
+    local root="$BUILD/argv0-resource" src="$BUILD/argv0_resource.c"
+    local bin="$root/program" resource="$root/asset.txt"
+    local out="$BUILD/argv0_resource.frozen" log="$BUILD/argv0_resource.log"
+    local negative_out="$BUILD/argv0_negative.frozen"
+    local negative_log="$BUILD/argv0_negative.log"
+    local missing root_abs actual rc=0
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    root_abs=$(realpath "$root")
+    cat > "$src" <<'C'
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+    char path[PATH_MAX];
+    char *slash;
+    FILE *f;
+    char line[64];
+
+    if (argc == 3 && strcmp(argv[1], "--probe-missing") == 0) {
+        int fd;
+
+        errno = 0;
+        fd = open(argv[2], O_RDONLY);
+        if (fd >= 0) {
+            close(fd);
+            return 6;
+        }
+        if (errno != ENOENT)
+            return 7;
+        puts(argv[0]);
+        return 0;
+    }
+
+    if (!argv[0] || strlen(argv[0]) + sizeof("/asset.txt") > sizeof(path))
+        return 2;
+    strcpy(path, argv[0]);
+    slash = strrchr(path, '/');
+    if (!slash)
+        return 3;
+    strcpy(slash + 1, "asset.txt");
+    f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "open %s: %s\n", path, strerror(errno));
+        return 4;
+    }
+    if (!fgets(line, sizeof(line), f)) {
+        fclose(f);
+        return 5;
+    }
+    fclose(f);
+    fputs(line, stdout);
+    return 0;
+}
+C
+    if ! gcc -o "$bin" "$src"; then
+        fail "extraction argv[0] resource root" "fixture compile failed"
+        rm -rf "$root"
+        rm -f "$src"
+        return
+    fi
+    printf 'resource-ok\n' > "$resource"
+
+    if ! run_freeze "$DLFREEZE" -t -f "$root_abs/*" -o "$out" -- "$bin" \
+            >"$log" 2>&1; then
+        fail "extraction argv[0] resource root" "dlfreeze failed"
+    else
+        # The host copy must not be available when the frozen program runs;
+        # success then proves argv[0] points into the extracted private tree.
+        rm -f "$resource"
+        capture_output actual "$out" || rc=$?
+        if [ "$rc" -eq 0 ] && [ "$actual" = "resource-ok" ]; then
+            pass "extraction argv[0] resource root"
+        else
+            fail "extraction argv[0] resource root" \
+                "captured resource was not found (exit $rc, output=$actual)"
+        fi
+    fi
+
+    # Negative trace entries describe absent host paths; by themselves they
+    # must not turn the extracted program into a resource-root layout or
+    # replace the executable identity recorded by the packer.
+    missing="$root_abs/missing.txt"
+    rm -f "$negative_out" "$negative_log" "$missing"
+    if ! run_freeze env PATH="$root_abs:$PATH" "$DLFREEZE" \
+            -v -t -f "$root_abs/*" -o "$negative_out" -- program \
+            --probe-missing "$missing" >"$negative_log" 2>&1; then
+        fail "negative-only trace preserves argv[0]" "dlfreeze failed"
+    elif ! grep -Fq "$missing" "$negative_log"; then
+        fail "negative-only trace preserves argv[0]" \
+            "trace did not record the failed probe"
+    else
+        rc=0
+        capture_output actual "$negative_out" --probe-missing "$missing" || rc=$?
+        if [ "$rc" -eq 0 ] && [ "$actual" = "$root_abs/program" ]; then
+            pass "negative-only trace preserves argv[0]"
+        else
+            fail "negative-only trace preserves argv[0]" \
+                "identity changed (exit $rc, output=$actual)"
+        fi
+    fi
+
+    rm -rf "$root"
+    rm -f "$src" "$out" "$log" "$negative_out" "$negative_log"
+}
+
+# ===================================================================
 # Test 2b: direct-load never retries after application handoff
 # ===================================================================
 test_direct_handoff_once() {
@@ -6905,6 +7093,8 @@ test_glibc_layout_gate
 test_glibc_stack_end_direct
 test_glibc_private_exception_direct
 test_exit_code
+test_upx_payload_mapping
+test_extraction_argv0_resource_root
 test_direct_handoff_once
 test_direct_signal_forwarding
 test_direct_pty_interaction

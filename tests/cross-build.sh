@@ -31,6 +31,148 @@ run_suite() {
     run_with_timeout_seconds "$TEST_SUITE_TIMEOUT" "$@"
 }
 
+verify_frozen_artifact() {
+    verify_artifact=$1
+    verify_expected_rc=$2
+    verify_expected_file=$3
+    verify_output_mode=$4
+    shift 4
+
+    verify_output=$(mktemp)
+    verify_stderr=$(mktemp)
+    verify_rc=0
+    case "$verify_output_mode" in
+        stdout)
+            run_with_timeout_seconds "$TEST_RUN_TIMEOUT" \
+                env DLFREEZE_NO_FORK=1 "$verify_artifact" "$@" \
+                >"$verify_output" 2>"$verify_stderr" || verify_rc=$?
+            ;;
+        combined)
+            run_with_timeout_seconds "$TEST_RUN_TIMEOUT" \
+                env DLFREEZE_NO_FORK=1 "$verify_artifact" "$@" \
+                >"$verify_output" 2>&1 || verify_rc=$?
+            ;;
+        *)
+            echo "ERROR: unknown smoke-test output mode: $verify_output_mode" >&2
+            rm -f "$verify_output" "$verify_stderr"
+            return 1
+            ;;
+    esac
+
+    if [ "$verify_rc" -ne "$verify_expected_rc" ] ||
+       { [ "$verify_expected_file" != - ] &&
+         ! cmp -s "$verify_expected_file" "$verify_output"; }; then
+        echo "ERROR: artifact smoke test failed: $verify_artifact" >&2
+        echo "  expected exit: $verify_expected_rc" >&2
+        echo "  actual exit:   $verify_rc" >&2
+        if [ "$verify_expected_file" != - ]; then
+            echo "  expected output:" >&2
+            sed -n '1,40p' "$verify_expected_file" >&2
+            echo "  actual output:" >&2
+            sed -n '1,40p' "$verify_output" >&2
+        fi
+        if [ -s "$verify_stderr" ]; then
+            echo "  actual stderr:" >&2
+            sed -n '1,40p' "$verify_stderr" >&2
+        fi
+        rm -f "$verify_output" "$verify_stderr"
+        return 1
+    fi
+
+    rm -f "$verify_output" "$verify_stderr"
+    return 0
+}
+
+# Return 0 when a compressed artifact was created and smoke-tested, 1 when
+# UPX cannot compress this ELF (best-effort coverage), and 2 when UPX produced
+# an executable that does not preserve the source artifact's behavior.
+make_upx_artifact() {
+    upx_source=$1
+    upx_output=$2
+    upx_label=$3
+    upx_expected_rc=$4
+    upx_expected_file=$5
+    upx_output_mode=$6
+    shift 6
+
+    rm -f "$upx_output"
+    if ! upx --best -o "$upx_output" "$upx_source" 2>/dev/null; then
+        echo "UPX: cannot compress $upx_label (skipping)"
+        rm -f "$upx_output"
+        return 1
+    fi
+    chmod +x "$upx_output"
+    if ! verify_frozen_artifact "$upx_output" "$upx_expected_rc" \
+            "$upx_expected_file" "$upx_output_mode" "$@"; then
+        rm -f "$upx_output"
+        return 2
+    fi
+    return 0
+}
+
+# A coarse image probe cannot certify an individual runtime.  Capture the
+# final pack log and footer so a Python/Ruby artifact is published only when
+# that exact executable received direct-loader metadata.  Extraction mode
+# cannot generically virtualize arbitrary captured absolute paths.
+freeze_cross_direct_data_artifact() {
+    direct_label=$1
+    direct_output=$2
+    shift 2
+    direct_log="${direct_output}.pack.log"
+
+    rm -f "$direct_output" "$direct_log"
+    if ! run_freeze /work/build/dlfreeze -v -d -o "$direct_output" "$@" \
+            >"$direct_log" 2>&1; then
+        echo "ERROR: failed to freeze $direct_label" >&2
+        sed -n '1,160p' "$direct_log" >&2
+        rm -f "$direct_output" "$direct_log"
+        return 1
+    fi
+
+    direct_size=$(stat -c %s "$direct_output" 2>/dev/null || true)
+    direct_magic=
+    direct_meta=
+    if [ -n "$direct_size" ] && [ "$direct_size" -ge 64 ] 2>/dev/null; then
+        direct_magic=$(od -An -tx1 -j $((direct_size - 64)) -N8 \
+            "$direct_output" 2>/dev/null | tr -d '[:space:]')
+        direct_meta=$(od -An -tu8 -j $((direct_size - 24)) -N8 \
+            "$direct_output" 2>/dev/null | tr -d '[:space:]')
+    fi
+
+    direct_confirmed=0
+    if grep -Eq \
+            '^[[:space:]]*mode[[:space:]]*:[[:space:]]*direct-load \(in-process loader\)[[:space:]]*$' \
+            "$direct_log"; then
+        direct_confirmed=1
+    fi
+    direct_reason=$(grep -Eom1 \
+        'dlfreeze: warning: direct-load is unavailable for runtime .*creating an extraction-mode binary' \
+        "$direct_log" || true)
+
+    if [ "$direct_confirmed" -eq 1 ] &&
+       [ -z "$direct_reason" ] &&
+       [ "$direct_magic" = 444c465245455a00 ] &&
+       [ -n "$direct_meta" ] && [ "$direct_meta" != 0 ]; then
+        cat "$direct_log"
+        rm -f "$direct_log"
+        chmod +x "$direct_output"
+        return 0
+    fi
+
+    if [ "$direct_confirmed" -eq 0 ] && [ -n "$direct_reason" ] &&
+       [ "$direct_magic" = 444c465245455a00 ] &&
+       [ "$direct_meta" = 0 ]; then
+        echo "SKIP: $direct_label — $direct_reason"
+        rm -f "$direct_output" "$direct_log"
+        return 77
+    fi
+
+    echo "ERROR: $direct_label packer output did not unambiguously contain valid direct metadata" >&2
+    sed -n '1,160p' "$direct_log" >&2
+    rm -f "$direct_output" "$direct_log"
+    return 1
+}
+
 distro_name() {
     if [ -f /etc/os-release ]; then
         # shellcheck source=/dev/null
@@ -388,13 +530,25 @@ chmod +x "$OUTDIR/exitcode.frozen"
 
 # 3. UPX-compressed variants (best effort)
 if command -v upx >/dev/null 2>&1; then
-    for f in "$OUTDIR"/*.frozen; do
-        base=$(basename "$f" .frozen)
-        rm -f "$OUTDIR/${base}.upx.frozen"
-        if upx --best -o "$OUTDIR/${base}.upx.frozen" "$f" 2>/dev/null; then
-            chmod +x "$OUTDIR/${base}.upx.frozen"
+    if make_upx_artifact "$OUTDIR/hello.frozen" \
+            "$OUTDIR/hello.upx.frozen" hello 0 "$OUTDIR/hello.expected" \
+            combined foo bar; then
+        :
+    else
+        upx_rc=$?
+        [ "$upx_rc" -eq 1 ] || exit 1
+    fi
+    if make_upx_artifact "$OUTDIR/exitcode.frozen" \
+            "$OUTDIR/exitcode.upx.frozen" exitcode 0 - combined 0; then
+        if ! verify_frozen_artifact "$OUTDIR/exitcode.upx.frozen" \
+                42 - combined 42; then
+            rm -f "$OUTDIR/exitcode.upx.frozen"
+            exit 1
         fi
-    done
+    else
+        upx_rc=$?
+        [ "$upx_rc" -eq 1 ] || exit 1
+    fi
     echo "UPX compression: done"
 else
     echo "UPX: not available, skipping compressed variants"
@@ -402,15 +556,27 @@ fi
 
 # 4. Python3 — freeze a simple deterministic script (best effort)
 if command -v python3 >/dev/null 2>&1; then
-    if run_freeze /work/build/dlfreeze -v -d -t -f '/usr/*' -o "$OUTDIR/python3.frozen" -- python3 -c 'print(1+2)' 2>/dev/null; then
-        chmod +x "$OUTDIR/python3.frozen"
-        echo "3" > "$OUTDIR/python3.expected"
+    if freeze_cross_direct_data_artifact python3 "$OUTDIR/python3.frozen" \
+            -t -f '/usr/*' -- python3 -c 'print(1+2)'; then
+        if ! python3 -c 'print(1+2)' >"$OUTDIR/python3.expected" 2>/dev/null ||
+           ! verify_frozen_artifact "$OUTDIR/python3.frozen" 0 \
+                "$OUTDIR/python3.expected" stdout -c 'print(1+2)'; then
+            echo "ERROR: python3 direct artifact failed its producer smoke test" >&2
+            exit 1
+        fi
         if command -v upx >/dev/null 2>&1; then
-            upx --best -o "$OUTDIR/python3.upx.frozen" "$OUTDIR/python3.frozen" 2>/dev/null && \
-                chmod +x "$OUTDIR/python3.upx.frozen" || true
+            if make_upx_artifact "$OUTDIR/python3.frozen" \
+                    "$OUTDIR/python3.upx.frozen" python3 0 \
+                    "$OUTDIR/python3.expected" stdout -c 'print(1+2)'; then
+                :
+            else
+                upx_rc=$?
+                [ "$upx_rc" -eq 1 ] || exit 1
+            fi
         fi
     else
-        echo "WARNING: failed to freeze python3 (skipping)"
+        freeze_rc=$?
+        [ "$freeze_rc" -eq 77 ] || exit 1
     fi
 else
     echo "python3: not available, skipping"
@@ -419,15 +585,33 @@ fi
 # 5. Ruby — freeze a simple deterministic script (best effort)
 if command -v ruby >/dev/null 2>&1; then
     ruby_elf=$(resolve_ruby_elf || true)
-    if [ -n "$ruby_elf" ] && run_freeze /work/build/dlfreeze -v -d -t -f '/usr/*' -o "$OUTDIR/ruby.frozen" -- "$ruby_elf" -e 'puts 1+2' 2>/dev/null; then
-        chmod +x "$OUTDIR/ruby.frozen"
-        echo "3" > "$OUTDIR/ruby.expected"
+    if [ -n "$ruby_elf" ] &&
+       freeze_cross_direct_data_artifact ruby "$OUTDIR/ruby.frozen" \
+            -t -f '/usr/*' -- "$ruby_elf" -e 'puts 1+2'; then
+        if ! "$ruby_elf" -e 'puts 1+2' \
+                >"$OUTDIR/ruby.expected" 2>&1 ||
+           ! verify_frozen_artifact "$OUTDIR/ruby.frozen" 0 \
+                "$OUTDIR/ruby.expected" combined -e 'puts 1+2'; then
+            echo "ERROR: ruby direct artifact failed its producer smoke test" >&2
+            exit 1
+        fi
         if command -v upx >/dev/null 2>&1; then
-            upx --best -o "$OUTDIR/ruby.upx.frozen" "$OUTDIR/ruby.frozen" 2>/dev/null && \
-                chmod +x "$OUTDIR/ruby.upx.frozen" || true
+            if make_upx_artifact "$OUTDIR/ruby.frozen" \
+                    "$OUTDIR/ruby.upx.frozen" ruby 0 \
+                    "$OUTDIR/ruby.expected" combined -e 'puts 1+2'; then
+                :
+            else
+                upx_rc=$?
+                [ "$upx_rc" -eq 1 ] || exit 1
+            fi
         fi
     else
-        echo "WARNING: failed to freeze ruby (skipping)"
+        freeze_rc=$?
+        if [ -z "$ruby_elf" ]; then
+            echo "ruby: installed command has no ELF interpreter (skipping)"
+        elif [ "$freeze_rc" -ne 77 ]; then
+            exit 1
+        fi
     fi
 else
     echo "ruby: not available, skipping"
