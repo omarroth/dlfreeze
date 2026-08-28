@@ -13,10 +13,11 @@
  * of layouts derived from the corresponding upstream release sources; never
  * infer one layout from another or from the bootstrap libc.
  *
- * A profile is only an admission candidate.  The loader additionally decodes
- * independent target implementations (__errno_location, __tls_get_addr,
- * pthread_self, pthread_kill, pthread_detach and pthread_create) and requires
- * every decoded offset/address to agree with the selected profile.
+ * A profile is only a release-identity candidate.  It is never authority for
+ * a private write: the loader derives and cross-checks every field it uses
+ * from the mapped target's exported implementations before installing the
+ * target thread pointer.  In particular, a matching release string alone is
+ * insufficient to admit a downstream libc with a changed private layout.
  */
 struct dlfrz_musl_layout {
     uint16_t machine;
@@ -37,42 +38,27 @@ struct dlfrz_musl_layout {
     uint16_t thread_robust;
     uint16_t thread_locale;
     int8_t detach_initial;
-    uint8_t canary_zero_second_byte;
 
     uint16_t libc_size;
     uint16_t libc_can_do_threads;
     uint16_t libc_threaded;
-    uint16_t libc_secure;
-    uint16_t libc_threads_minus_1;
-    uint16_t libc_auxv;
     uint16_t libc_tls_head;
     uint16_t libc_tls_size;
     uint16_t libc_tls_align;
     uint16_t libc_tls_cnt;
-    uint16_t libc_page_size;
     uint16_t libc_global_locale;
     uint8_t libc_flag_width;
 };
 
-#define DLFRZ_MUSL_X86_119                                                   \
-    { EM_X86_64, 1, 1, 19, 280, 0, 8, 16, 24, 32, 40, 56, 68, 84, 168, 200, \
-      0, 0, 112, 0, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64, 4 }
-
-#define DLFRZ_MUSL_X86_124                                                   \
-    { EM_X86_64, 1, 1, 24, 224, 0, 8, 16, 24, 32, 40, 56, 60, 64, 144, 176, \
-      2, 0, 112, 0, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64, 4 }
-
 #define DLFRZ_MUSL_X86_12X(patch_)                                          \
     { EM_X86_64, 1, 2, patch_, 200, 0, 8, 16, 24, 32, 40, 48, 52, 56, 136,  \
-      168, 2, 1, 104, 0, 1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 1 }
+      168, 2, 104, 0, 1, 16, 24, 32, 40, 56, 1 }
 
 #define DLFRZ_MUSL_AARCH64_12X(patch_)                                      \
     { EM_AARCH64, 1, 2, patch_, 200, 200, 192, 8, 16, 24, 184, 32, 36, 40,   \
-      120, 152, 2, 1, 104, 0, 1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 1 }
+      120, 152, 2, 104, 0, 1, 16, 24, 32, 40, 56, 1 }
 
 static const struct dlfrz_musl_layout dlfrz_musl_layouts[] = {
-    DLFRZ_MUSL_X86_119,
-    DLFRZ_MUSL_X86_124,
     DLFRZ_MUSL_X86_12X(2),
     DLFRZ_MUSL_X86_12X(3),
     DLFRZ_MUSL_X86_12X(4),
@@ -161,8 +147,6 @@ dlfrz_musl_layout_lookup(uint16_t machine, const uint8_t *data, size_t size)
     return matched;
 }
 
-#undef DLFRZ_MUSL_X86_119
-#undef DLFRZ_MUSL_X86_124
 #undef DLFRZ_MUSL_X86_12X
 #undef DLFRZ_MUSL_AARCH64_12X
 

@@ -23,7 +23,7 @@ jobs:
           sudo apt-get install -y musl-tools
 
       - name: Build and test
-        run: make test
+        run: make WERROR=1 test
 
   build:
     runs-on: ubuntu-latest
@@ -43,13 +43,14 @@ jobs:
 
       - name: Package release archive
         run: |
-          mkdir -p dist/${RELEASE_NAME}
-          cp build/dlfreeze dist/${RELEASE_NAME}/
-          cp build/dlfreeze-bootstrap dist/${RELEASE_NAME}/
-          cp build/dlfreeze-preload.so dist/${RELEASE_NAME}/
-          cp README.md dist/${RELEASE_NAME}/
-          tar -C dist -czf dist/${RELEASE_NAME}.tar.gz ${RELEASE_NAME}
-          sha256sum dist/${RELEASE_NAME}.tar.gz > dist/${RELEASE_NAME}.sha256
+          mkdir -p "dist/${RELEASE_NAME}"
+          cp build/dlfreeze "dist/${RELEASE_NAME}/"
+          cp build/dlfreeze-bootstrap "dist/${RELEASE_NAME}/"
+          cp build/dlfreeze-preload.so "dist/${RELEASE_NAME}/"
+          cp build/dlfreeze-preload-static.so "dist/${RELEASE_NAME}/"
+          cp README.md "dist/${RELEASE_NAME}/"
+          tar -C dist -czf "dist/${RELEASE_NAME}.tar.gz" "${RELEASE_NAME}"
+          sha256sum "dist/${RELEASE_NAME}.tar.gz" > "dist/${RELEASE_NAME}.sha256"
 
       - uses: actions/upload-artifact@v4
         with:

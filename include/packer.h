@@ -4,17 +4,28 @@
 #include "dep_resolver.h"
 
 /* List of data files to embed alongside ELF objects */
+enum data_file_kind {
+    DATA_FILE_KIND_REGULAR = 0,
+    DATA_FILE_KIND_VIRTUAL,
+    DATA_FILE_KIND_NEGATIVE,
+    DATA_FILE_KIND_DIRECTORY
+};
+
 struct data_file_list {
-    char **paths;      /* absolute paths of files to embed */
-    int   *is_virtual; /* 0=real, 1=virtual placeholder, 2=negative (not found) */
+    char **paths;      /* exact absolute request identities */
+    char **source_paths; /* canonical sources for real entries, else NULL */
+    enum data_file_kind *kinds;
     int    count;
     int    capacity;
+    int    failed;     /* allocation/size failure while collecting paths */
 };
 
 void data_file_list_init(struct data_file_list *dl);
-void data_file_list_add(struct data_file_list *dl, const char *path);
+void data_file_list_add(struct data_file_list *dl, const char *path,
+                        const char *source_path);
 void data_file_list_add_virtual(struct data_file_list *dl, const char *path);
 void data_file_list_add_negative(struct data_file_list *dl, const char *path);
+void data_file_list_add_directory(struct data_file_list *dl, const char *path);
 void data_file_list_free(struct data_file_list *dl);
 
 struct pack_options {
