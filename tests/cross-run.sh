@@ -56,6 +56,39 @@ run_quiet() {
     run_with_timeout "$@"
 }
 
+run_direct_contract() {
+    contract_run_artifact=$1
+    contract_run_expected=$2
+    contract_run_label=$3
+    contract_run_output=$(mktemp)
+    contract_run_rc=0
+
+    set +e
+    run_with_timeout env DLFREEZE_NO_FORK=1 "$contract_run_artifact" \
+        >"$contract_run_output" 2>&1
+    contract_run_rc=$?
+    set -e
+    # Appending a non-newline sentinel before command substitution preserves
+    # trailing newlines, while avoiding a dependency on cmp/diff in the bare
+    # Fedora and Arch cross-run images.
+    contract_run_expected_cmp=$(cat "$contract_run_expected"; printf .)
+    contract_run_actual_cmp=$(cat "$contract_run_output"; printf .)
+
+    if [ "$contract_run_rc" -eq 0 ] &&
+       [ "$contract_run_expected_cmp" = "$contract_run_actual_cmp" ]; then
+        pass "$contract_run_label"
+    else
+        fail "$contract_run_label" \
+            "strict generic contract differs or rc=$contract_run_rc"
+        contract_run_exp=$(cat "$contract_run_expected")
+        contract_run_actual=$(cat "$contract_run_output")
+        diagnose_failure "$contract_run_artifact" "$contract_run_exp" \
+            "$contract_run_actual" env DLFREEZE_DEBUG=1 \
+            DLFREEZE_NO_FORK=1 "$contract_run_artifact"
+    fi
+    rm -f "$contract_run_output"
+}
+
 artifact_info() {
     path="$1"
 
@@ -119,38 +152,122 @@ if [ ! -d "$FROZEN_DIR" ]; then
     exit 1
 fi
 
-# CI may allow individual producers to omit application artifacts when that
-# exact runtime cannot be direct-loaded.  Still require the aggregate matrix
-# to retain representative strict-direct coverage on each architecture, so a
-# broad admission regression cannot turn every Python/Ruby test into a skip.
-if [ "${DLFREEZE_REQUIRE_RUNTIME_ARTIFACTS:-0}" = 1 ]; then
-    have_python=0
-    have_python_upx=0
-    have_ruby=0
-    have_ruby_upx=0
-    for src_dir in $FROZEN_GLOB; do
-        [ -d "$src_dir" ] || continue
-        if [ -f "$src_dir/python3.frozen" ] &&
-           [ -f "$src_dir/python3.expected" ]; then
-            have_python=1
+# Each producer describes every distinct glibc/musl runtime it found in a
+# small, non-executable status file.  A `direct` entry must have a generic C
+# artifact and expectation; `unsupported` is an explicit capability result.
+# The legacy environment-variable name is retained for workflow compatibility,
+# but Python and Ruby artifacts are no longer part of this coverage contract.
+require_direct_contracts=${DLFREEZE_REQUIRE_DIRECT_CONTRACTS:-${DLFREEZE_REQUIRE_RUNTIME_ARTIFACTS:-0}}
+case "$require_direct_contracts" in
+    0|1) ;;
+    *)
+        echo "ERROR: DLFREEZE_REQUIRE_DIRECT_CONTRACTS must be 0 or 1"
+        exit 2
+        ;;
+esac
+contract_source_count=0
+contract_direct_total=0
+contract_upx_total=0
+contract_error=0
+for src_dir in $FROZEN_GLOB; do
+    [ -d "$src_dir" ] || continue
+    contract_source_count=$((contract_source_count + 1))
+    if [ ! -f "$src_dir/hello.frozen" ] ||
+       [ ! -f "$src_dir/hello.expected" ]; then
+        echo "ERROR: $src_dir lacks the mandatory hello artifact pair"
+        contract_error=1
+    fi
+    contract_status="$src_dir/direct-contracts.v1"
+    if [ ! -f "$contract_status" ]; then
+        if [ "$require_direct_contracts" = 1 ]; then
+            echo "ERROR: $src_dir has no generic direct-contract status"
+            contract_error=1
         fi
-        if [ -f "$src_dir/python3.upx.frozen" ] &&
-           [ -f "$src_dir/python3.expected" ]; then
-            have_python_upx=1
+        continue
+    fi
+
+    contract_runtime_count=0
+    contract_seen_runtime=
+    while IFS='|' read -r contract_version contract_runtime \
+            contract_state contract_variant contract_extra; do
+        contract_runtime_count=$((contract_runtime_count + 1))
+        if [ "$contract_version" != 1 ] || [ -n "$contract_extra" ]; then
+            echo "ERROR: malformed generic direct-contract entry in $contract_status"
+            contract_error=1
+            continue
         fi
-        if [ -f "$src_dir/ruby.frozen" ] &&
-           [ -f "$src_dir/ruby.expected" ]; then
-            have_ruby=1
-        fi
-        if [ -f "$src_dir/ruby.upx.frozen" ] &&
-           [ -f "$src_dir/ruby.expected" ]; then
-            have_ruby_upx=1
-        fi
-    done
-    if [ "$have_python" -ne 1 ] || [ "$have_python_upx" -ne 1 ] ||
-       [ "$have_ruby" -ne 1 ] || [ "$have_ruby_upx" -ne 1 ]; then
-        echo "ERROR: aggregate artifacts lack required Python/Ruby plain+UPX coverage"
-        echo "  python=$have_python python_upx=$have_python_upx ruby=$have_ruby ruby_upx=$have_ruby_upx"
+        case "$contract_runtime" in
+            ''|*[!a-z0-9_-]*)
+                echo "ERROR: invalid runtime name in $contract_status: $contract_runtime"
+                contract_error=1
+                continue
+                ;;
+        esac
+        case " $contract_seen_runtime " in
+            *" $contract_runtime "*)
+                echo "ERROR: duplicate runtime in $contract_status: $contract_runtime"
+                contract_error=1
+                continue
+                ;;
+        esac
+        contract_seen_runtime="$contract_seen_runtime $contract_runtime"
+
+        contract_artifact="$src_dir/direct-$contract_runtime.frozen"
+        contract_expected="$src_dir/direct-$contract_runtime.expected"
+        contract_upx="$src_dir/direct-$contract_runtime.upx.frozen"
+        case "$contract_state|$contract_variant" in
+            direct\|plain)
+                contract_direct_total=$((contract_direct_total + 1))
+                if [ ! -f "$contract_artifact" ] ||
+                   [ ! -f "$contract_expected" ] ||
+                   [ -e "$contract_upx" ]; then
+                    echo "ERROR: $src_dir lacks its declared $contract_runtime direct contract"
+                    contract_error=1
+                fi
+                ;;
+            direct\|upx)
+                contract_direct_total=$((contract_direct_total + 1))
+                contract_upx_total=$((contract_upx_total + 1))
+                if [ ! -f "$contract_artifact" ] ||
+                   [ ! -f "$contract_expected" ] ||
+                   [ ! -f "$contract_upx" ]; then
+                    echo "ERROR: $src_dir lacks its declared $contract_runtime plain+UPX contract"
+                    contract_error=1
+                fi
+                ;;
+            unsupported\|none)
+                if [ -e "$contract_artifact" ] ||
+                   [ -e "$contract_expected" ] ||
+                   [ -e "$contract_upx" ]; then
+                    echo "ERROR: $src_dir published $contract_runtime artifacts while declaring it unsupported"
+                    contract_error=1
+                fi
+                ;;
+            *)
+                echo "ERROR: invalid state in $contract_status: $contract_state|$contract_variant"
+                contract_error=1
+                ;;
+        esac
+    done < "$contract_status"
+    if [ "$contract_runtime_count" -eq 0 ]; then
+        echo "ERROR: $contract_status contains no runtime entries"
+        contract_error=1
+    fi
+done
+
+if [ "$contract_error" -ne 0 ]; then
+    exit 1
+fi
+if [ "$contract_source_count" -eq 0 ]; then
+    echo "ERROR: no frozen producer directories matched $FROZEN_GLOB"
+    exit 1
+fi
+if [ "$require_direct_contracts" = 1 ]; then
+    if [ "$contract_source_count" -eq 0 ] ||
+       [ "$contract_direct_total" -eq 0 ] ||
+       [ "$contract_upx_total" -eq 0 ]; then
+        echo "ERROR: aggregate artifacts lack required generic direct coverage"
+        echo "  sources=$contract_source_count direct=$contract_direct_total upx=$contract_upx_total"
         exit 1
     fi
 fi
@@ -161,6 +278,7 @@ for src_dir in $FROZEN_GLOB; do
     src_env=$(basename "$src_dir")
     if [ ! -e "$src_dir/hello.frozen" ] \
         && [ ! -e "$src_dir/exitcode.frozen" ] \
+        && [ ! -e "$src_dir/direct-contracts.v1" ] \
         && [ ! -e "$src_dir/python3.frozen" ] \
         && [ ! -e "$src_dir/ruby.frozen" ]; then
         echo "--- Source: $src_env ---"
@@ -169,6 +287,38 @@ for src_dir in $FROZEN_GLOB; do
         continue
     fi
     echo "--- Source: $src_env ---"
+
+    # ── generic strict-direct contracts ─────────────────────────────
+    contract_status="$src_dir/direct-contracts.v1"
+    if [ -f "$contract_status" ]; then
+        while IFS='|' read -r contract_version contract_runtime \
+                contract_state contract_variant contract_extra; do
+            # The validation pass above already checked version, spelling,
+            # uniqueness, and file presence.
+            if [ "$contract_state" = unsupported ]; then
+                skip "$src_env/direct-$contract_runtime" \
+                    "producer runtime was not admitted for direct loading"
+                continue
+            fi
+
+            contract_artifact="$src_dir/direct-$contract_runtime.frozen"
+            contract_expected="$src_dir/direct-$contract_runtime.expected"
+            chmod +x "$contract_artifact" 2>/dev/null || true
+            run_direct_contract "$contract_artifact" "$contract_expected" \
+                "$src_env/direct-$contract_runtime.frozen"
+
+            if [ "$contract_variant" = upx ]; then
+                contract_upx="$src_dir/direct-$contract_runtime.upx.frozen"
+                chmod +x "$contract_upx" 2>/dev/null || true
+                run_direct_contract "$contract_upx" "$contract_expected" \
+                    "$src_env/direct-$contract_runtime.upx.frozen"
+            fi
+        done < "$contract_status"
+    elif [ "$require_direct_contracts" = 1 ]; then
+        fail "$src_env/direct-contract" "status file not found"
+    else
+        skip "$src_env/direct-contract" "status file not found"
+    fi
 
     # ── hello.frozen ───────────────────────────────────────────────
     frozen="$src_dir/hello.frozen"
@@ -300,7 +450,7 @@ for src_dir in $FROZEN_GLOB; do
     if [ -f "$frozen_rb" ] && [ -f "$expected_rb" ]; then
         chmod +x "$frozen_rb" 2>/dev/null || true
         rc=0
-        actual=$(run_capture env DLFREEZE_NO_FORK=1 \
+        actual=$(run_capture_stdout env DLFREEZE_NO_FORK=1 \
             "$frozen_rb" -e 'puts 1+2') || rc=$?
         exp=$(cat "$expected_rb")
         if [ "$actual" = "$exp" ] && [ "$rc" -eq 0 ]; then
@@ -320,7 +470,7 @@ for src_dir in $FROZEN_GLOB; do
     if [ -f "$frozen_rb_upx" ] && [ -f "$expected_rb" ]; then
         chmod +x "$frozen_rb_upx" 2>/dev/null || true
         rc=0
-        actual=$(run_capture env DLFREEZE_NO_FORK=1 \
+        actual=$(run_capture_stdout env DLFREEZE_NO_FORK=1 \
             "$frozen_rb_upx" -e 'puts 1+2') || rc=$?
         exp=$(cat "$expected_rb")
         if [ "$actual" = "$exp" ] && [ "$rc" -eq 0 ]; then

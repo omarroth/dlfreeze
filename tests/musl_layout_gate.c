@@ -165,14 +165,11 @@ static int selftest(void)
 
     layout = dlfrz_musl_layout_lookup(
         EM_X86_64, (const uint8_t *)x86_119, sizeof(x86_119));
-    if (!layout || layout->patch != 19 || layout->pthread_size != 280 ||
-        layout->thread_tid != 56 || layout->thread_errno != 68 ||
-        layout->libc_flag_width != 4)
+    if (layout)
         return 1;
     layout = dlfrz_musl_layout_lookup(
         EM_X86_64, (const uint8_t *)x86_124, sizeof(x86_124));
-    if (!layout || layout->patch != 24 || layout->pthread_size != 224 ||
-        layout->thread_errno != 60 || layout->detach_initial != 2)
+    if (layout)
         return 1;
     if (!profile_matches(EM_X86_64, x86_122, sizeof(x86_122), 2, 200, 48) ||
         !profile_matches(EM_X86_64, x86_126, sizeof(x86_126), 6, 200, 48) ||

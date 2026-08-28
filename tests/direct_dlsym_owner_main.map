@@ -1,0 +1,9 @@
+GLIBC_PRIVATE {
+    global:
+        _dl_audit_preinit;
+};
+
+GLIBC_2.35 {
+    global:
+        __rseq_flags;
+} GLIBC_PRIVATE;

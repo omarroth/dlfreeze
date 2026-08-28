@@ -27,6 +27,8 @@ struct mapped_elf {
     size_t dynamic_count;
 };
 
+static int spare_program_header(const struct mapped_elf *mapped);
+
 static int copy_fixture(const char *source, char path[64])
 {
     char buffer[16384];
@@ -257,6 +259,385 @@ out:
     return rc;
 }
 
+static int ambiguous_vaddr_translation_rejected(const char *source)
+{
+    char path[64] = "";
+    struct mapped_elf mapped;
+    uint64_t strtab_vaddr = 0;
+    int source_index = -1;
+    int candidate;
+    int rc = -1;
+
+    if (copy_fixture(source, path) < 0 || map_fixture(path, &mapped) < 0)
+        goto out;
+    for (size_t i = 0; i < mapped.dynamic_count; i++) {
+        if (mapped.dynamic[i].d_tag == DT_NULL)
+            break;
+        if (mapped.dynamic[i].d_tag == DT_STRTAB) {
+            strtab_vaddr = mapped.dynamic[i].d_un.d_ptr;
+            break;
+        }
+    }
+    candidate = spare_program_header(&mapped);
+    for (uint16_t i = 0; i < mapped.ehdr->e_phnum; i++) {
+        uint64_t delta;
+
+        if (mapped.phdr[i].p_type != PT_LOAD ||
+            strtab_vaddr < mapped.phdr[i].p_vaddr)
+            continue;
+        delta = strtab_vaddr - mapped.phdr[i].p_vaddr;
+        if (delta < mapped.phdr[i].p_filesz) {
+            source_index = i;
+            break;
+        }
+    }
+    if (!strtab_vaddr || candidate < 0 || source_index < 0)
+        goto unmap;
+    mapped.phdr[candidate] = mapped.phdr[source_index];
+    mapped.phdr[candidate].p_align = 1;
+    if (mapped.phdr[candidate].p_offset < mapped.size &&
+        mapped.phdr[candidate].p_filesz <
+            mapped.size - mapped.phdr[candidate].p_offset) {
+        mapped.phdr[candidate].p_offset++;
+    } else if (mapped.phdr[candidate].p_offset != 0) {
+        mapped.phdr[candidate].p_offset--;
+    } else {
+        goto unmap;
+    }
+    if (msync(mapped.data, mapped.size, MS_SYNC) < 0)
+        goto unmap;
+    unmap_fixture(&mapped);
+    {
+        struct elf_info info;
+
+        if (elf_parse(path, &info) < 0)
+            rc = 0;
+        else
+            elf_info_free(&info);
+    }
+    goto out;
+
+unmap:
+    unmap_fixture(&mapped);
+out:
+    if (path[0])
+        unlink(path);
+    return rc;
+}
+
+enum admission_mutation {
+    MUTATE_TYPE,
+    MUTATE_CLASS,
+    MUTATE_DATA,
+    MUTATE_IDENT_VERSION,
+    MUTATE_OSABI,
+    MUTATE_ABI_VERSION,
+    MUTATE_IDENT_PADDING,
+    MUTATE_MACHINE,
+    MUTATE_HEADER_SIZE,
+    MUTATE_PHENT_SIZE,
+    MUTATE_PHNUM_XNUM,
+    MUTATE_PH_BOUNDS,
+    MUTATE_UNALIGNED_PHOFF,
+    MUTATE_SH_BOUNDS,
+    MUTATE_DUP_DYNAMIC,
+    MUTATE_DUP_INTERP,
+    MUTATE_DYNAMIC_OUTSIDE_LOAD,
+    MUTATE_DYNAMIC_INCONGRUENT,
+    MUTATE_TLS_INCONGRUENT,
+    MUTATE_EMPTY_LOADS,
+    MUTATE_LOAD_ORDER,
+    MUTATE_UNTERMINATED_DYNAMIC,
+};
+
+static int parser_rejects(const char *path)
+{
+    struct elf_info info;
+
+    if (elf_check(path))
+        return -1;
+    if (elf_parse(path, &info) == 0) {
+        elf_info_free(&info);
+        return -1;
+    }
+    return 0;
+}
+
+static int spare_program_header(const struct mapped_elf *mapped)
+{
+    for (uint16_t i = 0; i < mapped->ehdr->e_phnum; i++) {
+        uint32_t type = mapped->phdr[i].p_type;
+
+        if (type != PT_LOAD && type != PT_DYNAMIC && type != PT_INTERP &&
+            type != PT_PHDR && type != PT_TLS)
+            return i;
+    }
+    return -1;
+}
+
+static int mutate_admission(const char *source,
+                            enum admission_mutation mutation)
+{
+    char path[64] = "";
+    struct mapped_elf mapped;
+    int candidate;
+    int source_index;
+    int rc = -1;
+
+    if (copy_fixture(source, path) < 0 || map_fixture(path, &mapped) < 0)
+        goto out;
+    switch (mutation) {
+    case MUTATE_TYPE:
+        mapped.ehdr->e_type = ET_REL;
+        break;
+    case MUTATE_CLASS:
+        mapped.ehdr->e_ident[EI_CLASS] = ELFCLASS32;
+        break;
+    case MUTATE_DATA:
+        mapped.ehdr->e_ident[EI_DATA] = ELFDATA2MSB;
+        break;
+    case MUTATE_IDENT_VERSION:
+        mapped.ehdr->e_ident[EI_VERSION] = EV_NONE;
+        break;
+    case MUTATE_OSABI:
+        mapped.ehdr->e_ident[EI_OSABI] = ELFOSABI_FREEBSD;
+        break;
+    case MUTATE_ABI_VERSION:
+        mapped.ehdr->e_ident[EI_ABIVERSION] = 1;
+        break;
+    case MUTATE_IDENT_PADDING:
+        mapped.ehdr->e_ident[EI_PAD] = 1;
+        break;
+    case MUTATE_MACHINE:
+        mapped.ehdr->e_machine = EM_NONE;
+        break;
+    case MUTATE_HEADER_SIZE:
+        mapped.ehdr->e_ehsize--;
+        break;
+    case MUTATE_PHENT_SIZE:
+        mapped.ehdr->e_phentsize--;
+        break;
+    case MUTATE_PHNUM_XNUM:
+        mapped.ehdr->e_phnum = PN_XNUM;
+        break;
+    case MUTATE_PH_BOUNDS:
+        mapped.ehdr->e_phoff = mapped.size - sizeof(Elf64_Phdr) + 1;
+        break;
+    case MUTATE_UNALIGNED_PHOFF:
+        mapped.ehdr->e_phoff++;
+        break;
+    case MUTATE_SH_BOUNDS:
+        if (mapped.ehdr->e_shoff == 0)
+            goto unmap;
+        mapped.ehdr->e_shoff = mapped.size - sizeof(Elf64_Shdr) + 1;
+        break;
+    case MUTATE_DUP_DYNAMIC:
+        candidate = spare_program_header(&mapped);
+        source_index = -1;
+        for (uint16_t i = 0; i < mapped.ehdr->e_phnum; i++)
+            if (mapped.phdr[i].p_type == PT_DYNAMIC)
+                source_index = i;
+        if (candidate < 0 || source_index < 0)
+            goto unmap;
+        mapped.phdr[candidate] = mapped.phdr[source_index];
+        break;
+    case MUTATE_DUP_INTERP:
+        candidate = spare_program_header(&mapped);
+        source_index = -1;
+        for (uint16_t i = 0; i < mapped.ehdr->e_phnum; i++)
+            if (mapped.phdr[i].p_type == PT_INTERP)
+                source_index = i;
+        if (candidate < 0 || source_index < 0)
+            goto unmap;
+        mapped.phdr[candidate] = mapped.phdr[source_index];
+        break;
+    case MUTATE_DYNAMIC_OUTSIDE_LOAD: {
+        uint64_t max_load_end = 0;
+        uint64_t outside;
+
+        source_index = -1;
+        for (uint16_t i = 0; i < mapped.ehdr->e_phnum; i++) {
+            uint64_t end;
+
+            if (mapped.phdr[i].p_type == PT_DYNAMIC)
+                source_index = i;
+            if (mapped.phdr[i].p_type != PT_LOAD ||
+                mapped.phdr[i].p_vaddr >
+                    UINT64_MAX - mapped.phdr[i].p_memsz)
+                continue;
+            end = mapped.phdr[i].p_vaddr + mapped.phdr[i].p_memsz;
+            if (end > max_load_end)
+                max_load_end = end;
+        }
+        if (source_index < 0 || max_load_end > UINT64_MAX - 0x1fff)
+            goto unmap;
+        outside = (max_load_end + 0xfff) & ~(uint64_t)0xfff;
+        outside += 0x1000;
+        if (mapped.phdr[source_index].p_memsz > UINT64_MAX - outside)
+            goto unmap;
+        mapped.phdr[source_index].p_vaddr = outside;
+        mapped.phdr[source_index].p_paddr = outside;
+        break;
+    }
+    case MUTATE_DYNAMIC_INCONGRUENT:
+        source_index = -1;
+        for (uint16_t i = 0; i < mapped.ehdr->e_phnum; i++)
+            if (mapped.phdr[i].p_type == PT_DYNAMIC)
+                source_index = i;
+        if (source_index < 0)
+            goto unmap;
+        mapped.phdr[source_index].p_align = 2;
+        mapped.phdr[source_index].p_vaddr ^= 1;
+        mapped.phdr[source_index].p_paddr =
+            mapped.phdr[source_index].p_vaddr;
+        break;
+    case MUTATE_TLS_INCONGRUENT:
+        source_index = -1;
+        for (uint16_t i = 0; i < mapped.ehdr->e_phnum; i++)
+            if (mapped.phdr[i].p_type == PT_TLS)
+                source_index = i;
+        if (source_index < 0)
+            goto unmap;
+        mapped.phdr[source_index].p_align = 2;
+        mapped.phdr[source_index].p_vaddr ^= 1;
+        mapped.phdr[source_index].p_paddr =
+            mapped.phdr[source_index].p_vaddr;
+        break;
+    case MUTATE_EMPTY_LOADS:
+        for (uint16_t i = 0; i < mapped.ehdr->e_phnum; i++) {
+            if (mapped.phdr[i].p_type == PT_LOAD) {
+                mapped.phdr[i].p_filesz = 0;
+                mapped.phdr[i].p_memsz = 0;
+            } else if (mapped.phdr[i].p_type == PT_DYNAMIC) {
+                mapped.phdr[i].p_type = PT_NULL;
+            }
+        }
+        break;
+    case MUTATE_LOAD_ORDER: {
+        int first = -1;
+        int last = -1;
+        Elf64_Phdr temporary;
+
+        for (uint16_t i = 0; i < mapped.ehdr->e_phnum; i++) {
+            if (mapped.phdr[i].p_type != PT_LOAD)
+                continue;
+            if (first < 0)
+                first = i;
+            last = i;
+        }
+        if (first < 0 || last <= first ||
+            mapped.phdr[first].p_vaddr >= mapped.phdr[last].p_vaddr)
+            goto unmap;
+        temporary = mapped.phdr[first];
+        mapped.phdr[first] = mapped.phdr[last];
+        mapped.phdr[last] = temporary;
+        break;
+    }
+    case MUTATE_UNTERMINATED_DYNAMIC:
+        for (size_t i = 0; i < mapped.dynamic_count; i++)
+            if (mapped.dynamic[i].d_tag == DT_NULL)
+                mapped.dynamic[i].d_tag = DT_DEBUG;
+        break;
+    }
+    if (msync(mapped.data, mapped.size, MS_SYNC) < 0)
+        goto unmap;
+    unmap_fixture(&mapped);
+    rc = parser_rejects(path);
+    goto out;
+
+unmap:
+    unmap_fixture(&mapped);
+out:
+    if (path[0])
+        unlink(path);
+    return rc;
+}
+
+static int malformed_admission_rejected(const char *shared_object,
+                                        const char *executable)
+{
+    static const enum admission_mutation shared_mutations[] = {
+        MUTATE_TYPE,
+        MUTATE_CLASS,
+        MUTATE_DATA,
+        MUTATE_IDENT_VERSION,
+        MUTATE_OSABI,
+        MUTATE_ABI_VERSION,
+        MUTATE_IDENT_PADDING,
+        MUTATE_MACHINE,
+        MUTATE_HEADER_SIZE,
+        MUTATE_PHENT_SIZE,
+        MUTATE_PHNUM_XNUM,
+        MUTATE_PH_BOUNDS,
+        MUTATE_UNALIGNED_PHOFF,
+        MUTATE_SH_BOUNDS,
+        MUTATE_DUP_DYNAMIC,
+        MUTATE_DYNAMIC_OUTSIDE_LOAD,
+        MUTATE_DYNAMIC_INCONGRUENT,
+        MUTATE_TLS_INCONGRUENT,
+        MUTATE_EMPTY_LOADS,
+        MUTATE_LOAD_ORDER,
+        MUTATE_UNTERMINATED_DYNAMIC,
+    };
+
+    for (size_t i = 0;
+         i < sizeof(shared_mutations) / sizeof(shared_mutations[0]); i++)
+        if (mutate_admission(shared_object, shared_mutations[i]) < 0)
+            return -1;
+    return mutate_admission(executable, MUTATE_DUP_INTERP);
+}
+
+static int descriptor_parse_is_path_race_safe(const char *source)
+{
+    static const char replacement[] = "not an ELF";
+    struct elf_info info;
+    struct stat source_stat;
+    char path[64] = "";
+    int source_fd = -1;
+    int replacement_fd = -1;
+    int rc = -1;
+
+    if (copy_fixture(source, path) < 0)
+        goto out;
+    source_fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (source_fd < 0 || fstat(source_fd, &source_stat) < 0 ||
+        source_stat.st_size < 0 || unlink(path) < 0)
+        goto out;
+    replacement_fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+                          0600);
+    if (replacement_fd < 0 ||
+        write(replacement_fd, replacement, sizeof(replacement)) !=
+            (ssize_t)sizeof(replacement))
+        goto out;
+    if (close(replacement_fd) < 0) {
+        replacement_fd = -1;
+        goto out;
+    }
+    replacement_fd = -1;
+
+    if (elf_parse_fd(source_fd, &info) < 0)
+        goto out;
+    elf_info_free(&info);
+    if (elf_parse_fd_range(source_fd, 0, (size_t)source_stat.st_size,
+                           &info) < 0)
+        goto out;
+    elf_info_free(&info);
+    if (elf_parse(path, &info) == 0) {
+        elf_info_free(&info);
+        goto out;
+    }
+    rc = 0;
+
+out:
+    if (replacement_fd >= 0)
+        close(replacement_fd);
+    if (source_fd >= 0)
+        close(source_fd);
+    if (path[0])
+        unlink(path);
+    return rc;
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 2 && argc != 3)
@@ -269,6 +650,12 @@ int main(int argc, char **argv)
         return 3;
     if (malformed_rela_rejected(argv[1]) < 0)
         return 4;
+    if (ambiguous_vaddr_translation_rejected(argv[1]) < 0)
+        return 9;
+    if (malformed_admission_rejected(argv[1], argv[0]) < 0)
+        return 7;
+    if (descriptor_parse_is_path_race_safe(argv[1]) < 0)
+        return 8;
     if (argc == 3) {
         if (parse_external_ie_requires_static_tls(argv[2]) < 0)
             return 5;

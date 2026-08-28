@@ -83,6 +83,136 @@ verify_frozen_artifact() {
     return 0
 }
 
+# Print the final packer diagnostic only when a failed direct-data freeze was
+# refused solely because the target runtime cannot provide direct loading.
+# These messages are emitted by mutually exclusive, fail-fast checks in
+# pack_frozen().  Requiring an exact final non-empty line avoids treating an
+# earlier target-program message, or a later genuine packer failure, as a
+# capability skip.
+classify_direct_capability_refusal() {
+    capability_rc=$1
+    capability_log=$2
+    [ "$capability_rc" -eq 1 ] 2>/dev/null || return 1
+    capability_last=$(awk 'NF { last = $0 } END { if (last != "") print last }' \
+        "$capability_log") || return 1
+
+    case "$capability_last" in
+        'dlfreeze: pathful DT_NEEDED entries require a supported direct-load mode'|\
+        'dlfreeze: pathful traced dlopen entries require a supported direct-load mode'|\
+        'dlfreeze: bare traced dlopen aliases require a supported direct-load mode'|\
+        'dlfreeze: captured files require a supported direct-load runtime')
+            printf '%s\n' "$capability_last"
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+# A successful pack may still be an intentional extraction fallback when the
+# filter matched no data.  The runtime path is variable, so validate the whole
+# diagnostic grammar and require exactly one such line.
+classify_direct_extraction_fallback() {
+    fallback_log=$1
+    awk '
+        /^dlfreeze: warning: direct-load is unavailable for runtime [^;[:cntrl:]]+; creating an extraction-mode binary$/ {
+            count++
+            reason = $0
+        }
+        END {
+            if (count == 1) {
+                print reason
+                exit 0
+            }
+            exit 1
+        }
+    ' "$fallback_log"
+}
+
+cross_build_classifier_selftest() {
+    classifier_log=$(mktemp)
+    classifier_reasons='dlfreeze: pathful DT_NEEDED entries require a supported direct-load mode
+dlfreeze: pathful traced dlopen entries require a supported direct-load mode
+dlfreeze: bare traced dlopen aliases require a supported direct-load mode
+dlfreeze: captured files require a supported direct-load runtime'
+
+    while IFS= read -r classifier_reason; do
+        printf 'unrelated trace output\n%s\n' "$classifier_reason" \
+            > "$classifier_log"
+        classifier_actual=$(classify_direct_capability_refusal \
+            1 "$classifier_log" || true)
+        if [ "$classifier_actual" != "$classifier_reason" ]; then
+            echo "classifier selftest rejected: $classifier_reason" >&2
+            rm -f "$classifier_log"
+            return 1
+        fi
+    done <<EOF
+$classifier_reasons
+EOF
+
+    printf '%s: unrelated suffix\n' \
+        'dlfreeze: captured files require a supported direct-load runtime' \
+        > "$classifier_log"
+    if classify_direct_capability_refusal 1 "$classifier_log" >/dev/null; then
+        echo "classifier selftest accepted an inexact diagnostic" >&2
+        rm -f "$classifier_log"
+        return 1
+    fi
+
+    printf '%s\ndlfreeze: packing failed\n' \
+        'dlfreeze: captured files require a supported direct-load runtime' \
+        > "$classifier_log"
+    if classify_direct_capability_refusal 1 "$classifier_log" >/dev/null; then
+        echo "classifier selftest hid a later packer failure" >&2
+        rm -f "$classifier_log"
+        return 1
+    fi
+
+    printf '%s\n' \
+        'dlfreeze: captured files require a supported direct-load runtime' \
+        > "$classifier_log"
+    if classify_direct_capability_refusal 124 "$classifier_log" >/dev/null; then
+        echo "classifier selftest hid a timeout" >&2
+        rm -f "$classifier_log"
+        return 1
+    fi
+
+    classifier_fallback='dlfreeze: warning: direct-load is unavailable for runtime /lib/ld-test.so; creating an extraction-mode binary'
+    printf 'trace output\n%s\npack summary\n' "$classifier_fallback" \
+        > "$classifier_log"
+    classifier_actual=$(classify_direct_extraction_fallback \
+        "$classifier_log" || true)
+    if [ "$classifier_actual" != "$classifier_fallback" ]; then
+        echo "classifier selftest rejected an exact extraction fallback" >&2
+        rm -f "$classifier_log"
+        return 1
+    fi
+    printf '%s: unrelated suffix\n' "$classifier_fallback" > "$classifier_log"
+    if classify_direct_extraction_fallback "$classifier_log" >/dev/null; then
+        echo "classifier selftest accepted an inexact extraction fallback" >&2
+        rm -f "$classifier_log"
+        return 1
+    fi
+    printf '%s\n%s\n' "$classifier_fallback" "$classifier_fallback" \
+        > "$classifier_log"
+    if classify_direct_extraction_fallback "$classifier_log" >/dev/null; then
+        echo "classifier selftest accepted duplicate extraction diagnostics" >&2
+        rm -f "$classifier_log"
+        return 1
+    fi
+
+    rm -f "$classifier_log"
+    echo "cross-build direct-capability classifier: PASS"
+}
+
+if [ "${1:-}" = --selftest-capability-classifier ]; then
+    if [ "$#" -ne 1 ]; then
+        echo "--selftest-capability-classifier takes no arguments" >&2
+        exit 2
+    fi
+    cross_build_classifier_selftest
+    exit $?
+fi
+
 # Return 0 when a compressed artifact was created and smoke-tested, 1 when
 # UPX cannot compress this ELF (best-effort coverage), and 2 when UPX produced
 # an executable that does not preserve the source artifact's behavior.
@@ -96,7 +226,11 @@ make_upx_artifact() {
     shift 6
 
     rm -f "$upx_output"
-    if ! upx --best -o "$upx_output" "$upx_source" 2>/dev/null; then
+    # UPX --best can spend an unbounded amount of time on large runtime
+    # artifacts.  Compression is optional coverage, but it must not stall the
+    # entire producer job; use the same finite budget as artifact creation.
+    if ! run_with_timeout_seconds "$TEST_FREEZE_TIMEOUT" \
+            upx --best -o "$upx_output" "$upx_source" 2>/dev/null; then
         echo "UPX: cannot compress $upx_label (skipping)"
         rm -f "$upx_output"
         return 1
@@ -111,9 +245,9 @@ make_upx_artifact() {
 }
 
 # A coarse image probe cannot certify an individual runtime.  Capture the
-# final pack log and footer so a Python/Ruby artifact is published only when
-# that exact executable received direct-loader metadata.  Extraction mode
-# cannot generically virtualize arbitrary captured absolute paths.
+# final pack log and footer so an artifact is published as a direct-load test
+# only when that exact executable received direct-loader metadata.  Extraction
+# mode cannot generically virtualize arbitrary captured absolute paths.
 freeze_cross_direct_data_artifact() {
     direct_label=$1
     direct_output=$2
@@ -121,9 +255,17 @@ freeze_cross_direct_data_artifact() {
     direct_log="${direct_output}.pack.log"
 
     rm -f "$direct_output" "$direct_log"
-    if ! run_freeze /work/build/dlfreeze -v -d -o "$direct_output" "$@" \
-            >"$direct_log" 2>&1; then
-        echo "ERROR: failed to freeze $direct_label" >&2
+    direct_rc=0
+    run_freeze /work/build/dlfreeze -v -d -o "$direct_output" "$@" \
+        >"$direct_log" 2>&1 || direct_rc=$?
+    if [ "$direct_rc" -ne 0 ]; then
+        if direct_reason=$(classify_direct_capability_refusal \
+                "$direct_rc" "$direct_log"); then
+            echo "SKIP: $direct_label — $direct_reason"
+            rm -f "$direct_output" "$direct_log"
+            return 77
+        fi
+        echo "ERROR: failed to freeze $direct_label (exit $direct_rc)" >&2
         sed -n '1,160p' "$direct_log" >&2
         rm -f "$direct_output" "$direct_log"
         return 1
@@ -145,9 +287,7 @@ freeze_cross_direct_data_artifact() {
             "$direct_log"; then
         direct_confirmed=1
     fi
-    direct_reason=$(grep -Eom1 \
-        'dlfreeze: warning: direct-load is unavailable for runtime .*creating an extraction-mode binary' \
-        "$direct_log" || true)
+    direct_reason=$(classify_direct_extraction_fallback "$direct_log" || true)
 
     if [ "$direct_confirmed" -eq 1 ] &&
        [ -z "$direct_reason" ] &&
@@ -279,6 +419,224 @@ EOF
     return 1
 }
 
+# Build one application-independent strict-direct contract for every distinct
+# host libc exposed by the available compilers.  The fixture covers startup,
+# an embedded data file, a traced dlopen object, constructors, library TLS, and
+# pthread TLS.  Its status file is the machine-readable producer contract used
+# by cross-run.sh; Python and Ruby remain useful smoke tests but do not decide
+# whether direct-loader coverage exists.
+build_generic_direct_contracts() {
+    contract_outdir=$1
+    contract_status="$contract_outdir/direct-contracts.v1"
+    contract_seen_cc=
+    contract_seen_runtime=
+    contract_runtime_count=0
+
+    : > "$contract_status"
+    contract_compilers=${DLFREEZE_CONTRACT_COMPILERS:-"gcc musl-gcc"}
+    # Compiler commands are whitespace-delimited command names/paths.  This is
+    # deliberately configurable so a renamed or additional target toolchain
+    # can participate without teaching the contract about libc filenames.
+    # shellcheck disable=SC2086
+    set -- $contract_compilers
+    for contract_cc do
+        contract_cc_path=$(command -v "$contract_cc" 2>/dev/null || true)
+        [ -n "$contract_cc_path" ] || continue
+        contract_cc_path=$(readlink -f "$contract_cc_path")
+        case " $contract_seen_cc " in
+            *" $contract_cc_path "*) continue ;;
+        esac
+        contract_seen_cc="$contract_seen_cc $contract_cc_path"
+
+        contract_probe_dir="/tmp/dlfreeze-cross-contract-probe-$$"
+        rm -rf "$contract_probe_dir"
+        mkdir -p "$contract_probe_dir"
+        cat > "$contract_probe_dir/probe.c" <<'EOF'
+int main(void) { return 0; }
+EOF
+        if ! "$contract_cc" -o "$contract_probe_dir/probe" \
+                "$contract_probe_dir/probe.c"; then
+            echo "ERROR: generic direct contract probe failed with $contract_cc" >&2
+            rm -rf "$contract_probe_dir"
+            return 1
+        fi
+        contract_interp=$(readelf -W -l "$contract_probe_dir/probe" 2>/dev/null |
+            sed -n 's/.*Requesting program interpreter: \([^]]*\)].*/\1/p')
+        rm -rf "$contract_probe_dir"
+        if [ -z "$contract_interp" ]; then
+            echo "SKIP: generic direct contract ($contract_cc) — no dynamic interpreter"
+            continue
+        fi
+        contract_interp_real=$(readlink -f "$contract_interp" 2>/dev/null || true)
+        contract_runtime_hash=$(
+            [ -n "$contract_interp_real" ] &&
+            [ -f "$contract_interp_real" ] &&
+            sha256sum "$contract_interp_real" 2>/dev/null | awk '{print $1}'
+        )
+        case "$contract_runtime_hash" in
+            ''|*[!0-9a-f]*)
+                echo "ERROR: generic direct contract ($contract_cc) cannot identify interpreter content: $contract_interp" >&2
+                return 1
+                ;;
+        esac
+        if [ "${#contract_runtime_hash}" -ne 64 ]; then
+            echo "ERROR: generic direct contract ($contract_cc) produced a non-SHA256 runtime identity" >&2
+            return 1
+        fi
+        contract_runtime="runtime-$contract_runtime_hash"
+        case " $contract_seen_runtime " in
+            *" $contract_runtime "*) continue ;;
+        esac
+        contract_seen_runtime="$contract_seen_runtime $contract_runtime"
+        contract_runtime_count=$((contract_runtime_count + 1))
+
+        contract_root="/tmp/dlfreeze-cross-direct-$contract_runtime"
+        contract_root_abs="$contract_root"
+        contract_asset="$contract_root/asset.txt"
+        contract_lib="$contract_root/libdlfreeze_contract.so"
+        contract_lib_src="$contract_root/library.c"
+        contract_main_src="$contract_root/main.c"
+        contract_main="$contract_root/main"
+        contract_artifact="$contract_outdir/direct-$contract_runtime.frozen"
+        contract_expected="$contract_outdir/direct-$contract_runtime.expected"
+        contract_upx="$contract_outdir/direct-$contract_runtime.upx.frozen"
+
+        rm -rf "$contract_root"
+        rm -f "$contract_artifact" "$contract_expected" "$contract_upx"
+        mkdir -p "$contract_root"
+        cat > "$contract_lib_src" <<'EOF'
+static __thread int contract_tls = 40;
+static int constructor_ready;
+
+__attribute__((constructor))
+static void contract_constructor(void)
+{
+    constructor_ready = 1;
+}
+
+int dlfreeze_contract_value(void)
+{
+    return constructor_ready + ++contract_tls;
+}
+EOF
+        cat > "$contract_main_src" <<'EOF'
+#include <dlfcn.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <string.h>
+
+#ifndef CONTRACT_ASSET
+#error CONTRACT_ASSET is required
+#endif
+#ifndef CONTRACT_LIBRARY
+#error CONTRACT_LIBRARY is required
+#endif
+
+static __thread int main_tls = 20;
+
+static void *contract_worker(void *unused)
+{
+    (void)unused;
+    if (main_tls != 20)
+        return (void *)1;
+    main_tls = 21;
+    return main_tls == 21 ? NULL : (void *)2;
+}
+
+int main(void)
+{
+    char asset[64];
+    void *handle;
+    void *worker_result = NULL;
+    int (*value)(void);
+    FILE *stream;
+    pthread_t thread;
+
+    stream = fopen(CONTRACT_ASSET, "r");
+    if (!stream || !fgets(asset, sizeof(asset), stream))
+        return 2;
+    fclose(stream);
+    asset[strcspn(asset, "\r\n")] = '\0';
+
+    handle = dlopen(CONTRACT_LIBRARY, RTLD_NOW | RTLD_LOCAL);
+    if (!handle)
+        return 3;
+    value = (int (*)(void))dlsym(handle, "dlfreeze_contract_value");
+    if (!value || value() != 42)
+        return 4;
+    if (pthread_create(&thread, NULL, contract_worker, NULL) != 0 ||
+        pthread_join(thread, &worker_result) != 0 || worker_result != NULL ||
+        main_tls != 20)
+        return 5;
+    puts(asset);
+    dlclose(handle);
+    return 0;
+}
+EOF
+        printf '%s\n' 'generic-direct-contract-ok' > "$contract_asset"
+        if ! "$contract_cc" -shared -fPIC \
+                -Wl,-soname,libdlfreeze_contract.so \
+                -o "$contract_lib" "$contract_lib_src" ||
+           ! "$contract_cc" -pthread -o "$contract_main" \
+                "-DCONTRACT_ASSET=\"$contract_asset\"" \
+                "-DCONTRACT_LIBRARY=\"$contract_lib\"" \
+                "$contract_main_src" -ldl; then
+            echo "ERROR: generic $contract_runtime direct contract compile failed" >&2
+            rm -rf "$contract_root"
+            return 1
+        fi
+        if ! run_with_timeout_seconds "$TEST_RUN_TIMEOUT" "$contract_main" \
+                > "$contract_expected" 2>&1; then
+            echo "ERROR: native generic $contract_runtime contract failed" >&2
+            rm -rf "$contract_root"
+            rm -f "$contract_expected"
+            return 1
+        fi
+
+        contract_freeze_rc=0
+        if freeze_cross_direct_data_artifact \
+                "generic $contract_runtime direct contract" "$contract_artifact" \
+                -t -f "$contract_root_abs/*" -- "$contract_main"; then
+            rm -rf "$contract_root"
+            if ! verify_frozen_artifact "$contract_artifact" 0 \
+                    "$contract_expected" combined; then
+                echo "ERROR: generic $contract_runtime direct contract failed its producer smoke test" >&2
+                rm -f "$contract_artifact" "$contract_expected"
+                return 1
+            fi
+
+            contract_upx_state=plain
+            if command -v upx >/dev/null 2>&1; then
+                if make_upx_artifact "$contract_artifact" "$contract_upx" \
+                        "generic-$contract_runtime" 0 "$contract_expected" \
+                        combined; then
+                    contract_upx_state=upx
+                else
+                    contract_upx_rc=$?
+                    [ "$contract_upx_rc" -eq 1 ] || return 1
+                fi
+            fi
+            printf '1|%s|direct|%s\n' \
+                "$contract_runtime" "$contract_upx_state" >> "$contract_status"
+        else
+            contract_freeze_rc=$?
+            rm -rf "$contract_root"
+            rm -f "$contract_artifact" "$contract_expected" "$contract_upx"
+            if [ "$contract_freeze_rc" -eq 77 ]; then
+                printf '1|%s|unsupported|none\n' \
+                    "$contract_runtime" >> "$contract_status"
+            else
+                return 1
+            fi
+        fi
+    done
+
+    if [ "$contract_runtime_count" -eq 0 ]; then
+        echo "ERROR: no dynamic runtime was available for the generic direct contract" >&2
+        return 1
+    fi
+}
+
 resolve_ruby_elf() {
     path=$(command -v ruby 2>/dev/null || true)
     if [ -n "$path" ]; then
@@ -389,11 +747,7 @@ elif [ -f /etc/arch-release ]; then
     tail -3 "$pacman_log"
     pacman $pacman_sandbox_opt -S --noconfirm --needed upx 2>/dev/null || true
     pacman $pacman_sandbox_opt -S --noconfirm --needed ruby 2>/dev/null || true
-    # Arch ships musl as a separate package providing /usr/bin/musl-gcc
-    if ! command -v musl-gcc >/dev/null 2>&1; then
-        # fall back to plain gcc; static-musl link will be dropped
-        link_musl_gcc_to_host_cc
-    fi
+    pacman $pacman_sandbox_opt -S --noconfirm --needed zig 2>/dev/null || true
 elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
     PKG=$(command -v dnf || command -v yum)
     pkg_log=/tmp/dlfreeze-rpm-install.log
@@ -407,17 +761,16 @@ elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
     tail -3 "$pkg_log"
     "$PKG" install -y -q strace 2>/dev/null || true
     "$PKG" install -y -q ruby 2>/dev/null || true
+    "$PKG" install -y -q zig 2>/dev/null || true
+    # Fedora exposes a real musl compiler wrapper in current releases.  Use it
+    # when available so the static bootstrap has the audited post-handoff TLS
+    # runtime required by direct mode; older releases may lack these packages.
+    "$PKG" install -y -q musl-gcc musl-libc-static 2>/dev/null || true
     # Fedora's core repos do not include UPX, so the package install is
     # expected to fail.  Fall through to the GitHub fetch helper below.
     "$PKG" install -y -q upx 2>/dev/null || true
     "$PKG" install -y -q curl tar xz 2>/dev/null || true
     fetch_upx_from_github || true
-    # Fedora doesn't ship musl-gcc in repos — fall back to plain gcc.
-    # The Makefile uses musl-gcc for the static bootstrap; on glibc-only
-    # systems we link statically against glibc instead.
-    if ! command -v musl-gcc >/dev/null 2>&1; then
-        link_musl_gcc_to_host_cc
-    fi
 elif [ -f /etc/debian_version ]; then
     export DEBIAN_FRONTEND=noninteractive
     if ! apt-get update -qq 2>/dev/null; then
@@ -455,10 +808,11 @@ echo ""
 # ── Build dlfreeze from source ─────────────────────────────────────
 cd /work
 rm -rf build
-make -j"$(nproc)" 2>&1
+make WERROR=1 -j"$(nproc)" 2>&1
 echo ""
 echo "Build artifacts:"
-ls -la build/dlfreeze build/dlfreeze-bootstrap build/dlfreeze-preload.so
+ls -la build/dlfreeze build/dlfreeze-bootstrap \
+    build/dlfreeze-preload.so build/dlfreeze-preload-static.so
 echo ""
 
 # ── Run test suite (Docker-dependent tests auto-skip) ──────────────
@@ -468,12 +822,6 @@ echo "--- Test suite ---"
 # Require direct-loader coverage exactly when this image has an admitted host
 # runtime.  A clean extraction fallback is a capability result; compiler,
 # packer, and ambiguous-output failures from the probe remain fatal.
-# Arch GCC 16 may inject -latomic_asneeded outside musl-gcc's private search
-# path.  Match the test-suite workaround so the capability probe measures the
-# runtime rather than that wrapper/toolchain quirk.
-if [ -e /usr/lib/libatomic_asneeded.a ]; then
-    export LIBRARY_PATH="${LIBRARY_PATH:+$LIBRARY_PATH:}/usr/lib"
-fi
 if probe_direct_runtime_admission; then
     DLFREEZE_REQUIRE_DIRECT=1
 else
@@ -497,6 +845,12 @@ echo ""
 OUTDIR="${OUTDIR:-/work/build/cross-test}"
 rm -rf "$OUTDIR"
 mkdir -p "$OUTDIR"
+
+# The generic contract is the strict direct-loader coverage signal.  Every
+# recognized producer libc gets its own artifact; unsupported runtimes are
+# recorded explicitly so consumers can distinguish a capability result from a
+# missing or silently downgraded test.
+build_generic_direct_contracts "$OUTDIR"
 
 # 1. Hello world — deterministic output for cross-environment comparison
 cat > /tmp/cross_hello.c <<'EOF'
@@ -588,17 +942,21 @@ if command -v ruby >/dev/null 2>&1; then
     if [ -n "$ruby_elf" ] &&
        freeze_cross_direct_data_artifact ruby "$OUTDIR/ruby.frozen" \
             -t -f '/usr/*' -- "$ruby_elf" -e 'puts 1+2'; then
+        # Ruby emits host-version/default-gem warnings on stderr which are
+        # intentionally not a stable cross-distribution program result.
+        # Preserve exit status and compare deterministic stdout; failures
+        # still print a combined diagnostic retry in cross-run.sh.
         if ! "$ruby_elf" -e 'puts 1+2' \
-                >"$OUTDIR/ruby.expected" 2>&1 ||
+                >"$OUTDIR/ruby.expected" 2>/dev/null ||
            ! verify_frozen_artifact "$OUTDIR/ruby.frozen" 0 \
-                "$OUTDIR/ruby.expected" combined -e 'puts 1+2'; then
+                "$OUTDIR/ruby.expected" stdout -e 'puts 1+2'; then
             echo "ERROR: ruby direct artifact failed its producer smoke test" >&2
             exit 1
         fi
         if command -v upx >/dev/null 2>&1; then
             if make_upx_artifact "$OUTDIR/ruby.frozen" \
                     "$OUTDIR/ruby.upx.frozen" ruby 0 \
-                    "$OUTDIR/ruby.expected" combined -e 'puts 1+2'; then
+                    "$OUTDIR/ruby.expected" stdout -e 'puts 1+2'; then
                 :
             else
                 upx_rc=$?

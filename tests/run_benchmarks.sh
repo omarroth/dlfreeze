@@ -188,7 +188,7 @@ run_case() {
             desc="python3 traced imports"
             bin="$PYTHON_BIN"
             out="$BENCH_DIR/python3-imports.frozen"
-            freeze_cmd=("$DLFREEZE" -t -f "$PYTHON_DATA_GLOB" -o "$out" -- "$bin" -c "$PYTHON_IMPORT_EXPR")
+            freeze_cmd=("$DLFREEZE" -d -t -f "$PYTHON_DATA_GLOB" -o "$out" -- "$bin" -c "$PYTHON_IMPORT_EXPR")
             native_cmd=("$bin" -c "$PYTHON_IMPORT_EXPR")
             frozen_cmd=("$out" -c "$PYTHON_IMPORT_EXPR")
             ;;
@@ -196,7 +196,7 @@ run_case() {
             desc="python3 numpy imports"
             bin="$PYTHON_BIN"
             out="$BENCH_DIR/python3-numpy.frozen"
-            freeze_cmd=("$DLFREEZE" -t -f "$PYTHON_DATA_GLOB" -o "$out" -- "$bin" -c "$PYTHON_NUMPY_EXPR")
+            freeze_cmd=("$DLFREEZE" -d -t -f "$PYTHON_DATA_GLOB" -o "$out" -- "$bin" -c "$PYTHON_NUMPY_EXPR")
             native_cmd=("$bin" -c "$PYTHON_NUMPY_EXPR")
             frozen_cmd=("$out" -c "$PYTHON_NUMPY_EXPR")
             ;;

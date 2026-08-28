@@ -284,7 +284,17 @@ def run_check(args: argparse.Namespace, work: Path) -> None:
         args.freeze_timeout,
         args.verbose,
     )
-    require_success("freeze-time REPL", traced, TRACE_MARKER)
+    if (
+        "pathful traced dlopen entries require a supported direct-load mode"
+        in traced.output
+    ):
+        raise UnsupportedDirectLoad(
+            "target runtime does not support required pathful dlopen capture"
+        )
+    if "captured files require a supported direct-load runtime" in traced.output:
+        raise UnsupportedDirectLoad(
+            "target runtime does not support captured-file direct-load"
+        )
     if (
         "direct-load is unavailable for runtime " in traced.output
         and "creating an extraction-mode binary" in traced.output
@@ -292,6 +302,7 @@ def run_check(args: argparse.Namespace, work: Path) -> None:
         raise UnsupportedDirectLoad(
             "target runtime does not support direct-load"
         )
+    require_success("freeze-time REPL", traced, TRACE_MARKER)
     if "mode       : direct-load" not in traced.output:
         raise CheckFailure(
             "packer did not produce a direct-load artifact\n"
