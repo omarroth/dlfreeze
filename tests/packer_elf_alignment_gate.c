@@ -91,6 +91,7 @@ static int phdr_byte_access_gate(void)
     Elf64_Phdr expected = {0};
     Elf64_Phdr actual;
     struct prelink_obj object = {0};
+    struct pl_control_range_builder control_builder = {0};
     void *pointer = NULL;
     size_t available = 0;
 
@@ -110,14 +111,18 @@ static int phdr_byte_access_gate(void)
     object.phdr_num = 1;
     object.phdr_entsz = sizeof(Elf64_Phdr);
     if (pl_parse_dynamic(&object, object.base, object.phdr_base,
-                         object.phdr_num, object.phdr_entsz) != 0 ||
+                         object.phdr_num, object.phdr_entsz,
+                         &control_builder) != 0 ||
         !pl_vaddr_pointer(&object, 3, 7, 1, PF_R, &pointer) ||
         pointer != mapped_bytes + 3 ||
         !pl_file_bytes_available(&object, 5, &available) ||
         available != sizeof(mapped_bytes) - 5 ||
         !pl_signed_offset_pointer(&object, 9, 4, PF_W, &pointer) ||
-        pointer != mapped_bytes + 9)
+        pointer != mapped_bytes + 9) {
+        pl_control_range_builder_release(&control_builder);
         return 0;
+    }
+    pl_control_range_builder_release(&control_builder);
     return 1;
 }
 

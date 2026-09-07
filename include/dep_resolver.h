@@ -65,6 +65,18 @@ struct dep_list {
     uint16_t  target_e_machine; /* required ELF machine for dependencies */
     enum dep_runtime_family runtime_family; /* target loader search ABI */
     int gnu_release_minor; /* stable target glibc 2.x minor, or -1 */
+    /* At least one successful pure-RTLD_LAZY request names an identity outside
+     * the immutable startup dependency graph.  V8 tags fork-descendant
+     * records and tracks first observations per process; loader namespaces
+     * and unload/reload cycles still mean only startup ownership proves that
+     * an object is already visible before a traced call. */
+    int traced_requires_native_lazy_semantics;
+    /* A failed dlopen/dlmopen has no link-map identity to replay and its
+     * loader-owned error state is observable through dlerror().  Direct mode
+     * cannot infer that native result from a successful-object manifest, so
+     * a complete trace must retain the call and select native-loader
+     * semantics regardless of the target libc family. */
+    int traced_requires_native_loader_semantics;
 };
 
 /* Resolve all shared-library dependencies of an ELF binary (BFS). */
@@ -72,6 +84,9 @@ int dep_resolve(const char *exe_path, struct dep_list *deps);
 
 /* Merge versioned dlopen trace records from trace_file. */
 int dep_add_dlopen_libs(struct dep_list *deps, const char *trace_file);
+
+/* Descriptor-bound variant; consumes trace_fd on every return path. */
+int dep_add_dlopen_libs_fd(struct dep_list *deps, int trace_fd);
 
 /* Mark traced dlopen closures that require startup static-TLS placement. */
 int dep_mark_dlopen_early_closures(struct dep_list *deps);

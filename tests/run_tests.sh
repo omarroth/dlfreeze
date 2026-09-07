@@ -97,6 +97,20 @@ capture_output() {
     return "$__rc"
 }
 
+capture_output_with_timeout_seconds() {
+    local __var="$1" __limit="$2" __tmp __rc
+    shift 2
+
+    __tmp=$(mktemp)
+    set +e
+    run_with_timeout_seconds "$__limit" "$@" >"$__tmp" 2>&1
+    __rc=$?
+    set -e
+    printf -v "$__var" '%s' "$(cat "$__tmp")"
+    rm -f "$__tmp"
+    return "$__rc"
+}
+
 capture_output_in_dir() {
     local __var="$1" __dir="$2" __tmp __rc
     shift 2
@@ -123,6 +137,42 @@ compiler_targets_glibc() {
         grep '^#define __GLIBC__ ' >/dev/null
 }
 
+# Hand-authored dlopen protocol fixtures must carry the same full stat
+# revision as the preload helper.  Keep the conversion in C so signed time_t,
+# nanoseconds, dev_t, and ino_t use the target libc's exact representation.
+dlopen_trace_snapshot_fields() {
+    local helper="$BUILD/dlopen_trace_snapshot"
+
+    if [ ! -x "$helper" ] &&
+       ! gcc -Wall -Wextra -Werror -O2 -D_GNU_SOURCE \
+            -o "$helper" tests/dlopen_trace_snapshot.c; then
+        return 1
+    fi
+    "$helper" "$1"
+}
+
+# Start hand-authored parser cases from a real, transaction-complete V8
+# startup snapshot.  The parser intentionally refuses records which omit the
+# mapped startup image, so a header/owner-only synthetic prefix would test an
+# obsolete protocol rather than the record under examination.
+create_dlopen_trace_baseline() {
+    local trace="$1" helper="$2"
+    shift 2
+
+    : > "$trace"
+    trace=$(realpath "$trace")
+    env -u LD_PRELOAD \
+        -u DLFREEZE_TRACE_FD -u DLFREEZE_TRACE_IDENTITY \
+        -u DLFREEZE_TRACE_OWNER_PID -u DLFREEZE_FILE_TRACE_FD \
+        -u DLFREEZE_FILE_TRACE_IDENTITY -u DLFREEZE_FILE_TRACE_FILE \
+        LD_PRELOAD="$helper" DLFREEZE_TRACE_FILE="$trace" \
+        "$@" >/dev/null 2>&1 &&
+        [ "$(sed -n '1p' "$trace")" = '#DLFREEZE_DLOPEN_TRACE_V8' ] &&
+        grep -Eq '^O [0-9a-f]{16}$' "$trace" &&
+        grep -Eq '^A [0-9a-f]{16} [0-9a-f]{16}$' "$trace" &&
+        grep -Eq '^K [0-9a-f]{16} [0-9a-f]{16} [0-9a-f]{16}$' "$trace"
+}
+
 # GNU ld can reserve unused DT_NULL slots but has no option for emitting both
 # DT_RPATH and DT_RUNPATH.  Turn the first reserved terminator into an empty
 # DT_RUNPATH while leaving the following terminator intact.  The supported
@@ -137,7 +187,7 @@ elf64_inject_empty_runpath() {
         return 1
     fi
     section=$(LC_ALL=C readelf -SW "$file" 2>/dev/null |
-        awk '$2 == ".dynamic" { print $5, $6; exit }')
+        awk '$2 == ".dynamic" && !found { print $5, $6; found = 1 }')
     read -r dynamic_offset dynamic_size <<<"$section"
     if [[ ! "$dynamic_offset" =~ ^[0-9A-Fa-f]+$ ]] ||
        [[ ! "$dynamic_size" =~ ^[0-9A-Fa-f]+$ ]]; then
@@ -149,7 +199,7 @@ elf64_inject_empty_runpath() {
         -w16 -t x8 "$file" 2>/dev/null |
         awk '$1 == "0000000000000000" {
                  if (!seen) { first = NR - 1; seen = 1 }
-                 else { print first; exit }
+                 else if (!printed) { print first; printed = 1 }
              }')
     if [[ ! "$first_null" =~ ^[0-9]+$ ]]; then
         return 1
@@ -258,6 +308,40 @@ test_bootstrap_secure_gate() {
     rm -f "$helper"
 }
 
+test_bootstrap_fileback_gate() {
+    echo "--- bootstrap exact clean payload proof gate ---"
+    local helper="$BUILD/bootstrap_fileback_gate"
+
+    if gcc -O2 -g -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
+            -ffunction-sections -fdata-sections -Wl,--gc-sections \
+            -o "$helper" tests/bootstrap_fileback_gate.c &&
+       chmod 0555 "$helper" &&
+       run_with_timeout_seconds 8 "$helper"; then
+        pass "bootstrap one-smaps exact clean file-alias proof"
+    else
+        fail "bootstrap file-backed payload proof gate" \
+            "compile failed, mapping identity differed, or parsing timed out"
+    fi
+    rm -f "$helper"
+}
+
+test_loader_fileback_gate() {
+    echo "--- loader exact-startup fileback and lazy-copy gate ---"
+    local helper="$BUILD/loader_fileback_gate"
+
+    if gcc -std=c11 -O2 -g -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
+            -fno-stack-protector -ffunction-sections -fdata-sections \
+            -Wl,--gc-sections -o "$helper" \
+            tests/loader_fileback_gate.c -ldl -pthread &&
+       run_with_timeout_seconds 12 "$helper"; then
+        pass "loader startup compare skip and fdless lazy copy fallback"
+    else
+        fail "loader file-backed segment authority gate" \
+            "compile failed, provenance/copy fallback differed, or fd remained open"
+    fi
+    rm -f "$helper"
+}
+
 test_packer_alias_gate() {
     echo "--- packer alias ownership complexity gate ---"
     local helper="$BUILD/packer_alias_gate"
@@ -286,6 +370,22 @@ test_packer_elf_alignment_gate() {
     else
         fail "packer ELF alignment and transaction gate" \
             "compile failed, malformed bounds were admitted, or mutation leaked"
+    fi
+    rm -f "$helper"
+}
+
+test_packer_prelink_relocation_gate() {
+    echo "--- packer prelink relocation authority gate ---"
+    local helper="$BUILD/packer_prelink_relocation_gate"
+
+    if gcc -std=c11 -O2 -g -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
+            -ffunction-sections -fdata-sections -Wl,--gc-sections \
+            -o "$helper" tests/packer_prelink_relocation_gate.c &&
+       run_with_timeout_seconds 8 "$helper"; then
+        pass "packer prelink control authority and deferred symbolic fixups"
+    else
+        fail "packer prelink relocation authority gate" \
+            "compile failed, mutable metadata was admitted, or ownership leaked"
     fi
     rm -f "$helper"
 }
@@ -455,13 +555,17 @@ freeze_require_direct_with() {
     DIRECT_META_OFF=""
     if ! run_freeze "$freezer" -d -o "$output" "$@" >"$log" 2>&1; then
         runtime_warning=$(grep -Em1 \
-            '^dlfreeze: (captured files require a supported direct-load runtime|pathful traced dlopen entries require a supported direct-load mode|pathful DT_NEEDED entries require a supported direct-load mode)$' \
+            '^dlfreeze: (captured files require a supported direct-load runtime|pathful traced dlopen entries require a supported direct-load mode|pathful DT_NEEDED entries require a supported direct-load mode|.* requires native loader semantics, but this manifest requires direct-load semantics)$' \
             "$log" || true)
         if [ -n "$runtime_warning" ]; then
             DIRECT_FREEZE_REASON=${runtime_warning#dlfreeze: }
             return 77
         fi
         fail "$label" "dlfreeze failed"
+        if [ -s "$log" ]; then
+            echo "--- $label pack log (last 80 lines) ---" >&2
+            tail -n 80 "$log" >&2 || true
+        fi
         return 1
     fi
 
@@ -530,10 +634,10 @@ freeze_and_compare() {
     shift 3  # remaining args are passed to both runs
 
     if ! run_freeze "$DLFREEZE" -v -o "$output" "$binary"; then
-        fail "$label" "dlfreeze failed"; return 1
+        fail "$label" "dlfreeze failed"; return 0
     fi
     if [ ! -x "$output" ]; then
-        fail "$label" "output not executable"; return 1
+        fail "$label" "output not executable"; return 0
     fi
 
     local expect actual rc_e=0 rc_a=0
@@ -565,7 +669,10 @@ int main(int argc, char **argv) {
     return 0;
 }
 C
-    gcc -o "$bin" "$src" -lm
+    if ! gcc -o "$bin" "$src" -lm; then
+        fail "hello" "fixture compile failed"
+        return
+    fi
 
     # compare (ignore argv[0] line by using args 1+)
     if ! run_freeze "$DLFREEZE" -v -o "$out" "$bin"; then fail "hello" "dlfreeze failed"; return; fi
@@ -830,7 +937,8 @@ test_glibc_tunable_defaults_direct() {
         return
     fi
     interp=$(LC_ALL=C readelf -l /bin/true 2>/dev/null |
-        sed -n 's@.*interpreter: \(.*\)]@\1@p' | head -n1)
+        sed -n 's@.*interpreter: \(.*\)]@\1@p' |
+        awk 'NR == 1 { print }')
     if [ -z "$interp" ] || [ ! -x "$interp" ]; then
         skip "$label" "target interpreter path is unavailable"
         return
@@ -1656,7 +1764,14 @@ test_renamed_runtime_identity() {
     local trace="$BUILD/custom-runtime-hardlink.trace"
     local gate="$BUILD/dep_interpreter_trace_gate"
     local gate_log="$BUILD/dep_interpreter_trace_gate.log"
-    local alias_abs alias_hex
+    local alias_abs alias_hex alias_snapshot malformed_mode mode_grammar_ok
+    local failed_load_record failed_load_grammar_ok
+    local descriptor_case descriptor_expected
+    local trace_base="$BUILD/custom-runtime-hardlink.base.trace"
+    local trace_helper trace_owner trace_attempt=0000000000000002
+    local trace_other_pid=fffffffffffffffe
+    local snap_dev snap_ino snap_type snap_size snap_ms snap_mn snap_cs snap_cn
+    local malformed_snapshot snapshot_grammar_ok
     local cc=gcc rc=0 freeze_rc=0
     local label="renamed runtime content identity"
     cat > "$src" <<'C'
@@ -1695,7 +1810,7 @@ C
     # PT_INTERP pathname.  A traced hardlink spelling must therefore be
     # ignored rather than becoming a dlopen alias (or, for musl, mutating the
     # startup libc entry into a traced object).
-    rm -f "$alias" "$trace" "$gate" "$gate_log"
+    rm -f "$alias" "$trace" "$trace_base" "$gate" "$gate_log"
     if ! ln "$custom" "$alias" ||
        ! gcc -O2 -g -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
             -o "$gate" tests/dep_interpreter_trace_gate.c \
@@ -1705,13 +1820,272 @@ C
     else
         alias_abs=$(realpath "$alias")
         alias_hex=$(printf '%s' "$alias_abs" | od -An -tx1 | tr -d ' \n')
-        printf '#DLFREEZE_DLOPEN_TRACE_V4\nP %s %s %s\n' \
-            "$alias_hex" "$alias_hex" "$alias_hex" >"$trace"
-        if "$gate" "$bin" "$trace" "$alias_abs" >"$gate_log" 2>&1; then
+        alias_snapshot=$(dlopen_trace_snapshot_fields "$alias_abs")
+        trace_helper="$BUILD/dlfreeze-preload.so"
+        if [ "$cc" = musl-gcc ]; then
+            trace_helper="$BUILD/dlfreeze-preload-static.so"
+        fi
+        if ! create_dlopen_trace_baseline \
+                "$trace_base" "$trace_helper" "$bin"; then
+            fail "V8 dlopen parser fixtures" \
+                "could not capture transaction-complete startup evidence"
+        else
+        trace_owner=$(sed -n '2s/^O //p' "$trace_base")
+        cp "$trace_base" "$trace"
+        printf 'B %s %s\nP %s %s 0000000000000000 00000002 %s %s %s %s\n' \
+            "$trace_owner" "$trace_attempt" "$trace_owner" \
+            "$trace_attempt" "$alias_hex" "$alias_hex" "$alias_hex" \
+            "$alias_snapshot" >>"$trace"
+        if "$gate" "$bin" "$trace" "$alias_abs" 0 \
+                >"$gate_log" 2>&1; then
             pass "traced interpreter hardlink identity"
         else
             fail "traced interpreter hardlink identity" \
                 "resolver packaged an already-mapped file identity"
+        fi
+
+        read -r snap_dev snap_ino snap_type snap_size snap_ms snap_mn \
+            snap_cs snap_cn <<<"$alias_snapshot"
+        snapshot_grammar_ok=1
+        for malformed_snapshot in \
+                "000000000000001 $snap_ino $snap_type $snap_size $snap_ms $snap_mn $snap_cs $snap_cn" \
+                "$snap_dev $snap_ino 000000000000800A $snap_size $snap_ms $snap_mn $snap_cs $snap_cn" \
+                "$snap_dev $snap_ino $snap_type $snap_size $snap_ms 000000003b9aca00 $snap_cs $snap_cn" \
+                "$snap_dev $snap_ino $snap_type $snap_size $snap_ms $snap_mn $snap_cs"; do
+            cp "$trace_base" "$trace"
+            printf 'B %s %s\nP %s %s 0000000000000000 00000002 %s %s %s %s\n' \
+                "$trace_owner" "$trace_attempt" "$trace_owner" \
+                "$trace_attempt" "$alias_hex" "$alias_hex" \
+                "$alias_hex" "$malformed_snapshot" >>"$trace"
+            if "$gate" "$bin" "$trace" "$alias_abs" \
+                    >"$gate_log" 2>&1 ||
+               ! grep -Eq \
+                    'dlfreeze: (malformed dlopen trace source snapshot|unsupported or malformed dlopen trace format)' \
+                    "$gate_log"; then
+                snapshot_grammar_ok=0
+                break
+            fi
+        done
+        if [ "$snapshot_grammar_ok" -eq 1 ]; then
+            pass "strict V8 dlopen source snapshot grammar"
+        else
+            fail "strict V8 dlopen source snapshot grammar" \
+                "snapshot '$malformed_snapshot' was accepted or misdiagnosed"
+        fi
+
+        cp "$trace_base" "$trace"
+        printf '#DLFREEZE_DLOPEN_TRACE_V8\n' >>"$trace"
+        if ! "$gate" "$bin" "$trace" "$alias_abs" >"$gate_log" 2>&1 &&
+           grep -Fq 'duplicate dlopen trace version header' "$gate_log"; then
+            pass "duplicate V8 dlopen header fails closed"
+        else
+            fail "duplicate V8 dlopen header" \
+                "duplicate process-image header was accepted"
+        fi
+
+        cp "$trace_base" "$trace"
+        printf 'B %s %s\n' "$trace_owner" "$trace_attempt" >>"$trace"
+        if ! "$gate" "$bin" "$trace" "$alias_abs" 0 0 \
+                >"$gate_log" 2>&1 &&
+           grep -Fq 'incomplete dlopen operation evidence' "$gate_log"; then
+            pass "unmatched V8 loader transaction fails closed at EOF"
+        else
+            fail "unmatched V8 loader transaction" \
+                "dangling begin record was accepted or misdiagnosed"
+        fi
+
+        # Exercise each descriptor fail-closed boundary with compact
+        # hand-authored V8 records, independently of helper-side generation.
+        # In particular, W must not close a loader B with the same key.
+        for descriptor_case in orphan-w duplicate-v mismatched-commit \
+                dangling-v; do
+            cp "$trace_base" "$trace"
+            case "$descriptor_case" in
+                orphan-w)
+                    printf 'W %s %s\n' "$trace_owner" "$trace_attempt" \
+                        >>"$trace"
+                    descriptor_expected='dlfreeze: malformed descriptor-operation trace record'
+                    ;;
+                duplicate-v)
+                    printf 'V %s %s\nV %s %s\n' \
+                        "$trace_owner" "$trace_attempt" \
+                        "$trace_owner" "$trace_attempt" >>"$trace"
+                    descriptor_expected='dlfreeze: malformed descriptor-operation trace record'
+                    ;;
+                mismatched-commit)
+                    printf 'B %s %s\nW %s %s\n' \
+                        "$trace_owner" "$trace_attempt" \
+                        "$trace_owner" "$trace_attempt" >>"$trace"
+                    descriptor_expected='dlfreeze: malformed descriptor-operation trace record'
+                    ;;
+                dangling-v)
+                    printf 'V %s %s\n' "$trace_owner" "$trace_attempt" \
+                        >>"$trace"
+                    descriptor_expected='dlfreeze: incomplete descriptor operation during dlopen tracing'
+                    ;;
+            esac
+            if ! "$gate" "$bin" "$trace" "$alias_abs" 0 0 \
+                    >"$gate_log" 2>&1 &&
+               grep -Fq "$descriptor_expected" "$gate_log"; then
+                pass "$descriptor_case V8 descriptor transaction fails closed"
+            else
+                fail "$descriptor_case V8 descriptor transaction parser gate" \
+                    "record was accepted or misdiagnosed"
+            fi
+        done
+
+        cp "$trace_base" "$trace"
+        printf 'B %s %s\nB %s %s\nQ %s %s\nP %s %s 0000000000000000 00000002 %s %s %s %s\n' \
+            "$trace_owner" "$trace_attempt" \
+            "$trace_other_pid" "$trace_attempt" \
+            "$trace_other_pid" "$trace_attempt" \
+            "$trace_owner" "$trace_attempt" "$alias_hex" \
+            "$alias_hex" "$alias_hex" "$alias_snapshot" >>"$trace"
+        if "$gate" "$bin" "$trace" "$alias_abs" 0 0 \
+                >"$gate_log" 2>&1; then
+            pass "V8 loader transactions key attempts by process"
+        else
+            fail "V8 interleaved process transactions" \
+                "same attempt number in distinct processes was conflated"
+        fi
+
+        cp "$trace_base" "$trace"
+        printf 'B %s %s\nP %s %s 0000000000000000 00000002 %s %s %s %s\n' \
+            "$trace_owner" "$trace_attempt" \
+            "$trace_other_pid" "$trace_attempt" "$alias_hex" \
+            "$alias_hex" "$alias_hex" "$alias_snapshot" >>"$trace"
+        if ! "$gate" "$bin" "$trace" "$alias_abs" 0 0 \
+                >"$gate_log" 2>&1 &&
+           grep -Fq 'dlopen trace root has no matching operation evidence' \
+                "$gate_log"; then
+            pass "cross-process V8 transaction commit is rejected"
+        else
+            fail "cross-process V8 transaction commit" \
+                "root record consumed another process's pending operation"
+        fi
+
+        printf '#DLFREEZE_DLOPEN_TRACE_V7\n' >"$trace"
+        if ! "$gate" "$bin" "$trace" "$alias_abs" >"$gate_log" 2>&1 &&
+           grep -Fq 'V7 has no descriptor-operation transactions' \
+                "$gate_log"; then
+            pass "non-transactional V7 dlopen trace is rejected"
+        else
+            fail "V7 dlopen trace compatibility boundary" \
+                "old non-transactional trace was accepted"
+        fi
+
+        printf '#DLFREEZE_DLOPEN_TRACE_V6\n' >"$trace"
+        if ! "$gate" "$bin" "$trace" "$alias_abs" >"$gate_log" 2>&1 &&
+           grep -Fq 'V6 has no mapped-object or owner-exec provenance' \
+                "$gate_log"; then
+            pass "unprovenanced V6 dlopen trace is rejected"
+        else
+            fail "V6 dlopen trace compatibility boundary" \
+                "old unprovenanced trace was accepted"
+        fi
+
+        cp "$trace_base" "$trace"
+        if "$BUILD/dlopen_trace_snapshot" --max-record "$trace_owner" \
+                >>"$trace" &&
+           ! "$gate" "$bin" "$trace" "$alias_abs" >"$gate_log" 2>&1 &&
+           grep -Fq 'traced dlopen object is no longer readable' \
+                "$gate_log" &&
+           ! grep -Fq 'malformed or truncated dlopen trace' "$gate_log"; then
+            pass "maximum-length V8 dlopen record fits parser buffer"
+        else
+            fail "maximum-length V8 dlopen record" \
+                "syntactically complete boundary record was truncated"
+        fi
+
+        # The mode word is part of the trace protocol's trust boundary.  It
+        # has one canonical spelling and must describe a mode the replay
+        # implementation admits; otherwise a corrupted trace could silently
+        # change the direct-versus-extraction decision.
+        mode_grammar_ok=1
+        for malformed_mode in \
+                0000002 000000002 0000000A 00000000 40000002; do
+            cp "$trace_base" "$trace"
+            printf 'B %s %s\nP %s %s 0000000000000000 %s %s %s %s %s\n' \
+                "$trace_owner" "$trace_attempt" "$trace_owner" \
+                "$trace_attempt" "$malformed_mode" "$alias_hex" \
+                "$alias_hex" "$alias_hex" "$alias_snapshot" >>"$trace"
+            if "$gate" "$bin" "$trace" "$alias_abs" \
+                    >"$gate_log" 2>&1 ||
+               ! grep -Fq \
+                    'dlfreeze: unsupported or malformed dlopen trace mode' \
+                    "$gate_log"; then
+                mode_grammar_ok=0
+                break
+            fi
+        done
+        if [ "$mode_grammar_ok" -eq 1 ]; then
+            pass "strict V8 dlopen trace mode grammar"
+        else
+            fail "strict V8 dlopen trace mode grammar" \
+                "mode $malformed_mode was accepted or misdiagnosed"
+        fi
+
+        # Failed calls have no successful link_map identity to package.  V8
+        # records the API, NULL-vs-present filename, namespace, and exact mode
+        # beside the loader-operation transaction so the packer can retain
+        # native loader/dlerror semantics, including for invalid modes.
+        failed_load_grammar_ok=1
+        for failed_load_record in \
+                "D P 0000000000000000 00000002" \
+                "D N 0000000000000000 00000000" \
+                "M P ffffffffffffffff 0000000a" \
+                "M N 0000000000000000 ffffffff"; do
+            cp "$trace_base" "$trace"
+            printf 'B %s %s\nF %s %s %s\n' \
+                "$trace_owner" "$trace_attempt" "$trace_owner" \
+                "$trace_attempt" "$failed_load_record" >>"$trace"
+            if ! "$gate" "$bin" "$trace" "$alias_abs" 0 1 \
+                    >"$gate_log" 2>&1; then
+                failed_load_grammar_ok=0
+                break
+            fi
+        done
+        if [ "$failed_load_grammar_ok" -eq 1 ]; then
+            pass "V8 failed-load semantic classification"
+        else
+            fail "V8 failed-load semantic classification" \
+                "canonical record '$failed_load_record' was rejected or misclassified"
+        fi
+
+        failed_load_grammar_ok=1
+        for failed_load_record in \
+                "X P 0000000000000000 00000002" \
+                "D X 0000000000000000 00000002" \
+                "D P 000000000000000 00000002" \
+                "D P 00000000000000000 00000002" \
+                "D P 000000000000000A 00000002" \
+                "D P 0000000000000001 00000002" \
+                "D P 0000000000000000 0000002" \
+                "D P 0000000000000000 000000002" \
+                "D P 0000000000000000 0000000A" \
+                "D P 0000000000000000 00000002 " \
+                "D P 0000000000000000 00000002 extra" \
+                "D P 0000000000000000" \
+                'F'; do
+            cp "$trace_base" "$trace"
+            printf 'B %s %s\nF %s %s %s\n' \
+                "$trace_owner" "$trace_attempt" "$trace_owner" \
+                "$trace_attempt" "$failed_load_record" >>"$trace"
+            if "$gate" "$bin" "$trace" "$alias_abs" 0 1 \
+                    >"$gate_log" 2>&1 ||
+               ! grep -Fq \
+                    'dlfreeze: unsupported or malformed failed-load trace record' \
+                    "$gate_log"; then
+                failed_load_grammar_ok=0
+                break
+            fi
+        done
+        if [ "$failed_load_grammar_ok" -eq 1 ]; then
+            pass "strict V8 failed-load record grammar"
+        else
+            fail "strict V8 failed-load record grammar" \
+                "record '$failed_load_record' was accepted or misdiagnosed"
+        fi
         fi
     fi
 
@@ -1720,12 +2094,12 @@ C
     if [ "$freeze_rc" -eq 77 ]; then
         skip "$label" "$DIRECT_FREEZE_REASON"
         rm -f "$src" "$probe" "$bin" "$out" "$custom" "$log" \
-            "$alias" "$trace" "$gate" "$gate_log"
+            "$alias" "$trace" "$trace_base" "$gate" "$gate_log"
         return
     fi
     if [ "$freeze_rc" -ne 0 ]; then
         rm -f "$src" "$probe" "$bin" "$out" "$custom" "$log" \
-            "$alias" "$trace" "$gate" "$gate_log"
+            "$alias" "$trace" "$trace_base" "$gate" "$gate_log"
         return
     fi
 
@@ -1738,7 +2112,7 @@ C
         fail "$label" \
             "colliding interpreter basename selected the wrong trace helper"
         rm -f "$src" "$probe" "$bin" "$out" "$custom" "$log" \
-            "$alias" "$trace" "$gate" "$gate_log"
+            "$alias" "$trace" "$trace_base" "$gate" "$gate_log"
         return
     fi
 
@@ -1752,7 +2126,132 @@ C
         fail "$label" "exit=$rc output=$actual"
     fi
     rm -f "$src" "$probe" "$bin" "$out" "$custom" "$log" \
-        "$alias" "$trace" "$gate" "$gate_log"
+        "$alias" "$trace" "$trace_base" "$gate" "$gate_log"
+}
+
+# A failed dynamic-loader call has no link_map to add to the dependency
+# manifest, but omitting it changes the observable dlerror state under direct
+# replay.  Exercise the transactional V8 failure grammar at its producer
+# boundary and
+# verify that the raw-syscall record write preserves both errno and dlerror.
+test_failed_loader_trace_records() {
+    echo "--- failed loader-call trace records ---"
+    local probe="$BUILD/failed_loader_trace"
+    local trace="$BUILD/failed_loader_trace.log"
+    local helper="$BUILD/dlfreeze-preload.so"
+    local out="$BUILD/failed_loader_trace.frozen"
+    local log="$BUILD/failed_loader_trace.freeze.log"
+    local case_name expected_record expect actual trace_actual owner_record
+    local owner_pid trace_attempt trace_begin
+    local expect_rc actual_rc
+    local -a cases=(now deepbind null newlm newlm-null)
+
+    if [ ! -r "$helper" ] ||
+       ! "$TEST_REAL_GCC" -Wall -Wextra -Werror -O2 \
+            -o "$probe" tests/dlopen_failed_trace_gate.c -ldl; then
+        fail "failed loader-call trace records" \
+            "fixture/helper unavailable or fixture compile failed"
+        rm -f "$probe" "$trace"
+        return
+    fi
+
+    for case_name in "${cases[@]}"; do
+        case "$case_name" in
+            now)
+                expected_record='D P 0000000000000000 00000002'
+                ;;
+            deepbind)
+                expected_record='D P 0000000000000000 0000000a'
+                ;;
+            null)
+                expected_record='D N 0000000000000000 00000000'
+                ;;
+            newlm)
+                expected_record='M P ffffffffffffffff 00000002'
+                ;;
+            newlm-null)
+                expected_record='M N ffffffffffffffff 00000002'
+                ;;
+        esac
+        expect=""; expect_rc=0
+        capture_output expect env -u LD_PRELOAD -u DLFREEZE_TRACE_FILE \
+            "$probe" "$case_name" || expect_rc=$?
+        if [ "$expect_rc" -eq 77 ]; then
+            skip "failed $case_name loader-call trace" \
+                "target libc does not expose dlmopen namespaces"
+            continue
+        fi
+        if [ "$expect_rc" -eq 78 ]; then
+            skip "failed $case_name loader-call trace" \
+                "this call does not fail on the target libc"
+            continue
+        fi
+        if [ "$expect_rc" -ne 0 ]; then
+            fail "failed $case_name loader-call native control" \
+                "exit=$expect_rc output=$expect"
+            continue
+        fi
+
+        rm -f "$trace"
+        actual=""; actual_rc=0
+        capture_output actual env LD_PRELOAD="$helper" \
+            DLFREEZE_TRACE_FILE="$trace" \
+            "$probe" "$case_name" || actual_rc=$?
+        owner_record=$(sed -n '2p' "$trace" 2>/dev/null || true)
+        owner_pid=${owner_record#O }
+        trace_begin=$(tail -n 2 "$trace" 2>/dev/null |
+            sed -n '1p' || true)
+        trace_attempt=${trace_begin##* }
+        trace_actual=$(tail -n 1 "$trace" 2>/dev/null || true)
+        if [ "$actual_rc" -eq "$expect_rc" ] &&
+           [ "$actual" = "$expect" ] &&
+           [ "$(sed -n '1p' "$trace" 2>/dev/null || true)" = \
+                '#DLFREEZE_DLOPEN_TRACE_V8' ] &&
+           [[ "$owner_pid" =~ ^[0-9a-f]{16}$ ]] &&
+           [[ "$trace_attempt" =~ ^[0-9a-f]{16}$ ]] &&
+           [ "$trace_begin" = "B $owner_pid $trace_attempt" ] &&
+           [ "$trace_actual" = \
+                "F $owner_pid $trace_attempt $expected_record" ] &&
+           ! grep -q '^! ' "$trace"; then
+            pass "failed $case_name loader-call trace preserves error state"
+        else
+            fail "failed $case_name loader-call trace" \
+                "exit=$actual_rc expected-exit=$expect_rc output=$actual expected=$expect trace=$trace_actual"
+        fi
+    done
+
+    # A failed NOW probe must select extraction on every target libc: native
+    # dlerror text is loader-owned state and cannot be reconstructed from a
+    # manifest containing only successfully mapped objects.
+    expect=""; expect_rc=0
+    capture_output expect env -u LD_PRELOAD -u DLFREEZE_TRACE_FILE \
+        "$probe" now || expect_rc=$?
+    if [ "$expect_rc" -ne 0 ]; then
+        fail "failed loader-call extraction control" \
+            "exit=$expect_rc output=$expect"
+    elif ! run_freeze "$DLFREEZE" -d -t -o "$out" -- "$probe" now \
+            >"$log" 2>&1; then
+        fail "failed loader-call extraction selection" "dlfreeze failed"
+        tail -n 80 "$log" || true
+    elif ! grep -Eq \
+            'failed traced dynamic-loader call.*creating an extraction-mode binary' \
+            "$log"; then
+        fail "failed loader-call extraction selection" \
+            "packer did not report the native-semantics fallback"
+        tail -n 80 "$log" || true
+    else
+        rm -f "$probe"
+        actual=""; actual_rc=0
+        capture_output actual env -u LD_PRELOAD -u DLFREEZE_TRACE_FILE \
+            "$out" now || actual_rc=$?
+        if [ "$actual_rc" -eq "$expect_rc" ] && [ "$actual" = "$expect" ]; then
+            pass "failed loader call preserves native result by extraction"
+        else
+            fail "failed loader-call extraction replay" \
+                "exit=$actual_rc expected-exit=$expect_rc output=$actual expected=$expect"
+        fi
+    fi
+    rm -f "$probe" "$trace" "$out" "$log"
 }
 
 # ===================================================================
@@ -2223,10 +2722,15 @@ test_direct_target_auxv_identity() {
     cat > "$src" <<'C'
 #define _GNU_SOURCE
 #include <elf.h>
+#include <inttypes.h>
 #include <link.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <sys/auxv.h>
+
+#ifndef AT_HWCAP2
+#define AT_HWCAP2 26
+#endif
 
 extern void _start(void);
 
@@ -2234,6 +2738,8 @@ static uintptr_t constructor_phdr;
 static uintptr_t constructor_phnum;
 static uintptr_t constructor_phent;
 static uintptr_t constructor_entry;
+static uintptr_t constructor_hwcap;
+static uintptr_t constructor_hwcap2;
 
 __attribute__((constructor))
 static void remember_constructor_auxv(void)
@@ -2242,6 +2748,8 @@ static void remember_constructor_auxv(void)
     constructor_phnum = getauxval(AT_PHNUM);
     constructor_phent = getauxval(AT_PHENT);
     constructor_entry = getauxval(AT_ENTRY);
+    constructor_hwcap = getauxval(AT_HWCAP);
+    constructor_hwcap2 = getauxval(AT_HWCAP2);
 }
 
 struct phdr_match {
@@ -2270,17 +2778,23 @@ int main(void)
     };
     uintptr_t phent = getauxval(AT_PHENT);
     uintptr_t entry = getauxval(AT_ENTRY);
+    uintptr_t hwcap = getauxval(AT_HWCAP);
+    uintptr_t hwcap2 = getauxval(AT_HWCAP2);
 
     if (!match.phdr || !match.phnum || phent != sizeof(Elf64_Phdr) ||
         entry != (uintptr_t)&_start)
         return 2;
     if (constructor_phdr != match.phdr ||
         constructor_phnum != match.phnum ||
-        constructor_phent != phent || constructor_entry != entry)
+        constructor_phent != phent || constructor_entry != entry ||
+        constructor_hwcap != hwcap || constructor_hwcap2 != hwcap2)
         return 3;
     if (dl_iterate_phdr(match_main_phdr, &match) < 0 || match.matches != 1)
         return 4;
-    puts("target-auxv-ok");
+    if (!hwcap)
+        return 5;
+    printf("target-auxv-ok hwcap=%" PRIxPTR " hwcap2=%" PRIxPTR "\n",
+           hwcap, hwcap2);
     return 0;
 }
 C
@@ -2292,7 +2806,8 @@ C
         return
     fi
     capture_output expect "$bin" || rc_e=$?
-    if [ "$rc_e" -ne 0 ] || [ "$expect" != "target-auxv-ok" ]; then
+    if [ "$rc_e" -ne 0 ] ||
+       [[ "$expect" != "target-auxv-ok hwcap="*" hwcap2="* ]]; then
         fail "native target auxiliary-vector identity" \
             "exit=$rc_e output=$expect"
         rm -f "$src" "$bin" "$out" "$log"
@@ -2322,7 +2837,8 @@ C
                 "fixture compile failed"
         else
             capture_output expect "$musl_bin" || rc_e=$?
-            if [ "$rc_e" -ne 0 ] || [ "$expect" != "target-auxv-ok" ]; then
+            if [ "$rc_e" -ne 0 ] ||
+               [[ "$expect" != "target-auxv-ok hwcap="*" hwcap2="* ]]; then
                 fail "native musl target auxiliary-vector identity" \
                     "exit=$rc_e output=$expect"
             else
@@ -2348,6 +2864,245 @@ C
     fi
     rm -f "$src" "$bin" "$out" "$log" \
         "$musl_bin" "$musl_out" "$musl_log"
+}
+
+# ===================================================================
+# Test 1g1: target-owned x86 CPU initialization publishes the cache fields
+# consumed by libc's public sysconf API, including indeterminate -1 results.
+# ===================================================================
+test_direct_x86_cache_sysconf_identity() {
+    echo "--- direct x86 cache sysconf identity ---"
+    local src="$BUILD/x86_cache_sysconf.c"
+    local bin="$BUILD/x86_cache_sysconf"
+    local launcher_src="$BUILD/x86_cache_sysconf_launcher.c"
+    local launcher="$BUILD/x86_cache_sysconf_launcher"
+    local out="$BUILD/x86_cache_sysconf.frozen"
+    local log="$BUILD/x86_cache_sysconf.log"
+    local expect="" actual="" rc_e=0 rc=0 freeze_rc=0
+
+    if [ "$(uname -m)" != x86_64 ]; then
+        skip "direct x86 cache sysconf identity" "requires x86-64"
+        return
+    fi
+    cat > "$src" <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <stdio.h>
+#include <unistd.h>
+
+struct query { const char *name; int value; };
+#define QUERY(name) { #name, name }
+
+int main(void)
+{
+    static const struct query queries[] = {
+#ifdef _SC_LEVEL1_ICACHE_SIZE
+        QUERY(_SC_LEVEL1_ICACHE_SIZE),
+#endif
+#ifdef _SC_LEVEL1_ICACHE_ASSOC
+        QUERY(_SC_LEVEL1_ICACHE_ASSOC),
+#endif
+#ifdef _SC_LEVEL1_ICACHE_LINESIZE
+        QUERY(_SC_LEVEL1_ICACHE_LINESIZE),
+#endif
+#ifdef _SC_LEVEL1_DCACHE_SIZE
+        QUERY(_SC_LEVEL1_DCACHE_SIZE),
+#endif
+#ifdef _SC_LEVEL1_DCACHE_ASSOC
+        QUERY(_SC_LEVEL1_DCACHE_ASSOC),
+#endif
+#ifdef _SC_LEVEL1_DCACHE_LINESIZE
+        QUERY(_SC_LEVEL1_DCACHE_LINESIZE),
+#endif
+#ifdef _SC_LEVEL2_CACHE_SIZE
+        QUERY(_SC_LEVEL2_CACHE_SIZE),
+#endif
+#ifdef _SC_LEVEL2_CACHE_ASSOC
+        QUERY(_SC_LEVEL2_CACHE_ASSOC),
+#endif
+#ifdef _SC_LEVEL2_CACHE_LINESIZE
+        QUERY(_SC_LEVEL2_CACHE_LINESIZE),
+#endif
+#ifdef _SC_LEVEL3_CACHE_SIZE
+        QUERY(_SC_LEVEL3_CACHE_SIZE),
+#endif
+#ifdef _SC_LEVEL3_CACHE_ASSOC
+        QUERY(_SC_LEVEL3_CACHE_ASSOC),
+#endif
+#ifdef _SC_LEVEL3_CACHE_LINESIZE
+        QUERY(_SC_LEVEL3_CACHE_LINESIZE),
+#endif
+#ifdef _SC_LEVEL4_CACHE_SIZE
+        QUERY(_SC_LEVEL4_CACHE_SIZE),
+#endif
+#ifdef _SC_LEVEL4_CACHE_ASSOC
+        QUERY(_SC_LEVEL4_CACHE_ASSOC),
+#endif
+#ifdef _SC_LEVEL4_CACHE_LINESIZE
+        QUERY(_SC_LEVEL4_CACHE_LINESIZE),
+#endif
+        { NULL, 0 },
+    };
+
+    if (queries[0].name == NULL)
+        return 79;
+    for (size_t i = 0; queries[i].name != NULL; i++) {
+        long value;
+        int error;
+
+        errno = 0;
+        value = sysconf(queries[i].value);
+        error = errno;
+        printf("%s=%ld:%d\n", queries[i].name, value, error);
+    }
+    return 0;
+}
+C
+    cat > "$launcher_src" <<'C'
+#define _GNU_SOURCE
+#include <sched.h>
+#include <unistd.h>
+
+int main(int argc, char **argv)
+{
+    cpu_set_t allowed;
+    cpu_set_t selected;
+    int cpu = -1;
+
+    if (argc != 2)
+        return 76;
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0)
+        return 77;
+    for (int candidate = 0; candidate < CPU_SETSIZE; candidate++) {
+        if (CPU_ISSET(candidate, &allowed)) {
+            cpu = candidate;
+            break;
+        }
+    }
+    if (cpu < 0)
+        return 77;
+    CPU_ZERO(&selected);
+    CPU_SET(cpu, &selected);
+    if (sched_setaffinity(0, sizeof(selected), &selected) != 0)
+        return 77;
+    execl(argv[1], argv[1], (char *)0);
+    return 78;
+}
+C
+
+    if ! gcc -Wall -Wextra -Werror -o "$bin" "$src" ||
+       ! gcc -Wall -Wextra -Werror -o "$launcher" "$launcher_src"; then
+        fail "direct x86 cache sysconf identity" "fixture compile failed"
+        rm -f "$src" "$bin" "$launcher_src" "$launcher" "$out" "$log"
+        return
+    fi
+    capture_output expect "$launcher" "$bin" || rc_e=$?
+    if [ "$rc_e" -eq 79 ]; then
+        skip "direct x86 cache sysconf identity" \
+            "target libc exposes no x86 cache sysconf selectors"
+        rm -f "$src" "$bin" "$launcher_src" "$launcher" "$out" "$log"
+        return
+    elif [ "$rc_e" -eq 77 ]; then
+        skip "direct x86 cache sysconf identity" \
+            "CPU affinity is unavailable"
+        rm -f "$src" "$bin" "$launcher_src" "$launcher" "$out" "$log"
+        return
+    elif [ "$rc_e" -ne 0 ] || [ -z "$expect" ]; then
+        fail "native x86 cache sysconf identity" \
+            "exit=$rc_e output=$expect"
+        rm -f "$src" "$bin" "$launcher_src" "$launcher" "$out" "$log"
+        return
+    fi
+    freeze_require_direct "direct x86 cache sysconf identity" "$log" \
+        "$out" "$bin" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "direct x86 cache sysconf identity" "$DIRECT_FREEZE_REASON"
+    elif [ "$freeze_rc" -eq 0 ]; then
+        capture_output actual env DLFREEZE_NO_FORK=1 \
+            "$launcher" "$out" || rc=$?
+        actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+        if [ "$rc" -eq 0 ] && [ "$actual" = "$expect" ]; then
+            pass "direct x86 cache sysconf identity"
+        else
+            fail "direct x86 cache sysconf identity" \
+                "exit=$rc expected=$expect actual=$actual"
+        fi
+    fi
+    rm -f "$src" "$bin" "$launcher_src" "$launcher" "$out" "$log"
+}
+
+# ===================================================================
+# Test 1g2: glibc system-wide tunables are cache-owned startup state.  A
+# vendor may backport the extension independently of its libc release string.
+# Redirect an embedded interpreter to one immutable cache snapshot carrying
+# extension tag 2 and require refusal before target initialization.
+# ===================================================================
+test_glibc_cache_tunables_refusal() {
+    echo "--- glibc cache tunables refusal ---"
+    local minor
+    local src="$BUILD/cache_tunables_target.c"
+    local bin="$BUILD/cache_tunables_target"
+    local out="$BUILD/cache_tunables.frozen"
+    local log="$BUILD/cache_tunables.log"
+    local helper="$BUILD/cache_tunables_layout_gate"
+    local cache=/tmp/ld.so.cache
+    local actual="" rc=0 freeze_rc=0 cache_created=0
+
+    minor=$({ getconf GNU_LIBC_VERSION 2>/dev/null || true; } |
+        sed -n 's/^glibc 2\.\([0-9][0-9]*\)$/\1/p')
+    if ! [[ "$minor" =~ ^[0-9]+$ ]] ||
+       [ "$minor" -lt 34 ] || [ "$minor" -gt 44 ]; then
+        skip "glibc cache tunables refusal" \
+            "requires an admitted glibc 2.34-2.44 runtime"
+        return
+    fi
+    cat > "$src" <<'C'
+#include <stdio.h>
+int main(void) { puts("cache-tag2-target-ran"); return 0; }
+C
+    if ! gcc -Wall -Wextra -Werror -o "$bin" "$src" ||
+       ! gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -O2 \
+            -Iinclude tests/glibc_layout_gate.c -o "$helper"; then
+        fail "glibc cache tunables refusal" "fixture compile failed"
+        rm -f "$src" "$bin" "$out" "$log" "$helper"
+        return
+    fi
+    freeze_require_direct "glibc cache tunables refusal" "$log" \
+        "$out" "$bin" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "glibc cache tunables refusal" "$DIRECT_FREEZE_REASON"
+    elif [ "$freeze_rc" -eq 0 ]; then
+        capture_output actual env DLFREEZE_NO_FORK=1 "$out" || rc=$?
+        actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+        if [ "$rc" -ne 0 ] || [ "$actual" != cache-tag2-target-ran ]; then
+            fail "glibc cache tunables baseline" \
+                "exit=$rc output=$actual"
+        elif [ -e "$cache" ]; then
+            skip "glibc cache tunables refusal" \
+                "$cache already exists"
+        elif ! cp /etc/ld.so.cache "$cache" ||
+             ! "$helper" --cache-add-tag2 "$cache" ||
+             ! "$helper" --frozen-cache-path "$cache" "$out"; then
+            skip "glibc cache tunables refusal" \
+                "target cache path fixture is not representable"
+        else
+            cache_created=1
+            actual=""; rc=0
+            capture_output actual env DLFREEZE_NO_FORK=1 "$out" || rc=$?
+            if [ "$rc" -eq 127 ] &&
+               [[ "$actual" == *"target glibc cache contains system-wide tunable overrides"* ]] &&
+               [[ "$actual" != *"cache-tag2-target-ran"* ]]; then
+                pass "glibc cache tunables refusal"
+            else
+                fail "glibc cache tunables refusal" \
+                    "exit=$rc output=$actual"
+            fi
+        fi
+    fi
+    rm -f "$src" "$bin" "$out" "$log" "$helper"
+    if [ "$cache_created" -eq 1 ]; then
+        rm -f "$cache"
+    fi
 }
 
 # ===================================================================
@@ -2456,8 +3211,8 @@ test_glibc_internal_module_loading_direct() {
             "fixture requires glibc"
         return
     fi
-    glibc_minor=$(getconf GNU_LIBC_VERSION 2>/dev/null |
-        awk -F. 'NF == 2 { print $2; exit }')
+    glibc_minor=$({ getconf GNU_LIBC_VERSION 2>/dev/null || true; } |
+        awk -F. 'NF == 2 && !found { print $2; found = 1 }')
     if [[ "$glibc_minor" =~ ^[0-9]+$ ]] &&
        [ "$glibc_minor" -ge 34 ]; then
         require_bridge=1
@@ -2580,7 +3335,10 @@ test_exit_code() {
 #include <stdlib.h>
 int main(int ac, char **av) { return ac > 1 ? atoi(av[1]) : 42; }
 C
-    gcc -o "$bin" "$src"
+    if ! gcc -o "$bin" "$src"; then
+        fail "exit-code" "fixture compile failed"
+        return
+    fi
     if ! run_freeze "$DLFREEZE" -o "$out" "$bin"; then fail "exit-code" "dlfreeze failed"; return; fi
 
     local e0 a0 e42 a42 ed ad
@@ -3268,10 +4026,13 @@ C
     capture_output actual env -u DLFREEZE_NO_FORK LD_AUDIT= \
         LD_PRELOAD="$preload_so" "$clean_out" \
         "$captured.host" "$host_dir" || rc=$?
+    # Recoverable failures in the supervised direct child are deliberately
+    # silent: extraction is an internal implementation choice and must not
+    # add diagnostics to otherwise successful application output.  The
+    # preload constructor is positive evidence that the native loader, not
+    # the direct loader, consumed LD_PRELOAD.
     if [ "$rc" -eq 0 ] &&
-       [[ "$actual" == *"refusing direct load: nonempty LD_PRELOAD is unsupported"* ]] &&
-       [[ "$actual" == *"policy-preload-ran"* ]] &&
-       [[ "$actual" == *"$expect"* ]]; then
+       [ "$actual" = $'policy-preload-ran\n'"$expect" ]; then
         pass "LD_PRELOAD extraction fallback"
     else
         fail "LD_PRELOAD extraction fallback" "exit=$rc output=$actual"
@@ -3281,9 +4042,11 @@ C
     capture_output actual env -u DLFREEZE_NO_FORK LD_PRELOAD= \
         LD_AUDIT="$preload_so" "$clean_out" \
         "$captured.host" "$host_dir" || rc=$?
-    if [ "$rc" -eq 0 ] &&
-       [[ "$actual" == *"refusing direct load: nonempty LD_AUDIT is unsupported"* ]] &&
-       [[ "$actual" == *"$expect"* ]]; then
+    # The strict/direct-only case above proves that a nonempty LD_AUDIT is
+    # never admitted by the in-process loader.  A clean manifest may retry
+    # silently through the native loader, including on runtimes which accept
+    # but otherwise ignore LD_AUDIT.
+    if [ "$rc" -eq 0 ] && [ "$actual" = "$expect" ]; then
         pass "LD_AUDIT extraction fallback"
     else
         fail "LD_AUDIT extraction fallback" "exit=$rc output=$actual"
@@ -3293,7 +4056,7 @@ C
     rm -f "$src"
 }
 
-# File-trace V4 keeps the absolute spelling derived from cwd separate from
+# File-trace V9 keeps the absolute spelling derived from cwd separate from
 # the canonical source copied into the artifact.  Exercise every path-only
 # VFS entry point after all traced files, symlinks, and directories disappear.
 test_captured_file_request_identity_direct() {
@@ -3606,12 +4369,13 @@ test_vfs_dir_handle_registry() {
 
     rm -rf "$root"
     rm -f "$out" "$log"
-    mkdir -p "$data"
+    mkdir -p "$data/other"
     root=$(realpath "$root")
     data="$root/data"
     bin="$root/program"
     printf '1\n' >"$data/first.txt"
     printf '2\n' >"$data/second.txt"
+    printf '3\n' >"$data/other/third.txt"
 
     if ! gcc -Wall -Wextra -Werror -pthread \
             -o "$bin" tests/vfs_dir_registry.c; then
@@ -3620,7 +4384,7 @@ test_vfs_dir_handle_registry() {
         rm -f "$out" "$log"
         return
     fi
-    capture_output actual "$bin" "$data" "$data/second.txt" || rc=$?
+    capture_output actual "$bin" "$data" "$data/second.txt" "$root" || rc=$?
     if [ "$rc" -ne 0 ] || [ "$actual" != "$expected" ]; then
         fail "native DIR handle registry control" \
             "exit=$rc output=$actual"
@@ -3630,7 +4394,7 @@ test_vfs_dir_handle_registry() {
     fi
 
     freeze_require_direct "VFS DIR handle registry" "$log" "$out" \
-        -t -f "$data/*" -- "$bin" "$data" "$data/second.txt" ||
+        -t -f "$data/*" -- "$bin" "$data" "$data/second.txt" "$root" ||
         freeze_rc=$?
     if [ "$freeze_rc" -eq 77 ]; then
         skip "VFS DIR handle registry" "$DIRECT_FREEZE_REASON"
@@ -3647,7 +4411,7 @@ test_vfs_dir_handle_registry() {
     rm -rf "$data"
     actual=""; rc=0
     capture_output actual env DLFREEZE_NO_FORK=1 \
-        "$out" "$data" "$data/second.txt" || rc=$?
+        "$out" "$data" "$data/second.txt" "$root" || rc=$?
     actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
     if [ "$rc" -eq 0 ] && [ "$actual" = "$expected" ]; then
         pass "VFS DIR handle registry"
@@ -3690,7 +4454,11 @@ int main(int argc, char **argv) {
     return 200;
     }
 C
-    gcc -o "$bin" "$src"
+    if ! gcc -o "$bin" "$src"; then
+        fail "direct handoff executes once" "fixture compile failed"
+        rm -f "$src" "$bin" "$out" "$marker" "$pack_log"
+        return
+    fi
     freeze_require_direct "direct handoff executes once" "$pack_log" \
         "$out" "$bin" || freeze_rc=$?
     if [ "$freeze_rc" -eq 77 ]; then
@@ -3732,6 +4500,11 @@ C
 
     if grep -Eq '^[[:space:]]*pre-linked[[:space:]]*:[[:space:]]*yes' \
             "$pack_log"; then
+        # Prelinked bytes are now extraction-safe, so a clean artifact keeps
+        # the same pre-handoff fallback supervisor as an ordinary relocatable
+        # artifact.  The default launcher PID and target PID must therefore
+        # be distinct; the explicit strict/no-fork path still preserves the
+        # exact process identity.
         rm -f "$marker"
         rc=0
         env -u DLFREEZE_NO_FORK "$out" "$marker" pid \
@@ -3739,14 +4512,31 @@ C
         frozen_pid=$!
         wait "$frozen_pid" || rc=$?
         target_pid=$(cat "$marker" 2>/dev/null || true)
-        if [ "$rc" -eq 0 ] && [ "$target_pid" = "$frozen_pid" ]; then
-            pass "prelinked direct process identity"
+        if [ "$rc" -eq 0 ] && [ -n "$target_pid" ] &&
+           [ "$target_pid" != "$frozen_pid" ]; then
+            pass "prelinked clean artifact remains supervised"
         else
-            fail "prelinked direct process identity" \
+            fail "prelinked clean artifact supervisor" \
+                "launcher_pid=$frozen_pid target_pid=$target_pid exit=$rc"
+        fi
+
+        rm -f "$marker"
+        rc=0
+        env DLFREEZE_NO_FORK=1 "$out" "$marker" pid \
+            >/dev/null 2>&1 &
+        frozen_pid=$!
+        wait "$frozen_pid" || rc=$?
+        target_pid=$(cat "$marker" 2>/dev/null || true)
+        if [ "$rc" -eq 0 ] && [ "$target_pid" = "$frozen_pid" ]; then
+            pass "prelinked strict direct process identity"
+        else
+            fail "prelinked strict direct process identity" \
                 "launcher_pid=$frozen_pid target_pid=$target_pid exit=$rc"
         fi
     else
-        skip "prelinked direct process identity" \
+        skip "prelinked clean artifact remains supervised" \
+            "fixture used runtime relocation"
+        skip "prelinked strict direct process identity" \
             "fixture used runtime relocation"
     fi
     rm -f "$src" "$bin" "$out" "$marker" "$pack_log"
@@ -3852,7 +4642,7 @@ C
         fail "fallback supervisor signal forwarding" \
             "application child did not become ready"
     else
-        kill -TERM "$wrapper"
+        kill -TERM "$wrapper" 2>/dev/null || true
         wait "$wrapper" || rc=$?
         local child_alive=0
         if kill -0 "$child" 2>/dev/null; then
@@ -3914,7 +4704,7 @@ C
         fail "fallback asynchronous signal forwarding" \
             "application child did not become ready"
     else
-        kill -WINCH "$wrapper"
+        kill -WINCH "$wrapper" 2>/dev/null || true
         wait "$wrapper" || rc=$?
         local marker_lines=0
         child_alive=0
@@ -3953,7 +4743,7 @@ C
         fail "fallback asynchronous fault-number forwarding" \
             "application child did not become ready"
     else
-        kill -ABRT "$wrapper"
+        kill -ABRT "$wrapper" 2>/dev/null || true
         wait "$wrapper" || rc=$?
         marker_lines=0 child_alive=0
         [ -f "$marker" ] && marker_lines=$(wc -l < "$marker")
@@ -3992,7 +4782,7 @@ C
         fail "fallback repeated fault-number forwarding" \
             "application child did not become ready"
     else
-        kill -SEGV "$wrapper"
+        kill -SEGV "$wrapper" 2>/dev/null || true
         for _ in {1..100}; do
             [ "$(tail -n 1 "$marker" 2>/dev/null)" = segv1 ] && break
             sleep 0.02
@@ -4003,7 +4793,7 @@ C
             fail "fallback repeated fault-number forwarding" \
                 "first SIGSEGV was not handled"
         else
-            kill -SEGV "$wrapper"
+            kill -SEGV "$wrapper" 2>/dev/null || true
             wait "$wrapper" || rc=$?
             marker_lines=0 child_alive=0
             [ -f "$marker" ] && marker_lines=$(wc -l < "$marker")
@@ -4097,10 +4887,429 @@ C
         else
             fail "direct startup inherited SIGCHLD" "exit=$rc"
         fi
+        rc=0
+        run_with_timeout env DLFREEZE_NO_FORK=1 \
+            "$launcher" "$direct" || rc=$?
+        if [ "$rc" -eq 37 ]; then
+            pass "contained CPU probe preserves inherited SIGCHLD"
+        else
+            fail "contained CPU probe inherited SIGCHLD" "exit=$rc"
+        fi
     fi
 
     rm -f "$target_src" "$launcher_src" "$target" "$launcher" \
         "$direct" "$extracted" "$direct_log" "$extracted_log"
+}
+
+# ===================================================================
+# Test 2c1a: a sandbox may deny the contained CPU probe's signal-zero clone,
+# its atomic result write, or its __WCLONE reap.  Clean artifacts may fall
+# back only when containment is intact; strict direct mode must never retry
+# the target initializer in-process.
+# ===================================================================
+test_direct_cpu_probe_seccomp_fallback() {
+    echo "--- contained CPU probe seccomp fallback ---"
+    local target_src="$BUILD/cpu_probe_seccomp_target.c"
+    local launcher_src="$BUILD/cpu_probe_seccomp_launcher.c"
+    local target="$BUILD/cpu_probe_seccomp_target"
+    local launcher="$BUILD/cpu_probe_seccomp_launcher"
+    local out="$BUILD/cpu_probe_seccomp.frozen"
+    local log="$BUILD/cpu_probe_seccomp.log"
+    local clean_out="$BUILD/cpu_probe_seccomp.clean.frozen"
+    local clean_log="$BUILD/cpu_probe_seccomp.clean.log"
+    local fallback_out="" actual="" rc=0 freeze_rc=0 clean_rc=0
+    local prelinked=0 clean=0 limit
+
+    if [ "$(uname -m)" != x86_64 ]; then
+        skip "contained CPU probe seccomp fallback" "requires x86-64"
+        skip "contained CPU probe seccomp strict refusal" "requires x86-64"
+        skip "supervised exact-file probe seccomp fallback" \
+            "requires x86-64"
+        skip "fallback avoids optional filesystem metadata probes" \
+            "requires x86-64"
+        skip "strict direct skips exact-file probe" "requires x86-64"
+        skip "contained CPU probe result-write refusal" "requires x86-64"
+        skip "contained CPU probe reap containment refusal" \
+            "requires x86-64"
+        skip "contained CPU post-wrapper failure is terminal" \
+            "requires x86-64"
+        skip "terminal loader exit survives marker denial" "requires x86-64"
+        skip "application exit 126 survives handoff" "requires x86-64"
+        return
+    fi
+    if ! getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
+        skip "contained CPU probe seccomp fallback" \
+            "requires glibc x86 CPU-feature initialization"
+        skip "contained CPU probe seccomp strict refusal" \
+            "requires glibc x86 CPU-feature initialization"
+        skip "supervised exact-file probe seccomp fallback" \
+            "requires glibc x86 CPU-feature initialization"
+        skip "fallback avoids optional filesystem metadata probes" \
+            "requires glibc x86 CPU-feature initialization"
+        skip "strict direct skips exact-file probe" \
+            "requires glibc x86 CPU-feature initialization"
+        skip "contained CPU probe result-write refusal" \
+            "requires glibc x86 CPU-feature initialization"
+        skip "contained CPU probe reap containment refusal" \
+            "requires glibc x86 CPU-feature initialization"
+        skip "contained CPU post-wrapper failure is terminal" \
+            "requires glibc x86 CPU-feature initialization"
+        skip "terminal loader exit survives marker denial" \
+            "requires glibc x86 CPU-feature initialization"
+        skip "application exit 126 survives handoff" \
+            "requires glibc x86 CPU-feature initialization"
+        return
+    fi
+    cat > "$target_src" <<'C'
+#include <stdlib.h>
+#include <stdio.h>
+
+static volatile unsigned char large_bss[64U * 1024U * 1024U];
+
+int main(void) {
+    large_bss[0] = 1;
+    large_bss[sizeof(large_bss) - 1] = 2;
+    if (getenv("DLFREEZE_TEST_EXIT_126"))
+        return 126;
+    puts("cpu-probe-seccomp-target-ran");
+    return large_bss[0] + large_bss[sizeof(large_bss) - 1] - 3;
+}
+C
+    cat > "$launcher_src" <<'C'
+#include <errno.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <stddef.h>
+#include <string.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#ifndef SECCOMP_RET_KILL_PROCESS
+#define SECCOMP_RET_KILL_PROCESS SECCOMP_RET_KILL
+#endif
+
+int main(int argc, char **argv)
+{
+    struct sock_filter deny_clone[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_clone, 0, 3),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, args[0])),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K,
+                 SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_filter deny_result_write[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_write, 0, 3),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, args[2])),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 568, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K,
+                 SECCOMP_RET_ERRNO | (EIO & SECCOMP_RET_DATA)),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_filter deny_clone_reap[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_wait4, 0, 3),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, args[2])),
+        BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, 0x80000000U, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K,
+                 SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_filter deny_all_writes[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_write, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K,
+                 SECCOMP_RET_ERRNO | (EIO & SECCOMP_RET_DATA)),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_filter kill_fstatfs[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_fstatfs, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+#ifdef __NR_statx
+    struct sock_filter kill_optional_fs_metadata[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_fstatfs, 1, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_statx, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+#endif
+    struct sock_fprog program = {
+        .len = 0,
+        .filter = 0,
+    };
+
+    if (argc != 3)
+        return 76;
+    if (strcmp(argv[1], "clone") == 0) {
+        program.len = (unsigned short)(sizeof(deny_clone) /
+                                       sizeof(deny_clone[0]));
+        program.filter = deny_clone;
+    } else if (strcmp(argv[1], "write") == 0) {
+        program.len = (unsigned short)(sizeof(deny_result_write) /
+                                       sizeof(deny_result_write[0]));
+        program.filter = deny_result_write;
+    } else if (strcmp(argv[1], "wait4") == 0) {
+        program.len = (unsigned short)(sizeof(deny_clone_reap) /
+                                       sizeof(deny_clone_reap[0]));
+        program.filter = deny_clone_reap;
+    } else if (strcmp(argv[1], "allwrite") == 0) {
+        program.len = (unsigned short)(sizeof(deny_all_writes) /
+                                       sizeof(deny_all_writes[0]));
+        program.filter = deny_all_writes;
+    } else if (strcmp(argv[1], "fstatfs-kill") == 0) {
+        program.len = (unsigned short)(sizeof(kill_fstatfs) /
+                                       sizeof(kill_fstatfs[0]));
+        program.filter = kill_fstatfs;
+#ifdef __NR_statx
+    } else if (strcmp(argv[1], "fs-metadata-kill") == 0) {
+        program.len = (unsigned short)(sizeof(kill_optional_fs_metadata) /
+                                       sizeof(kill_optional_fs_metadata[0]));
+        program.filter = kill_optional_fs_metadata;
+#endif
+    } else {
+        return 76;
+    }
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 ||
+        prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program) != 0)
+        return 77;
+    execl(argv[2], argv[2], (char *)0);
+    return 78;
+}
+C
+    if ! gcc -Wall -Wextra -Werror -o "$target" "$target_src" ||
+       ! gcc -Wall -Wextra -Werror -o "$launcher" "$launcher_src"; then
+        fail "contained CPU probe seccomp fallback" "fixture compile failed"
+        rm -f "$target_src" "$launcher_src" "$target" "$launcher" \
+            "$out" "$log" "$clean_out" "$clean_log"
+        return
+    fi
+    freeze_require_direct "contained CPU probe seccomp" "$log" \
+        "$out" "$target" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "contained CPU probe seccomp fallback" "$DIRECT_FREEZE_REASON"
+        skip "contained CPU probe seccomp strict refusal" \
+            "$DIRECT_FREEZE_REASON"
+        skip "supervised exact-file probe seccomp fallback" \
+            "$DIRECT_FREEZE_REASON"
+        skip "fallback avoids optional filesystem metadata probes" \
+            "$DIRECT_FREEZE_REASON"
+        skip "strict direct skips exact-file probe" \
+            "$DIRECT_FREEZE_REASON"
+        skip "contained CPU probe result-write refusal" \
+            "$DIRECT_FREEZE_REASON"
+        skip "contained CPU probe reap containment refusal" \
+            "$DIRECT_FREEZE_REASON"
+        skip "contained CPU post-wrapper failure is terminal" \
+            "$DIRECT_FREEZE_REASON"
+        skip "terminal loader exit survives marker denial" \
+            "$DIRECT_FREEZE_REASON"
+        skip "application exit 126 survives handoff" \
+            "$DIRECT_FREEZE_REASON"
+    elif [ "$freeze_rc" -eq 0 ]; then
+        if grep -Eq 'pre-linked[[:space:]]*:[[:space:]]*yes' "$log"; then
+            prelinked=1
+        fi
+        if [ "$prelinked" -eq 0 ]; then
+            clean=1
+            fallback_out="$out"
+        else
+            # A large zero-fill segment costs almost no packer file I/O but
+            # forces the prelink child to reserve its full memory image.
+            # Bound RLIMIT_DATA until packing succeeds with a clean,
+            # explicitly non-prelinked direct artifact.
+            for limit in 12288 16384 24576 32768 49152 65536; do
+                clean_rc=0
+                set +e
+                (
+                    ulimit -d "$limit" || exit 125
+                    run_freeze "$DLFREEZE" -d -o "$clean_out" -- "$target"
+                ) >"$clean_log" 2>&1
+                clean_rc=$?
+                set -e
+                if [ "$clean_rc" -eq 0 ] &&
+                   grep -Fq 'dlfreeze: pre-linker failed' "$clean_log" &&
+                   grep -Eq 'pre-linked[[:space:]]*:[[:space:]]*no' \
+                       "$clean_log"; then
+                    clean=1
+                    fallback_out="$clean_out"
+                    break
+                fi
+            done
+        fi
+        capture_output actual env DLFREEZE_NO_FORK=1 \
+            "$launcher" clone "$out" || rc=$?
+        if [ "$rc" -eq 77 ]; then
+            skip "contained CPU probe seccomp fallback" \
+                "seccomp filter unavailable"
+            skip "contained CPU probe seccomp strict refusal" \
+                "seccomp filter unavailable"
+            skip "supervised exact-file probe seccomp fallback" \
+                "seccomp filter unavailable"
+            skip "fallback avoids optional filesystem metadata probes" \
+                "seccomp filter unavailable"
+            skip "strict direct skips exact-file probe" \
+                "seccomp filter unavailable"
+            skip "contained CPU probe result-write refusal" \
+                "seccomp filter unavailable"
+            skip "contained CPU probe reap containment refusal" \
+                "seccomp filter unavailable"
+            skip "contained CPU post-wrapper failure is terminal" \
+                "seccomp filter unavailable"
+            skip "terminal loader exit survives marker denial" \
+                "seccomp filter unavailable"
+            skip "application exit 126 survives handoff" \
+                "seccomp filter unavailable"
+        else
+            if [ "$rc" -eq 127 ] &&
+               [[ "$actual" == *"target x86 CPU probe is unavailable before target invocation"* ]] &&
+               [[ "$actual" != *"cpu-probe-seccomp-target-ran"* ]]; then
+                pass "contained CPU probe seccomp strict refusal"
+            else
+                fail "contained CPU probe seccomp strict refusal" \
+                    "exit=$rc output=$actual"
+            fi
+            if [ "$clean" -ne 1 ]; then
+                skip "contained CPU probe seccomp fallback" \
+                    "could not produce a clean non-prelinked artifact"
+                skip "supervised exact-file probe seccomp fallback" \
+                    "could not produce a clean non-prelinked artifact"
+                skip "fallback avoids optional filesystem metadata probes" \
+                    "could not produce a clean non-prelinked artifact"
+                skip "contained CPU post-wrapper failure is terminal" \
+                    "could not produce a clean non-prelinked artifact"
+                skip "application exit 126 survives handoff" \
+                    "could not produce a clean non-prelinked artifact"
+                skip "terminal loader exit survives marker denial" \
+                    "could not produce a clean non-prelinked artifact"
+            else
+                actual=""; rc=0
+                capture_output actual env -u DLFREEZE_NO_FORK \
+                    "$launcher" fstatfs-kill "$fallback_out" || rc=$?
+                if [ "$rc" -eq 0 ] &&
+                   [[ "$actual" == *"cpu-probe-seccomp-target-ran"* ]]; then
+                    pass "supervised exact-file probe seccomp fallback"
+                else
+                    fail "supervised exact-file probe seccomp fallback" \
+                        "exit=$rc output=$actual"
+                fi
+
+                actual=""; rc=0
+                capture_output actual env -u DLFREEZE_NO_FORK \
+                    "$launcher" fs-metadata-kill "$fallback_out" || rc=$?
+                if [ "$rc" -eq 76 ]; then
+                    skip "fallback avoids optional filesystem metadata probes" \
+                        "statx syscall number unavailable in test headers"
+                elif [ "$rc" -eq 0 ] &&
+                   [[ "$actual" == *"cpu-probe-seccomp-target-ran"* ]]; then
+                    pass "fallback avoids optional filesystem metadata probes"
+                else
+                    fail "optional filesystem metadata probe containment" \
+                        "exit=$rc output=$actual"
+                fi
+
+                actual=""; rc=0
+                capture_output actual env -u DLFREEZE_NO_FORK \
+                    "$launcher" clone "$fallback_out" || rc=$?
+                # A pre-clone refusal is a recoverable failure in the
+                # supervised child, so it is intentionally silent before the
+                # native-loader retry.  The strict case above proves the same
+                # denied clone cannot enter the target in direct mode.
+                if [ "$rc" -eq 0 ] &&
+                   [ "$actual" = "cpu-probe-seccomp-target-ran" ]; then
+                    pass "contained CPU probe seccomp fallback"
+                else
+                    fail "contained CPU probe seccomp fallback" \
+                        "exit=$rc output=$actual"
+                fi
+
+                actual=""; rc=0
+                capture_output actual env -u DLFREEZE_NO_FORK \
+                    "$launcher" write "$fallback_out" || rc=$?
+                if [ "$rc" -eq 127 ] &&
+                   [[ "$actual" == *"target x86 CPU probe failed safely in its contained child"* ]] &&
+                   [[ "$actual" != *"cpu-probe-seccomp-target-ran"* ]]; then
+                    pass "contained CPU post-wrapper failure is terminal"
+                else
+                    fail "contained CPU post-wrapper failure is terminal" \
+                        "exit=$rc output=$actual"
+                fi
+
+                actual=""; rc=0
+                capture_output actual env -u DLFREEZE_NO_FORK \
+                    DLFREEZE_TEST_EXIT_126=1 "$fallback_out" || rc=$?
+                if [ "$rc" -eq 126 ]; then
+                    pass "application exit 126 survives handoff"
+                else
+                    fail "application exit 126 survives handoff" \
+                        "exit=$rc output=$actual"
+                fi
+
+                actual=""; rc=0
+                capture_output actual env -u DLFREEZE_NO_FORK \
+                    "$launcher" allwrite "$fallback_out" || rc=$?
+                if [ "$rc" -eq 127 ] &&
+                   [[ "$actual" != *"cpu-probe-seccomp-target-ran"* ]]; then
+                    pass "terminal loader exit survives marker denial"
+                else
+                    fail "terminal loader exit survives marker denial" \
+                        "exit=$rc output=$actual"
+                fi
+            fi
+
+            actual=""; rc=0
+            capture_output actual env DLFREEZE_NO_FORK=1 \
+                "$launcher" fstatfs-kill "$out" || rc=$?
+            if [ "$rc" -eq 0 ] &&
+               [[ "$actual" == *"cpu-probe-seccomp-target-ran"* ]]; then
+                pass "strict direct skips exact-file probe"
+            else
+                fail "strict direct skips exact-file probe" \
+                    "exit=$rc output=$actual"
+            fi
+
+            actual=""; rc=0
+            capture_output actual env DLFREEZE_NO_FORK=1 \
+                "$launcher" write "$out" || rc=$?
+            if [ "$rc" -eq 127 ] &&
+               [[ "$actual" == *"target x86 CPU probe failed safely in its contained child"* ]] &&
+               [[ "$actual" != *"cpu-probe-seccomp-target-ran"* ]]; then
+                pass "contained CPU probe result-write refusal"
+            else
+                fail "contained CPU probe result-write refusal" \
+                    "exit=$rc output=$actual"
+            fi
+
+            actual=""; rc=0
+            capture_output actual env -u DLFREEZE_NO_FORK \
+                "$launcher" wait4 "$out" || rc=$?
+            if [ "$rc" -eq 127 ] &&
+               [[ "$actual" == *"target x86 CPU probe containment could not be re-established"* ]] &&
+               [[ "$actual" != *"cpu-probe-seccomp-target-ran"* ]]; then
+                pass "contained CPU probe reap containment refusal"
+            else
+                fail "contained CPU probe reap containment refusal" \
+                    "exit=$rc output=$actual"
+            fi
+        fi
+    fi
+    rm -f "$target_src" "$launcher_src" "$target" "$launcher" \
+        "$out" "$log" "$clean_out" "$clean_log"
 }
 
 # ===================================================================
@@ -4334,9 +5543,21 @@ test_preload_fortified_open_entrypoints() {
         if env LD_PRELOAD="$BUILD/dlfreeze-preload.so" \
                 DLFREEZE_FILE_TRACE_FILE="$trace" \
                 "$bin" "$input" "$directory" "$basename" &&
-           [ "$(grep -Fxc "F $input_hex $input_hex" "$trace")" -eq 2 ] &&
-           [ "$(grep -Fxc "D $directory_hex $directory_hex" "$trace")" -eq 1 ] &&
-           [ "$(wc -l < "$trace")" -eq 4 ]; then
+           [ "$(grep -Ec "^F [0-9a-f]{16} $input_hex $input_hex( [0-9a-f]{16}){8}$" \
+                "$trace")" -eq 2 ] &&
+           [ "$(grep -Ec "^D [0-9a-f]{16} $directory_hex $directory_hex( [0-9a-f]{16}){8}$" \
+                "$trace")" -eq 1 ] &&
+           [ "$(grep -Ec '^B [0-9a-f]{16} [0-9a-f]{16}$' \
+                "$trace")" -eq 3 ] &&
+           [ "$(grep -Ec '^K [0-9a-f]{16} [0-9a-f]{16}$' \
+                "$trace")" -eq 3 ] &&
+           awk 'NR == 1 && $0 == "#DLFREEZE_PRELOAD_TRACE_V9" { next }
+                NR == 2 && $1 == "O" && NF == 2 { next }
+                $1 ~ /^[BKVW]$/ && NF == 3 { next }
+                $1 ~ /^[FD]$/ && NF == 12 { next }
+                $1 == "N" && NF == 3 { next }
+                $1 == "U" && NF == 4 { next }
+                { exit 1 }' "$trace"; then
             pass "preload helper traces fortified $suffix open/openat"
         else
             fail "preload helper fortified $suffix open entry points" \
@@ -4422,17 +5643,30 @@ test_preload_helper_initialization_race() {
     fi
 
     actual=""; rc=0
-    capture_output actual env LD_PRELOAD="$helper" \
+    capture_output_with_timeout_seconds actual 120 \
+        env LD_PRELOAD="$helper" \
         DLFREEZE_FILE_TRACE_FILE="$trace" "$target" || rc=$?
     if [ "$rc" -eq 0 ] && [ "$actual" = preload-init-race-ok ] &&
-       [ "$(sed -n '1p' "$trace")" = "#DLFREEZE_PRELOAD_TRACE_V4" ] &&
-       [ "$(grep -Fxc '#DLFREEZE_PRELOAD_TRACE_V4' "$trace")" -eq 1 ] &&
-       [ "$(grep -Fxc 'D 2f646576 2f646576' "$trace")" -eq 3200 ] &&
-       [ "$(wc -l < "$trace")" -eq 3201 ]; then
+       [ "$(sed -n '1p' "$trace")" = "#DLFREEZE_PRELOAD_TRACE_V9" ] &&
+       [ "$(grep -Fxc '#DLFREEZE_PRELOAD_TRACE_V9' "$trace")" -eq 1 ] &&
+       [ "$(grep -Ec '^O [0-9a-f]{16}$' "$trace")" -eq 1 ] &&
+       [ "$(grep -Ec '^D [0-9a-f]{16} 2f646576 2f646576( [0-9a-f]{16}){8}$' \
+            "$trace")" -eq 3200 ] &&
+       [ "$(grep -Ec '^B [0-9a-f]{16} [0-9a-f]{16}$' \
+            "$trace")" -eq 22400 ] &&
+       [ "$(grep -Ec '^K [0-9a-f]{16} [0-9a-f]{16}$' \
+            "$trace")" -eq 22400 ] &&
+       awk 'NR == 1 && $0 == "#DLFREEZE_PRELOAD_TRACE_V9" { next }
+            NR == 2 && $1 == "O" && NF == 2 { next }
+            $1 ~ /^[BKVW]$/ && NF == 3 { next }
+            $1 ~ /^[FD]$/ && NF == 12 { next }
+            $1 == "N" && NF == 3 { next }
+            $1 == "U" && NF == 4 { next }
+            { exit 1 }' "$trace"; then
         pass "preload helper concurrent records remain atomic"
     else
         fail "preload helper concurrent record atomicity" \
-            "exit=$rc output=$actual lines=$(wc -l <\"$trace\" 2>/dev/null || echo missing)"
+            "exit=$rc output=$actual"
     fi
     rm -rf "$root"
 }
@@ -4441,7 +5675,7 @@ test_preload_helper_initialization_race() {
 # An LD_PRELOAD interposer is visible before its constructor necessarily
 # runs.  Link an earlier-constructor fixture as the helper's DT_NEEDED
 # dependency so the ordering is deterministic: both its dlopen and open must
-# lazily initialize the V4 streams and be recorded before the helper ctor.
+# lazily initialize both trace streams and be recorded before the helper ctor.
 # The dependency's destructor also runs after the helper's destructor would
 # have run, so its final open must remain traceable until process teardown.
 # ===================================================================
@@ -4496,25 +5730,148 @@ test_preload_helper_constructor_order() {
     if [ "$rc" -eq 0 ] &&
        [ "$actual" = preload-early-constructor-ok ] &&
        [ -r "$trace" ] && [ -r "$file_trace" ] &&
-       [ "$(sed -n '1p' "$trace")" = "#DLFREEZE_DLOPEN_TRACE_V4" ] &&
-       [ "$(sed -n '1p' "$file_trace")" = "#DLFREEZE_PRELOAD_TRACE_V4" ] &&
-       [ "$(grep -Fxc '#DLFREEZE_DLOPEN_TRACE_V4' "$trace")" -eq 1 ] &&
-       [ "$(grep -Fxc '#DLFREEZE_PRELOAD_TRACE_V4' "$file_trace")" -eq 1 ] &&
-       grep -Fq "P $dlopen_hex $dlopen_hex $dlopen_hex" "$trace" &&
-       grep -Fq "F $open_hex $open_hex" "$file_trace"; then
+       [ "$(sed -n '1p' "$trace")" = "#DLFREEZE_DLOPEN_TRACE_V8" ] &&
+       [ "$(sed -n '1p' "$file_trace")" = "#DLFREEZE_PRELOAD_TRACE_V9" ] &&
+       [ "$(grep -Fxc '#DLFREEZE_DLOPEN_TRACE_V8' "$trace")" -eq 1 ] &&
+       [ "$(grep -Fxc '#DLFREEZE_PRELOAD_TRACE_V9' "$file_trace")" -eq 1 ] &&
+       grep -Eq "^P [0-9a-f]{16} [0-9a-f]{16} [0-9a-f]{16} 00000002 $dlopen_hex $dlopen_hex $dlopen_hex( [0-9a-f]{16}){8}$" "$trace" &&
+       grep -Eq "^F [0-9a-f]{16} $open_hex $open_hex( [0-9a-f]{16}){8}$" "$file_trace"; then
         pass "preload helper pre-constructor tracing"
     else
         fail "preload helper pre-constructor tracing" \
-            "exit=$rc output=$actual or exact V4 records are missing"
+            "exit=$rc output=$actual or exact readiness records are missing"
     fi
 
     if [ -r "$file_trace" ] &&
-       grep -Fq "F $late_hex $late_hex" "$file_trace"; then
+       grep -Eq "^F [0-9a-f]{16} $late_hex $late_hex( [0-9a-f]{16}){8}$" \
+            "$file_trace"; then
         pass "preload helper post-finalizer tracing"
     else
         fail "preload helper post-finalizer tracing" \
             "late dependency-destructor record is missing"
     fi
+    rm -rf "$root"
+}
+
+# A helper dependency constructor can split the process before the helper's
+# own constructor runs.  fork children must inherit a usable claimed stream;
+# a pre-init vfork child must forward execvp without touching the parent's
+# TLS, atomics, locks, or trace descriptors.
+test_preload_helper_early_process_order() {
+    echo "--- preload helper pre-init fork/vfork ordering ---"
+
+    local root="$BUILD/preload_early_process" helper early target launcher
+    local child_lib child_file static_child dltrace filetrace actual owner
+    local child_hex child_file_hex mode rc static_ok=1
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    root=$(cd "$root" && pwd -P)
+    helper="$root/dlfreeze-preload-early.so"
+    early="$root/libpreload-early-process.so"
+    target="$root/target"
+    launcher="$root/launcher"
+    child_lib="$root/libchild.so"
+    child_file="$root/child.txt"
+    static_child="$root/static-child"
+    printf '%s\n' preinit-child-input >"$child_file"
+
+    cat >"$root/launcher.c" <<'C'
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+int main(int argc, char **argv)
+{
+    char owner[32];
+
+    if (argc < 3 || snprintf(owner, sizeof(owner), "%ld", (long)getpid()) <= 0)
+        return 2;
+    if (setenv("DLFREEZE_TRACE_OWNER_PID", owner, 1) != 0 ||
+        setenv("LD_PRELOAD", argv[1], 1) != 0)
+        return 3;
+    execv(argv[2], argv + 2);
+    return 4;
+}
+C
+    if ! gcc -Wall -Wextra -Werror -O2 -D_GNU_SOURCE \
+            -DDLFREEZE_EARLY_FORK_PRELOAD -shared -fPIC \
+            -o "$early" tests/preload_early_fork.c -ldl ||
+       ! gcc -Wall -Wextra -Werror -O2 -D_GNU_SOURCE -Iinclude \
+            -U_FORTIFY_SOURCE -shared -fPIC -o "$helper" \
+            src/dlopen_preload.c -Wl,--no-as-needed -L"$root" \
+            -lpreload-early-process -Wl,-rpath,'$ORIGIN' -ldl -lpthread ||
+       ! gcc -Wall -Wextra -Werror -O2 -D_GNU_SOURCE \
+            -Wl,--no-as-needed -L"$root" -Wl,-rpath,'$ORIGIN' \
+            -o "$target" tests/preload_early_fork.c \
+            -lpreload-early-process -ldl ||
+       ! gcc -Wall -Wextra -Werror -O2 -D_GNU_SOURCE \
+            -o "$launcher" "$root/launcher.c" ||
+       ! gcc -shared -fPIC -DTRACE_VALUE=22 -o "$child_lib" \
+            tests/trace_process_library.c; then
+        fail "preload helper pre-init process ordering" \
+            "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+    if ! gcc -static -Wall -Wextra -Werror -O2 \
+            -o "$static_child" tests/trace_exec_static_child.c \
+            >/dev/null 2>&1; then
+        static_ok=0
+    fi
+
+    child_hex=$(printf '%s' "$child_lib" | od -An -tx1 | tr -d ' \n')
+    child_file_hex=$(printf '%s' "$child_file" | od -An -tx1 | tr -d ' \n')
+    for mode in fork vfork; do
+        if [ "$mode" = vfork ] && [ "$static_ok" -eq 0 ]; then
+            skip "preload helper pre-init vfork execvp" \
+                "a static exec child could not be linked"
+            continue
+        fi
+        dltrace="$root/$mode.dlopen.trace"
+        filetrace="$root/$mode.file.trace"
+        actual=""; rc=0
+        capture_output_with_timeout_seconds actual 20 env -u LD_PRELOAD \
+            DLFREEZE_TRACE_FILE="$dltrace" \
+            DLFREEZE_FILE_TRACE_FILE="$filetrace" \
+            DLFREEZE_EARLY_PROCESS_MODE="$mode" \
+            DLFREEZE_EARLY_PROCESS_LIBRARY="$child_lib" \
+            DLFREEZE_EARLY_PROCESS_FILE="$child_file" \
+            DLFREEZE_EARLY_PROCESS_CHILD="$static_child" \
+            "$launcher" "$helper" "$target" || rc=$?
+        owner=$(sed -n '2s/^O //p' "$dltrace" 2>/dev/null || true)
+        if [ "$mode" = fork ]; then
+            if [ "$rc" -eq 0 ] && [ -z "$actual" ] &&
+               [[ "$owner" =~ ^[0-9a-f]{16}$ ]] &&
+               awk -v owner="$owner" -v source="$child_hex" \
+                   '$1 ~ /^[PS]$/ && $2 != owner && $8 == source {
+                        found = 1
+                    }
+                    END { exit !found }' "$dltrace" &&
+               awk -v owner="$owner" -v request="$child_file_hex" \
+                   '$1 == "F" && $2 != owner && $3 == request {
+                        found = 1
+                    }
+                    END { exit !found }' "$filetrace" &&
+               ! grep -q '^! ' "$dltrace" &&
+               ! grep -q '^! ' "$filetrace"; then
+                pass "preload helper pre-init fork child tracing"
+            else
+                fail "preload helper pre-init fork child" \
+                    "exit=$rc output=$actual owner=$owner"
+            fi
+        elif [ "$rc" -eq 0 ] && [ -z "$actual" ] &&
+             [ "$(sed -n '1p' "$dltrace" 2>/dev/null || true)" = \
+                  '#DLFREEZE_DLOPEN_TRACE_V8' ] &&
+             [ "$(sed -n '1p' "$filetrace" 2>/dev/null || true)" = \
+                  '#DLFREEZE_PRELOAD_TRACE_V9' ] &&
+             ! grep -q '^! ' "$dltrace" && ! grep -q '^! ' "$filetrace"; then
+            pass "preload helper pre-init vfork execvp forwarding"
+        else
+            fail "preload helper pre-init vfork execvp" \
+                "exit=$rc output=$actual"
+        fi
+    done
     rm -rf "$root"
 }
 
@@ -4695,7 +6052,7 @@ MAP
     elif [ "$runtime_family" = musl ] &&
          grep -Fq "trace helper candidate: $helper" "$log" &&
          ! grep -Fq 'target ABI mismatch' "$log" &&
-         grep -Fq 'no valid V4 readiness' "$log" && [ ! -e "$out" ]; then
+         grep -Fq 'no valid V8 readiness' "$log" && [ ! -e "$out" ]; then
         pass "musl trace helper uses name-only version semantics"
     elif [ "$runtime_family" != musl ] &&
          grep -Fq 'trace helper rejected:' "$log" &&
@@ -4958,7 +6315,7 @@ C
                 >"$bad_log" 2>&1; then
             fail "incompatible trace helper refusal" \
                 "packaging unexpectedly succeeded"
-        elif grep -Fq 'produced no valid V4 readiness record' "$bad_log" &&
+        elif grep -Fq 'produced no valid V8 readiness record' "$bad_log" &&
              [ ! -e "$bad_out" ]; then
             pass "incompatible trace helper fails closed"
         else
@@ -4985,7 +6342,8 @@ test_trace_helper_error_transparency() {
     local trace="$root/dlopen.trace" file_trace="$root/file.trace"
     local fd_reuse_target="$root/fd-reuse-target"
     local replacement="$root/replacement.trace"
-    local actual="" expect="" rc=0 control_rc=0 elapsed=0
+    local source_hex="" actual="" expect="" replacement_size=""
+    local rc=0 control_rc=0 elapsed=0
 
     rm -rf "$root"
     mkdir -p "$root"
@@ -5026,6 +6384,8 @@ C
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 
 int dlinfo(void *handle, int request, void *info) {
@@ -5041,6 +6401,22 @@ int fstat(int fd, struct stat *st) {
     (void)st;
     errno = EBADF;
     return -1;
+}
+
+char *realpath(const char *path, char *resolved) {
+    static char *(*next_realpath)(const char *, char *);
+
+    if (strncmp(path, "/proc/self/fd/", 14) == 0) {
+        errno = EACCES;
+        return NULL;
+    }
+    if (!next_realpath)
+        next_realpath = dlsym(RTLD_NEXT, "realpath");
+    if (!next_realpath) {
+        errno = ENOSYS;
+        return NULL;
+    }
+    return next_realpath(path, resolved);
 }
 C
     if ! gcc -shared -fPIC -Wl,-soname,libtrace_errno.so \
@@ -5061,10 +6437,16 @@ C
         DLFREEZE_TRACE_FILE="$trace" \
         DLFREEZE_FILE_TRACE_FILE="$file_trace" \
         "$target" "$lib" "$target_src" || rc=$?
+    source_hex=$(printf '%s' "$(readlink -f "$target_src")" |
+        od -An -tx1 | tr -d ' \n')
     if [ "$control_rc" -eq 0 ] && [ "$rc" -eq 0 ] &&
        [ "$actual" = "$expect" ] &&
-       grep -Fq '! successful-dlopen-has-no-link-map' "$trace"; then
-        pass "trace helper preserves wrapped-call errno"
+       grep -Eq '^! [0-9a-f]{16} successful-dlopen-has-no-link-map$' \
+            "$trace" &&
+       grep -Eq "^F [0-9a-f]{16} $source_hex $source_hex" \
+            "$file_trace" &&
+       ! grep -q '^! ' "$file_trace"; then
+        pass "trace helper preserves errno and recovers stable request paths"
     else
         fail "trace helper errno transparency" \
             "control=$control_rc/$expect traced=$rc/$actual"
@@ -5090,28 +6472,690 @@ C
         fi
     fi
 
+    rm -f "$file_trace"
     actual=""; rc=0
     capture_output actual env \
         LD_PRELOAD="$BUILD/dlfreeze-preload.so" \
         DLFREEZE_FILE_TRACE_FILE="$(readlink -f "$file_trace")" \
         "$fd_reuse_target" "$(readlink -f "$file_trace")" \
         "$replacement" "$target_src" || rc=$?
-    if [ "$rc" -eq 137 ] && [ ! -s "$replacement" ] &&
-       [[ "$actual" == *"cannot write a complete trace record"* ]]; then
-        pass "trace helper descriptor-reuse failure is contained"
+    if [ "$rc" -eq 0 ] && [ -z "$actual" ] &&
+       [ "$(cat "$replacement" 2>/dev/null || true)" = \
+            application-fd-ok ] &&
+       [ "$(sed -n '1p' "$file_trace" 2>/dev/null || true)" = \
+            '#DLFREEZE_PRELOAD_TRACE_V9' ] &&
+       grep -Eq "^F [0-9a-f]{16} $source_hex $source_hex" \
+            "$file_trace" &&
+       ! grep -q '^! ' "$file_trace"; then
+        pass "trace helper rehomes a closed writer without app-fd corruption"
     else
-        fail "trace helper descriptor-reuse containment" \
-            "exit=$rc replacement-size=$(wc -c <\"$replacement\" 2>/dev/null || echo missing) output=$actual"
+        if [ -e "$replacement" ]; then
+            replacement_size=$(wc -c < "$replacement")
+        else
+            replacement_size=missing
+        fi
+        fail "trace helper writer-fd reuse" \
+            "exit=$rc replacement-size=$replacement_size output=$actual"
     fi
 
     rm -rf "$root"
 }
 
 # ===================================================================
-# Every exec'd process may initialize the preload helper and append its own
-# readiness header.  Those headers are valid process-boundary records.  A
-# failed open for a reason other than nonexistence must also never become a
-# negative VFS entry.
+# Descriptor operations call through downstream interposers without holding
+# helper locks.  Their V/W transactions expose interrupted calls while
+# in-flight target reservations prevent concurrent trace-fd rehomes from
+# colliding with application descriptor numbers.
+# ===================================================================
+test_preload_descriptor_transactions() {
+    echo "--- preload descriptor-operation transactions ---"
+
+    local actual="" rc=0
+
+    capture_output_with_timeout_seconds actual 120 \
+        bash tests/preload-descriptor-transactions-gate.sh "$BUILD" || rc=$?
+    if [ "$rc" -eq 0 ] &&
+       [[ "$actual" == *"descriptor transaction gate: PASS"* ]]; then
+        pass "preload descriptor-operation transactions"
+    else
+        fail "preload descriptor-operation transactions" \
+            "exit=$rc output=$actual"
+    fi
+}
+
+# ===================================================================
+# Closing or replacing a helper-owned descriptor must preserve the hidden
+# stream while retaining ordinary application fd semantics.  An fd-table
+# split cannot preserve one process-global descriptor publication across both
+# tables, so CLOSE_RANGE_UNSHARE instead terminates both streams before
+# forwarding the native call.  Exercise those policies in separate processes.
+# ===================================================================
+test_trace_descriptor_lifecycle() {
+    echo "--- trace descriptor lifecycle ---"
+
+    local root="$BUILD/trace_descriptor_lifecycle"
+    local target="$root/target" trace="$root/ordinary.file.trace"
+    local dltrace="$root/unshare.dlopen.trace"
+    local filetrace="$root/unshare.file.trace"
+    local fallback_trace="$root/closefrom-enosys.file.trace"
+    local input="$root/input.txt" replacement="$root/replacement.txt"
+    local unshare_replacement="$root/unshare-replacement.txt"
+    local input_hex actual="" rc=0
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    root=$(cd "$root" && pwd -P)
+    target="$root/target"
+    trace="$root/ordinary.file.trace"
+    dltrace="$root/unshare.dlopen.trace"
+    filetrace="$root/unshare.file.trace"
+    fallback_trace="$root/closefrom-enosys.file.trace"
+    input="$root/input.txt"
+    replacement="$root/replacement.txt"
+    unshare_replacement="$root/unshare-replacement.txt"
+    printf '%s\n' trace-fd-input >"$input"
+    if ! gcc -Wall -Wextra -Werror -O2 -D_GNU_SOURCE \
+            -o "$target" tests/preload_trace_fd_lifecycle.c \
+            -ldl -pthread; then
+        fail "trace descriptor lifecycle" "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+    input_hex=$(printf '%s' "$input" | od -An -tx1 | tr -d ' \n')
+
+    capture_output_with_timeout_seconds actual 120 env \
+        LD_PRELOAD="$BUILD/dlfreeze-preload.so" \
+        DLFREEZE_FILE_TRACE_FILE="$trace" \
+        "$target" ordinary "$trace" "$input" "$replacement" || rc=$?
+    if [ "$rc" -eq 77 ]; then
+        skip "trace descriptor close/dup/range lifecycle" \
+            "close_range or closefrom is unavailable"
+    else
+        if [ "$rc" -eq 0 ] && [ "$actual" = trace-fd-lifecycle-ok ] &&
+           [ "$(cat "$replacement" 2>/dev/null || true)" = \
+                application-dup-ok ] &&
+           [ "$(sed -n '1p' "$trace" 2>/dev/null || true)" = \
+                '#DLFREEZE_PRELOAD_TRACE_V9' ] &&
+           [ "$(grep -Fxc '#DLFREEZE_PRELOAD_TRACE_V9' "$trace")" -eq 1 ] &&
+           [ "$(grep -Ec '^O [0-9a-f]{16}$' "$trace")" -eq 1 ] &&
+           grep -Eq "^F [0-9a-f]{16} $input_hex $input_hex( [0-9a-f]{16}){8}$" \
+                "$trace" &&
+           ! grep -q '^! ' "$trace" &&
+           awk 'NR == 1 { next }
+                NR == 2 && $1 == "O" && NF == 2 { next }
+                $1 ~ /^[BKVW]$/ && NF == 3 { next }
+                $1 ~ /^[FD]$/ && NF == 12 { next }
+                $1 == "U" && NF == 4 { next }
+                { exit 1 }' "$trace"; then
+            pass "trace descriptor close/dup/range lifecycle and write race"
+        else
+            fail "trace descriptor close/dup/range lifecycle" \
+                "exit=$rc output=$actual replacement=$(cat "$replacement" 2>/dev/null || true)"
+            tail -n 40 "$trace" 2>/dev/null || true
+        fi
+    fi
+
+    actual=""; rc=0
+    capture_output_with_timeout_seconds actual 20 env \
+        LD_PRELOAD="$BUILD/dlfreeze-preload.so" \
+        DLFREEZE_FILE_TRACE_FILE="$fallback_trace" \
+        "$target" closefrom-enosys "$fallback_trace" "$input" \
+        "$replacement" || rc=$?
+    if [ "$rc" -eq 77 ]; then
+        skip "trace closefrom ENOSYS fallback" \
+            "seccomp, a high descriptor, or closefrom is unavailable"
+    elif [ "$rc" -eq 0 ] &&
+         [ "$actual" = trace-closefrom-enosys-ok ] &&
+         [ "$(sed -n '1p' "$fallback_trace" 2>/dev/null || true)" = \
+              '#DLFREEZE_PRELOAD_TRACE_V9' ] &&
+         [ "$(grep -Ec '^O [0-9a-f]{16}$' "$fallback_trace")" -eq 1 ] &&
+         grep -Eq "^F [0-9a-f]{16} $input_hex $input_hex( [0-9a-f]{16}){8}$" \
+              "$fallback_trace" &&
+         ! grep -q '^! ' "$fallback_trace"; then
+        pass "closefrom ENOSYS fallback closes fds above lowered RLIMIT"
+    else
+        fail "trace closefrom ENOSYS fallback" \
+            "exit=$rc output=$actual"
+        tail -n 20 "$fallback_trace" 2>/dev/null || true
+    fi
+
+    actual=""; rc=0
+    capture_output_with_timeout_seconds actual 20 env \
+        LD_PRELOAD="$BUILD/dlfreeze-preload.so" \
+        DLFREEZE_TRACE_FILE="$dltrace" \
+        DLFREEZE_FILE_TRACE_FILE="$filetrace" \
+        "$target" unshare "$filetrace" "$input" \
+        "$unshare_replacement" || rc=$?
+    if [ "$rc" -eq 77 ]; then
+        skip "trace descriptor CLOSE_RANGE_UNSHARE lifecycle" \
+            "CLOSE_RANGE_UNSHARE is unavailable"
+    elif [ "$rc" -eq 0 ] && [ "$actual" = trace-fd-unshare-ok ] &&
+         [ "$(cat "$unshare_replacement" 2>/dev/null || true)" = \
+              $'application-main-ok\napplication-worker-ok' ] &&
+         [ "$(sed -n '1p' "$dltrace" 2>/dev/null || true)" = \
+              '#DLFREEZE_DLOPEN_TRACE_V8' ] &&
+         [ "$(sed -n '1p' "$filetrace" 2>/dev/null || true)" = \
+              '#DLFREEZE_PRELOAD_TRACE_V9' ] &&
+         [ "$(grep -Ec '^O [0-9a-f]{16}$' "$dltrace")" -eq 1 ] &&
+         [ "$(grep -Ec '^O [0-9a-f]{16}$' "$filetrace")" -eq 1 ] &&
+         [ "$(grep -Ec '^! [0-9a-f]{16} close-range-unshare-cannot-preserve-process-wide-trace-fds$' "$dltrace")" -eq 1 ] &&
+         [ "$(grep -Ec '^! [0-9a-f]{16} close-range-unshare-cannot-preserve-process-wide-trace-fds$' "$filetrace")" -eq 1 ] &&
+         awk '/^!/ { terminal = NR }
+              END { exit !(terminal && terminal == NR) }' "$dltrace" &&
+         awk '/^!/ { terminal = NR }
+              END { exit !(terminal && terminal == NR) }' "$filetrace"; then
+        pass "CLOSE_RANGE_UNSHARE preserves syscall semantics and terminates trace"
+    else
+        fail "trace descriptor CLOSE_RANGE_UNSHARE lifecycle" \
+            "exit=$rc output=$actual replacement=$(cat "$unshare_replacement" 2>/dev/null || true)"
+        tail -n 20 "$dltrace" 2>/dev/null || true
+        tail -n 20 "$filetrace" 2>/dev/null || true
+    fi
+    rm -rf "$root"
+}
+
+# A cwd mutator may overlap a relative file or loader request.  Hold chdir
+# inside the helper's odd epoch with a second generic interposer: both native
+# calls must return, while their path attribution fails closed in the trace.
+test_trace_cwd_overlap() {
+    echo "--- trace cwd overlap ---"
+
+    local root="$BUILD/trace_cwd_overlap" old new target blocker library helper
+    local reentrant reentrant_target final nested_dir reentrant_trace
+    local dirfd_mock dirfd_target dirfd_old dirfd_new dirfd_trace
+    local dltrace filetrace input reentrant_input input_hex actual="" rc=0
+
+    rm -rf "$root"
+    mkdir -p "$root/old" "$root/new" "$root/final" "$root/nested" \
+        "$root/dirfd-old" "$root/dirfd-new"
+    root=$(cd "$root" && pwd -P)
+    old="$root/old"
+    new="$root/new"
+    target="$root/target"
+    blocker="$root/libcwd-blocker.so"
+    library="$old/libcwd-overlap.so"
+    helper=$(realpath "$BUILD/dlfreeze-preload.so")
+    dltrace="$root/dlopen.trace"
+    filetrace="$root/file.trace"
+    input="$old/input.txt"
+    reentrant="$root/libreentrant-chdir.so"
+    reentrant_target="$root/reentrant-target"
+    final="$root/final"
+    nested_dir="$root/nested"
+    reentrant_trace="$root/reentrant.file.trace"
+    reentrant_input="$final/input.txt"
+    dirfd_mock="$root/libdirfd-replacer.so"
+    dirfd_target="$root/dirfd-target"
+    dirfd_old="$root/dirfd-old"
+    dirfd_new="$root/dirfd-new"
+    dirfd_trace="$root/dirfd.file.trace"
+    printf '%s\n' cwd-overlap-input >"$input"
+    printf '%s\n' reentrant-chdir-input >"$reentrant_input"
+    printf 'A\n' >"$dirfd_old/input.txt"
+    printf 'B\n' >"$dirfd_new/input.txt"
+
+    if ! gcc -Wall -Wextra -Werror -O2 -D_GNU_SOURCE -shared -fPIC \
+            -o "$blocker" tests/preload_cwd_blocker.c -ldl ||
+       ! gcc -Wall -Wextra -Werror -O2 -shared -fPIC \
+            -o "$library" tests/preload_cwd_library.c ||
+       ! gcc -Wall -Wextra -Werror -O2 -D_GNU_SOURCE -rdynamic \
+            -o "$target" tests/preload_cwd_overlap.c -ldl -pthread ||
+       ! gcc -Wall -Wextra -Werror -O2 -D_GNU_SOURCE -shared -fPIC \
+            -o "$reentrant" tests/preload_reentrant_chdir.c -ldl ||
+       ! gcc -Wall -Wextra -Werror -O2 -D_GNU_SOURCE \
+            -o "$reentrant_target" \
+            tests/preload_reentrant_chdir_target.c ||
+       ! gcc -Wall -Wextra -Werror -O2 -D_GNU_SOURCE -shared -fPIC \
+            -o "$dirfd_mock" tests/preload_dirfd_replacer.c -ldl ||
+       ! gcc -Wall -Wextra -Werror -O2 -D_GNU_SOURCE \
+            -o "$dirfd_target" \
+            tests/preload_dirfd_replacement_target.c; then
+        fail "trace cwd overlap" "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+
+    capture_output_in_dir actual "$old" env \
+        LD_PRELOAD="$helper:$blocker" \
+        DLFREEZE_TRACE_FILE="$dltrace" \
+        DLFREEZE_FILE_TRACE_FILE="$filetrace" \
+        "$target" "$new" input.txt ./libcwd-overlap.so || rc=$?
+    if [ "$rc" -eq 0 ] && [ "$actual" = cwd-overlap-ok ] &&
+       [ "$(sed -n '1p' "$dltrace" 2>/dev/null || true)" = \
+            '#DLFREEZE_DLOPEN_TRACE_V8' ] &&
+       [ "$(sed -n '1p' "$filetrace" 2>/dev/null || true)" = \
+            '#DLFREEZE_PRELOAD_TRACE_V9' ] &&
+       grep -Eq '^! [0-9a-f]{16} pre-dlopen-cwd-is-unstable$' \
+            "$dltrace" &&
+       grep -Eq '^! [0-9a-f]{16} cwd-changed-during-dlopen$' \
+            "$dltrace" &&
+       grep -Eq '^! [0-9a-f]{16} cwd-changed-during-file-operation$' \
+            "$filetrace" &&
+       grep -Eq '^! [0-9a-f]{16} cwd-changed-during-dlopen$' \
+            "$filetrace" &&
+       ! grep -qx '!' "$dltrace" && ! grep -qx '!' "$filetrace"; then
+        pass "overlapping cwd mutation rejects attribution without deadlock"
+    else
+        fail "trace cwd overlap" "exit=$rc output=$actual"
+        tail -n 20 "$dltrace" 2>/dev/null || true
+        tail -n 20 "$filetrace" 2>/dev/null || true
+    fi
+
+    input_hex=$(printf '%s' "$reentrant_input" |
+        od -An -tx1 | tr -d ' \n')
+    actual=""; rc=0
+    capture_output_with_timeout_seconds actual 20 env \
+        LD_PRELOAD="$helper:$reentrant" \
+        DLFREEZE_FILE_TRACE_FILE="$reentrant_trace" \
+        DLFREEZE_REENTRANT_CWD="$nested_dir" \
+        "$reentrant_target" "$final" input.txt || rc=$?
+    if [ "$rc" -eq 0 ] && [ "$actual" = reentrant-chdir-ok ] &&
+       [ "$(sed -n '1p' "$reentrant_trace" 2>/dev/null || true)" = \
+            '#DLFREEZE_PRELOAD_TRACE_V9' ] &&
+       grep -Eq "^F [0-9a-f]{16} $input_hex $input_hex( [0-9a-f]{16}){8}$" \
+            "$reentrant_trace" &&
+       ! grep -q '^! ' "$reentrant_trace"; then
+        pass "reentrant lower-interposer chdir preserves cwd epoch"
+    else
+        fail "trace reentrant chdir" "exit=$rc output=$actual"
+        tail -n 20 "$reentrant_trace" 2>/dev/null || true
+    fi
+
+    actual=""; rc=0
+    capture_output_with_timeout_seconds actual 20 env \
+        LD_PRELOAD="$helper:$dirfd_mock" \
+        DLFREEZE_FILE_TRACE_FILE="$dirfd_trace" \
+        DLFREEZE_DIRFD_REPLACEMENT="$dirfd_new" \
+        "$dirfd_target" "$dirfd_old" || rc=$?
+    if [ "$rc" -eq 0 ] && [ "$actual" = dirfd-replacement-ok ] &&
+       [ "$(sed -n '1p' "$dirfd_trace" 2>/dev/null || true)" = \
+            '#DLFREEZE_PRELOAD_TRACE_V9' ] &&
+       grep -Eq '^! [0-9a-f]{16} dirfd-changed-during-file-operation$' \
+            "$dirfd_trace" && ! grep -qx '!' "$dirfd_trace"; then
+        pass "openat rejects replaced directory-fd attribution"
+    else
+        fail "trace directory-fd replacement" \
+            "exit=$rc output=$actual"
+        tail -n 20 "$dirfd_trace" 2>/dev/null || true
+    fi
+    rm -rf "$root"
+}
+
+# A DSO constructor can fork and let the child return through the inherited
+# outer dlopen call.  An application child-atfork handler also gets to issue a
+# genuinely nested dlopen before the helper's fork wrapper returns.  The child
+# must retain the surviving recursive lock frames, but must not commit its
+# inherited copy of the parent's outer transaction.
+test_trace_constructor_fork_recovery() {
+    echo "--- trace constructor-fork recovery ---"
+
+    local root="$BUILD/trace_constructor_fork" target outer nested input
+    local dltrace filetrace gate out log native actual owner
+    local outer_hex nested_hex input_hex rc=0 native_rc=0 freeze_rc=0
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    root=$(cd "$root" && pwd -P)
+    target="$root/target"
+    outer="$root/libconstructor-fork.so"
+    nested="$root/libatfork-nested.so"
+    input="$root/child-input.txt"
+    dltrace="$root/dlopen.trace"
+    filetrace="$root/file.trace"
+    gate="$root/dep-gate"
+    out="$root/target.frozen"
+    log="$root/freeze.log"
+    printf '%s\n' constructor-fork-input >"$input"
+
+    if ! gcc -Wall -Wextra -Werror -O2 -D_GNU_SOURCE -shared -fPIC \
+            -o "$outer" tests/preload_constructor_fork_library.c ||
+       ! gcc -Wall -Wextra -Werror -O2 -shared -fPIC \
+            -DTRACE_VALUE=22 -o "$nested" \
+            tests/trace_process_library.c ||
+       ! gcc -Wall -Wextra -Werror -O2 -D_GNU_SOURCE \
+            -o "$target" tests/preload_constructor_fork.c -ldl -pthread ||
+       ! gcc -Wall -Wextra -Werror -O2 -g -D_GNU_SOURCE -Iinclude \
+            -o "$gate" tests/dep_interpreter_trace_gate.c \
+            src/dep_resolver.c src/elf_parser.c; then
+        fail "trace constructor-fork recovery" "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+    if readelf -d "$outer" | grep -Fq 'libatfork-nested.so'; then
+        fail "trace constructor-fork recovery" \
+            "outer fixture has an application-specific startup dependency"
+        rm -rf "$root"
+        return
+    fi
+
+    capture_output native "$target" "$outer" "$nested" "$input" ||
+        native_rc=$?
+    if [ "$native_rc" -ne 0 ] || [ "$native" != constructor-fork-ok ]; then
+        fail "trace constructor-fork native control" \
+            "exit=$native_rc output=$native"
+        rm -rf "$root"
+        return
+    fi
+
+    capture_output_with_timeout_seconds actual 20 env \
+        LD_PRELOAD="$BUILD/dlfreeze-preload.so" \
+        DLFREEZE_TRACE_FILE="$dltrace" \
+        DLFREEZE_FILE_TRACE_FILE="$filetrace" \
+        "$target" "$outer" "$nested" "$input" || rc=$?
+    owner=$(sed -n '2s/^O //p' "$dltrace" 2>/dev/null || true)
+    outer_hex=$(printf '%s' "$outer" | od -An -tx1 | tr -d ' \n')
+    nested_hex=$(printf '%s' "$nested" | od -An -tx1 | tr -d ' \n')
+    input_hex=$(printf '%s' "$input" | od -An -tx1 | tr -d ' \n')
+    if [ "$rc" -eq 0 ] && [ "$actual" = constructor-fork-ok ] &&
+       [[ "$owner" =~ ^[0-9a-f]{16}$ ]] &&
+       awk -v owner="$owner" -v source="$outer_hex" \
+           '$1 ~ /^[PS]$/ && $2 == owner && $8 == source { found = 1 }
+            END { exit !found }' "$dltrace" &&
+       awk -v owner="$owner" -v source="$nested_hex" \
+           '$1 ~ /^[PS]$/ && $2 != owner && $8 == source { found = 1 }
+            END { exit !found }' "$dltrace" &&
+       awk -v owner="$owner" -v source="$outer_hex" \
+           '$1 ~ /^[PS]$/ && $2 != owner && $8 == source { bad = 1 }
+            END { exit bad }' "$dltrace" &&
+       awk -v owner="$owner" -v request="$input_hex" \
+           '$1 == "F" && $2 != owner && $3 == request { found = 1 }
+            END { exit !found }' "$filetrace" &&
+       ! grep -q '^! ' "$dltrace" && ! grep -q '^! ' "$filetrace" &&
+       "$gate" "$target" "$dltrace" /no-such-alias 0 0 \
+            >"$root/gate.log" 2>&1; then
+        pass "constructor fork return and child-atfork nested dlopen tracing"
+    else
+        fail "trace constructor-fork recovery" \
+            "exit=$rc output=$actual owner=$owner"
+        tail -n 30 "$dltrace" 2>/dev/null || true
+        tail -n 20 "$filetrace" 2>/dev/null || true
+        rm -rf "$root"
+        return
+    fi
+
+    freeze_require_direct "constructor-fork nested attribution direct-load" \
+        "$log" "$out" -t -- "$target" "$outer" "$nested" "$input" ||
+        freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "constructor-fork nested attribution direct-load" \
+            "$DIRECT_FREEZE_REASON"
+    elif [ "$freeze_rc" -ne 0 ]; then
+        :
+    else
+        mv "$outer" "$outer.host-unavailable"
+        mv "$nested" "$nested.host-unavailable"
+        actual=""; rc=0
+        capture_output_with_timeout_seconds actual 20 \
+            "$out" "$outer" "$nested" "$input" || rc=$?
+        actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+        if [ "$rc" -eq 0 ] && [ "$actual" = constructor-fork-ok ]; then
+            pass "constructor-fork nested attribution direct-load"
+        else
+            fail "constructor-fork nested attribution direct-load" \
+                "exit=$rc output=$actual"
+        fi
+    fi
+    rm -rf "$root"
+}
+
+# ===================================================================
+# One trace stream may contain inherited fork descendants, but never a new
+# exec generation.  Records carry their pid, the helper holds one OFD lock
+# across the fork tree, and successful dlopen roots carry an immutable source
+# revision.  Exercise those boundaries independently of application names.
+# ===================================================================
+test_trace_process_and_dlopen_provenance() {
+    echo "--- trace process and dlopen source provenance ---"
+
+    local root
+    root="$(realpath "$BUILD")/trace_process_provenance"
+    local libsrc="tests/trace_process_library.c" target="$root/target"
+    local parent_lib="$root/libparent.so" child_lib="$root/libchild.so"
+    local mutable_lib="$root/libmutable.so" replacement="$root/replacement.so"
+    local parent_file="$root/parent.txt" child_file="$root/child.txt"
+    local dltrace="$root/dlopen.trace" filetrace="$root/file.trace"
+    local helper="$BUILD/dlfreeze-preload.so" gate="$root/dep-gate"
+    local owner owner_pid parent_hex child_hex parent_file_hex child_file_hex
+    local actual="" rc=0 out="$root/target.frozen" log="$root/freeze.log"
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    printf '%s\n' parent-input >"$parent_file"
+    printf '%s\n' child-input >"$child_file"
+    if [ ! -r "$helper" ] ||
+       ! gcc -shared -fPIC -DTRACE_VALUE=11 -o "$parent_lib" "$libsrc" ||
+       ! gcc -shared -fPIC -DTRACE_VALUE=22 -o "$child_lib" "$libsrc" ||
+       ! gcc -Wall -Wextra -Werror -O2 -o "$target" \
+            tests/trace_process_provenance.c -ldl ||
+       ! gcc -O2 -g -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
+            -o "$gate" tests/dep_interpreter_trace_gate.c \
+            src/dep_resolver.c src/elf_parser.c; then
+        fail "trace process provenance fixtures" "compile failed"
+        rm -rf "$root"
+        return
+    fi
+
+    parent_hex=$(printf '%s' "$parent_lib" | od -An -tx1 | tr -d ' \n')
+    child_hex=$(printf '%s' "$child_lib" | od -An -tx1 | tr -d ' \n')
+    parent_file_hex=$(printf '%s' "$parent_file" |
+        od -An -tx1 | tr -d ' \n')
+    child_file_hex=$(printf '%s' "$child_file" |
+        od -An -tx1 | tr -d ' \n')
+
+    capture_output actual env LD_PRELOAD="$helper" \
+        DLFREEZE_TRACE_FILE="$dltrace" \
+        DLFREEZE_FILE_TRACE_FILE="$filetrace" \
+        "$target" fork "$parent_lib" "$child_lib" \
+        "$parent_file" "$child_file" || rc=$?
+    owner=$(sed -n '2p' "$dltrace" 2>/dev/null || true)
+    owner_pid=${owner#O }
+    if [ "$rc" -eq 0 ] && [[ "$owner_pid" =~ ^[0-9a-f]{16}$ ]] &&
+       awk -v owner="$owner_pid" -v source="$parent_hex" \
+           '$1 ~ /^[PS]$/ && $2 == owner && $8 == source { found = 1 }
+            END { exit !found }' "$dltrace" &&
+       awk -v owner="$owner_pid" -v source="$child_hex" \
+           '$1 ~ /^[PS]$/ && $2 != owner && $8 == source { found = 1 }
+            END { exit !found }' "$dltrace" &&
+       awk -v owner="$owner_pid" -v request="$parent_file_hex" \
+           '$1 == "F" && $2 == owner && $3 == request { found = 1 }
+            END { exit !found }' "$filetrace" &&
+       awk -v owner="$owner_pid" -v request="$child_file_hex" \
+           '$1 == "F" && $2 != owner && $3 == request { found = 1 }
+            END { exit !found }' "$filetrace" &&
+       ! grep -q '^! ' "$dltrace" && ! grep -q '^! ' "$filetrace" &&
+       "$gate" "$target" "$dltrace" /no-such-alias 0 0 \
+            >"$root/gate.log" 2>&1; then
+        pass "fork descendants retain explicit trace provenance"
+    else
+        fail "fork descendant trace provenance" \
+            "exit=$rc output=$actual owner=$owner"
+    fi
+
+    rm -f "$dltrace" "$filetrace"
+    actual=""; rc=0
+    capture_output actual env LD_PRELOAD="$helper" \
+        DLFREEZE_TRACE_FILE="$dltrace" \
+        DLFREEZE_FILE_TRACE_FILE="$filetrace" \
+        "$target" fork-exec "$target" "$child_lib" "$child_file" \
+        "$parent_lib" "$parent_file" || rc=$?
+    if [ "$rc" -eq 0 ] && ! grep -Fq "$child_hex" "$dltrace" &&
+       ! grep -Fq "$child_file_hex" "$filetrace" &&
+       grep -Fq "$parent_hex" "$dltrace" &&
+       grep -Fq "$parent_file_hex" "$filetrace" &&
+       ! grep -q '^! ' "$dltrace" && ! grep -q '^! ' "$filetrace"; then
+        pass "fork-exec descendants are excluded without poisoning owner"
+    else
+        fail "fork-exec trace exclusion" "exit=$rc output=$actual"
+    fi
+
+    rm -f "$dltrace" "$filetrace"
+    actual=""; rc=0
+    capture_output actual env LD_PRELOAD="$helper" \
+        DLFREEZE_TRACE_FILE="$dltrace" \
+        DLFREEZE_FILE_TRACE_FILE="$filetrace" \
+        "$target" exec "$target" "$child_lib" "$child_file" || rc=$?
+    if [ "$rc" -eq 0 ] &&
+       grep -Eq '^! [0-9a-f]{16} trace-stream-already-claimed$' \
+            "$dltrace" &&
+       grep -Eq '^! [0-9a-f]{16} trace-stream-already-claimed$' \
+            "$filetrace"; then
+        pass "same-pid exec poisons prior trace generation"
+    else
+        fail "same-pid exec trace generation" "exit=$rc output=$actual"
+    fi
+
+    rc=0
+    run_freeze "$DLFREEZE" -t -o "$out" -- "$target" daemon \
+        >"$log" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ] && [ ! -e "$out" ] &&
+       grep -Fq 'dlopen trace is still owned by a live traced process' \
+            "$log"; then
+        pass "live fork descendant prevents partial trace parsing"
+    else
+        fail "live fork descendant trace lock" \
+            "exit=$rc artifact=$([ -e "$out" ] && echo yes || echo no)"
+    fi
+
+    rm -f "$out"
+    if ! gcc -shared -fPIC -DTRACE_VALUE=11 -o "$mutable_lib" "$libsrc" ||
+       ! gcc -shared -fPIC -DTRACE_VALUE=22 -o "$replacement" "$libsrc"; then
+        fail "dlopen source revision fixture" "compile failed"
+    else
+        rc=0
+        run_freeze "$DLFREEZE" -t -o "$out" -- "$target" replace \
+            "$mutable_lib" "$replacement" >"$log" 2>&1 || rc=$?
+        if [ "$rc" -ne 0 ] && [ ! -e "$out" ] &&
+           grep -Fq 'traced dlopen object changed after tracing' "$log"; then
+            pass "post-dlopen pathname replacement fails provenance check"
+        else
+            fail "dlopen source revision provenance" \
+                "exit=$rc artifact=$([ -e "$out" ] && echo yes || echo no)"
+            tail -n 40 "$log" || true
+        fi
+    fi
+    rm -rf "$root"
+}
+
+# ===================================================================
+# A lower interposer can terminate the process after the native open has
+# succeeded but before this helper regains control to publish F/D/N/U
+# evidence.  V9's pre-call B must remain unmatched so the collector rejects
+# that successful-looking prefix instead of packaging an incomplete image.
+# ===================================================================
+test_file_trace_transaction_exit_window() {
+    echo "--- file trace native-call exit window ---"
+
+    local root="$BUILD/file_trace_exit_window"
+    local lower="$root/libfile-exit.so" target="$root/target"
+    local helper="$BUILD/dlfreeze-preload.so"
+    local input="$root/input.txt" trace="$root/file.trace"
+    local out="$root/target.frozen" log="$root/freeze.log"
+    local actual="" native_rc=0 traced_rc=0 freeze_rc=0
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    root=$(cd "$root" && pwd -P)
+    lower="$root/libfile-exit.so"
+    target="$root/target"
+    input="$root/input.txt"
+    trace="$root/file.trace"
+    out="$root/target.frozen"
+    log="$root/freeze.log"
+    printf '%s\n' file-transaction-input >"$input"
+
+    if ! gcc -Wall -Wextra -Werror -O2 -D_GNU_SOURCE -shared -fPIC \
+            -o "$lower" tests/preload_file_exit_interposer.c -ldl ||
+       ! gcc -Wall -Wextra -Werror -O2 -D_GNU_SOURCE -o "$target" \
+            tests/preload_file_exit_target.c -Wl,--no-as-needed \
+            -L"$root" -lfile-exit -Wl,-rpath,'$ORIGIN' ||
+       ! readelf -d "$target" 2>/dev/null |
+            grep -F 'Shared library: [libfile-exit.so]' >/dev/null; then
+        fail "file trace native-call exit window" "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+
+    capture_output actual env DLFREEZE_EXIT_AFTER_OPEN="$input" \
+        "$target" "$input" || native_rc=$?
+    if [ "$native_rc" -ne 0 ] || [ -n "$actual" ]; then
+        fail "file trace native-call exit native control" \
+            "exit=$native_rc output=$actual"
+        rm -rf "$root"
+        return
+    fi
+
+    actual=""; traced_rc=0
+    capture_output actual env LD_PRELOAD="$helper" \
+        DLFREEZE_FILE_TRACE_FILE="$trace" \
+        DLFREEZE_EXIT_AFTER_OPEN="$input" \
+        "$target" "$input" || traced_rc=$?
+    if [ "$traced_rc" -eq 0 ] && [ -z "$actual" ] &&
+       [ "$(sed -n '1p' "$trace" 2>/dev/null || true)" = \
+            '#DLFREEZE_PRELOAD_TRACE_V9' ] &&
+       awk '$1 == "B" && NF == 3 { begun[$2 FS $3]++ }
+            $1 == "K" && NF == 3 { committed[$2 FS $3]++ }
+            END {
+                for (key in begun)
+                    if (begun[key] > committed[key])
+                        found = 1
+                exit !found
+            }' "$trace"; then
+        pass "file trace records pre-call begin before lower _exit"
+    else
+        fail "file trace pre-call begin" \
+            "exit=$traced_rc output=$actual"
+        tail -n 30 "$trace" 2>/dev/null || true
+        rm -rf "$root"
+        return
+    fi
+
+    run_freeze env DLFREEZE_EXIT_AFTER_OPEN="$input" \
+        "$DLFREEZE" -d -t -f "$input" -o "$out" -- "$target" "$input" \
+        >"$log" 2>&1 || freeze_rc=$?
+    if [ "$freeze_rc" -ne 0 ] && [ ! -e "$out" ] &&
+       grep -Fq 'dlfreeze: incomplete file operation evidence' "$log"; then
+        pass "dangling V9 file operation fails closed"
+    else
+        fail "dangling V9 file operation parser gate" \
+            "exit=$freeze_rc artifact=$([ -e "$out" ] && echo yes || echo no)"
+        tail -n 50 "$log" 2>/dev/null || true
+    fi
+
+    for mode in orphan-w duplicate-v mismatched-v-k dangling-v; do
+        local expected
+
+        case "$mode" in
+            orphan-w|mismatched-v-k)
+                expected='dlfreeze: unmatched file trace operation commit'
+                ;;
+            duplicate-v)
+                expected='dlfreeze: duplicate or excessive file trace operation begin'
+                ;;
+            dangling-v)
+                expected='dlfreeze: incomplete file operation evidence'
+                ;;
+        esac
+        out="$root/$mode.frozen"
+        log="$root/$mode.log"
+        freeze_rc=0
+        run_freeze "$DLFREEZE" -d -t -f "$input" -o "$out" -- \
+            "$target" "$input" "$mode" >"$log" 2>&1 || freeze_rc=$?
+        if [ "$freeze_rc" -ne 0 ] && [ ! -e "$out" ] &&
+           grep -Fq "$expected" "$log"; then
+            pass "$mode V9 file operation fails closed"
+        else
+            fail "$mode V9 file operation parser gate" \
+                "exit=$freeze_rc artifact=$([ -e "$out" ] && echo yes || echo no)"
+            tail -n 50 "$log" 2>/dev/null || true
+        fi
+    done
+    rm -rf "$root"
+}
+
+# ===================================================================
+# Replacing the traced root's process image discards the direct loader state.
+# The owner writes an exec-begin transaction before the successful call; the
+# old stream ends with that attempt pending and must never be packaged.
 # ===================================================================
 test_trace_exec_headers_and_open_errors() {
     echo "--- trace exec headers and open error classification ---"
@@ -5188,21 +7232,17 @@ C
         return
     fi
 
-    freeze_require_direct "trace exec headers and open errors" "$log" \
-        "$out" -t -f "$root/*" -- "$parent" "$child" "$resource" ||
-        freeze_rc=$?
-    if [ "$freeze_rc" -eq 77 ]; then
-        skip "trace exec headers and open errors" "$DIRECT_FREEZE_REASON"
-    elif [ "$freeze_rc" -eq 0 ]; then
-        if grep -Eq '^[[:space:]]*data files[[:space:]]*:[[:space:]]*1 matched$' \
-                "$log" &&
-           grep -Fq 'exec-trace-ok' "$log" && [ -x "$out" ]; then
-            pass "trace exec headers and open errors"
-        else
-            fail "trace exec headers and open errors" \
-                "repeated header was rejected or failed open became DATA"
-            tail -n 80 "$log" || true
-        fi
+    run_freeze "$DLFREEZE" -d -t -f "$root/*" -o "$out" -- \
+        "$parent" "$child" "$resource" >"$log" 2>&1 || freeze_rc=$?
+    if [ "$freeze_rc" -ne 0 ] && [ ! -e "$out" ] &&
+       grep -Fq \
+            'traced owner replaced its process image during dlopen tracing' \
+            "$log"; then
+        pass "same-pid exec trace fails closed"
+    else
+        fail "same-pid exec trace ownership" \
+            "exit=$freeze_rc artifact=$([ -e "$out" ] && echo yes || echo no)"
+        tail -n 80 "$log" || true
     fi
     rm -rf "$root"
 }
@@ -5290,6 +7330,998 @@ C
         else
             fail "deleted out-of-scope trace file" \
                 "exit=$rc output=$actual or manifest count differs"
+        fi
+    fi
+    rm -rf "$root"
+}
+
+# ===================================================================
+# A successful open may return a regular descriptor which has no stable
+# source pathname.  Linux memfds provide a portable fixture; qemu-user uses
+# the same shape when it represents selected procfs files.  An unresolved
+# observation outside the capture filter is harmless, while selecting it must
+# fail closed instead of copying whatever the request happens to name later.
+# ===================================================================
+test_trace_unresolved_open_scope() {
+    echo "--- trace unresolved successful-open scope ---"
+
+    local root="$BUILD/trace_unresolved_open"
+    local capture retained retained_host src bin out log
+    local rejected rejected_log directory_rejected directory_rejected_log
+    local malformed malformed_log
+    local actual="" rc=0 freeze_rc=0 rejected_rc=0 directory_rejected_rc=0
+    local malformed_rc=0
+
+    rm -rf "$root"
+    mkdir -p "$root/capture"
+    root=$(cd "$root" && pwd -P)
+    capture="$root/capture"
+    retained="$capture/retained.txt"
+    retained_host="$retained.host"
+    src="$root/target.c"
+    bin="$root/target"
+    out="$root/target.frozen"
+    log="$root/target.log"
+    rejected="$root/rejected.frozen"
+    rejected_log="$root/rejected.log"
+    directory_rejected="$root/directory-rejected.frozen"
+    directory_rejected_log="$root/directory-rejected.log"
+    malformed="$root/malformed.frozen"
+    malformed_log="$root/malformed.log"
+
+    cat > "$src" <<'C'
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+static int find_file_trace_fd(void)
+{
+    const char *identity = getenv("DLFREEZE_FILE_TRACE_IDENTITY");
+    unsigned long long device, inode, type, rdevice;
+    struct stat status;
+    char extra;
+
+    if (!identity ||
+        sscanf(identity, "%16llx:%16llx:%16llx:%16llx%c",
+               &device, &inode, &type, &rdevice, &extra) != 4)
+        return -1;
+    for (int fd = 3; fd < 1024; fd++) {
+        if (fstat(fd, &status) == 0 &&
+            (unsigned long long)status.st_dev == device &&
+            (unsigned long long)status.st_ino == inode &&
+            (unsigned long long)(status.st_mode & S_IFMT) == type &&
+            (unsigned long long)status.st_rdev == rdevice)
+            return fd;
+    }
+    return -1;
+}
+
+static int read_exact(int fd, char *buffer, size_t size)
+{
+    size_t done = 0;
+
+    while (done < size) {
+        ssize_t count = read(fd, buffer + done, size - done);
+
+        if (count <= 0)
+            return 0;
+        done += (size_t)count;
+    }
+    return 1;
+}
+
+int main(int argc, char **argv)
+{
+    static const char ephemeral[] = "memfd-observation\n";
+    char proc_path[64];
+    char directory_template[] = "/tmp/dlfreeze-unresolved-dir.XXXXXX";
+    char buffer[64];
+    int memory_fd;
+    int reopened_fd;
+    int retained_fd;
+    int directory_fd;
+    int trace_fd;
+    int length;
+
+    if (argc != 2 && argc != 3)
+        return 2;
+    memory_fd = memfd_create("dlfreeze-unresolved-open", MFD_CLOEXEC);
+    if (memory_fd < 0 ||
+        write(memory_fd, ephemeral, sizeof(ephemeral) - 1) !=
+            (ssize_t)(sizeof(ephemeral) - 1))
+        return 3;
+    length = snprintf(proc_path, sizeof(proc_path),
+                      "/proc/self/fd/%d", memory_fd);
+    if (length < 0 || (size_t)length >= sizeof(proc_path))
+        return 4;
+    reopened_fd = open(proc_path, O_RDONLY | O_CLOEXEC);
+    if (reopened_fd < 0 ||
+        !read_exact(reopened_fd, buffer, sizeof(ephemeral) - 1) ||
+        memcmp(buffer, ephemeral, sizeof(ephemeral) - 1) != 0)
+        return 5;
+    close(reopened_fd);
+    close(memory_fd);
+
+    retained_fd = open(argv[1], O_RDONLY | O_CLOEXEC);
+    if (retained_fd < 0)
+        return 6;
+    length = (int)read(retained_fd, buffer, sizeof(buffer));
+    if (length <= 0 || write(STDOUT_FILENO, buffer, (size_t)length) != length)
+        return 7;
+    if (close(retained_fd) != 0)
+        return 8;
+
+    if (argc == 3 && strcmp(argv[2], "directory") == 0) {
+        if (!mkdtemp(directory_template))
+            return 9;
+        directory_fd = open(directory_template,
+                            O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (directory_fd < 0 || rmdir(directory_template) != 0)
+            return 10;
+        length = snprintf(proc_path, sizeof(proc_path),
+                          "/proc/self/fd/%d", directory_fd);
+        if (length < 0 || (size_t)length >= sizeof(proc_path))
+            return 11;
+        reopened_fd = open(proc_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (reopened_fd < 0 || close(reopened_fd) != 0 ||
+            close(directory_fd) != 0)
+            return 12;
+    } else if (argc == 3) {
+        static const char malformed[] = "U F 0g\n";
+
+        trace_fd = find_file_trace_fd();
+        if (trace_fd < 0 ||
+            syscall(SYS_write, trace_fd, malformed,
+                    sizeof(malformed) - 1) !=
+                (ssize_t)(sizeof(malformed) - 1))
+            return 14;
+    }
+    return 0;
+}
+C
+    printf '%s\n' 'unresolved-scope-ok' > "$retained"
+    if ! gcc -Wall -Wextra -Werror -O2 -o "$bin" "$src"; then
+        fail "trace unresolved successful-open scope" "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+
+    freeze_require_direct "trace unresolved successful-open scope" "$log" \
+        "$out" -t -f "$capture/*" -- "$bin" "$retained" ||
+        freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "trace unresolved successful-open scope" "$DIRECT_FREEZE_REASON"
+    elif [ "$freeze_rc" -eq 0 ]; then
+        mv "$retained" "$retained_host"
+        capture_output actual "$out" "$retained" || rc=$?
+        mv "$retained_host" "$retained"
+        if [ "$rc" -eq 0 ] && [ "$actual" = "unresolved-scope-ok" ] &&
+           grep -Eq '^[[:space:]]*data files[[:space:]]*:[[:space:]]*1 matched$' \
+                "$log"; then
+            pass "unresolved out-of-scope open is ignored"
+        else
+            fail "trace unresolved out-of-scope open" \
+                "exit=$rc output=$actual or manifest count differs"
+        fi
+    fi
+
+    run_freeze "$DLFREEZE" -d -t -f '/proc/self/fd/*' -o "$rejected" -- \
+        "$bin" "$retained" >"$rejected_log" 2>&1 || rejected_rc=$?
+    if [ "$rejected_rc" -ne 0 ] && [ ! -e "$rejected" ] &&
+       grep -Fq 'selected successful open has no stable source path: /proc/self/fd/' \
+            "$rejected_log"; then
+        pass "selected unresolved open fails closed"
+    else
+        fail "selected unresolved successful-open scope" \
+            "exit=$rejected_rc artifact=$([ -e "$rejected" ] && echo yes || echo no)"
+        tail -n 40 "$rejected_log" || true
+    fi
+
+    run_freeze "$DLFREEZE" -d -t -f '/proc/self/fd/*/a*' \
+        -o "$directory_rejected" -- "$bin" "$retained" directory \
+        >"$directory_rejected_log" 2>&1 || directory_rejected_rc=$?
+    if [ "$directory_rejected_rc" -ne 0 ] &&
+       [ ! -e "$directory_rejected" ] &&
+       grep -Fq 'selected successful open has no stable source path: /proc/self/fd/' \
+            "$directory_rejected_log"; then
+        pass "selected unresolved directory-child scope fails closed"
+    else
+        fail "selected unresolved directory-child scope" \
+            "exit=$directory_rejected_rc artifact=$([ -e "$directory_rejected" ] && echo yes || echo no)"
+        tail -n 40 "$directory_rejected_log" || true
+    fi
+
+    run_freeze "$DLFREEZE" -d -t -f "$capture/*" -o "$malformed" -- \
+        "$bin" "$retained" malformed >"$malformed_log" 2>&1 ||
+        malformed_rc=$?
+    if [ "$malformed_rc" -ne 0 ] && [ ! -e "$malformed" ] &&
+       grep -Fq 'dlfreeze: malformed file trace record' "$malformed_log"; then
+        pass "malformed unresolved-open record fails closed"
+    else
+        fail "malformed unresolved successful-open record" \
+            "exit=$malformed_rc artifact=$([ -e "$malformed" ] && echo yes || echo no)"
+        tail -n 40 "$malformed_log" || true
+    fi
+    rm -rf "$root"
+}
+
+# ===================================================================
+# A traced source path is not authority by itself.  Bind selected regular
+# files and negative probes to the revision observed by the helper, and fail
+# if the target replaces, mutates, or creates that path before packing.
+# ===================================================================
+test_trace_file_revision_provenance() {
+    echo "--- traced file revision provenance ---"
+
+    local root="$BUILD/trace-file-revision"
+    local capture="$root/capture" src="$root/target.c" bin="$root/target"
+    local input replacement out log mode rc expected label
+
+    rm -rf "$root"
+    mkdir -p "$capture"
+    root=$(cd "$root" && pwd -P)
+    capture="$root/capture"
+    src="$root/target.c"
+    bin="$root/target"
+    input="$capture/input.txt"
+    replacement="$root/replacement.txt"
+
+    cat > "$src" <<'C'
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+int main(int argc, char **argv)
+{
+    static const char mutation[] = "same-inode-content-mutation\n";
+    char byte;
+    int fd;
+
+    if (argc != 4)
+        return 2;
+    if (strcmp(argv[3], "appear") == 0) {
+        errno = 0;
+        fd = open(argv[1], O_RDONLY | O_CLOEXEC);
+        if (fd >= 0 || errno != ENOENT)
+            return 3;
+        return rename(argv[2], argv[1]) == 0 ? 0 : 4;
+    }
+
+    fd = open(argv[1], O_RDONLY | O_CLOEXEC);
+    if (fd < 0 || read(fd, &byte, 1) != 1 || close(fd) != 0)
+        return 5;
+    if (strcmp(argv[3], "replace") == 0)
+        return rename(argv[2], argv[1]) == 0 ? 0 : 6;
+    if (strcmp(argv[3], "mutate") != 0)
+        return 7;
+    fd = open(argv[1], O_WRONLY | O_TRUNC | O_CLOEXEC);
+    if (fd < 0 ||
+        write(fd, mutation, sizeof(mutation) - 1) !=
+            (ssize_t)(sizeof(mutation) - 1) ||
+        close(fd) != 0)
+        return 8;
+    return 0;
+}
+C
+    if ! gcc -Wall -Wextra -Werror -O2 -o "$bin" "$src"; then
+        fail "traced file revision provenance" "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+
+    for mode in replace mutate appear; do
+        rm -f "$input" "$replacement"
+        if [ "$mode" = "appear" ]; then
+            printf '%s\n' 'new-path' > "$replacement"
+            expected='selected missing path changed after tracing'
+            label='selected negative path creation'
+        else
+            printf '%s\n' 'old-revision' > "$input"
+            printf '%s\n' 'replacement-revision' > "$replacement"
+            expected='captured source changed after tracing'
+            if [ "$mode" = "replace" ]; then
+                label='selected file replacement'
+            else
+                label='selected same-inode mutation'
+            fi
+        fi
+        out="$root/$mode.frozen"
+        log="$root/$mode.log"
+        rc=0
+        run_freeze "$DLFREEZE" -d -t -f "$capture/*" -o "$out" -- \
+            "$bin" "$input" "$replacement" "$mode" >"$log" 2>&1 || rc=$?
+        if [ "$rc" -ne 0 ] && [ ! -e "$out" ] &&
+           grep -Fq "$expected" "$log"; then
+            pass "$label fails closed"
+        else
+            fail "$label provenance" \
+                "exit=$rc artifact=$([ -e "$out" ] && echo yes || echo no)"
+            tail -n 40 "$log" || true
+        fi
+    done
+    rm -rf "$root"
+}
+
+# ===================================================================
+# Trace scratch files follow a usable TMPDIR and fall back to /tmp.  The
+# traced process receives only identity-bound descriptors: their names are
+# already unlinked, legacy path variables are absent, and recreating those
+# names cannot redirect either trace stream.
+# ===================================================================
+test_trace_tmpdir_selection() {
+    echo "--- trace TMPDIR selection ---"
+
+    local root="$BUILD/trace-tmpdir" tmp unsafe system_tmp
+    local marker fallback_marker unsafe_marker
+    local src bin out fallback_out unsafe_out log fallback_log unsafe_log
+    local rc=0 fallback_rc=0 unsafe_rc=0
+
+    rm -rf "$root"
+    mkdir -p "$root/tmp" "$root/unsafe/leaf"
+    chmod 0700 "$root" "$root/tmp" "$root/unsafe/leaf"
+    chmod 0777 "$root/unsafe"
+    root=$(cd "$root" && pwd -P)
+    tmp="$root/tmp"
+    unsafe="$root/unsafe/leaf"
+    system_tmp=$(realpath /tmp)
+    marker="$root/selected.marker"
+    fallback_marker="$root/fallback.marker"
+    unsafe_marker="$root/unsafe.marker"
+    src="$root/target.c"
+    bin="$root/target"
+    out="$root/selected.frozen"
+    fallback_out="$root/fallback.frozen"
+    unsafe_out="$root/unsafe.frozen"
+    log="$root/selected.log"
+    fallback_log="$root/fallback.log"
+    unsafe_log="$root/unsafe.log"
+
+    cat > "$src" <<'C'
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+static int parse_fd(const char *value)
+{
+    char *end;
+    long parsed;
+
+    if (!value || !value[0])
+        return -1;
+    parsed = strtol(value, &end, 10);
+    return *end == '\0' && parsed >= 0 && parsed <= 0x7fffffffL
+        ? (int)parsed : -1;
+}
+
+static int identity_matches(int fd, const char *value)
+{
+    unsigned long long device, inode, type, rdevice;
+    struct stat status;
+    char extra;
+
+    if (!value || sscanf(value, "%16llx:%16llx:%16llx:%16llx%c",
+                         &device, &inode, &type, &rdevice, &extra) != 4 ||
+        fstat(fd, &status) != 0)
+        return 0;
+    return (unsigned long long)status.st_dev == device &&
+           (unsigned long long)status.st_ino == inode &&
+           (unsigned long long)(status.st_mode & S_IFMT) == type &&
+           (unsigned long long)status.st_rdev == rdevice &&
+           S_ISREG(status.st_mode);
+}
+
+static int find_identity_fd(const char *identity)
+{
+    for (int fd = 3; fd < 1024; fd++) {
+        if (identity_matches(fd, identity))
+            return fd;
+    }
+    return -1;
+}
+
+static int deleted_trace_name(int fd, const char *prefix,
+                              char *path, size_t path_size)
+{
+    char link[64];
+    static const char suffix[] = " (deleted)";
+    size_t length, suffix_length = sizeof(suffix) - 1;
+    int count = snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    ssize_t result;
+
+    if (count < 0 || (size_t)count >= sizeof(link))
+        return 0;
+    result = readlink(link, path, path_size - 1);
+    if (result < 0 || (size_t)result >= path_size)
+        return 0;
+    path[result] = '\0';
+    length = (size_t)result;
+    if (length <= suffix_length ||
+        strcmp(path + length - suffix_length, suffix) != 0)
+        return 0;
+    path[length - suffix_length] = '\0';
+    return strncmp(path, prefix, strlen(prefix)) == 0;
+}
+
+static int replace_deleted_name(const char *path)
+{
+    static const char replacement[] = "unrelated replacement\n";
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    int ok = fd >= 0 &&
+        write(fd, replacement, sizeof(replacement) - 1) ==
+            (ssize_t)(sizeof(replacement) - 1) &&
+        close(fd) == 0 && unlink(path) == 0;
+
+    if (fd >= 0 && !ok) {
+        close(fd);
+        unlink(path);
+    }
+    return ok;
+}
+
+int main(int argc, char **argv)
+{
+    const char *file_identity = getenv("DLFREEZE_FILE_TRACE_IDENTITY");
+    const char *dlopen_identity = getenv("DLFREEZE_TRACE_IDENTITY");
+    int configured_file_fd = parse_fd(getenv("DLFREEZE_FILE_TRACE_FD"));
+    int configured_dlopen_fd = parse_fd(getenv("DLFREEZE_TRACE_FD"));
+    int file_fd = find_identity_fd(file_identity);
+    int dlopen_fd = find_identity_fd(dlopen_identity);
+    struct stat file_status, dlopen_status;
+    char file_path[4096], dlopen_path[4096];
+    FILE *marker;
+    int ok;
+
+    if (argc != 3)
+        return 2;
+    ok = !getenv("DLFREEZE_FILE_TRACE_FILE") &&
+         !getenv("DLFREEZE_TRACE_FILE") &&
+         configured_file_fd >= 0 && configured_dlopen_fd >= 0 &&
+         file_fd >= 0 && dlopen_fd >= 0 && file_fd != dlopen_fd &&
+         identity_matches(file_fd, file_identity) &&
+         identity_matches(dlopen_fd, dlopen_identity) &&
+         fstat(file_fd, &file_status) == 0 &&
+         fstat(dlopen_fd, &dlopen_status) == 0 &&
+         (file_status.st_dev != dlopen_status.st_dev ||
+          file_status.st_ino != dlopen_status.st_ino) &&
+         deleted_trace_name(file_fd, argv[1],
+                            file_path, sizeof(file_path)) &&
+         deleted_trace_name(dlopen_fd, argv[1],
+                            dlopen_path, sizeof(dlopen_path)) &&
+         strcmp(file_path, dlopen_path) != 0 &&
+         replace_deleted_name(file_path) &&
+         replace_deleted_name(dlopen_path);
+    marker = fopen(argv[2], "w");
+    if (!marker)
+        return 3;
+    if (fprintf(marker, "%s\n", ok ? "ok" : "wrong-root") < 0 ||
+        fclose(marker) != 0)
+        return 4;
+    return 0;
+}
+C
+    if ! gcc -Wall -Wextra -Werror -O2 -o "$bin" "$src"; then
+        fail "trace TMPDIR selection" "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+
+    : > "$marker"
+    chmod 0600 "$marker"
+    run_freeze env TMPDIR="$tmp" sh -c \
+        'umask 0777; exec "$@"' sh "$DLFREEZE" -d -t \
+        -f "$root/no-match/*" -o "$out" -- "$bin" "$tmp/" "$marker" \
+        >"$log" 2>&1 || rc=$?
+    if [ "$rc" -eq 0 ] && [ -x "$out" ] &&
+       [ "$(cat "$marker" 2>/dev/null)" = ok ] &&
+       [ -z "$(find "$tmp" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+        pass "trace scratch files honor TMPDIR"
+    else
+        fail "trace TMPDIR selection" "exit=$rc marker=$(cat "$marker" 2>/dev/null || true)"
+        tail -n 40 "$log" || true
+    fi
+
+    run_freeze env TMPDIR="$root/does-not-exist" "$DLFREEZE" -d -t \
+        -f "$root/no-match/*" -o "$fallback_out" -- \
+        "$bin" "$system_tmp/" "$fallback_marker" >"$fallback_log" 2>&1 ||
+        fallback_rc=$?
+    if [ "$fallback_rc" -eq 0 ] && [ -x "$fallback_out" ] &&
+       [ "$(cat "$fallback_marker" 2>/dev/null)" = ok ]; then
+        pass "trace scratch files fall back from invalid TMPDIR"
+    else
+        fail "trace TMPDIR fallback" \
+            "exit=$fallback_rc marker=$(cat "$fallback_marker" 2>/dev/null || true)"
+        tail -n 40 "$fallback_log" || true
+    fi
+
+    run_freeze env TMPDIR="$unsafe" "$DLFREEZE" -d -t \
+        -f "$root/no-match/*" -o "$unsafe_out" -- \
+        "$bin" "$system_tmp/" "$unsafe_marker" >"$unsafe_log" 2>&1 ||
+        unsafe_rc=$?
+    if [ "$unsafe_rc" -eq 0 ] && [ -x "$unsafe_out" ] &&
+       [ "$(cat "$unsafe_marker" 2>/dev/null)" = ok ] &&
+       [ -z "$(find "$unsafe" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+        pass "trace scratch files reject an unsafe TMPDIR ancestor"
+    else
+        fail "trace unsafe TMPDIR fallback" \
+            "exit=$unsafe_rc marker=$(cat "$unsafe_marker" 2>/dev/null || true)"
+        tail -n 40 "$unsafe_log" || true
+    fi
+    rm -rf "$root"
+}
+
+# ===================================================================
+# Extraction scratch directories follow the same TMPDIR contract as the
+# tracing helpers.  The target observes the prepended LD_LIBRARY_PATH while
+# the directory still exists, so it can verify both selection and exact mode;
+# the supervisor must remove that same bound directory after the child exits.
+# ===================================================================
+test_bootstrap_tmpdir_selection() {
+    echo "--- bootstrap extraction TMPDIR selection ---"
+
+    local root="$BUILD/bootstrap-tmpdir" tmp unsafe system_tmp candidate
+    local src bin out log actual="" selected="" rc=0 meta_failed=0
+    local launcher_src launcher noexec_src noexec_probe noexec_candidate
+    local probe_rc=0 system_probe_rc=0 seccomp_unavailable=0
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    chmod 0700 "$root"
+    mkdir -m 0700 "$root/tmp" "$root/unsafe"
+    chmod 0777 "$root/unsafe"
+    mkdir -m 0700 "$root/unsafe/leaf" "$root/meta:colon" \
+        "$root/meta;semicolon" "$root/meta\$token"
+    root=$(cd "$root" && pwd -P)
+    tmp="$root/tmp"
+    unsafe="$root/unsafe/leaf"
+    system_tmp=$(realpath /tmp)
+    src="$root/target.c"
+    bin="$root/target"
+    out="$root/target.frozen"
+    log="$root/freeze.log"
+    launcher_src="$root/fs-probe-launcher.c"
+    launcher="$root/fs-probe-launcher"
+    noexec_src="$root/noexec-probe.c"
+    noexec_probe="$root/noexec-probe"
+    noexec_candidate="/dev/shm/dlfreeze-bootstrap-tmpdir-$$-$RANDOM"
+
+    cat > "$src" <<'C'
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+
+int main(void)
+{
+    const char *library_path = getenv("LD_LIBRARY_PATH");
+    const char *check_signals = getenv("DLFREEZE_TEST_SIGCHLD_STATE");
+    char extraction_root[4096];
+    const char *separator;
+    struct stat status;
+    size_t length;
+
+    if (check_signals && check_signals[0]) {
+        struct sigaction action;
+        sigset_t mask;
+
+        if (sigaction(SIGCHLD, NULL, &action) < 0 ||
+            sigprocmask(SIG_SETMASK, NULL, &mask) < 0 ||
+            action.sa_handler != SIG_IGN ||
+            sigismember(&mask, SIGCHLD) != 1)
+            return 5;
+    }
+    if (!library_path || !library_path[0])
+        return 2;
+    separator = strchr(library_path, ':');
+    length = separator ? (size_t)(separator - library_path) :
+                         strlen(library_path);
+    if (length == 0 || length >= sizeof(extraction_root))
+        return 3;
+    memcpy(extraction_root, library_path, length);
+    extraction_root[length] = '\0';
+    if (stat(extraction_root, &status) < 0 ||
+        !S_ISDIR(status.st_mode))
+        return 4;
+    printf("%04o %s\n", (unsigned)(status.st_mode & 07777),
+           extraction_root);
+    return 0;
+}
+C
+    if ! gcc -Wall -Wextra -Werror -O2 -o "$bin" "$src" ||
+       ! run_freeze "$DLFREEZE" -o "$out" -- "$bin" >"$log" 2>&1; then
+        fail "bootstrap TMPDIR selection" "fixture build or freeze failed"
+        tail -n 40 "$log" 2>/dev/null || true
+        rm -rf "$root"
+        return
+    fi
+
+    capture_output actual env TMPDIR="$tmp" sh -c \
+        'umask 0777; exec "$1"' sh "$out" || rc=$?
+    selected=${actual#0700 }
+    if [ "$rc" -eq 0 ] && [[ "$actual" == "0700 $tmp/dlfreeze."* ]] &&
+       [ ! -e "$selected" ] &&
+       [ -z "$(find "$tmp" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+        pass "bootstrap extraction honors TMPDIR and exact mode"
+    else
+        fail "bootstrap TMPDIR selection" "exit=$rc output=$actual"
+    fi
+
+    actual=""; selected=""; rc=0
+    capture_output actual env TMPDIR="$root/does-not-exist" "$out" || rc=$?
+    selected=${actual#0700 }
+    if [ "$rc" -eq 0 ] &&
+       [[ "$actual" == "0700 $system_tmp/dlfreeze."* ]] &&
+       [ ! -e "$selected" ]; then
+        pass "bootstrap extraction falls back from invalid TMPDIR"
+    else
+        fail "bootstrap invalid TMPDIR fallback" "exit=$rc output=$actual"
+    fi
+
+    actual=""; selected=""; rc=0
+    capture_output actual env TMPDIR="$unsafe" "$out" || rc=$?
+    selected=${actual#0700 }
+    if [ "$rc" -eq 0 ] &&
+       [[ "$actual" == "0700 $system_tmp/dlfreeze."* ]] &&
+       [ ! -e "$selected" ] &&
+       [ -z "$(find "$unsafe" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+        pass "bootstrap extraction rejects an unsafe TMPDIR ancestor"
+    else
+        fail "bootstrap unsafe TMPDIR fallback" "exit=$rc output=$actual"
+    fi
+
+    for candidate in "$root/meta:colon" "$root/meta;semicolon" \
+                     "$root/meta\$token"; do
+        actual=""; selected=""; rc=0
+        capture_output actual env TMPDIR="$candidate" "$out" || rc=$?
+        selected=${actual#0700 }
+        if [ "$rc" -ne 0 ] ||
+           [[ "$actual" != "0700 $system_tmp/dlfreeze."* ]] ||
+           [ -e "$selected" ] ||
+           [ -n "$(find "$candidate" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+            fail "bootstrap loader-path TMPDIR fallback" \
+                "candidate=$candidate exit=$rc output=$actual"
+            meta_failed=1
+        fi
+    done
+    if [ "$meta_failed" -eq 0 ]; then
+        pass "bootstrap extraction rejects loader-path metacharacters"
+    fi
+
+    cat > "$noexec_src" <<'C'
+#include <sys/statvfs.h>
+#include <sys/vfs.h>
+
+int main(int argc, char **argv)
+{
+#ifdef ST_NOEXEC
+    struct statfs filesystem;
+
+    if (argc != 2 || statfs(argv[1], &filesystem) != 0)
+        return 77;
+    return (filesystem.f_flags & ST_NOEXEC) != 0 ? 0 : 1;
+#else
+    (void)argc;
+    (void)argv;
+    return 77;
+#endif
+}
+C
+    if ! gcc -D_GNU_SOURCE -Wall -Wextra -Werror -O2 -o "$noexec_probe" \
+            "$noexec_src"; then
+        skip "bootstrap extraction falls back from noexec TMPDIR" \
+            "filesystem-flag probe could not be compiled"
+    elif [ ! -d /dev/shm ] || [ ! -w /dev/shm ]; then
+        skip "bootstrap extraction falls back from noexec TMPDIR" \
+            "/dev/shm is not writable"
+    else
+        probe_rc=0
+        "$noexec_probe" /dev/shm >/dev/null 2>&1 || probe_rc=$?
+        system_probe_rc=0
+        "$noexec_probe" /tmp >/dev/null 2>&1 || system_probe_rc=$?
+        if [ "$probe_rc" -eq 77 ] || [ "$system_probe_rc" -eq 77 ]; then
+            skip "bootstrap extraction falls back from noexec TMPDIR" \
+                "mount execution flags are unavailable"
+        elif [ "$probe_rc" -ne 0 ]; then
+            skip "bootstrap extraction falls back from noexec TMPDIR" \
+                "/dev/shm is executable"
+        elif [ "$system_probe_rc" -eq 0 ]; then
+            skip "bootstrap extraction falls back from noexec TMPDIR" \
+                "/tmp is also mounted noexec"
+        elif ! mkdir -m 0700 "$noexec_candidate"; then
+            skip "bootstrap extraction falls back from noexec TMPDIR" \
+                "cannot create a private noexec candidate"
+        else
+            actual=""; selected=""; rc=0
+            capture_output actual env TMPDIR="$noexec_candidate" \
+                "$out" || rc=$?
+            selected=${actual#0700 }
+            if [ "$rc" -eq 0 ] &&
+               [[ "$actual" == "0700 $system_tmp/dlfreeze."* ]] &&
+               [ ! -e "$selected" ] &&
+               [ -z "$(find "$noexec_candidate" -mindepth 1 \
+                           -print -quit 2>/dev/null)" ]; then
+                pass "bootstrap extraction falls back from noexec TMPDIR"
+            else
+                fail "bootstrap noexec TMPDIR fallback" \
+                    "exit=$rc output=$actual"
+            fi
+            rmdir "$noexec_candidate" 2>/dev/null || true
+        fi
+    fi
+
+    cat > "$launcher_src" <<'C'
+#include <errno.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <signal.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#ifndef SECCOMP_RET_KILL_PROCESS
+#define SECCOMP_RET_KILL_PROCESS SECCOMP_RET_KILL
+#endif
+
+int main(int argc, char **argv)
+{
+    struct sock_fprog program;
+    int preserve_sigchld = 0;
+
+#ifdef __NR_pipe2
+    struct sock_filter kill_pipe2[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_pipe2, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+#endif
+#ifdef __NR_fstatfs
+    struct sock_filter kill_fstatfs[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_fstatfs, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_filter trap_fstatfs[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_fstatfs, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+#endif
+#ifdef __NR_statx
+    struct sock_filter kill_statx[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_statx, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+#endif
+#if defined(__NR_fstatfs) && defined(__NR_statx)
+    struct sock_filter kill_both[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_fstatfs, 1, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_statx, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+#endif
+
+    if (argc != 3)
+        return 76;
+    memset(&program, 0, sizeof(program));
+    if (strcmp(argv[1], "pipe2") == 0) {
+#ifdef __NR_pipe2
+        program.len = (unsigned short)(sizeof(kill_pipe2) /
+                                       sizeof(kill_pipe2[0]));
+        program.filter = kill_pipe2;
+#else
+        return 76;
+#endif
+    } else if (strcmp(argv[1], "fstatfs") == 0) {
+#ifdef __NR_fstatfs
+        program.len = (unsigned short)(sizeof(kill_fstatfs) /
+                                       sizeof(kill_fstatfs[0]));
+        program.filter = kill_fstatfs;
+#else
+        return 76;
+#endif
+    } else if (strcmp(argv[1], "fstatfs-trap-ignore") == 0) {
+#ifdef __NR_fstatfs
+        struct sigaction action;
+
+        memset(&action, 0, sizeof(action));
+        action.sa_handler = SIG_IGN;
+        sigemptyset(&action.sa_mask);
+        if (sigaction(SIGSYS, &action, NULL) < 0)
+            return 75;
+        program.len = (unsigned short)(sizeof(trap_fstatfs) /
+                                       sizeof(trap_fstatfs[0]));
+        program.filter = trap_fstatfs;
+#else
+        return 76;
+#endif
+    } else if (strcmp(argv[1], "statx") == 0) {
+#ifdef __NR_statx
+        program.len = (unsigned short)(sizeof(kill_statx) /
+                                       sizeof(kill_statx[0]));
+        program.filter = kill_statx;
+#else
+        return 76;
+#endif
+    } else if (strcmp(argv[1], "both-preserve") == 0) {
+#if defined(__NR_fstatfs) && defined(__NR_statx)
+        struct sigaction action;
+        sigset_t blocked;
+
+        preserve_sigchld = 1;
+        memset(&action, 0, sizeof(action));
+        action.sa_handler = SIG_IGN;
+        sigemptyset(&action.sa_mask);
+        sigemptyset(&blocked);
+        sigaddset(&blocked, SIGCHLD);
+        if (sigaction(SIGCHLD, &action, NULL) < 0 ||
+            sigprocmask(SIG_BLOCK, &blocked, NULL) < 0)
+            return 75;
+        program.len = (unsigned short)(sizeof(kill_both) /
+                                       sizeof(kill_both[0]));
+        program.filter = kill_both;
+#else
+        return 76;
+#endif
+    } else {
+        return 76;
+    }
+    if (preserve_sigchld &&
+        setenv("DLFREEZE_TEST_SIGCHLD_STATE", "1", 1) < 0)
+        return 75;
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 ||
+        prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program) < 0)
+        return 77;
+    execl(argv[2], argv[2], (char *)NULL);
+    return 78;
+}
+C
+    if ! gcc -Wall -Wextra -Werror -O2 -o "$launcher" \
+            "$launcher_src"; then
+        skip "filesystem containment adds no pipe2 dependency" \
+            "seccomp fixture could not be compiled"
+        skip "contained fstatfs bootstrap probe" \
+            "seccomp fixture could not be compiled"
+        skip "handled SIGSYS cannot authorize filesystem metadata" \
+            "seccomp fixture could not be compiled"
+        skip "contained statx bootstrap probe" \
+            "seccomp fixture could not be compiled"
+        skip "filesystem probes preserve inherited SIGCHLD" \
+            "seccomp fixture could not be compiled"
+    else
+        actual=""; selected=""; rc=0
+        capture_output actual env TMPDIR="$tmp" \
+            "$launcher" pipe2 "$out" || rc=$?
+        selected=${actual#0700 }
+        if [ "$rc" -eq 77 ]; then
+            skip "filesystem containment adds no pipe2 dependency" \
+                "seccomp filters are unavailable"
+        elif [ "$rc" -eq 76 ]; then
+            skip "filesystem containment adds no pipe2 dependency" \
+                "pipe2 syscall number is unavailable"
+        elif [ "$rc" -eq 0 ] &&
+             [[ "$actual" == "0700 $tmp/dlfreeze."* ]] &&
+             [ ! -e "$selected" ]; then
+            pass "filesystem containment adds no pipe2 dependency"
+        else
+            fail "filesystem containment pipe2 independence" \
+                "exit=$rc output=$actual"
+        fi
+
+        actual=""; selected=""; rc=0
+        capture_output actual env TMPDIR="$tmp" \
+            "$launcher" fstatfs "$out" || rc=$?
+        selected=${actual#0700 }
+        if [ "$rc" -eq 77 ]; then
+            seccomp_unavailable=1
+            skip "contained fstatfs bootstrap probe" \
+                "seccomp filters are unavailable"
+        elif [ "$rc" -eq 76 ]; then
+            skip "contained fstatfs bootstrap probe" \
+                "fstatfs syscall number is unavailable"
+        elif [ "$rc" -eq 0 ] &&
+             [[ "$actual" == "0700 $tmp/dlfreeze."* ]] &&
+             [ ! -e "$selected" ]; then
+            pass "contained fstatfs bootstrap probe"
+        else
+            fail "contained fstatfs bootstrap probe" \
+                "exit=$rc output=$actual"
+        fi
+
+        actual=""; selected=""; rc=0
+        capture_output actual env TMPDIR="$tmp" \
+            "$launcher" fstatfs-trap-ignore "$out" || rc=$?
+        selected=${actual#0700 }
+        if [ "$rc" -eq 77 ]; then
+            skip "handled SIGSYS cannot authorize filesystem metadata" \
+                "seccomp filters are unavailable"
+        elif [ "$rc" -eq 76 ]; then
+            skip "handled SIGSYS cannot authorize filesystem metadata" \
+                "fstatfs syscall number is unavailable"
+        elif [ "$rc" -eq 0 ] &&
+             [[ "$actual" == "0700 $tmp/dlfreeze."* ]] &&
+             [ ! -e "$selected" ]; then
+            pass "handled SIGSYS cannot authorize filesystem metadata"
+        else
+            fail "handled SIGSYS filesystem probe containment" \
+                "exit=$rc output=$actual"
+        fi
+
+        if [ "$seccomp_unavailable" -eq 1 ]; then
+            skip "contained statx bootstrap probe" \
+                "seccomp filters are unavailable"
+            skip "filesystem probes preserve inherited SIGCHLD" \
+                "seccomp filters are unavailable"
+        else
+            actual=""; selected=""; rc=0
+            capture_output actual env TMPDIR="$tmp" \
+                "$launcher" statx "$out" || rc=$?
+            selected=${actual#0700 }
+            if [ "$rc" -eq 77 ]; then
+                seccomp_unavailable=1
+                skip "contained statx bootstrap probe" \
+                    "seccomp filters are unavailable"
+            elif [ "$rc" -eq 76 ]; then
+                skip "contained statx bootstrap probe" \
+                    "statx syscall number is unavailable"
+            elif [ "$rc" -eq 0 ] &&
+                 [[ "$actual" == "0700 $tmp/dlfreeze."* ]] &&
+                 [ ! -e "$selected" ]; then
+                pass "contained statx bootstrap probe"
+            else
+                fail "contained statx bootstrap probe" \
+                    "exit=$rc output=$actual"
+            fi
+
+            if [ "$seccomp_unavailable" -eq 1 ]; then
+                skip "filesystem probes preserve inherited SIGCHLD" \
+                    "seccomp filters are unavailable"
+            else
+                actual=""; selected=""; rc=0
+                capture_output actual env TMPDIR="$tmp" \
+                    "$launcher" both-preserve "$out" || rc=$?
+                selected=${actual#0700 }
+                if [ "$rc" -eq 76 ]; then
+                    skip "filesystem probes preserve inherited SIGCHLD" \
+                        "required syscall numbers are unavailable"
+                elif [ "$rc" -eq 77 ]; then
+                    skip "filesystem probes preserve inherited SIGCHLD" \
+                        "seccomp filters are unavailable"
+                elif [ "$rc" -eq 0 ] &&
+                     [[ "$actual" == "0700 $tmp/dlfreeze."* ]] &&
+                     [ ! -e "$selected" ]; then
+                    pass "filesystem probes preserve inherited SIGCHLD"
+                else
+                    fail "filesystem probe signal-state preservation" \
+                        "exit=$rc output=$actual"
+                fi
+            fi
         fi
     fi
     rm -rf "$root"
@@ -5394,8 +8426,9 @@ SH
 }
 
 # ===================================================================
-# Relative executable spellings are argv identity, not extraction paths.
-# Only their final component may be materialized below the private root.
+# Relative executable spellings are manifest identity, not extraction paths.
+# Only their final component may be materialized below the private root;
+# runtime argv[0] remains the caller's frozen-artifact spelling.
 # ===================================================================
 test_relative_executable_identity_extraction() {
     echo "--- relative executable identity in extraction mode ---"
@@ -5452,8 +8485,8 @@ C
     capture_output parent_actual "$parent_out" || rc=$?
     marker_actual=$(cat "$marker" 2>/dev/null || true)
     if [ "$rc" -eq 0 ] &&
-       [ "$dot_actual" = "./dot-relative-target" ] &&
-       [ "$parent_actual" = "../$escape_name" ] &&
+       [ "$dot_actual" = "$dot_out" ] &&
+       [ "$parent_actual" = "$parent_out" ] &&
        [ "$marker_actual" = "outside-sentinel" ]; then
         pass "relative executable extraction identity"
     else
@@ -5649,7 +8682,11 @@ int main(void) {
     return 0;
 }
 C
-    gcc -pthread -o "$bin" "$src"
+    if ! gcc -pthread -o "$bin" "$src"; then
+        fail "direct fork/atfork lifecycle" "fixture compile failed"
+        rm -f "$src" "$bin" "$out" "$log"
+        return
+    fi
     freeze_require_direct "direct fork/atfork lifecycle" "$log" "$out" \
         "$bin" || freeze_rc=$?
     if [ "$freeze_rc" -eq 77 ]; then
@@ -6411,7 +9448,11 @@ static void constructor(void) {
 
 int main(void) { return 99; }
 C
-    gcc -o "$bin" "$src"
+    if ! gcc -o "$bin" "$src"; then
+        fail "direct constructor signal" "fixture compile failed"
+        rm -f "$src" "$bin" "$out" "$log"
+        return
+    fi
     freeze_require_direct "direct constructor signal" "$log" "$out" \
         "$bin" || freeze_rc=$?
     if [ "$freeze_rc" -eq 77 ]; then
@@ -6753,12 +9794,12 @@ C
         return
     fi
 
-    # A prelinked artifact contains relocated PT_LOAD bytes and must never be
-    # retried through the system dynamic linker after an unmarked child
-    # failure.  Moving a PIE main to the bootstrap's own 0x40000000 mapping
-    # keeps metadata structurally valid but makes MAP_FIXED_NOREPLACE fail
-    # before handoff.  A zero ET_DYN base is intentionally rejected earlier
-    # by the canonical metadata validator and would not exercise this path.
+    # Prelink persists only explicit-addend RELA RELATIVE values, which the
+    # native loader deterministically overwrites, while RELR remains pristine
+    # for runtime replay.  Moving a PIE main to the bootstrap's own
+    # 0x40000000 mapping keeps metadata structurally valid but makes the
+    # direct MAP_FIXED_NOREPLACE attempt fail before handoff; the supervisor
+    # must then retry the same embedded ELF bytes through native extraction.
     meta_flags=$(od -An -tu4 -j $((meta_off + 48)) -N4 "$out" \
         2>/dev/null | tr -d '[:space:]')
     if [[ "$meta_flags" =~ ^[0-9]+$ ]] &&
@@ -6769,16 +9810,14 @@ C
                 conv=notrunc status=none
         actual=""; rc=0
         capture_output actual env -u DLFREEZE_NO_FORK "$prelinked" || rc=$?
-        if [ "$rc" -eq 127 ] &&
-           [[ "$actual" == *"refusing extraction fallback for a prelinked"* ]] &&
-           [[ "$actual" != *"metadata-target-ran"* ]]; then
-            pass "prelinked direct failure refuses extraction"
+        if [ "$rc" -eq 0 ] && [ "$actual" = "metadata-target-ran" ]; then
+            pass "prelinked direct failure falls back safely"
         else
-            fail "prelinked direct failure refuses extraction" \
+            fail "prelinked direct failure fallback" \
                 "exit=$rc output=$actual"
         fi
     else
-        skip "prelinked direct failure refuses extraction" \
+        skip "prelinked direct failure falls back safely" \
             "fixture was not prelinked"
     fi
 
@@ -7510,11 +10549,14 @@ test_tls_firstbyte_semantics_direct() {
     # The direct metadata admits 4K, 16K, and 64K kernels.  Keep distinct
     # PT_LOAD segments distinct at the largest supported runtime page size;
     # a 4K-only fixture otherwise creates overlapping mappings on AArch64.
-    if ! gcc -shared -fPIC -Wl,-z,max-page-size=65536 \
+    # Bind the fixture DSO eagerly so target crt objects cannot add an
+    # unrelated unresolved weak lazy slot that masks the PT_TLS contract.
+    # Lazy weak binding has its own dedicated startup regression gate.
+    if ! gcc -shared -fPIC -Wl,-z,now -Wl,-z,max-page-size=65536 \
             -Wl,-T,tests/tls_firstbyte.ld \
             -Wl,-soname,libtls-firstbyte.so \
             -o "$lib" tests/tls_firstbyte_lib.c ||
-       ! gcc -pthread -L"$root" -Wl,-rpath,'$ORIGIN' \
+       ! gcc -pthread -Wl,-z,now -L"$root" -Wl,-rpath,'$ORIGIN' \
             -o "$static_bin" tests/tls_firstbyte_main.c \
             -Wl,--no-as-needed -Wl,-l:libtls-firstbyte.so ||
        ! gcc -pthread -o "$dynamic_bin" \
@@ -7529,7 +10571,7 @@ test_tls_firstbyte_semantics_direct() {
     fi
 
     tls_line=$(LC_ALL=C readelf -W -l "$lib" 2>/dev/null |
-        awk '$1 == "TLS" { print; exit }')
+        awk '$1 == "TLS" && !found { print; found = 1 }')
     tls_vaddr=$(awk '{ print $3 }' <<<"$tls_line")
     tls_align=$(awk '{ print $NF }' <<<"$tls_line")
     if [[ ! "$tls_vaddr" =~ ^0x[[:xdigit:]]+$ ]] ||
@@ -7576,7 +10618,7 @@ test_tls_firstbyte_semantics_direct() {
     fi
 
     tls_line=$(LC_ALL=C readelf -W -l "$lib" 2>/dev/null |
-        awk '$1 == "TLS" { print; exit }')
+        awk '$1 == "TLS" && !found { print; found = 1 }')
     tls_vaddr=$(awk '{ print $3 }' <<<"$tls_line")
     tls_align=$(awk '{ print $NF }' <<<"$tls_line")
     if [[ ! "$tls_vaddr" =~ ^0x[[:xdigit:]]+$ ]] ||
@@ -8295,7 +11337,7 @@ C
     diagnostics=$([ -n "$interp" ] && "$interp" --list-diagnostics \
         2>/dev/null || true)
     dst_lib=$(sed -n 's/^dl_dst_lib="\([^"]*\)"$/\1/p' \
-        <<<"$diagnostics" | head -n1)
+        <<<"$diagnostics" | awk 'NR == 1 { print }')
     lib_candidates=(lib lib64 x86_64-linux-gnu aarch64-linux-gnu)
     if [ -n "$dst_lib" ] && [[ "$dst_lib" != /* ]] &&
        [[ "/$dst_lib/" != */../* ]] &&
@@ -8584,7 +11626,7 @@ C
     else
         empty_marker_offset=$(LC_ALL=C strings -a -td "$empty_middle" |
             awk -v marker="$empty_marker" \
-                '$2 == marker { print $1; exit }')
+                '$2 == marker && !found { print $1; found = 1 }')
         if [[ ! "$empty_marker_offset" =~ ^[0-9]+$ ]] ||
            ! printf '\0' | dd of="$empty_middle" bs=1 \
                 seek="$empty_marker_offset" count=1 conv=notrunc \
@@ -8887,7 +11929,9 @@ C
     local early_middle="$early_deep/libdlfreeze_scope_middle.so"
     local early_leaf="$early_private/libdlfreeze_scope_leaf.so"
     local early_main="$early/main" trace="$early/trace"
-    local root_abs root_hex
+    local trace_base="$early/trace.base" trace_owner
+    local root_abs root_hex root_snapshot
+    local trace_attempt=0000000000000002
     mkdir -p "$early_request" "$early_deep" "$early_private"
     cat > "$early/leaf.c" <<'C'
 static __thread int dlfreeze_scope_tls = 42;
@@ -8921,9 +11965,18 @@ C
     else
         root_abs=$(realpath "$early_root")
         root_hex=$(printf '%s' "$root_abs" | od -An -tx1 | tr -d ' \n')
-        printf '#DLFREEZE_DLOPEN_TRACE_V4\nP %s %s %s\n' \
-            "$root_hex" "$root_hex" "$root_hex" > "$trace"
-        if "$gate" "$early_main" "$trace" >"$log" 2>&1 &&
+        root_snapshot=$(dlopen_trace_snapshot_fields "$root_abs")
+        if create_dlopen_trace_baseline "$trace_base" \
+                "$BUILD/dlfreeze-preload.so" "$early_main"; then
+            trace_owner=$(sed -n '2s/^O //p' "$trace_base")
+            cp "$trace_base" "$trace"
+            printf 'B %s %s\nP %s %s 0000000000000000 00000002 %s %s %s %s\n' \
+                "$trace_owner" "$trace_attempt" "$trace_owner" \
+                "$trace_attempt" "$root_hex" "$root_hex" "$root_hex" \
+                "$root_snapshot" >> "$trace"
+        fi
+        if [ -n "${trace_owner:-}" ] &&
+           "$gate" "$early_main" "$trace" >"$log" 2>&1 &&
            grep -Eq '^NEEDED=libdlfreeze_scope_root[.]so[[:space:]].*EARLY=1$' \
                 "$log" &&
            grep -Eq '^NEEDED=libdlfreeze_scope_middle[.]so[[:space:]].*EARLY=1$' \
@@ -9053,7 +12106,7 @@ C
             source_interp=$(LC_ALL=C readelf -l "$prefix_probe" 2>/dev/null |
                 sed -n \
                     's/.*Requesting program interpreter: \([^]]*\)].*/\1/p' |
-                head -n 1)
+                awk 'NR == 1 { print }')
             interp_base=${source_interp##*/}
             musl_arch=${interp_base#ld-musl-}
             musl_arch=${musl_arch%%.so*}
@@ -9543,8 +12596,8 @@ C
         rm -rf "$root"
         return
     fi
-    libc_path=$(LC_ALL=C ldd "$main" 2>/dev/null |
-        awk '$1 == "libc.so.6" { print $3; exit }')
+    libc_path=$({ LC_ALL=C ldd "$main" 2>/dev/null || true; } |
+        awk '$1 == "libc.so.6" && !found { print $3; found = 1 }')
     libc_path=$(realpath "$libc_path" 2>/dev/null || true)
     if [ -z "$libc_path" ]; then
         skip "pathful glibc direct admission" \
@@ -9653,14 +12706,17 @@ C
         interp=$(LC_ALL=C readelf -lW "$oracle_bin" 2>/dev/null |
             sed -n \
                 's/.*Requesting program interpreter: \([^]]*\)].*/\1/p' |
-            head -n 1)
+            awk 'NR == 1 { print }')
         needed=$(LC_ALL=C readelf -dW "$oracle_bin" 2>/dev/null |
             sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p' |
-            head -n 1)
+            awk 'NR == 1 { print }')
         loader_path=$(env -u LD_LIBRARY_PATH "$interp" --list \
             "$oracle_bin" 2>/dev/null |
             awk -v needed="$needed" \
-                '$1 == needed && $2 == "=>" { print $3; exit }')
+                '$1 == needed && $2 == "=>" && !found {
+                    print $3
+                    found = 1
+                }')
         if ! env -u LD_LIBRARY_PATH "$dep_gate" "$oracle_bin" \
                 >"$log" 2>&1; then
             fail "GNU pack cache native oracle" \
@@ -9902,6 +12958,29 @@ test_vfs_hash_complexity_gate() {
     else
         fail "VFS adversarial complexity gate" \
             "exit=$rc (timeout or structural mismatch)"
+    fi
+    rm -f "$gate"
+}
+
+test_startup_dependency_index_gate() {
+    echo "--- startup dependency identity index complexity gate ---"
+    local gate="$BUILD/startup_dependency_index_gate"
+    local rc=0
+
+    if ! gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -O2 -Iinclude \
+            -ffunction-sections -fdata-sections -fno-stack-protector \
+            -Wl,--gc-sections -o "$gate" \
+            tests/startup_dependency_index_gate.c -ldl -pthread; then
+        fail "startup dependency identity index" "WERROR fixture compile failed"
+        rm -f "$gate"
+        return
+    fi
+    run_with_timeout_seconds 10 "$gate" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        pass "startup dependency aliases are indexed independently of manifest cardinality"
+    else
+        fail "startup dependency identity index" \
+            "exit=$rc (timeout, first-loaded ordering, or source conflict mismatch)"
     fi
     rm -f "$gate"
 }
@@ -10256,10 +13335,15 @@ test_cat() {
 
     # stdin
     if ! run_freeze "$DLFREEZE" -o "$out" /bin/cat; then fail "cat stdin" "dlfreeze failed"; return; fi
-    local expect actual
-    expect=$(echo "hello world" | /bin/cat)
-    actual=$(echo "hello world" | run_with_timeout "$out")
-    if [ "$expect" = "$actual" ]; then pass "cat stdin"; else fail "cat stdin" "output differs"; fi
+    local expect actual rc_e=0 rc_a=0
+    expect=$(printf '%s\n' "hello world" | /bin/cat) || rc_e=$?
+    actual=$(printf '%s\n' "hello world" |
+        run_with_timeout "$out") || rc_a=$?
+    if [ "$expect" = "$actual" ] && [ "$rc_e" -eq "$rc_a" ]; then
+        pass "cat stdin"
+    else
+        fail "cat stdin" "output or exit code differs (exit $rc_e vs $rc_a)"
+    fi
     rm -f "$out"
 }
 
@@ -10886,14 +13970,30 @@ __attribute__((noreturn)) void opaque_start(void) { _exit(23); }
 C
 
     if command -v musl-gcc >/dev/null 2>&1; then
-        musl-gcc -O2 -o "$pos_bin" "$pos_src"
-        musl-gcc -O2 -nostartfiles -Wl,-e,opaque_start \
-            -o "$neg_bin" "$neg_src"
+        if ! musl-gcc -O2 -o "$pos_bin" "$pos_src" ||
+           ! musl-gcc -O2 -nostartfiles -Wl,-e,opaque_start \
+                -o "$neg_bin" "$neg_src"; then
+            fail "ELF entry-point startup fixtures" "musl fixture compile failed"
+            rm -f "$pos_src" "$neg_src" "$pos_bin" "$neg_bin" \
+                  "$pos_out" "$neg_out" "$log"
+            return
+        fi
     else
-        gcc -O2 -o "$pos_bin" "$pos_src"
-        gcc -O2 -nostartfiles -Wl,-e,opaque_start -o "$neg_bin" "$neg_src"
+        if ! gcc -O2 -o "$pos_bin" "$pos_src" ||
+           ! gcc -O2 -nostartfiles -Wl,-e,opaque_start \
+                -o "$neg_bin" "$neg_src"; then
+            fail "ELF entry-point startup fixtures" "fixture compile failed"
+            rm -f "$pos_src" "$neg_src" "$pos_bin" "$neg_bin" \
+                  "$pos_out" "$neg_out" "$log"
+            return
+        fi
     fi
-    strip --strip-all "$pos_bin" "$neg_bin"
+    if ! strip --strip-all "$pos_bin" "$neg_bin"; then
+        fail "ELF entry-point startup fixtures" "fixture strip failed"
+        rm -f "$pos_src" "$neg_src" "$pos_bin" "$neg_bin" \
+              "$pos_out" "$neg_out" "$log"
+        return
+    fi
 
     freeze_require_direct "stripped conventional entry" "$log" \
         "$pos_out" "$pos_bin" || freeze_rc=$?
@@ -11084,16 +14184,22 @@ C
 }
 
 # ===================================================================
-# Test 4c: direct-load preserves requested executable identity
+# Test 4c: direct-load preserves caller-owned argv[0]
 # ===================================================================
 test_symlink_exe_identity_direct() {
-    echo "--- symlink executable identity direct-load ---"
-    local src="$BUILD/identity_main.c" bin="$BUILD/identity-target"
-    local alpha="$BUILD/identity-alpha" beta="$BUILD/identity-beta"
-    local out_alpha="$BUILD/identity-alpha.frozen" out_beta="$BUILD/identity-beta.frozen"
-    local log_alpha="$BUILD/identity-alpha.log" log_beta="$BUILD/identity-beta.log"
+    echo "--- runtime argv[0] identity direct-load ---"
+    local root="$BUILD/runtime_argv0_identity"
+    local src="$root/identity_main.c" launcher_src="$root/launcher.c"
+    local bin="$root/identity-target" launcher="$root/launcher"
+    local native_dir="$root/native" frozen_dir="$root/frozen"
+    local alpha="$native_dir/identity-alpha" beta="$native_dir/identity-beta"
+    local frozen_alpha="$frozen_dir/identity-alpha"
+    local frozen_beta="$frozen_dir/identity-beta"
+    local out="$root/identity.frozen" log="$root/identity.log"
     local freeze_rc=0
-    rm -f "$log_alpha" "$log_beta"
+
+    rm -rf "$root"
+    mkdir -p "$native_dir" "$frozen_dir"
 
     cat > "$src" <<'C'
 #include <stdio.h>
@@ -11106,6 +14212,7 @@ static const char *base_name(const char *path) {
 
 int main(int argc, char **argv) {
     const char *name = base_name(argv[0]);
+    printf("argv0=%s\n", argv[0]);
     printf("name=%s\n", name);
     if (strcmp(name, "identity-alpha") == 0) puts("mode=alpha");
     else if (strcmp(name, "identity-beta") == 0) puts("mode=beta");
@@ -11114,55 +14221,98 @@ int main(int argc, char **argv) {
     return 0;
 }
 C
-    gcc -o "$bin" "$src"
-    ln -sf "$(basename "$bin")" "$alpha"
-    ln -sf "$(basename "$bin")" "$beta"
+    cat > "$launcher_src" <<'C'
+#include <errno.h>
+#include <stdio.h>
+#include <unistd.h>
 
-    freeze_require_direct "symlink executable identity direct-load" \
-        "$log_alpha" "$out_alpha" "$alpha" || freeze_rc=$?
+extern char **environ;
+
+int main(int argc, char **argv) {
+    char *target_argv[3];
+
+    if (argc != 3)
+        return 2;
+    target_argv[0] = argv[2];
+    target_argv[1] = (char *)"argument";
+    target_argv[2] = NULL;
+    execve(argv[1], target_argv, environ);
+    perror("execve");
+    return errno ? errno : 127;
+}
+C
+    if ! gcc -Wall -Wextra -Werror -o "$bin" "$src" ||
+       ! gcc -Wall -Wextra -Werror -o "$launcher" "$launcher_src"; then
+        fail "runtime argv[0] identity direct-load" \
+            "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+    ln -s "../$(basename "$bin")" "$alpha"
+    ln -s "../$(basename "$bin")" "$beta"
+
+    freeze_require_direct "runtime argv[0] identity direct-load" \
+        "$log" "$out" "$alpha" || freeze_rc=$?
     if [ "$freeze_rc" -eq 77 ]; then
-        skip "symlink executable identity direct-load" "$DIRECT_FREEZE_REASON"
-        rm -f "$src" "$bin" "$alpha" "$beta" "$out_alpha" "$out_beta" \
-              "$log_alpha" "$log_beta"
+        skip "runtime argv[0] identity direct-load" "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
         return
     fi
     if [ "$freeze_rc" -ne 0 ]; then
-        rm -f "$src" "$bin" "$alpha" "$beta" "$out_alpha" "$out_beta" \
-              "$log_alpha" "$log_beta"
+        rm -rf "$root"
         return
     fi
-    freeze_rc=0
-    freeze_require_direct "symlink executable identity direct-load" \
-        "$log_beta" "$out_beta" "$beta" || freeze_rc=$?
-    if [ "$freeze_rc" -eq 77 ]; then
-        skip "symlink executable identity direct-load" "$DIRECT_FREEZE_REASON"
-        rm -f "$src" "$bin" "$alpha" "$beta" "$out_alpha" "$out_beta" \
-              "$log_alpha" "$log_beta"
-        return
-    fi
-    if [ "$freeze_rc" -ne 0 ]; then
-        rm -f "$src" "$bin" "$alpha" "$beta" "$out_alpha" "$out_beta" \
-              "$log_alpha" "$log_beta"
-        return
-    fi
+    ln -s "../$(basename "$out")" "$frozen_alpha"
+    ln -s "../$(basename "$out")" "$frozen_beta"
 
-    local expect_alpha actual_alpha expect_beta actual_beta rc=0
-    capture_output expect_alpha "$alpha" arg1 || rc=$?
-    capture_output actual_alpha "$out_alpha" arg1 || rc=$?
-    capture_output expect_beta "$beta" arg1 arg2 || rc=$?
-    capture_output actual_beta "$out_beta" arg1 arg2 || rc=$?
+    local expect_alpha actual_alpha expect_beta actual_beta
+    local expect_path actual_path
+    local expect_custom actual_custom expect_empty actual_empty rc=0
+    # Invoke the native and frozen symlinks with the same caller-owned
+    # spelling.  Their backing directories necessarily differ, so comparing
+    # the absolute shell-expanded paths would test the fixture layout rather
+    # than argv[0] preservation.
+    capture_output_in_dir expect_alpha "$native_dir" \
+        ./identity-alpha arg1 || rc=$?
+    capture_output_in_dir actual_alpha "$frozen_dir" \
+        ./identity-alpha arg1 || rc=$?
+    capture_output_in_dir expect_beta "$native_dir" \
+        ./identity-beta arg1 arg2 || rc=$?
+    capture_output_in_dir actual_beta "$frozen_dir" \
+        ./identity-beta arg1 arg2 || rc=$?
+    capture_output expect_path env PATH="$native_dir:$PATH" \
+        identity-alpha path-argument || rc=$?
+    capture_output actual_path env PATH="$frozen_dir:$PATH" \
+        identity-alpha path-argument || rc=$?
+    capture_output expect_custom "$launcher" "$bin" \
+        '<custom/runtime-name>' || rc=$?
+    capture_output actual_custom "$launcher" "$out" \
+        '<custom/runtime-name>' || rc=$?
+    capture_output expect_empty "$launcher" "$bin" '' || rc=$?
+    capture_output actual_empty "$launcher" "$out" '' || rc=$?
     actual_alpha=$(printf '%s\n' "$actual_alpha" | strip_dlfreeze_warnings)
     actual_beta=$(printf '%s\n' "$actual_beta" | strip_dlfreeze_warnings)
+    actual_path=$(printf '%s\n' "$actual_path" | strip_dlfreeze_warnings)
+    actual_custom=$(printf '%s\n' "$actual_custom" | strip_dlfreeze_warnings)
+    actual_empty=$(printf '%s\n' "$actual_empty" | strip_dlfreeze_warnings)
 
-    if [ "$rc" = "0" ] && [ "$expect_alpha" = "$actual_alpha" ] && [ "$expect_beta" = "$actual_beta" ]; then
-        pass "symlink executable identity direct-load"
+    if [ "$rc" -eq 0 ] &&
+       [ "$expect_alpha" = "$actual_alpha" ] &&
+       [ "$expect_beta" = "$actual_beta" ] &&
+       [ "$expect_path" = "$actual_path" ] &&
+       [ "$expect_custom" = "$actual_custom" ] &&
+       [ "$expect_empty" = "$actual_empty" ]; then
+        pass "runtime argv[0] identity direct-load"
     else
-        fail "symlink executable identity direct-load" "argv[0] identity differs"
+        fail "runtime argv[0] identity direct-load" \
+            "runtime symlink, custom, or empty argv[0] differs"
         diff -u <(printf '%s\n' "$expect_alpha") <(printf '%s\n' "$actual_alpha") | head -20 || true
         diff -u <(printf '%s\n' "$expect_beta") <(printf '%s\n' "$actual_beta") | head -20 || true
+        diff -u <(printf '%s\n' "$expect_path") <(printf '%s\n' "$actual_path") | head -20 || true
+        diff -u <(printf '%s\n' "$expect_custom") <(printf '%s\n' "$actual_custom") | head -20 || true
+        diff -u <(printf '%s\n' "$expect_empty") <(printf '%s\n' "$actual_empty") | head -20 || true
     fi
-    rm -f "$src" "$bin" "$alpha" "$beta" "$out_alpha" "$out_beta" \
-          "$log_alpha" "$log_beta"
+    rm -rf "$root"
 }
 
 # ===================================================================
@@ -11242,7 +14392,11 @@ test_dlopen_program() {
 int mylib_add(int a, int b) { return a + b; }
 const char *mylib_greet(void) { return "hello from mylib"; }
 C
-    gcc -shared -fPIC -o "$shlib" "$shlib_src"
+    if ! gcc -shared -fPIC -o "$shlib" "$shlib_src"; then
+        fail "dlopen" "shared-library fixture compile failed"
+        rm -f "$shlib_src" "$shlib" "$prog_src" "$prog" "$out"
+        return
+    fi
 
     cat > "$prog_src" <<'C'
 #include <stdio.h>
@@ -11259,7 +14413,11 @@ int main(void) {
     return 0;
 }
 C
-    gcc -o "$prog" "$prog_src" -ldl
+    if ! gcc -o "$prog" "$prog_src" -ldl; then
+        fail "dlopen" "program fixture compile failed"
+        rm -f "$shlib_src" "$shlib" "$prog_src" "$prog" "$out"
+        return
+    fi
 
     # the regular program needs LD_LIBRARY_PATH to find the .so
     local expect actual rc_e=0 rc_a=0
@@ -11353,7 +14511,11 @@ test_dlopen_fallback() {
     cat > "$shlib_src" <<'C'
 int fallback_mul(int a, int b) { return a * b; }
 C
-    gcc -shared -fPIC -o "$shlib" "$shlib_src"
+    if ! gcc -shared -fPIC -o "$shlib" "$shlib_src"; then
+        fail "dlopen-fallback" "shared-library fixture compile failed"
+        rm -f "$shlib_src" "$shlib" "$prog_src" "$prog" "$out"
+        return
+    fi
     local shlib_abs
     shlib_abs=$(realpath "$shlib")
 
@@ -11372,7 +14534,11 @@ int main(void) {
     return 0;
 }
 C
-    gcc -o "$prog" "$prog_src" -ldl
+    if ! gcc -o "$prog" "$prog_src" -ldl; then
+        fail "dlopen-fallback" "program fixture compile failed"
+        rm -f "$shlib_src" "$shlib" "$prog_src" "$prog" "$out"
+        return
+    fi
 
     # Freeze WITHOUT tracing — libfallback.so will NOT be embedded
     if ! run_freeze "$DLFREEZE" -v -o "$out" "$prog"; then
@@ -11481,7 +14647,13 @@ test_direct_dlopen_embedded() {
 int emb_add(int a, int b) { return a + b; }
 const char *emb_greet(void) { return "hello from embedded"; }
 C
-    gcc -shared -fPIC -o "$shlib" "$shlib_src"
+    if ! gcc -shared -fPIC -o "$shlib" "$shlib_src"; then
+        fail "direct dlopen embedded" \
+            "shared-library fixture compile failed"
+        rm -f "$shlib_src" "$shlib" "$prog_src" "$prog" "$out" \
+              "$log" "$bad"
+        return
+    fi
 
     cat > "$prog_src" <<'C'
 #include <stdio.h>
@@ -11498,7 +14670,12 @@ int main(void) {
     return 0;
 }
 C
-    gcc -o "$prog" "$prog_src" -ldl
+    if ! gcc -o "$prog" "$prog_src" -ldl; then
+        fail "direct dlopen embedded" "program fixture compile failed"
+        rm -f "$shlib_src" "$shlib" "$prog_src" "$prog" "$out" \
+              "$log" "$bad"
+        return
+    fi
 
     local expect rc_e=0
     capture_output expect env LD_LIBRARY_PATH="$BUILD" "$prog" || rc_e=$?
@@ -11603,14 +14780,25 @@ test_direct_dlopen_deps() {
     cat > "$dep_src" <<'C'
 int dep_mul(int a, int b) { return a * b; }
 C
-    gcc -shared -fPIC -o "$dep" "$dep_src"
+    if ! gcc -shared -fPIC -o "$dep" "$dep_src"; then
+        fail "direct dlopen dependencies" \
+            "dependency fixture compile failed"
+        rm -f "$dep_src" "$dep" "$top_src" "$top" "$prog_src" "$prog" \
+              "$out" "$log"
+        return
+    fi
 
     # Top-level library that depends on libdep.so
     cat > "$top_src" <<'C'
 extern int dep_mul(int a, int b);
 int top_compute(int x) { return dep_mul(x, x); }
 C
-    gcc -shared -fPIC -o "$top" "$top_src" -L"$BUILD" -ldep
+    if ! gcc -shared -fPIC -o "$top" "$top_src" -L"$BUILD" -ldep; then
+        fail "direct dlopen dependencies" "top-level fixture compile failed"
+        rm -f "$dep_src" "$dep" "$top_src" "$top" "$prog_src" "$prog" \
+              "$out" "$log"
+        return
+    fi
 
     cat > "$prog_src" <<'C'
 #include <stdio.h>
@@ -11625,7 +14813,12 @@ int main(void) {
     return 0;
 }
 C
-    gcc -o "$prog" "$prog_src" -ldl
+    if ! gcc -o "$prog" "$prog_src" -ldl; then
+        fail "direct dlopen dependencies" "program fixture compile failed"
+        rm -f "$dep_src" "$dep" "$top_src" "$top" "$prog_src" "$prog" \
+              "$out" "$log"
+        return
+    fi
 
     local expect rc_e=0
     capture_output expect env LD_LIBRARY_PATH="$BUILD" "$prog" || rc_e=$?
@@ -13401,7 +16594,7 @@ C
         mkdir -p "$prefix_lib" "$prefix_etc" "$configured" "$alternate"
         source_interp=$(LC_ALL=C readelf -l "$main" 2>/dev/null |
             sed -n 's/.*Requesting program interpreter: \([^]]*\)].*/\1/p' |
-            head -n 1)
+            awk 'NR == 1 { print }')
         interp_base=${source_interp##*/}
         musl_arch=${interp_base#ld-musl-}
         musl_arch=${musl_arch%%.so*}
@@ -14814,7 +18007,7 @@ C
     fi
     needed_order=$(readelf -d "$top" 2>/dev/null |
         sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p' |
-        head -n 2 | tr '\n' ' ')
+        awk 'NR <= 2 { printf "%s ", $0 }')
     if [ "$needed_order" != \
          "libdlfrz_sibling_b.so libdlfrz_sibling_c.so " ]; then
         fail "direct-dlopen sibling scope" \
@@ -14962,7 +18155,7 @@ C
     fi
     needed_order=$(readelf -d "$top" 2>/dev/null |
         sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p' |
-        head -n 2 | tr '\n' ' ')
+        awk 'NR <= 2 { printf "%s ", $0 }')
     if [ "$needed_order" != \
          "libdlfrz_bfs_a.so libdlfrz_bfs_b.so " ] ||
        readelf -d "$top" 2>/dev/null |
@@ -15439,6 +18632,42 @@ C
 # ===================================================================
 # Test 9f: sibling IFUNC sees later-sibling ordinary data relocations
 # ===================================================================
+test_direct_startup_ifunc_phase() {
+    echo "--- direct startup IFUNC phase ---"
+
+    local actual="" rc=0
+
+    capture_output_with_timeout_seconds actual 240 \
+        bash tests/direct-startup-ifunc-phase-gate.sh "$BUILD" || rc=$?
+    if [ "$rc" -eq 77 ]; then
+        skip "direct startup IFUNC phase" "$actual"
+    elif [ "$rc" -eq 0 ] &&
+         [[ "$actual" == *"PASS: direct startup IFUNC graph is read-only until runtime"* ]]; then
+        DIRECT_ARTIFACTS=$((DIRECT_ARTIFACTS + 1))
+        pass "direct startup IFUNC graph remains read-only until runtime"
+    else
+        fail "direct startup IFUNC phase" "exit=$rc output=$actual"
+    fi
+}
+
+test_preload_early_ifunc_trace() {
+    echo "--- preload early-IFUNC trace initialization ---"
+
+    local actual="" rc=0
+
+    capture_output_with_timeout_seconds actual 240 \
+        bash tests/preload-early-ifunc-trace-gate.sh "$BUILD" || rc=$?
+    if [ "$rc" -eq 77 ]; then
+        skip "preload early-IFUNC trace initialization" "$actual"
+    elif [ "$rc" -eq 0 ] &&
+         [[ "$actual" == *"PASS: preload tracing starts before target IFUNC dlopen"* ]]; then
+        pass "preload tracing starts before target IFUNC dlopen"
+    else
+        fail "preload early-IFUNC trace initialization" \
+            "exit=$rc output=$actual"
+    fi
+}
+
 test_direct_dlopen_ifunc_data_order() {
     echo "--- direct dlopen IFUNC/data phase ordering ---"
     local root="$BUILD/dlopen_ifunc_data_order"
@@ -15508,7 +18737,7 @@ C
     fi
     needed_order=$(readelf -d "$top" 2>/dev/null |
         sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p' |
-        head -n 2 | tr '\n' ' ')
+        awk 'NR <= 2 { printf "%s ", $0 }')
     if [ "$needed_order" != \
          "libdlfrz_ifunc_b.so libdlfrz_ifunc_c.so " ]; then
         fail "direct-dlopen IFUNC/data ordering" \
@@ -15590,7 +18819,12 @@ static void *copy_ifunc_resolver(void) {
 int copy_ifunc_selected(void)
     __attribute__((ifunc("copy_ifunc_resolver")));
 C
-    if ! gcc -shared -fPIC -Wl,-soname,libdlfrz_copy_ifunc.so \
+    # Keep this fixture entirely eager: some target startup objects add an
+    # unrelated unresolved weak PLT slot (for example, __gmon_start__) to
+    # every DSO.  The dedicated lazy-binding gates exercise that contract;
+    # this gate must reach the COPY-before-IFUNC phase ordering it names.
+    if ! gcc -shared -fPIC -Wl,-z,now \
+            -Wl,-soname,libdlfrz_copy_ifunc.so \
             -o "$lib" "$lib_src"; then
         if compiler_supports_gnu_ifunc "$root"; then
             fail "direct COPY/IFUNC ordering" "provider compile failed"
@@ -16025,10 +19259,12 @@ test_direct_gnu_unique_transaction_rollback() {
     echo "--- direct GNU-unique transaction rollback ---"
     local root="$BUILD/gnu_unique_rollback"
     local unique_src="$root/failed-owner.cc"
-    local bad_src="$root/bad.c" root_src="$root/root.c"
+    local bad_src="$root/bad.c" provider_src="$root/provider.c"
+    local root_src="$root/root.c"
     local good_src="$root/good-owner.cc" main_src="$root/main.c"
     local failed_owner="$root/libunique_failed_owner.so"
     local bad="$root/libunique_bad.so" failed_root="$root/libunique_root.so"
+    local provider="$root/libunique_missing_provider.so"
     local good="$root/libunique_good_owner.so" main="$root/main"
     local out="$root/main.frozen" log="$root/main.log"
     local cxx expect actual freeze_rc=0 native_rc=0 rc=0
@@ -16056,6 +19292,9 @@ CXX
 extern int dlfreeze_rollback_missing_definition;
 int unique_bad_value(void) { return dlfreeze_rollback_missing_definition; }
 C
+    cat > "$provider_src" <<'C'
+int dlfreeze_rollback_missing_definition = 9;
+C
     cat > "$root_src" <<'C'
 extern int *failed_unique_address(void);
 extern int unique_bad_value(void);
@@ -16064,16 +19303,21 @@ int unique_root_value(void) {
 }
 C
     if ! "$cxx" -std=c++17 -Wall -Wextra -Werror -O2 -shared -fPIC \
-            -Wl,-z,now -Wl,-soname,libunique_failed_owner.so \
+            -nostdlib -Wl,-z,now \
+            -Wl,-soname,libunique_failed_owner.so \
             -o "$failed_owner" "$unique_src" ||
        ! gcc -Wall -Wextra -Werror -O2 -shared -fPIC -Wl,-z,now \
             -Wl,-soname,libunique_bad.so -o "$bad" "$bad_src" ||
+       ! gcc -Wall -Wextra -Werror -O2 -shared -fPIC -Wl,-z,now \
+            -Wl,-soname,libunique_missing_provider.so \
+            -o "$provider" "$provider_src" ||
        ! gcc -Wall -Wextra -Werror -O2 -shared -fPIC -Wl,-z,now \
             -Wl,-soname,libunique_root.so -Wl,--no-as-needed \
             -L"$root" -Wl,-rpath,'$ORIGIN' -o "$failed_root" "$root_src" \
             -lunique_failed_owner -lunique_bad ||
        ! "$cxx" -std=c++17 -Wall -Wextra -Werror -O2 -shared -fPIC \
-            -Wl,-z,now -Wl,-soname,libunique_good_owner.so \
+            -nostdlib -Wl,-z,now \
+            -Wl,-soname,libunique_good_owner.so \
             -o "$good" "$good_src"; then
         fail "direct GNU-unique transaction rollback" \
             "provider compile failed"
@@ -16096,6 +19340,7 @@ C
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 typedef int *(*address_fn)(void);
 int main(int argc, char **argv) {
@@ -16105,6 +19350,14 @@ int main(int argc, char **argv) {
     int *symbol;
     int saved_stderr;
     int nullfd;
+    if (argc == 5 && strcmp(argv[1], "trace") == 0) {
+        void *provider = dlopen(argv[2], RTLD_NOW | RTLD_GLOBAL);
+        void *root = provider
+            ? dlopen(argv[3], RTLD_NOW | RTLD_LOCAL) : NULL;
+        void *owner = root
+            ? dlopen(argv[4], RTLD_NOW | RTLD_LOCAL) : NULL;
+        return provider && root && owner ? 0 : 9;
+    }
     if (argc != 3)
         return 2;
     saved_stderr = dup(STDERR_FILENO);
@@ -16158,8 +19411,13 @@ C
         rm -rf "$root"
         return
     fi
+    # Trace a successful closure for every dormant DSO.  Exercising the
+    # intentionally failed call during tracing would correctly select native
+    # loader semantics under the failed-call/dlerror contract and would no
+    # longer test the direct loader's own transaction rollback.
     freeze_require_direct "direct GNU-unique transaction rollback" \
-        "$log" "$out" -t -- "$main" "$failed_root" "$good" || freeze_rc=$?
+        "$log" "$out" -t -- "$main" trace "$provider" "$failed_root" \
+        "$good" || freeze_rc=$?
     if [ "$freeze_rc" -eq 77 ]; then
         skip "direct GNU-unique transaction rollback" \
             "$DIRECT_FREEZE_REASON"
@@ -16431,8 +19689,10 @@ C
 }
 
 # Public dlopen mode bits must drive loader state rather than being ignored.
-# The direct loader binds eagerly, never unloads, and supports one namespace,
-# but it still preserves NOLOAD and LOCAL-to-GLOBAL visibility semantics.
+# The direct loader preserves NOLOAD and LOCAL-to-GLOBAL visibility semantics.
+# musl deliberately binds both public modes eagerly; a GNU pure-LAZY request
+# for a new object must fail before activation because direct mode has no
+# native PLT resolver.
 test_direct_dlopen_mode_contract() {
     echo "--- direct dlopen mode contract ---"
     local root="$BUILD/dlopen_mode_contract"
@@ -16535,9 +19795,19 @@ int main(int argc, char **argv) {
         !default_absent("mode_dependency_value"))
         return 6;
 
-    /* RTLD_LAZY is accepted for compatibility, but the direct loader
-     * deliberately completes this dependency relocation eagerly. */
+    /* musl implements RTLD_LAZY eagerly.  GNU, however, promises genuine
+     * lazy PLT binding, so direct mode must reject a new pure-LAZY object
+     * without running its constructor or publishing either symbol. */
+    (void)dlerror();
     handle = dlopen(argv[2], RTLD_LAZY | RTLD_LOCAL);
+#if defined(__GLIBC__)
+    if (handle != NULL || dlerror() == NULL ||
+        access(argv[3], F_OK) == 0 || errno != ENOENT ||
+        !default_absent("mode_top_value") ||
+        !default_absent("mode_dependency_value"))
+        return 7;
+    handle = dlopen(argv[2], RTLD_NOW | RTLD_LOCAL);
+#endif
     top_value = handle ? (value_fn)dlsym(handle, "mode_top_value") : NULL;
     dependency_value = handle
         ? (value_fn)dlsym(handle, "mode_dependency_value") : NULL;
@@ -16616,6 +19886,516 @@ C
     else
         fail "direct dlopen mode contract" "exit=$rc output=$actual"
         tail -n 60 "$log" || true
+    fi
+    rm -rf "$root"
+}
+
+# GNU RTLD_LAZY permits an object with an unresolved, uncalled PLT target to
+# load successfully.  Direct mode has no native PLT resolver, so an untraced
+# late load must reject before constructors run, while a traced load must make
+# the whole artifact use the native loader through extraction mode.
+test_gnu_traced_lazy_binding_fallback() {
+    echo "--- GNU traced RTLD_LAZY native-binding fallback ---"
+    local root="$BUILD/gnu_lazy_binding"
+    local lib_src="$root/library.c" lib="$root/libdlfreeze_lazy_gap.so"
+    local prog_src="$root/main.c" prog="$root/main"
+    local direct_out="$root/main.direct.frozen"
+    local direct_log="$root/main.direct.log"
+    local fallback_out="$root/main.extraction.frozen"
+    local fallback_log="$root/main.extraction.log"
+    local missing_out="$root/main.missing.extraction.frozen"
+    local missing_log="$root/main.missing.extraction.log"
+    local marker="$root/constructor.marker"
+    local name="libdlfreeze_lazy_gap.so"
+    local missing_name="libdlfreeze_optional_missing_7d09e6.so"
+    local relocations dynamic actual="" missing_expect=""
+    local rc=0 freeze_rc=0 missing_rc=0
+
+    if ! compiler_targets_glibc; then
+        skip "GNU traced RTLD_LAZY native-binding fallback" \
+            "test compiler does not target glibc"
+        return
+    fi
+    if ! command -v readelf >/dev/null 2>&1; then
+        skip "GNU traced RTLD_LAZY native-binding fallback" \
+            "readelf not installed"
+        return
+    fi
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    cat > "$lib_src" <<'C'
+#include <fcntl.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+extern int dlfreeze_lazy_missing(void);
+
+__attribute__((constructor)) static void lazy_constructor(void) {
+    const char *marker = getenv("DLFREEZE_LAZY_MARKER");
+    int fd;
+
+    if (!marker || !marker[0])
+        return;
+    fd = open(marker, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd >= 0) {
+        (void)write(fd, "constructed\n", 12);
+        (void)close(fd);
+    }
+}
+
+int dlfreeze_lazy_present(void) { return 73; }
+int dlfreeze_lazy_uncalled(void) { return dlfreeze_lazy_missing(); }
+C
+    cat > "$prog_src" <<'C'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+typedef int (*value_fn)(void);
+
+int main(int argc, char **argv) {
+    const char *error;
+    void *handle;
+    value_fn value;
+
+    if (argc == 1)
+        return 0;
+    if (argc == 3 && strcmp(argv[1], "optional") == 0) {
+        (void)dlerror();
+        handle = dlopen(argv[2], RTLD_LAZY | RTLD_LOCAL);
+        if (handle) {
+            (void)dlclose(handle);
+            return 10;
+        }
+        error = dlerror();
+        if (!error)
+            return 11;
+        printf("optional-error=%s\n", error);
+        return 0;
+    }
+    if (argc != 4 || setenv("DLFREEZE_LAZY_MARKER", argv[3], 1) != 0)
+        return 2;
+
+    (void)dlerror();
+    handle = dlopen(argv[2], RTLD_LAZY | RTLD_LOCAL);
+    if (strcmp(argv[1], "reject") == 0) {
+        if (handle != NULL) {
+            (void)dlclose(handle);
+            return 3;
+        }
+        error = dlerror();
+        if (!error || !strstr(error, "requires native lazy binding"))
+            return 4;
+        if (access(argv[3], F_OK) == 0 || errno != ENOENT)
+            return 5;
+        puts("lazy-rejected-before-constructor");
+        return 0;
+    }
+    if (strcmp(argv[1], "open") != 0)
+        return 6;
+    if (!handle) {
+        fprintf(stderr, "dlopen: %s\n", dlerror());
+        return 7;
+    }
+    (void)dlerror();
+    value = (value_fn)dlsym(handle, "dlfreeze_lazy_present");
+    error = dlerror();
+    if (!value || error || value() != 73)
+        return 8;
+    if (dlclose(handle) != 0)
+        return 9;
+    puts("lazy-value=73");
+    return 0;
+}
+C
+
+    if ! gcc -shared -fPIC -Wl,-z,lazy -Wl,-soname,"$name" \
+            -o "$lib" "$lib_src" ||
+       ! gcc -Wl,-rpath,'$ORIGIN' -o "$prog" "$prog_src" -ldl; then
+        fail "GNU RTLD_LAZY native-binding fixture" "compile failed"
+        rm -rf "$root"
+        return
+    fi
+    relocations=$(LC_ALL=C readelf -Wr "$lib" 2>/dev/null || true)
+    dynamic=$(LC_ALL=C readelf -d "$lib" 2>/dev/null || true)
+    if ! grep -E \
+            'JUMP_SLOT[^[:cntrl:]]*dlfreeze_lazy_missing' \
+            <<<"$relocations" >/dev/null ||
+       grep -Eq '\(BIND_NOW\)|FLAGS[^[:cntrl:]]*NOW' <<<"$dynamic"; then
+        fail "GNU RTLD_LAZY native-binding fixture" \
+            "linker did not retain a lazy unresolved PLT relocation"
+        rm -rf "$root"
+        return
+    fi
+
+    rm -f "$marker"
+    capture_output actual env -u LD_BIND_NOW -u LD_BIND_NOT \
+        "$prog" open "$name" "$marker" || rc=$?
+    if [ "$rc" -ne 0 ] || [ "$actual" != "lazy-value=73" ] ||
+       [ ! -f "$marker" ]; then
+        fail "native GNU unresolved uncalled RTLD_LAZY control" \
+            "exit=$rc output=$actual"
+        rm -rf "$root"
+        return
+    fi
+    pass "native GNU unresolved uncalled RTLD_LAZY control"
+
+    capture_output missing_expect env -u LD_BIND_NOW -u LD_BIND_NOT \
+        "$prog" optional "$missing_name" || missing_rc=$?
+    if [ "$missing_rc" -ne 0 ] ||
+       [[ "$missing_expect" != \
+          "optional-error=$missing_name:"* ]]; then
+        fail "native GNU failed optional RTLD_LAZY control" \
+            "exit=$missing_rc output=$missing_expect"
+        rm -rf "$root"
+        return
+    fi
+    pass "native GNU failed optional RTLD_LAZY control"
+
+    rm -f "$marker"
+    freeze_require_direct "GNU untraced RTLD_LAZY rejection" \
+        "$direct_log" "$direct_out" "$prog" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "GNU untraced RTLD_LAZY rejection" "$DIRECT_FREEZE_REASON"
+    elif [ "$freeze_rc" -eq 0 ]; then
+        actual=""; rc=0
+        capture_output actual env -u LD_BIND_NOW -u LD_BIND_NOT \
+            DLFREEZE_NO_FORK=1 "$direct_out" reject "$name" "$marker" ||
+            rc=$?
+        actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+        if [ "$rc" -eq 0 ] &&
+           [ "$actual" = "lazy-rejected-before-constructor" ] &&
+           [ ! -e "$marker" ]; then
+            pass "GNU direct rejects untraced new RTLD_LAZY before mutation"
+        else
+            fail "GNU untraced RTLD_LAZY rejection" \
+                "exit=$rc output=$actual"
+        fi
+    fi
+
+    rm -f "$marker"
+    if ! run_freeze env -u LD_BIND_NOW -u LD_BIND_NOT \
+            LD_LIBRARY_PATH="$root" \
+            "$DLFREEZE" -d -t -o "$fallback_out" -- \
+            "$prog" open "$name" "$marker" >"$fallback_log" 2>&1; then
+        fail "GNU traced RTLD_LAZY extraction fallback" \
+            "dlfreeze failed"
+        tail -n 80 "$fallback_log" || true
+        rm -rf "$root"
+        return
+    fi
+    if [ ! -x "$fallback_out" ] || [ ! -f "$marker" ] ||
+       ! grep -Eq \
+            'traced RTLD_LAZY.*creating an extraction-mode binary' \
+            "$fallback_log"; then
+        fail "GNU traced RTLD_LAZY extraction fallback" \
+            "packer did not select and explain extraction mode"
+        tail -n 80 "$fallback_log" || true
+        rm -rf "$root"
+        return
+    fi
+
+    if ! run_freeze env -u LD_BIND_NOW -u LD_BIND_NOT \
+            LD_LIBRARY_PATH="$root" \
+            "$DLFREEZE" -d -t -o "$missing_out" -- \
+            "$prog" optional "$missing_name" >"$missing_log" 2>&1; then
+        fail "GNU failed optional RTLD_LAZY extraction fallback" \
+            "dlfreeze failed"
+        tail -n 80 "$missing_log" || true
+        rm -rf "$root"
+        return
+    fi
+    if [ ! -x "$missing_out" ] ||
+       ! grep -Eq \
+            'failed traced dynamic-loader call.*creating an extraction-mode binary' \
+            "$missing_log"; then
+        fail "GNU failed optional RTLD_LAZY extraction fallback" \
+            "failed-load marker did not select extraction mode"
+        tail -n 80 "$missing_log" || true
+        rm -rf "$root"
+        return
+    fi
+
+    # Neither original ELF may contribute to the successful replay.
+    rm -f "$marker" "$lib" "$prog"
+    actual=""; rc=0
+    capture_output actual env -u DLFREEZE_NO_FORK -u LD_LIBRARY_PATH \
+        -u LD_BIND_NOW -u LD_BIND_NOT "$fallback_out" \
+        open "$name" "$marker" || rc=$?
+    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+    if [ "$rc" -eq 0 ] && [ "$actual" = "lazy-value=73" ] &&
+       [ -f "$marker" ]; then
+        pass "GNU traced RTLD_LAZY falls back to native extraction"
+    else
+        fail "GNU traced RTLD_LAZY extraction replay" \
+            "exit=$rc output=$actual"
+        tail -n 80 "$fallback_log" || true
+    fi
+
+    actual=""; rc=0
+    capture_output actual env -u DLFREEZE_NO_FORK -u LD_LIBRARY_PATH \
+        -u LD_BIND_NOW -u LD_BIND_NOT "$missing_out" \
+        optional "$missing_name" || rc=$?
+    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+    if [ "$rc" -eq "$missing_rc" ] && [ "$actual" = "$missing_expect" ]; then
+        pass "GNU failed optional RTLD_LAZY preserves native result"
+    else
+        fail "GNU failed optional RTLD_LAZY replay" \
+            "exit=$rc expected-exit=$missing_rc output=$actual expected=$missing_expect"
+        tail -n 80 "$missing_log" || true
+    fi
+    rm -rf "$root"
+}
+
+# GNU also leaves startup-object PLT slots lazy unless the object requests
+# BIND_NOW.  A strong undefined JUMP_SLOT is therefore legal when the program
+# never calls it.  The direct loader has no native PLT trampoline, so it must
+# detect this before target effects and let a supervised, extraction-capable
+# artifact retry through the embedded native loader.
+test_gnu_startup_lazy_binding_fallback() {
+    echo "--- GNU startup lazy-PLT native-binding fallback ---"
+    local root="$BUILD/gnu_startup_lazy_binding"
+    local lib_src="$root/library.c" lib="$root/libstartup_lazy_gap.so"
+    local prog_src="$root/main.c" prog="$root/main"
+    local out="$root/main.frozen" log="$root/main.log"
+    local expected="startup-lazy-present=37" actual=""
+    local relocations dynamic rc=0 freeze_rc=0
+
+    if ! compiler_targets_glibc; then
+        skip "GNU startup lazy-PLT fallback" \
+            "test compiler does not target glibc"
+        return
+    fi
+    if ! command -v readelf >/dev/null 2>&1; then
+        skip "GNU startup lazy-PLT fallback" "readelf not installed"
+        return
+    fi
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    cat >"$lib_src" <<'C'
+extern int dlfreeze_startup_lazy_missing(void);
+
+int dlfreeze_startup_lazy_present(void) { return 37; }
+int dlfreeze_startup_lazy_uncalled(void) {
+    return dlfreeze_startup_lazy_missing();
+}
+C
+    cat >"$prog_src" <<'C'
+#include <stdio.h>
+
+extern int dlfreeze_startup_lazy_present(void);
+
+int main(void) {
+    printf("startup-lazy-present=%d\n", dlfreeze_startup_lazy_present());
+    return dlfreeze_startup_lazy_present() == 37 ? 0 : 1;
+}
+C
+
+    # Isolate the intended strong lazy import.  Some target startup files add
+    # their own unresolved weak PLT slot to every DSO; omitting DSO startup
+    # files and binding the executable eagerly prevents that unrelated ABI
+    # detail from deciding which refusal this semantic gate observes.
+    if ! gcc -shared -fPIC -nostartfiles -Wl,-z,lazy \
+            -Wl,-soname,libstartup_lazy_gap.so -o "$lib" "$lib_src" ||
+       ! gcc -Wl,-z,now -Wl,--allow-shlib-undefined \
+            -Wl,--no-as-needed -L"$root" -Wl,-rpath,'$ORIGIN' \
+            -o "$prog" "$prog_src" -lstartup_lazy_gap; then
+        fail "GNU startup lazy-PLT fixture" "compile failed"
+        rm -rf "$root"
+        return
+    fi
+    relocations=$(LC_ALL=C readelf -Wr "$lib" 2>/dev/null || true)
+    dynamic=$(LC_ALL=C readelf -d "$lib" 2>/dev/null || true)
+    if ! grep -E \
+            'JUMP_SLOT[^[:cntrl:]]*dlfreeze_startup_lazy_missing' \
+            <<<"$relocations" >/dev/null ||
+       grep -Eq '\(BIND_NOW\)|FLAGS[^[:cntrl:]]*NOW' <<<"$dynamic"; then
+        fail "GNU startup lazy-PLT fixture" \
+            "linker did not retain a lazy unresolved PLT relocation"
+        rm -rf "$root"
+        return
+    fi
+
+    capture_output actual env -u LD_BIND_NOW -u LD_BIND_NOT "$prog" || rc=$?
+    if [ "$rc" -ne 0 ] || [ "$actual" != "$expected" ]; then
+        fail "native GNU startup unresolved lazy-PLT control" \
+            "exit=$rc output=$actual"
+        rm -rf "$root"
+        return
+    fi
+    pass "native GNU startup unresolved lazy-PLT control"
+
+    freeze_require_direct "GNU startup lazy-PLT fallback" "$log" \
+        "$out" "$prog" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "GNU startup lazy-PLT strict refusal" "$DIRECT_FREEZE_REASON"
+        skip "GNU startup lazy-PLT supervised fallback" \
+            "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+
+    actual=""; rc=0
+    capture_output actual env -u LD_BIND_NOW -u LD_BIND_NOT \
+        DLFREEZE_NO_FORK=1 "$out" || rc=$?
+    if [ "$rc" -eq 127 ] &&
+       [[ "$actual" == *"native lazy PLT binding is required"* ]] &&
+       [[ "$actual" == *"dlfreeze_startup_lazy_missing"* ]] &&
+       [[ "$actual" != *"$expected"* ]]; then
+        pass "GNU startup lazy-PLT strict refusal"
+    else
+        fail "GNU startup lazy-PLT strict refusal" \
+            "exit=$rc output=$actual"
+    fi
+
+    # Prove that the fallback uses only the embedded executable, DSO, and
+    # native interpreter rather than reopening either source ELF.
+    rm -f "$prog" "$lib"
+    actual=""; rc=0
+    capture_output actual env -u DLFREEZE_NO_FORK -u LD_LIBRARY_PATH \
+        -u LD_BIND_NOW -u LD_BIND_NOT "$out" || rc=$?
+    if [ "$rc" -eq 0 ] && [ "$actual" = "$expected" ]; then
+        pass "GNU startup lazy-PLT supervised fallback"
+    else
+        fail "GNU startup lazy-PLT supervised fallback" \
+            "exit=$rc output=$actual"
+        tail -n 80 "$log" || true
+    fi
+    rm -rf "$root"
+}
+
+# An unresolved weak PLT import has the same native-lazy requirement as a
+# strong import: a later RTLD_GLOBAL object may define it before its first
+# call.  Eagerly writing zero would silently change that behavior.  Exercise
+# this separately so a toolchain-provided weak slot cannot mask the symbol
+# whose binding semantics the gate is intended to prove.
+test_gnu_startup_weak_lazy_binding_fallback() {
+    echo "--- GNU startup weak lazy-PLT native-binding fallback ---"
+    local root="$BUILD/gnu_startup_weak_lazy_binding"
+    local lib_src="$root/library.c" lib="$root/libstartup_weak_lazy_gap.so"
+    local prog_src="$root/main.c" prog="$root/main"
+    local out="$root/main.frozen" log="$root/main.log"
+    local expected="startup-weak-lazy-present=53" actual=""
+    local relocations symbols dynamic rc=0 freeze_rc=0
+
+    if ! compiler_targets_glibc; then
+        skip "GNU startup weak lazy-PLT fallback" \
+            "test compiler does not target glibc"
+        return
+    fi
+    if ! command -v readelf >/dev/null 2>&1; then
+        skip "GNU startup weak lazy-PLT fallback" "readelf not installed"
+        return
+    fi
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    cat >"$lib_src" <<'C'
+extern int dlfreeze_startup_weak_lazy_missing(void)
+    __attribute__((weak));
+
+int dlfreeze_startup_weak_lazy_present(void) { return 53; }
+int dlfreeze_startup_weak_lazy_uncalled(void) {
+    return dlfreeze_startup_weak_lazy_missing();
+}
+C
+    cat >"$prog_src" <<'C'
+#include <stdio.h>
+
+extern int dlfreeze_startup_weak_lazy_present(void);
+
+int main(void) {
+    printf("startup-weak-lazy-present=%d\n",
+           dlfreeze_startup_weak_lazy_present());
+    return dlfreeze_startup_weak_lazy_present() == 53 ? 0 : 1;
+}
+C
+
+    if ! gcc -shared -fPIC -nostartfiles -Wl,-z,lazy \
+            -Wl,-soname,libstartup_weak_lazy_gap.so \
+            -o "$lib" "$lib_src" ||
+       ! gcc -Wl,-z,now -Wl,--no-as-needed -L"$root" \
+            -Wl,-rpath,'$ORIGIN' -o "$prog" "$prog_src" \
+            -lstartup_weak_lazy_gap; then
+        fail "GNU startup weak lazy-PLT fixture" "compile failed"
+        rm -rf "$root"
+        return
+    fi
+    relocations=$(LC_ALL=C readelf -Wr "$lib" 2>/dev/null || true)
+    symbols=$(LC_ALL=C readelf -Ws "$lib" 2>/dev/null || true)
+    dynamic=$(LC_ALL=C readelf -d "$lib" 2>/dev/null || true)
+    if ! grep -E \
+            'JUMP_SLOT[^[:cntrl:]]*dlfreeze_startup_weak_lazy_missing' \
+            <<<"$relocations" >/dev/null ||
+       ! grep -E \
+            'WEAK[[:space:]]+DEFAULT[[:space:]]+UND[[:space:]]+dlfreeze_startup_weak_lazy_missing' \
+            <<<"$symbols" >/dev/null ||
+       grep -Eq '\(BIND_NOW\)|FLAGS[^[:cntrl:]]*NOW' <<<"$dynamic"; then
+        fail "GNU startup weak lazy-PLT fixture" \
+            "linker did not retain the weak lazy unresolved PLT relocation"
+        rm -rf "$root"
+        return
+    fi
+
+    capture_output actual env -u LD_BIND_NOW -u LD_BIND_NOT "$prog" || rc=$?
+    if [ "$rc" -ne 0 ] || [ "$actual" != "$expected" ]; then
+        fail "native GNU startup weak unresolved lazy-PLT control" \
+            "exit=$rc output=$actual"
+        rm -rf "$root"
+        return
+    fi
+    pass "native GNU startup weak unresolved lazy-PLT control"
+
+    freeze_require_direct "GNU startup weak lazy-PLT fallback" "$log" \
+        "$out" "$prog" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "GNU startup weak lazy-PLT strict refusal" \
+            "$DIRECT_FREEZE_REASON"
+        skip "GNU startup weak lazy-PLT supervised fallback" \
+            "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+
+    actual=""; rc=0
+    capture_output actual env -u LD_BIND_NOW -u LD_BIND_NOT \
+        DLFREEZE_NO_FORK=1 "$out" || rc=$?
+    if [ "$rc" -eq 127 ] &&
+       [[ "$actual" == *"native lazy PLT binding is required"* ]] &&
+       [[ "$actual" == *"dlfreeze_startup_weak_lazy_missing"* ]] &&
+       [[ "$actual" != *"$expected"* ]]; then
+        pass "GNU startup weak lazy-PLT strict refusal"
+    else
+        fail "GNU startup weak lazy-PLT strict refusal" \
+            "exit=$rc output=$actual"
+    fi
+
+    # The supervised retry must use the embedded executable, DSO, and native
+    # interpreter after both source files have disappeared.
+    rm -f "$prog" "$lib"
+    actual=""; rc=0
+    capture_output actual env -u DLFREEZE_NO_FORK -u LD_LIBRARY_PATH \
+        -u LD_BIND_NOW -u LD_BIND_NOT "$out" || rc=$?
+    if [ "$rc" -eq 0 ] && [ "$actual" = "$expected" ]; then
+        pass "GNU startup weak lazy-PLT supervised fallback"
+    else
+        fail "GNU startup weak lazy-PLT supervised fallback" \
+            "exit=$rc output=$actual"
+        tail -n 80 "$log" || true
     fi
     rm -rf "$root"
 }
@@ -16795,7 +20575,7 @@ test_direct_dlopen_embedded_static_tls() {
     local native_actual native_rc=0
     local root_relocs=""
     local have_ifunc=0
-    local use_preloaded_trace=0
+    local trace_promotion_supported=1
     local -a ifunc_cflags=()
 
     rm -rf "$root"
@@ -16895,8 +20675,15 @@ test_direct_dlopen_embedded_static_tls() {
     capture_output native_actual "$prog" || native_rc=$?
     if [ "$native_rc" -ne 0 ]; then
         if [[ "$native_actual" == *"initial-exec TLS resolves to dynamic definition"* ]]; then
-            use_preloaded_trace=1
-            echo "INFO: native libc rejects runtime initial-exec TLS; using the startup-preloaded trace fixture"
+            trace_promotion_supported=0
+            skip "direct traced static-TLS promotion" \
+                "native loader rejects runtime initial-exec TLS"
+            skip "direct traced external-IE TLS promotion" \
+                "native loader rejects runtime initial-exec TLS"
+            if [ "$have_ifunc" -eq 1 ]; then
+                skip "direct traced dormant IRELATIVE timing" \
+                    "native trace fixture cannot load its TLS closure"
+            fi
         elif [[ "$native_actual" == *"cannot allocate memory in static TLS block"* ]]; then
             skip "direct traced static-TLS promotion" \
                 "native loader has no static-TLS surplus for the trace fixture"
@@ -16920,22 +20707,29 @@ test_direct_dlopen_embedded_static_tls() {
         fi
     fi
 
-    if [ "$use_preloaded_trace" -eq 1 ]; then
-        freeze_require_direct "direct traced static-TLS promotion" "$log" \
-            "$out" -t "$prog" trace || freeze_rc=$?
-    else
+    if [ "$trace_promotion_supported" -eq 1 ]; then
         freeze_require_direct "direct traced static-TLS promotion" "$log" \
             "$out" -t "$prog" -- || freeze_rc=$?
+    else
+        # Some native loaders cannot produce a successful trace for a late
+        # initial-exec TLS closure.  Do not inject a preload or replace the
+        # traced process image to manufacture one: both would violate the
+        # trace authority contract.  A plain direct artifact still exercises
+        # the generic fail-closed path for untraced static-TLS loads below.
+        freeze_require_direct "direct untraced static-TLS rejection" "$log" \
+            "$out" "$prog" || freeze_rc=$?
     fi
     if [ "$freeze_rc" -eq 77 ]; then
-        skip "direct traced static-TLS promotion" "$DIRECT_FREEZE_REASON"
-        skip "direct traced external-IE TLS promotion" "$DIRECT_FREEZE_REASON"
+        if [ "$trace_promotion_supported" -eq 1 ]; then
+            skip "direct traced static-TLS promotion" "$DIRECT_FREEZE_REASON"
+            skip "direct traced external-IE TLS promotion" "$DIRECT_FREEZE_REASON"
+            if [ "$have_ifunc" -eq 1 ]; then
+                skip "direct traced dormant IRELATIVE timing" \
+                    "$DIRECT_FREEZE_REASON"
+            fi
+        fi
         skip "direct untraced static-TLS rejection" "$DIRECT_FREEZE_REASON"
         skip "direct untraced external-IE rejection" "$DIRECT_FREEZE_REASON"
-        if [ "$have_ifunc" -eq 1 ]; then
-            skip "direct traced dormant IRELATIVE timing" \
-                "$DIRECT_FREEZE_REASON"
-        fi
         rm -rf "$root"
         return
     fi
@@ -16944,33 +20738,35 @@ test_direct_dlopen_embedded_static_tls() {
         return
     fi
 
-    mv "$dep" "${dep}.bak"
-    mv "$root_a" "${root_a}.bak"
-    mv "$root_b" "${root_b}.bak"
-    mv "$external_owner" "${external_owner}.bak"
-    mv "$external_requester" "${external_requester}.bak"
-    capture_output actual "$out" || rc=$?
-    mv "${dep}.bak" "$dep"
-    mv "${root_a}.bak" "$root_a"
-    mv "${root_b}.bak" "$root_b"
-    mv "${external_owner}.bak" "$external_owner"
-    mv "${external_requester}.bak" "$external_requester"
-    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
-    if [ "$rc" -eq 0 ] &&
-       [ "$actual" = "promoted-static-tls-ok" ]; then
-        pass "direct traced static-TLS promotion"
-        pass "direct traced external-IE TLS promotion"
-        if [ "$have_ifunc" -eq 1 ]; then
-            pass "direct traced dormant IRELATIVE timing"
-        fi
-    else
-        fail "direct traced static-TLS promotion" \
-            "exit=$rc actual=$actual"
-        fail "direct traced external-IE TLS promotion" \
-            "exit=$rc actual=$actual"
-        if [ "$have_ifunc" -eq 1 ]; then
-            fail "direct traced dormant IRELATIVE timing" \
+    if [ "$trace_promotion_supported" -eq 1 ]; then
+        mv "$dep" "${dep}.bak"
+        mv "$root_a" "${root_a}.bak"
+        mv "$root_b" "${root_b}.bak"
+        mv "$external_owner" "${external_owner}.bak"
+        mv "$external_requester" "${external_requester}.bak"
+        capture_output actual "$out" || rc=$?
+        mv "${dep}.bak" "$dep"
+        mv "${root_a}.bak" "$root_a"
+        mv "${root_b}.bak" "$root_b"
+        mv "${external_owner}.bak" "$external_owner"
+        mv "${external_requester}.bak" "$external_requester"
+        actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+        if [ "$rc" -eq 0 ] &&
+           [ "$actual" = "promoted-static-tls-ok" ]; then
+            pass "direct traced static-TLS promotion"
+            pass "direct traced external-IE TLS promotion"
+            if [ "$have_ifunc" -eq 1 ]; then
+                pass "direct traced dormant IRELATIVE timing"
+            fi
+        else
+            fail "direct traced static-TLS promotion" \
                 "exit=$rc actual=$actual"
+            fail "direct traced external-IE TLS promotion" \
+                "exit=$rc actual=$actual"
+            if [ "$have_ifunc" -eq 1 ]; then
+                fail "direct traced dormant IRELATIVE timing" \
+                    "exit=$rc actual=$actual"
+            fi
         fi
     fi
 
@@ -17014,9 +20810,10 @@ test_direct_dlopen_startup_owned_ie() {
 
     rm -rf "$root"
     mkdir -p "$root"
-    if ! gcc -shared -fPIC -Wl,-soname,libdlfrz_external_ie_owner.so \
+    if ! gcc -shared -fPIC -Wl,-z,now \
+            -Wl,-soname,libdlfrz_external_ie_owner.so \
             -o "$owner" tests/direct_external_ie_owner.c ||
-       ! gcc -shared -fPIC \
+       ! gcc -shared -fPIC -Wl,-z,now \
             -Wl,-soname,libdlfrz_external_ie_requester.so \
             -Wl,-rpath,'$ORIGIN' -L"$root" -o "$requester" \
             tests/direct_external_ie_requester.c \
@@ -17041,7 +20838,7 @@ test_direct_dlopen_startup_owned_ie() {
     fi
 
     requester_abs=$(realpath "$requester")
-    if ! gcc -std=c11 -D_GNU_SOURCE -pthread \
+    if ! gcc -std=c11 -D_GNU_SOURCE -pthread -Wl,-z,now \
             -DREQUESTER_PATH="\"$requester_abs\"" \
             -Wl,-rpath,'$ORIGIN' -L"$root" -o "$prog" \
             tests/direct_startup_ie_main.c \
@@ -17100,7 +20897,11 @@ test_direct_runtime_parser_bounds() {
     local pn_xnum="$root/libdirect_pn_xnum.so"
     local prog="$root/main" out="$root/main.frozen" log="$root/main.log"
     local stride_gate="$root/loader_section_stride_gate"
+    local protection_gate="$root/protection_lifecycle_gate"
     local dynamic_gate="$root/runtime_dynamic_reader_gate"
+    local relocation_cache_gate="$root/relocation_replay_cache_gate"
+    local relr_replay_gate="$root/relr_replay_admission_gate"
+    local property_gate="$root/gnu_properties_gate"
     local load_gate="$root/load_segments_gate"
     local version_gate="$root/elf_version_stress_gate"
     local section_gate="$root/elf_sections_gate"
@@ -17109,6 +20910,16 @@ test_direct_runtime_parser_bounds() {
 
     rm -rf "$root"
     mkdir -p "$root"
+    if ! gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -O2 -Iinclude \
+            -o "$property_gate" tests/gnu_properties_gate.c ||
+       ! run_with_timeout_seconds 5 "$property_gate"; then
+        fail "GNU property admission policy" \
+            "shared parser compile or semantic gate failed"
+        rm -rf "$root"
+        return
+    fi
+    pass "packer/runtime GNU property admission policy is shared"
+
     if ! gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -O2 -Iinclude \
             -ffunction-sections -fdata-sections -fno-stack-protector \
             -Wl,--gc-sections -o "$dynamic_gate" \
@@ -17124,7 +20935,43 @@ test_direct_runtime_parser_bounds() {
     pass "runtime high-cardinality defined/needed versions use a paged index"
     pass "runtime version index rejects malformed chains and duplicate indices"
     pass "runtime startup source-owner indexing handles 65,535 aliases"
+    pass "runtime fused symbol queries preserve GNU/SysV/keyed hash semantics"
+    pass "runtime immutable dynsym queries bind precomputed hashes to exact names"
+    pass "runtime immutable exact-name index preserves live writable-table semantics"
+    pass "runtime symbol-key radix sorting is bounded and stable"
     pass "runtime GNU/SysV/version collision chains use bounded keyed name checks"
+    pass "runtime loader lock avoids uncontended wakes and preserves fork repair"
+    pass "runtime populated TLS DTV hits avoid the loader lock"
+    pass "loader memchr is exact-bounds across guard pages and alignments"
+
+    if ! gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -O2 -Iinclude \
+            -ffunction-sections -fdata-sections -fno-stack-protector \
+            -Wl,--gc-sections -o "$relocation_cache_gate" \
+            tests/relocation_replay_cache_gate.c -ldl -pthread ||
+       ! run_with_timeout_seconds 10 "$relocation_cache_gate"; then
+        fail "runtime relocation replay cache" \
+            "binding epoch, mutable fallback, or phase gate failed"
+        rm -rf "$root"
+        return
+    fi
+    pass "runtime immutable relocation bindings are requester/symbol cached"
+    pass "runtime relocation binding cache preserves mutable and GNU-unique fallback"
+    pass "runtime relocation binding cache is epoch-load bounded"
+    pass "runtime relocation replay validates only its owning phase"
+
+    if ! gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -O2 -Iinclude \
+            -ffunction-sections -fdata-sections -fno-stack-protector \
+            -Wl,--gc-sections -o "$relr_replay_gate" \
+            tests/relr_replay_admission_gate.c -ldl -pthread ||
+       ! run_with_timeout_seconds 10 "$relr_replay_gate"; then
+        fail "runtime RELR replay admission" \
+            "immutable authority, malicious encoding, or fast replay gate failed"
+        rm -rf "$root"
+        return
+    fi
+    pass "runtime RELR replay requires complete relocation admission"
+    pass "runtime RELR replay preserves immutable writable-table authority"
+    pass "runtime RELR replay avoids repeated PT_LOAD destination scans"
 
     if ! gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -Iinclude \
             -ffunction-sections -fdata-sections -fno-stack-protector \
@@ -17141,15 +20988,29 @@ test_direct_runtime_parser_bounds() {
     pass "loader libc-service provider/type/version/PT_LOAD gates"
     pass "loader private service symbols require one hash-consistent default"
     pass "loader embedded ELF mappings stop at the embedded file boundary"
+    pass "loader writable public PHDR cannot mutate internal authority"
     pass "loader RELRO protects only the native complete-page range"
     pass "loader prelinked weak and STN_UNDEF values are runtime-canonical"
     pass "loader prelinked zero-fill RELATIVE replay"
     pass "loader scalar relocations support unaligned destinations"
+    pass "loader writable relocation and replay tables use immutable authority"
     pass "loader rejects misaligned typed ELF control tables"
     pass "loader GNU-hash chains remain file-backed"
     pass "loader ORIGIN parsing follows target token grammar"
     pass "loader detects system-wide glibc preload policy"
     pass "loader target-specific atfork registration backends"
+
+    if ! gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -O2 -Iinclude \
+            -ffunction-sections -fdata-sections -fno-stack-protector \
+            -Wl,--gc-sections -o "$protection_gate" \
+            tests/protection_lifecycle_gate.c -ldl -pthread ||
+       ! run_with_timeout_seconds 10 "$protection_gate"; then
+        fail "loader protection lifecycle" \
+            "producer PT_LOAD or relocation-time RELRO gate failed"
+        rm -rf "$root"
+        return
+    fi
+    pass "loader producers finalize PT_LOAD before RELRO sealing"
 
     if ! gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -O2 -Iinclude \
             -o "$load_gate" tests/load_segments_gate.c; then
@@ -17477,7 +21338,12 @@ test_direct_dlopen_fallback() {
     cat > "$shlib_src" <<'C'
 int fb2_double(int x) { return x * 2; }
 C
-    gcc -shared -fPIC -o "$shlib" "$shlib_src"
+    if ! gcc -shared -fPIC -o "$shlib" "$shlib_src"; then
+        fail "direct-dlopen fallback" \
+            "shared-library fixture compile failed"
+        rm -f "$shlib_src" "$shlib" "$prog_src" "$prog" "$out" "$log"
+        return
+    fi
     local shlib_abs
     shlib_abs=$(realpath "$shlib")
 
@@ -17497,7 +21363,11 @@ int main(void) {
     return 0;
 }
 C
-    gcc -o "$prog" "$prog_src" -ldl
+    if ! gcc -o "$prog" "$prog_src" -ldl; then
+        fail "direct-dlopen fallback" "program fixture compile failed"
+        rm -f "$shlib_src" "$shlib" "$prog_src" "$prog" "$out" "$log"
+        return
+    fi
 
     local expect rc_e=0
     capture_output expect "$prog" || rc_e=$?
@@ -17774,6 +21644,11 @@ test_python_repl_pty_direct() {
             --freeze-timeout "$TEST_FREEZE_TIMEOUT" \
             --run-timeout "$TEST_RUN_TIMEOUT" >"$log" 2>&1 || rc=$?
     if [ "$rc" -eq 0 ]; then
+        # The PTY driver performs its own exact `mode: direct-load` check,
+        # outside freeze_require_direct in this shell.  Account for that
+        # artifact so a selector containing only this test still satisfies
+        # the suite's aggregate direct-coverage requirement.
+        DIRECT_ARTIFACTS=$((DIRECT_ARTIFACTS + 1))
         pass "Python REPL PTY direct-load"
     elif [ "$rc" -eq 77 ]; then
         reason=$(grep -m1 '^SKIP: ' "$log" 2>/dev/null || true)
@@ -17795,60 +21670,77 @@ test_python_repl_pty_direct() {
 # ===================================================================
 test_glibc_tls_dtor_direct() {
     echo "--- glibc tls-dtor direct-load ---"
-    if ! command -v g++ &>/dev/null; then
-        skip "glibc-tls-dtor-direct" "g++ not installed"
+    if ! compiler_targets_glibc; then
+        skip "glibc-tls-dtor-direct" "test compiler does not target glibc"
         return
     fi
 
-    local lib_src="$BUILD/tls_dtor_lib.cpp" main_src="$BUILD/tls_dtor_main.cpp"
+    local lib_src="$BUILD/tls_dtor_lib.c" main_src="$BUILD/tls_dtor_main.c"
     local lib="$BUILD/libtls_dtor.so" bin="$BUILD/tls_dtor_main"
     local out="$BUILD/tls_dtor_main.frozen" log="$BUILD/tls_dtor_main.log"
     local freeze_rc=0
     rm -f "$log"
 
-    cat > "$lib_src" <<'CPP'
-struct Marker {
-    int value;
-    Marker() : value(0) {}
-    ~Marker() {}
-};
+    cat > "$lib_src" <<'C'
+extern void *__dso_handle;
+extern int __cxa_thread_atexit_impl(
+    void (*destructor)(void *), void *object, void *dso_symbol);
 
-thread_local Marker marker;
+static __thread int tls_dtor_value;
+static int tls_dtor_destroyed;
 
-extern "C" int tls_dtor_touch(void) {
-    return ++marker.value;
+static void tls_dtor_destroy(void *object) {
+    int *value = object;
+    if (value && *value == 1)
+        tls_dtor_destroyed++;
 }
-CPP
 
-    cat > "$main_src" <<'CPP'
+int tls_dtor_touch(void) {
+    if (++tls_dtor_value != 1 ||
+        __cxa_thread_atexit_impl(
+            tls_dtor_destroy, &tls_dtor_value, __dso_handle) != 0)
+        return -1;
+    return tls_dtor_value;
+}
+
+int tls_dtor_count(void) { return tls_dtor_destroyed; }
+C
+
+    cat > "$main_src" <<'C'
 #include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 
-extern "C" int tls_dtor_touch(void);
+extern int tls_dtor_touch(void);
+extern int tls_dtor_count(void);
 
 static void *run(void *arg) {
     (void)arg;
-    printf("%d\n", tls_dtor_touch());
-    return NULL;
+    return (void *)(uintptr_t)tls_dtor_touch();
 }
 
 int main(void) {
     pthread_t thread;
+    void *result = NULL;
 
     if (pthread_create(&thread, NULL, run, NULL) != 0)
         return 1;
-    if (pthread_join(thread, NULL) != 0)
+    if (pthread_join(thread, &result) != 0)
         return 2;
-    return 0;
+    printf("tls-dtor=%d\n", tls_dtor_count());
+    return (uintptr_t)result == 1 && tls_dtor_count() == 1 ? 0 : 3;
 }
-CPP
+C
 
-    if ! g++ -shared -fPIC -o "$lib" "$lib_src"; then
-        fail "glibc-tls-dtor-direct" "g++ failed building shared library"
+    # This is a TLS-lifetime test, so bind the complete startup graph eagerly
+    # and keep target-crt weak lazy slots out of its acceptance criteria.
+    if ! gcc -shared -fPIC -Wl,-z,now -o "$lib" "$lib_src"; then
+        fail "glibc-tls-dtor-direct" "failed building shared library"
         return
     fi
-    if ! g++ -pthread -L"$BUILD" -Wl,-rpath,'$ORIGIN' -o "$bin" "$main_src" -ltls_dtor; then
-        fail "glibc-tls-dtor-direct" "g++ failed building executable"
+    if ! gcc -pthread -Wl,-z,now -L"$BUILD" -Wl,-rpath,'$ORIGIN' \
+            -o "$bin" "$main_src" -ltls_dtor; then
+        fail "glibc-tls-dtor-direct" "failed building executable"
         return
     fi
     freeze_require_direct "glibc-tls-dtor-direct" "$log" "$out" -- \
@@ -17867,7 +21759,7 @@ CPP
     capture_output expect "$bin" || rc_e=$?
     capture_output actual "$out" || rc_a=$?
 
-    if [ "$expect" = "$actual" ] &&
+    if [ "$expect" = "tls-dtor=1" ] && [ "$actual" = "$expect" ] &&
        [ "$rc_e" -eq 0 ] && [ "$rc_a" -eq 0 ]; then
         pass "glibc tls-dtor direct-load"
     else
@@ -17964,7 +21856,7 @@ test_dlopen_soname_direct() {
 
     interp=$(LC_ALL=C readelf -lW "$gate" 2>/dev/null |
         sed -n 's/.*Requesting program interpreter: \([^]]*\)].*/\1/p' |
-        head -n 1)
+        awk 'NR == 1 { print }')
     if [ -z "$interp" ] || [ ! -r "$interp" ] ||
        ! command -v strings >/dev/null 2>&1; then
         skip "dlopen-soname-direct" \
@@ -18026,7 +21918,11 @@ int main(int argc, char **argv) {
     return 0;
 }
 C
-    gcc -o "$bin" "$src" -ldl
+    if ! gcc -o "$bin" "$src" -ldl; then
+        fail "dlopen-soname-direct" "fixture compile failed"
+        rm -f "$src" "$bin" "$out" "$log"
+        return
+    fi
 
     local native_path="" cache_real="" native_real=""
     native_path=$("$bin" native-path 2>/dev/null) || true
@@ -18080,7 +21976,12 @@ test_dlopen_relpath_direct() {
     cat > "$libsrc" <<'C'
 int answer(void) { return 42; }
 C
-    gcc -shared -fPIC -o "$lib" "$libsrc"
+    if ! gcc -shared -fPIC -o "$lib" "$libsrc"; then
+        fail "dlopen relative path direct-load" \
+            "shared-library fixture compile failed"
+        rm -f "$libsrc" "$lib" "$src" "$bin" "$out" "$log"
+        return
+    fi
 
     cat > "$src" <<'C'
 #include <stdio.h>
@@ -18094,7 +21995,12 @@ int main(void) {
     return 0;
 }
 C
-    gcc -o "$bin" "$src" -ldl
+    if ! gcc -o "$bin" "$src" -ldl; then
+        fail "dlopen relative path direct-load" \
+            "program fixture compile failed"
+        rm -f "$libsrc" "$lib" "$src" "$bin" "$out" "$log"
+        return
+    fi
 
     freeze_require_direct "dlopen-relpath-direct" "$log" "$out" "$bin" ||
         freeze_rc=$?
@@ -18232,7 +22138,7 @@ C
     rm -rf "$root"
 }
 
-# Two traced request spellings may identify one inode.  V4 retains both
+# Two traced request spellings may identify one inode.  V8 retains both
 # requests while keeping one map, constructor run, TLS module, and the first
 # loader-visible l_name.
 test_dlopen_same_source_aliases_direct() {
@@ -18488,7 +22394,7 @@ C
     rm -rf "$root"
 }
 
-# Every successful non-NULL dlopen must produce either a complete V4 record or
+# Every successful non-NULL dlopen must produce either a complete V8 record or
 # an explicit terminal marker.  Interpose dlinfo to emulate a libc which does
 # not expose RTLD_DI_LINKMAP for the returned handle.
 test_successful_dlopen_trace_fails_closed() {
@@ -18496,7 +22402,9 @@ test_successful_dlopen_trace_fails_closed() {
     local root="$BUILD/dlopen_trace_completeness"
     local libsrc="$root/lib.c" lib="$root/libtrace_complete.so"
     local src="$root/main.c" bin="$root/main"
-    local mocksrc="$root/mock_dlinfo.c" mock="$root/mock_dlinfo.so"
+    local mocksrc="$root/mock_dlinfo.c"
+    local mock="$root/libdlfreeze-mock-dlinfo.so"
+    local helper="$root/dlfreeze-preload.so" freezer="$root/dlfreeze"
     local out="$root/main.frozen" log="$root/freeze.log"
     local actual="" rc=0
 
@@ -18538,8 +22446,18 @@ int dlinfo(void *handle, int request, void *info) {
 C
     if ! gcc -shared -fPIC -Wl,-soname,libtrace_complete.so \
             -o "$lib" "$libsrc" ||
-       ! gcc -o "$bin" "$src" -ldl ||
-       ! gcc -shared -fPIC -o "$mock" "$mocksrc"; then
+       ! gcc -shared -fPIC -Wl,-soname,libdlfreeze-mock-dlinfo.so \
+            -o "$mock" "$mocksrc" ||
+       ! gcc -o "$bin" "$src" -Wl,--no-as-needed -L"$root" \
+            -l:libdlfreeze-mock-dlinfo.so -Wl,-rpath,'$ORIGIN' \
+            -Wl,--as-needed -ldl ||
+       ! gcc -Wall -Wextra -Werror -O2 -D_GNU_SOURCE -Iinclude \
+            -U_FORTIFY_SOURCE -shared -fPIC -Wl,-z,defs \
+            -o "$helper" src/dlopen_preload.c \
+            -Wl,--no-as-needed -L"$root" \
+            -l:libdlfreeze-mock-dlinfo.so -Wl,-rpath,'$ORIGIN' -ldl ||
+       ! cp "$DLFREEZE" "$freezer" ||
+       ! cp "$BUILD/dlfreeze-bootstrap" "$root/dlfreeze-bootstrap"; then
         fail "successful dlopen trace completeness" \
             "fixture compile failed"
         rm -rf "$root"
@@ -18554,7 +22472,7 @@ C
         return
     fi
 
-    if run_freeze env LD_PRELOAD="$mock" "$DLFREEZE" -t -o "$out" -- \
+    if run_freeze "$freezer" -v -t -o "$out" -- \
             "$bin" "$lib" >"$log" 2>&1; then
         fail "successful dlopen trace completeness" \
             "packaging unexpectedly succeeded"
@@ -18950,7 +22868,11 @@ int main(void) {
     return 0;
 }
 C
-    gcc -o "$bin" "$src" -ldl -lpthread
+    if ! gcc -o "$bin" "$src" -ldl -lpthread; then
+        fail "dlopen TLS per-thread direct-load" "fixture compile failed"
+        rm -f "$src" "$bin" "$out" "$log"
+        return
+    fi
 
     freeze_require_direct "dlopen-tls-per-thread-direct" "$log" "$out" \
         "$bin" || freeze_rc=$?
@@ -19064,17 +22986,23 @@ test_glibc_tls_teardown_direct() {
 
 # ===================================================================
 # Test 17b: a conservative glibc DTV capacity must bound every read from
-# the old allocation.  Put a capacity-zero DTV at the end of a readable
-# page and protect the following page; __tls_get_addr must grow the DTV
-# and reconstruct the startup module's static slot without reading past
-# the advertised generation entry.
+# the old allocation.  Load an uncaptured global-dynamic TLS module, then put
+# a capacity-zero DTV at the end of a readable page and protect the following
+# page.  The native control only proves that the late GD access works; the
+# foreign guarded DTV is a direct-loader safety gate which must grow the table
+# instead of indexing beyond its advertised capacity.
 # ===================================================================
 test_glibc_dtv_capacity_direct() {
     echo "--- glibc DTV capacity direct-load ---"
     local libsrc="$BUILD/dtvcap-lib.c" lib="$BUILD/libdtvcap.so"
     local src="$BUILD/dtvcap-main.c" bin="$BUILD/dtvcap-main"
     local out="$BUILD/dtvcap-main.frozen" log="$BUILD/dtvcap-main.log"
-    local actual="" libc_banner="" relocs="" rc=0 freeze_rc=0
+    local startup_src="$BUILD/dtvcap-startup-main.c"
+    local startup_bin="$BUILD/dtvcap-startup-main"
+    local startup_out="$BUILD/dtvcap-startup-main.frozen"
+    local startup_log="$BUILD/dtvcap-startup-main.log"
+    local actual="" expect="" libc_banner="" relocs="" lib_abs
+    local rc=0 native_rc=0 freeze_rc=0
     local -a tls_cflags=()
 
     libc_banner=$(ldd --version 2>&1 || true)
@@ -19095,8 +23023,11 @@ test_glibc_dtv_capacity_direct() {
 __thread int dtvcap_value = 37;
 int dtvcap_read(void) { return dtvcap_value; }
 C
+    # The same DSO is exercised both as a late RTLD_NOW object and as a
+    # startup owner.  Make its PLT policy eager so the startup half measures
+    # DTV repair rather than unrelated weak lazy imports from target crt.
     if ! gcc -shared -fPIC -ftls-model=global-dynamic \
-            "${tls_cflags[@]}" -Wl,-soname,libdtvcap.so \
+            "${tls_cflags[@]}" -Wl,-z,now -Wl,-soname,libdtvcap.so \
             -o "$lib" "$libsrc"; then
         skip "glibc DTV capacity direct-load" \
             "compiler cannot emit traditional global-dynamic TLS"
@@ -19113,12 +23044,12 @@ C
 
     cat > "$src" <<'C'
 #define _GNU_SOURCE
+#include <dlfcn.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
-
-extern int dtvcap_read(void);
 
 static uintptr_t current_tp(void)
 {
@@ -19131,20 +23062,42 @@ static uintptr_t current_tp(void)
     return tp;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
-    size_t page = (size_t)sysconf(_SC_PAGESIZE);
-    unsigned char *map = mmap(NULL, page * 2, PROT_READ | PROT_WRITE,
-                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    int (*dtvcap_read)(void);
+    void *handle;
+    size_t page;
+    unsigned char *map;
     uintptr_t tp;
     uintptr_t **dtv_slot;
     uintptr_t *raw;
 
+    if (argc != 3)
+        return 2;
+    handle = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+    if (!handle)
+        return 3;
+    dlerror();
+    dtvcap_read = (int (*)(void))dlsym(handle, "dtvcap_read");
+    if (!dtvcap_read || dlerror() != NULL)
+        return 4;
+    if (strcmp(argv[2], "control") == 0) {
+        if (dtvcap_read() != 37)
+            return 5;
+        puts("dtv-capacity-control-ok");
+        return 0;
+    }
+    if (strcmp(argv[2], "guarded") != 0)
+        return 6;
+
+    page = (size_t)sysconf(_SC_PAGESIZE);
+    map = mmap(NULL, page * 2, PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (map == MAP_FAILED ||
         mprotect(map + page, page, PROT_NONE) != 0)
-        return 2;
+        return 7;
 
-    /* header entry + generation entry are the final 32 readable bytes. */
+    /* Header entry + generation entry are the final 32 readable bytes. */
     raw = (uintptr_t *)(map + page) - 4;
     raw[0] = 0; /* advertised module capacity */
     raw[1] = 0;
@@ -19160,17 +23113,26 @@ int main(void)
     *dtv_slot = raw + 2;
 
     if (dtvcap_read() != 37)
-        return 3;
+        return 8;
     if (*dtv_slot == raw + 2 || (*dtv_slot)[-2] == 0)
-        return 4;
+        return 9;
     puts("dtv-capacity-ok");
     return 0;
 }
 C
-    if ! gcc -o "$bin" "$src" -L"$BUILD" -Wl,-rpath,'$ORIGIN' \
-            -Wl,--no-as-needed -ldtvcap; then
+    if ! gcc -o "$bin" "$src" -ldl; then
         fail "glibc DTV capacity direct-load" \
             "could not build guarded-DTV fixture"
+        rm -f "$libsrc" "$lib" "$src" "$bin" "$out" "$log"
+        return
+    fi
+
+    lib_abs=$(realpath "$lib")
+    capture_output expect "$bin" "$lib_abs" control || native_rc=$?
+    if [ "$native_rc" -ne 0 ] ||
+       [ "$expect" != "dtv-capacity-control-ok" ]; then
+        fail "glibc DTV capacity native control" \
+            "exit=$native_rc output=$expect"
         rm -f "$libsrc" "$lib" "$src" "$bin" "$out" "$log"
         return
     fi
@@ -19187,14 +23149,126 @@ C
         return
     fi
 
-    capture_output actual "$out" || rc=$?
+    capture_output actual "$out" "$lib_abs" guarded || rc=$?
     actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
     if [ "$rc" -eq 0 ] && [ "$actual" = "dtv-capacity-ok" ]; then
         pass "glibc DTV capacity direct-load"
     else
         fail "glibc DTV capacity direct-load" "exit=$rc output=$actual"
     fi
-    rm -f "$libsrc" "$lib" "$src" "$bin" "$out" "$log"
+
+    # Keep the late-module case above distinct from a startup DT_NEEDED TLS
+    # owner.  A published nonzero static TPOFF is useful layout metadata, but
+    # __tls_get_addr must still honor a conservative per-thread DTV header and
+    # enter the repair path before returning the static block address.
+    cat > "$startup_src" <<'C'
+#define _GNU_SOURCE
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+extern int dtvcap_read(void);
+
+static uintptr_t current_tp(void)
+{
+    uintptr_t tp;
+#if defined(__x86_64__)
+    __asm__ volatile("movq %%fs:0, %0" : "=r"(tp));
+#elif defined(__aarch64__)
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+#endif
+    return tp;
+}
+
+int main(int argc, char **argv)
+{
+    size_t page;
+    unsigned char *map;
+    uintptr_t tp;
+    uintptr_t **dtv_slot;
+    uintptr_t *raw;
+
+    if (argc != 2)
+        return 2;
+    if (strcmp(argv[1], "control") == 0) {
+        if (dtvcap_read() != 37)
+            return 3;
+        puts("dtv-startup-capacity-control-ok");
+        return 0;
+    }
+    if (strcmp(argv[1], "guarded") != 0)
+        return 4;
+
+    page = (size_t)sysconf(_SC_PAGESIZE);
+    map = mmap(NULL, page * 2, PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (map == MAP_FAILED ||
+        mprotect(map + page, page, PROT_NONE) != 0)
+        return 5;
+    raw = (uintptr_t *)(map + page) - 4;
+    raw[0] = 0;
+    raw[1] = 0;
+    raw[2] = 1;
+    raw[3] = 0;
+    tp = current_tp();
+#if defined(__x86_64__)
+    dtv_slot = (uintptr_t **)(tp + 8);
+#else
+    dtv_slot = (uintptr_t **)tp;
+#endif
+
+    /* No libc call may intervene between publishing the conservative header
+     * and the global-dynamic access under test. */
+    *dtv_slot = raw + 2;
+    if (dtvcap_read() != 37)
+        return 6;
+    if (*dtv_slot == raw + 2 || (*dtv_slot)[-2] == 0)
+        return 7;
+    puts("dtv-startup-capacity-ok");
+    return 0;
+}
+C
+    if ! gcc -Wl,-z,now -o "$startup_bin" "$startup_src" -L"$BUILD" \
+            -Wl,-rpath,'$ORIGIN' -Wl,--no-as-needed -ldtvcap; then
+        fail "glibc startup DTV capacity direct-load" \
+            "could not build startup guarded-DTV fixture"
+    else
+        actual=""; native_rc=0
+        capture_output actual "$startup_bin" control || native_rc=$?
+        if [ "$native_rc" -ne 0 ] ||
+           [ "$actual" != "dtv-startup-capacity-control-ok" ]; then
+            fail "glibc startup DTV capacity native control" \
+                "exit=$native_rc output=$actual"
+        else
+            freeze_rc=0
+            freeze_require_direct "glibc-startup-dtv-capacity-direct" \
+                "$startup_log" "$startup_out" "$startup_bin" || \
+                freeze_rc=$?
+            if [ "$freeze_rc" -eq 77 ]; then
+                skip "glibc startup DTV capacity direct-load" \
+                    "$DIRECT_FREEZE_REASON"
+            elif [ "$freeze_rc" -eq 0 ]; then
+                mv "$lib" "${lib}.host-unavailable"
+                actual=""; rc=0
+                capture_output actual env DLFREEZE_NO_FORK=1 \
+                    "$startup_out" guarded || rc=$?
+                mv "${lib}.host-unavailable" "$lib"
+                actual=$(printf '%s\n' "$actual" | \
+                    strip_dlfreeze_warnings)
+                if [ "$rc" -eq 0 ] &&
+                   [ "$actual" = "dtv-startup-capacity-ok" ]; then
+                    pass "glibc startup DTV capacity direct-load"
+                else
+                    fail "glibc startup DTV capacity direct-load" \
+                        "exit=$rc output=$actual"
+                fi
+            fi
+        fi
+    fi
+    rm -f "$libsrc" "$lib" "$src" "$bin" "$out" "$log" \
+        "$startup_src" "$startup_bin" "$startup_out" "$startup_log"
 }
 
 # ===================================================================
@@ -19424,7 +23498,9 @@ C
         return
     fi
     sym_index=$(readelf --dyn-syms -W "$bad" 2>/dev/null |
-        awk '$NF == "dlfrz_bounds_symbol" { gsub(":", "", $1); print $1; exit }')
+        awk '$NF == "dlfrz_bounds_symbol" && !found {
+                 gsub(":", "", $1); print $1; found = 1
+             }')
     if ! [[ "$sym_index" =~ ^[0-9]+$ ]]; then
         fail "out-of-range symbol definition rejection" \
             "fixture symbol index not found"
@@ -19524,7 +23600,7 @@ C
 
     rela_size=$(wc -c < "$rela")
     rela_count=$(readelf -d "$bin" 2>/dev/null |
-        awk '/\(RELACOUNT\)/ { print $NF; exit }')
+        awk '/\(RELACOUNT\)/ && !found { print $NF; found = 1 }')
     rela_count=${rela_count:-0}
     if [ "$rela_size" -lt 24 ] || [ $((rela_size % 24)) -ne 0 ]; then
         skip "unsupported relocation direct-load" \
@@ -20776,7 +24852,8 @@ C
            [ "$actual" = "$native_bad" ]; then
             pass "$label (forged, name-only target runtime)"
         elif [ "$native_bad_rc" -ne 0 ] && [ "$rc" -eq 127 ] &&
-           [[ "$actual" == *"unresolved relocation symbol: memcpy"* ]] &&
+           { [[ "$actual" == *"unresolved relocation symbol: memcpy"* ]] ||
+             [[ "$actual" == *"native lazy PLT binding is required for unresolved symbol: memcpy"* ]]; } &&
            [[ "$actual" != *"memcpy-version-ok"* ]]; then
             pass "$label (forged)"
         else
@@ -21165,7 +25242,7 @@ C
     if [ "$freeze_rc" -eq 77 ]; then
         skip "stale direct musl layout strict refusal" \
             "$DIRECT_FREEZE_REASON"
-        skip "stale direct musl layout helper refusal" \
+        skip "stale direct musl layout supervised fallback" \
             "$DIRECT_FREEZE_REASON"
         rm -f "$helper" "$src" "$bin" "$out" "$log"
         return
@@ -21194,12 +25271,10 @@ C
 
     actual=""; rc=0
     capture_output actual env -u DLFREEZE_NO_FORK "$out" || rc=$?
-    if [ "$rc" -eq 127 ] &&
-       [[ "$actual" == *"direct-load artifact is incompatible"* ]] &&
-       [[ "$actual" != *"musl-layout-target-ran"* ]]; then
-        pass "stale direct musl layout helper refusal"
+    if [ "$rc" -eq 0 ] && [ "$actual" = "musl-layout-target-ran" ]; then
+        pass "stale direct musl layout supervised fallback"
     else
-        fail "stale direct musl layout helper refusal" \
+        fail "stale direct musl layout supervised fallback" \
             "exit=$rc output=$actual"
     fi
 
@@ -21426,7 +25501,7 @@ C
     if [ "$freeze_rc" -eq 77 ]; then
         skip "stale direct glibc layout strict refusal" \
             "$DIRECT_FREEZE_REASON"
-        skip "stale direct glibc layout helper refusal" \
+        skip "stale direct glibc layout supervised fallback" \
             "$DIRECT_FREEZE_REASON"
         rm -f "$helper" "$src" "$bin" "$out" "$log" \
             "$missing_reloc_out"
@@ -21461,7 +25536,7 @@ C
     # each witness and require runtime revalidation to stop before target
     # code, rather than trusting the packer's earlier admission.
     if [ "$(uname -m)" = x86_64 ]; then
-        for mode in accessor layout kind-root; do
+        for mode in accessor layout kind-root end; do
             x86_cpu_contract_out="$BUILD/glibc_x86_cpu_${mode//-/_}_mismatched.frozen"
             if ! cp "$out" "$x86_cpu_contract_out" ||
                ! "$helper" "--frozen-x86-cpu-$mode-mismatch" \
@@ -21510,12 +25585,10 @@ C
         actual=""; rc=0
         capture_output actual env -u DLFREEZE_NO_FORK \
             "$mismatched_libc_out" || rc=$?
-        if [ "$rc" -eq 127 ] &&
-           [[ "$actual" == *"libc/interpreter release mismatch"* ]] &&
-           [[ "$actual" != *"layout-target-ran"* ]]; then
-            pass "stale glibc libc/interpreter pairing helper refusal"
+        if [ "$rc" -eq 0 ] && [ "$actual" = "layout-target-ran" ]; then
+            pass "stale glibc libc/interpreter pairing supervised fallback"
         else
-            fail "stale glibc libc/interpreter pairing helper refusal" \
+            fail "stale glibc libc/interpreter pairing supervised fallback" \
                 "exit=$rc output=$actual"
         fi
     fi
@@ -21545,12 +25618,10 @@ C
         actual=""; rc=0
         capture_output actual env -u DLFREEZE_NO_FORK \
             "$hook_consumer_out" || rc=$?
-        if [ "$rc" -eq 127 ] &&
-           [[ "$actual" == *"libc/interpreter release mismatch"* ]] &&
-           [[ "$actual" != *"layout-target-ran"* ]]; then
-            pass "stale glibc dlfcn-hook consumer helper refusal"
+        if [ "$rc" -eq 0 ] && [ "$actual" = "layout-target-ran" ]; then
+            pass "stale glibc dlfcn-hook consumer supervised fallback"
         else
-            fail "stale glibc dlfcn-hook consumer helper refusal" \
+            fail "stale glibc dlfcn-hook consumer supervised fallback" \
                 "exit=$rc output=$actual"
         fi
     fi
@@ -21581,12 +25652,10 @@ C
         actual=""; rc=0
         capture_output actual env -u DLFREEZE_NO_FORK \
             "$tls_dtor_counter_out" || rc=$?
-        if [ "$rc" -eq 127 ] &&
-           [[ "$actual" == *"target glibc thread-layout validation"* ]] &&
-           [[ "$actual" != *"layout-target-ran"* ]]; then
-            pass "glibc TLS-dtor counter mismatch helper refusal"
+        if [ "$rc" -eq 0 ] && [ "$actual" = "layout-target-ran" ]; then
+            pass "glibc TLS-dtor counter mismatch supervised fallback"
         else
-            fail "glibc TLS-dtor counter mismatch helper refusal" \
+            fail "glibc TLS-dtor counter mismatch supervised fallback" \
                 "exit=$rc output=$actual"
         fi
     fi
@@ -21722,12 +25791,10 @@ C
         actual=""; rc=0
         capture_output actual env -u DLFREEZE_NO_FORK \
             "$missing_reloc_out" || rc=$?
-        if [ "$rc" -eq 127 ] &&
-           [[ "$actual" == *"direct-load artifact is incompatible"* ]] &&
-           [[ "$actual" != *"layout-target-ran"* ]]; then
-            pass "missing glibc GLRO relocation helper refusal"
+        if [ "$rc" -eq 0 ] && [ "$actual" = "layout-target-ran" ]; then
+            pass "missing glibc GLRO relocation supervised fallback"
         else
-            fail "missing glibc GLRO relocation helper refusal" \
+            fail "missing glibc GLRO relocation supervised fallback" \
                 "exit=$rc output=$actual"
         fi
     fi
@@ -21755,12 +25822,10 @@ C
         actual=""; rc=0
         capture_output actual env -u DLFREEZE_NO_FORK \
             "$missing_release_out" || rc=$?
-        if [ "$rc" -eq 127 ] &&
-           [[ "$actual" == *"direct-load artifact is incompatible"* ]] &&
-           [[ "$actual" != *"layout-target-ran"* ]]; then
-            pass "missing glibc release identity helper refusal"
+        if [ "$rc" -eq 0 ] && [ "$actual" = "layout-target-ran" ]; then
+            pass "missing glibc release identity supervised fallback"
         else
-            fail "missing glibc release identity helper refusal" \
+            fail "missing glibc release identity supervised fallback" \
                 "exit=$rc output=$actual"
         fi
     fi
@@ -21786,12 +25851,10 @@ C
 
     actual=""; rc=0
     capture_output actual env -u DLFREEZE_NO_FORK "$out" || rc=$?
-    if [ "$rc" -eq 127 ] &&
-       [[ "$actual" == *"direct-load artifact is incompatible"* ]] &&
-       [[ "$actual" != *"layout-target-ran"* ]]; then
-        pass "stale direct glibc layout helper refusal"
+    if [ "$rc" -eq 0 ] && [ "$actual" = "layout-target-ran" ]; then
+        pass "stale direct glibc layout supervised fallback"
     else
-        fail "stale direct glibc layout helper refusal" \
+        fail "stale direct glibc layout supervised fallback" \
             "exit=$rc output=$actual"
     fi
 
@@ -21802,13 +25865,16 @@ C
 # ===================================================================
 echo "======== dlfreeze test suite ========"
 echo "build dir: $BUILD"
-echo ""
 
+TEST_FUNCTIONS=(
 test_hello
 test_libc_semantics_gate
 test_bootstrap_secure_gate
+test_bootstrap_fileback_gate
+test_loader_fileback_gate
 test_packer_alias_gate
 test_packer_elf_alignment_gate
+test_packer_prelink_relocation_gate
 test_file_pattern_option_scaling
 test_musl_hello_direct
 test_glibc_tunable_environment_direct
@@ -21820,6 +25886,7 @@ test_musl_multibyte_direct
 test_musl_shared_tls_direct
 test_musl_target_contract_direct
 test_renamed_runtime_identity
+test_failed_loader_trace_records
 test_loader_post_tls_import_gate
 test_direct_bootstrap_libc_independence
 test_musl_layout_gate
@@ -21828,6 +25895,8 @@ test_glibc_layout_gate
 test_glibc_stack_end_direct
 test_direct_constructor_stack_identity
 test_direct_target_auxv_identity
+test_direct_x86_cache_sysconf_identity
+test_glibc_cache_tunables_refusal
 test_glibc_private_exception_direct
 test_glibc_internal_module_loading_direct
 test_exit_code
@@ -21840,18 +25909,30 @@ test_vfs_dir_handle_registry
 test_direct_handoff_once
 test_supervisor_signal_forwarding
 test_supervisor_inherited_sigchld
+test_direct_cpu_probe_seccomp_fallback
 test_direct_pty_interaction
 test_preload_helper_compile_matrix
 test_preload_fortified_open_entrypoints
 test_preload_helper_initialization_race
 test_preload_helper_constructor_order
+test_preload_helper_early_process_order
 test_trace_helper_symbol_version_compatibility
 test_trace_helper_main_rpath_ancestry
 test_aux_dependency_lookup_status
 test_trace_helper_completeness
 test_trace_helper_error_transparency
+test_preload_descriptor_transactions
+test_trace_descriptor_lifecycle
+test_trace_cwd_overlap
+test_trace_constructor_fork_recovery
+test_trace_process_and_dlopen_provenance
+test_file_trace_transaction_exit_window
 test_trace_exec_headers_and_open_errors
 test_trace_ignores_deleted_out_of_scope_file
+test_trace_unresolved_open_scope
+test_trace_file_revision_provenance
+test_trace_tmpdir_selection
+test_bootstrap_tmpdir_selection
 test_executable_path_empty_component
 test_relative_executable_identity_extraction
 test_exact_range_duplicate_extraction
@@ -21886,6 +25967,7 @@ test_pathful_glibc_direct_admission
 test_gnu_pack_cache_contract
 test_long_elf_metadata_strings
 test_vfs_hash_complexity_gate
+test_startup_dependency_index_gate
 test_high_cardinality_data_manifest
 test_ls
 test_cat
@@ -21925,6 +26007,8 @@ test_direct_dlopen_missing_needed
 test_direct_dlopen_sibling_scope
 test_direct_dlopen_bfs_scope
 test_direct_symbolic_lookup_scope
+test_preload_early_ifunc_trace
+test_direct_startup_ifunc_phase
 test_direct_dlopen_ifunc_data_order
 test_direct_copy_ifunc_order
 test_direct_dlsym_ifunc_repeated_resolution
@@ -21932,6 +26016,9 @@ test_direct_gnu_unique_local_scopes
 test_direct_gnu_unique_transaction_rollback
 test_direct_dlopen_admission_flags
 test_direct_dlopen_mode_contract
+test_gnu_traced_lazy_binding_fallback
+test_gnu_startup_lazy_binding_fallback
+test_gnu_startup_weak_lazy_binding_fallback
 test_direct_dlopen_local_caller_scope
 test_direct_dlopen_embedded_static_tls
 test_direct_dlopen_startup_owned_ie
@@ -21974,10 +26061,74 @@ test_default_version_interposition_direct
 test_special_version_admission_direct
 test_versioned_copy_relocation_direct
 test_interpreter_copy_object_direct
+)
+
+test_start_selector="${TEST_START_AT:-}"
+test_stop_selector="${TEST_STOP_AFTER:-}"
+test_start_index=0
+test_stop_index=$((${#TEST_FUNCTIONS[@]} - 1))
+test_start_found=0
+test_stop_found=0
+
+if [ -z "$test_start_selector" ]; then
+    test_start_found=1
+fi
+if [ -z "$test_stop_selector" ]; then
+    test_stop_found=1
+fi
+
+for test_index in "${!TEST_FUNCTIONS[@]}"; do
+    test_function="${TEST_FUNCTIONS[$test_index]}"
+    if ! declare -F "$test_function" >/dev/null; then
+        echo "ERROR: test registry names undefined function: $test_function" >&2
+        exit 2
+    fi
+    if [ "$test_function" = "$test_start_selector" ]; then
+        test_start_index=$test_index
+        test_start_found=1
+    fi
+    if [ "$test_function" = "$test_stop_selector" ]; then
+        test_stop_index=$test_index
+        test_stop_found=1
+    fi
+done
+
+if [ "$test_start_found" -eq 0 ]; then
+    echo "ERROR: unknown TEST_START_AT function: $test_start_selector" >&2
+    exit 2
+fi
+if [ "$test_stop_found" -eq 0 ]; then
+    echo "ERROR: unknown TEST_STOP_AFTER function: $test_stop_selector" >&2
+    exit 2
+fi
+if [ "$test_start_index" -gt "$test_stop_index" ]; then
+    echo "ERROR: TEST_START_AT ($test_start_selector) follows TEST_STOP_AFTER ($test_stop_selector)" >&2
+    exit 2
+fi
+
+test_selected_count=$((test_stop_index - test_start_index + 1))
+test_selected_start="${TEST_FUNCTIONS[$test_start_index]}"
+test_selected_stop="${TEST_FUNCTIONS[$test_stop_index]}"
+if [ "$test_selected_count" -eq "${#TEST_FUNCTIONS[@]}" ]; then
+    test_range_kind="full suite"
+else
+    test_range_kind="selected shard"
+fi
+test_range_summary="$test_selected_start .. $test_selected_stop ($test_selected_count/${#TEST_FUNCTIONS[@]} functions; $test_range_kind)"
+echo "selected range: $test_range_summary"
+echo ""
+
+for ((test_index = test_start_index;
+      test_index <= test_stop_index;
+      test_index++)); do
+    "${TEST_FUNCTIONS[$test_index]}"
+done
 
 case "${DLFREEZE_REQUIRE_DIRECT:-${CI:-0}}" in
     1|true|TRUE|yes|YES)
-        if [ "$DIRECT_ARTIFACTS" -eq 0 ]; then
+        if [ "$DIRECT_ARTIFACTS" -eq 0 ] &&
+           { [ "${DLFREEZE_REQUIRE_DIRECT_FULL_SUITE_ONLY:-0}" != 1 ] ||
+             [ "$test_selected_count" -eq "${#TEST_FUNCTIONS[@]}" ]; }; then
             fail "direct-load CI coverage" \
                 "no test produced a direct-load artifact"
         fi
@@ -21985,5 +26136,6 @@ case "${DLFREEZE_REQUIRE_DIRECT:-${CI:-0}}" in
 esac
 
 echo ""
+echo "======== selected range: $test_range_summary ========"
 echo "======== ${GRN}$PASS passed${RST}, ${RED}$FAIL failed${RST}, ${YLW}$SKIP skipped${RST}, $DIRECT_ARTIFACTS direct artifacts ========"
 [ "$FAIL" -eq 0 ]

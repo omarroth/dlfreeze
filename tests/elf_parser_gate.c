@@ -5,6 +5,7 @@
 
 #include <elf.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,15 +30,24 @@ struct mapped_elf {
 
 static int spare_program_header(const struct mapped_elf *mapped);
 
-static int copy_fixture(const char *source, char path[64])
+static int copy_fixture(const char *source, char path[PATH_MAX])
 {
+    const char *tmpdir = getenv("TMPDIR");
     char buffer[16384];
     int input = -1;
     int output = -1;
     int rc = -1;
+    int path_length;
     ssize_t count;
 
-    strcpy(path, "/tmp/dlfreeze-elf-parser.XXXXXX");
+    if (!tmpdir || !tmpdir[0])
+        tmpdir = "/tmp";
+    path_length = snprintf(path, PATH_MAX,
+                           "%s%sdlfreeze-elf-parser.XXXXXX",
+                           tmpdir,
+                           tmpdir[strlen(tmpdir) - 1] == '/' ? "" : "/");
+    if (path_length < 0 || path_length >= PATH_MAX)
+        return -1;
     output = mkstemp(path);
     input = open(source, O_RDONLY | O_CLOEXEC);
     if (input < 0 || output < 0)
@@ -154,7 +164,7 @@ static int parse_external_ie_requires_static_tls(const char *path)
 
 static int tpoff_without_flag(const char *source)
 {
-    char path[64] = "";
+    char path[PATH_MAX] = "";
     struct mapped_elf mapped;
     int rc = -1;
 
@@ -175,7 +185,7 @@ out:
 
 static int duplicate_zero_tls_rejected(const char *source)
 {
-    char path[64] = "";
+    char path[PATH_MAX] = "";
     struct mapped_elf mapped;
     int have_tls = 0;
     int candidate = -1;
@@ -220,7 +230,7 @@ out:
 
 static int malformed_rela_rejected(const char *source)
 {
-    char path[64] = "";
+    char path[PATH_MAX] = "";
     struct mapped_elf mapped;
     int found_rela = 0;
     int rc = -1;
@@ -261,7 +271,7 @@ out:
 
 static int ambiguous_vaddr_translation_rejected(const char *source)
 {
-    char path[64] = "";
+    char path[PATH_MAX] = "";
     struct mapped_elf mapped;
     uint64_t strtab_vaddr = 0;
     int source_index = -1;
@@ -378,7 +388,7 @@ static int spare_program_header(const struct mapped_elf *mapped)
 static int mutate_admission(const char *source,
                             enum admission_mutation mutation)
 {
-    char path[64] = "";
+    char path[PATH_MAX] = "";
     struct mapped_elf mapped;
     int candidate;
     int source_index;
@@ -592,7 +602,7 @@ static int descriptor_parse_is_path_race_safe(const char *source)
     static const char replacement[] = "not an ELF";
     struct elf_info info;
     struct stat source_stat;
-    char path[64] = "";
+    char path[PATH_MAX] = "";
     int source_fd = -1;
     int replacement_fd = -1;
     int rc = -1;

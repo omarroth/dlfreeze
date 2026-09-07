@@ -32,6 +32,48 @@
 #define DLFRZ_DT_SYMINFO        UINT64_C(0x6ffffeff)
 #define DLFRZ_DT_RELCOUNT       UINT64_C(0x6ffffffa)
 
+/* DT_FLAGS/DT_FLAGS_1 values used by the direct-loader admission contract.
+ * Keep private spellings here as well: the bootstrap, packer, and trace
+ * interposer can be built against different libc header versions. */
+#define DLFRZ_DF_ORIGIN       UINT64_C(0x00000001)
+#define DLFRZ_DF_SYMBOLIC     UINT64_C(0x00000002)
+#define DLFRZ_DF_BIND_NOW     UINT64_C(0x00000008)
+#define DLFRZ_DF_STATIC_TLS   UINT64_C(0x00000010)
+
+#define DLFRZ_DF_1_NOW        UINT64_C(0x00000001)
+#define DLFRZ_DF_1_NODELETE   UINT64_C(0x00000008)
+#define DLFRZ_DF_1_NOOPEN     UINT64_C(0x00000040)
+#define DLFRZ_DF_1_ORIGIN     UINT64_C(0x00000080)
+#define DLFRZ_DF_1_NODEFLIB   UINT64_C(0x00000800)
+#define DLFRZ_DF_1_NODUMP     UINT64_C(0x00001000)
+#define DLFRZ_DF_1_NODIRECT   UINT64_C(0x00020000)
+#define DLFRZ_DF_1_PIE        UINT64_C(0x08000000)
+
+/* Admit only policies implemented by direct replay.  DF_1_NOOPEN is an
+ * object-use restriction, not a prohibition on loading the object as part of
+ * the startup dependency graph, so it belongs in the supported set here.
+ * The operation-specific helper below rejects it for a later dlopen. */
+static inline int dlfrz_dynamic_flags_are_supported(
+    uint64_t flags, uint64_t flags_1, int is_main_executable)
+{
+    const uint64_t flags_allowed =
+        DLFRZ_DF_ORIGIN | DLFRZ_DF_SYMBOLIC | DLFRZ_DF_BIND_NOW |
+        DLFRZ_DF_STATIC_TLS;
+    const uint64_t flags_1_allowed =
+        DLFRZ_DF_1_NOW | DLFRZ_DF_1_NODELETE | DLFRZ_DF_1_NOOPEN |
+        DLFRZ_DF_1_ORIGIN | DLFRZ_DF_1_NODEFLIB |
+        DLFRZ_DF_1_NODUMP | DLFRZ_DF_1_NODIRECT | DLFRZ_DF_1_PIE;
+
+    return (flags & ~flags_allowed) == 0 &&
+           (flags_1 & ~flags_1_allowed) == 0 &&
+           ((flags_1 & DLFRZ_DF_1_PIE) == 0 || is_main_executable);
+}
+
+static inline int dlfrz_dynamic_flags_allow_dlopen(uint64_t flags_1)
+{
+    return (flags_1 & (DLFRZ_DF_1_NOOPEN | DLFRZ_DF_1_PIE)) == 0;
+}
+
 /* Linux dlopen mode values are part of the target ABI, even when the libc
  * used to build the static bootstrap omits a GNU spelling such as
  * RTLD_DEEPBIND.  Keep trace-time admission and direct replay on one exact
@@ -54,6 +96,17 @@ static inline int dlfrz_dlopen_mode_is_supported(int flags)
 
     return binding != 0 && (value & DLFRZ_RTLD_DEEPBIND) == 0 &&
            (value & ~known) == 0;
+}
+
+/* RTLD_NOW takes precedence when both binding bits are present.  A remaining
+ * pure-LAZY request needs a PLT resolver if it introduces a new object on a
+ * GNU runtime; musl deliberately implements both public modes eagerly. */
+static inline int dlfrz_dlopen_mode_requires_lazy_binding(int flags)
+{
+    const uint32_t value = (uint32_t)flags;
+
+    return (value & DLFRZ_RTLD_LAZY) != 0 &&
+           (value & DLFRZ_RTLD_NOW) == 0;
 }
 
 /* These tags request relocation formats, symbol-index extensions, or

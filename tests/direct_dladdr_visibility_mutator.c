@@ -103,12 +103,51 @@ int main(int argc, char **argv)
         dynsym_section->sh_link >= ehdr->e_shnum ||
         sections[dynsym_section->sh_link].sh_type != SHT_STRTAB)
         goto out;
-    for (size_t i = 0; i < ehdr->e_shnum; i++)
-        if ((sections[i].sh_type == SHT_REL ||
-             sections[i].sh_type == SHT_RELA) &&
-            sections[i].sh_link == (size_t)(dynsym_section - sections) &&
-            sections[i].sh_size != 0)
-            goto out;
+    for (size_t i = 0; i < ehdr->e_shnum; i++) {
+        const Elf64_Shdr *section = &sections[i];
+
+        if ((section->sh_type != SHT_REL &&
+             section->sh_type != SHT_RELA) ||
+            section->sh_link != (size_t)(dynsym_section - sections) ||
+            section->sh_size == 0)
+            continue;
+
+        /* Reordering DYNSYM is safe when a target emits only symbol-free
+         * relative relocations.  AArch64 commonly uses such relocations for
+         * locally bound GOT slots even with -Bsymbolic, whereas x86-64 can
+         * encode the same fixture without a dynamic relocation section. */
+        if (section->sh_type == SHT_REL) {
+            if (section->sh_entsize != sizeof(Elf64_Rel) ||
+                section->sh_size % sizeof(Elf64_Rel) != 0)
+                goto out;
+            for (size_t j = 0;
+                 j < section->sh_size / sizeof(Elf64_Rel); j++) {
+                Elf64_Rel relocation;
+
+                memcpy(&relocation,
+                       file + section->sh_offset +
+                           j * sizeof(relocation),
+                       sizeof(relocation));
+                if (ELF64_R_SYM(relocation.r_info) != STN_UNDEF)
+                    goto out;
+            }
+        } else {
+            if (section->sh_entsize != sizeof(Elf64_Rela) ||
+                section->sh_size % sizeof(Elf64_Rela) != 0)
+                goto out;
+            for (size_t j = 0;
+                 j < section->sh_size / sizeof(Elf64_Rela); j++) {
+                Elf64_Rela relocation;
+
+                memcpy(&relocation,
+                       file + section->sh_offset +
+                           j * sizeof(relocation),
+                       sizeof(relocation));
+                if (ELF64_R_SYM(relocation.r_info) != STN_UNDEF)
+                    goto out;
+            }
+        }
+    }
 
     symbol_count = dynsym_section->sh_size / sizeof(Elf64_Sym);
     if (symbol_count < 3 || symbol_count > UINT32_MAX)

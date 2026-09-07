@@ -6,9 +6,11 @@
 #include <string.h>
 #include <unistd.h>
 
-/* Rebind the helper's file-trace descriptor to an unrelated writable file,
- * then perform a traceable open.  A robust helper must fail closed before it
- * writes a syntactically valid record to the replacement descriptor. */
+/* Close the helper's visible file-trace descriptor, reuse that number for an
+ * unrelated application file, then perform a traceable open.  The close
+ * interposer must preserve the trace on a hidden descriptor without writing
+ * trace bytes to, closing, or otherwise corrupting the reused application
+ * descriptor. */
 int main(int argc, char **argv)
 {
     char proc_path[64];
@@ -16,6 +18,7 @@ int main(int argc, char **argv)
     int trace_fd = -1;
     int replacement;
     int input;
+    static const char marker[] = "application-fd-ok\n";
 
     if (argc != 4)
         return 2;
@@ -51,11 +54,16 @@ int main(int argc, char **argv)
             return 8;
         if (close(replacement) != 0)
             return 9;
+        replacement = trace_fd;
     }
+
+    if (write(replacement, marker, sizeof(marker) - 1) !=
+            (ssize_t)(sizeof(marker) - 1) ||
+        close(replacement) != 0)
+        return 10;
 
     input = open(argv[3], O_RDONLY);
     if (input < 0)
-        return 10;
-    close(input);
-    return 11;
+        return 11;
+    return close(input) == 0 ? 0 : 12;
 }

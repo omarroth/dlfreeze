@@ -67,5 +67,35 @@ int main(void)
             return 1;
         }
     }
+
+    {
+        const uint64_t supported_flags =
+            DLFRZ_DF_ORIGIN | DLFRZ_DF_SYMBOLIC | DLFRZ_DF_BIND_NOW |
+            DLFRZ_DF_STATIC_TLS;
+        const uint64_t supported_flags_1 =
+            DLFRZ_DF_1_NOW | DLFRZ_DF_1_NODELETE | DLFRZ_DF_1_NOOPEN |
+            DLFRZ_DF_1_ORIGIN | DLFRZ_DF_1_NODEFLIB |
+            DLFRZ_DF_1_NODUMP | DLFRZ_DF_1_NODIRECT;
+
+        if (!dlfrz_dynamic_flags_are_supported(
+                supported_flags, supported_flags_1, 0) ||
+            !dlfrz_dynamic_flags_are_supported(
+                supported_flags, supported_flags_1 | DLFRZ_DF_1_PIE, 1) ||
+            dlfrz_dynamic_flags_are_supported(
+                supported_flags, supported_flags_1 | DLFRZ_DF_1_PIE, 0) ||
+            dlfrz_dynamic_flags_are_supported(
+                supported_flags | UINT64_C(0x4), supported_flags_1, 0) ||
+            dlfrz_dynamic_flags_are_supported(
+                supported_flags, supported_flags_1 | UINT64_C(0x2), 0)) {
+            fputs("bad dynamic-flags admission classification\n", stderr);
+            return 1;
+        }
+        if (dlfrz_dynamic_flags_allow_dlopen(DLFRZ_DF_1_NOOPEN) ||
+            dlfrz_dynamic_flags_allow_dlopen(DLFRZ_DF_1_PIE) ||
+            !dlfrz_dynamic_flags_allow_dlopen(DLFRZ_DF_1_NODELETE)) {
+            fputs("bad dlopen flags classification\n", stderr);
+            return 1;
+        }
+    }
     return 0;
 }

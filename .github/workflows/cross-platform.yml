@@ -29,6 +29,14 @@ on:
           - fedora-41
           - fedora-rawhide
           - arch-latest
+      test_start_at:
+        description: Optional first tests/run_tests.sh function
+        required: false
+        type: string
+      test_stop_after:
+        description: Optional last tests/run_tests.sh function
+        required: false
+        type: string
 
 concurrency:
   group: cross-platform-${{ github.ref }}
@@ -73,10 +81,15 @@ jobs:
           github.event_name != 'workflow_dispatch' ||
           ((inputs.architecture == 'all' || inputs.architecture == matrix.arch) &&
            (inputs.environment == 'all' || inputs.environment == matrix.env))
+        env:
+          TEST_START_AT: ${{ inputs.test_start_at || '' }}
+          TEST_STOP_AFTER: ${{ inputs.test_stop_after || '' }}
         run: |
           set -o pipefail
           docker run --rm --platform linux/${{ matrix.arch }} \
             -v "$PWD":/work -w /work \
+            -e TEST_START_AT \
+            -e TEST_STOP_AFTER \
             ${{ matrix.image }} \
             sh /work/tests/cross-build.sh 2>&1 | tee cross-build.log
 

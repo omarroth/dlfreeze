@@ -23,12 +23,20 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <sys/mman.h>
+#include <sys/sysmacros.h>
+#include <sys/statvfs.h>
+#include <sys/vfs.h>
 #include <stdint.h>
 #include <elf.h>
 
 #include "common.h"
 #include "load_segments.h"
 #include "loader.h"
+
+/* Some standalone musl sysroots intentionally omit Linux kernel headers. */
+#ifndef PROC_SUPER_MAGIC
+#define PROC_SUPER_MAGIC 0x9fa0
+#endif
 
 /*
  * Reserve one program-header slot for the packer to turn into the payload
@@ -72,12 +80,10 @@ static int g_tmpdir_fd = -1;
 static int g_tmp_parent_fd = -1;
 static dev_t g_tmpdir_dev;
 static ino_t g_tmpdir_ino;
-static uint64_t g_tmpdir_mount_id;
-static int g_tmpdir_mount_id_valid;
 static int g_bootstrap_secure_mode;
 extern char **environ;
 
-static int fdinfo_mount_id(int fd, uint64_t *mount_id)
+static int authenticated_fdinfo_mount_id(int fd, uint64_t *mount_id)
 {
     char path[64];
     char *line = NULL;
@@ -96,6 +102,32 @@ static int fdinfo_mount_id(int fd, uint64_t *mount_id)
     info_fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (info_fd < 0)
         return -1;
+    {
+        struct statfs filesystem;
+        int filesystem_result;
+
+        /* A path named /proc can be supplied by the mount namespace.  Do
+         * not consume its text as kernel identity evidence until the opened
+         * descriptor itself proves that it belongs to procfs. */
+        memset(&filesystem, 0, sizeof(filesystem));
+        filesystem_result = fstatfs(info_fd, &filesystem);
+        if (filesystem_result != 0) {
+            /* A seccomp SIGSYS handler may resume an unexecuted syscall with
+             * an unexpected nonnegative return value.  Only the documented
+             * exact success value can authorize bytes from fdinfo. */
+            saved_errno = filesystem_result < 0 && errno ? errno : EIO;
+            close(info_fd);
+            errno = saved_errno;
+            return -1;
+        }
+        if ((unsigned long)filesystem.f_type !=
+            (unsigned long)PROC_SUPER_MAGIC) {
+            saved_errno = ENODEV;
+            close(info_fd);
+            errno = saved_errno;
+            return -1;
+        }
+    }
     stream = fdopen(info_fd, "r");
     if (!stream) {
         saved_errno = errno;
@@ -158,23 +190,181 @@ out:
     return result;
 }
 
-static int fd_mount_id(int fd, uint64_t *mount_id)
-{
-#if defined(SYS_statx) && defined(STATX_MNT_ID) && defined(AT_EMPTY_PATH)
-    struct statx mount_st;
+enum contained_filesystem_probe_kind {
+    CONTAINED_FS_MOUNT_STATX_SAME = 1,
+    CONTAINED_FS_MOUNT_FDINFO_SAME = 2,
+    CONTAINED_FS_EXECUTION = 3
+};
 
-    memset(&mount_st, 0, sizeof(mount_st));
-    if (syscall(SYS_statx, fd, "", AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW,
-                STATX_MNT_ID, &mount_st) == 0 &&
-        (mount_st.stx_mask & STATX_MNT_ID) != 0) {
-        *mount_id = mount_st.stx_mnt_id;
-        return 0;
-    }
+#define CONTAINED_FS_WAIT_CLONE UINT32_C(0x80000000)
+
+enum contained_filesystem_probe_outcome {
+    /* Avoid zero so an unmodified wait status can never authorize a probe. */
+    CONTAINED_FS_PROBE_TRUE = 64,
+    CONTAINED_FS_PROBE_FALSE = 65,
+    CONTAINED_FS_PROBE_UNKNOWN = 66
+};
+
+static void contained_filesystem_probe_child(
+    enum contained_filesystem_probe_kind kind, int first_fd, int second_fd)
+    __attribute__((noreturn));
+static void contained_filesystem_probe_child(
+    enum contained_filesystem_probe_kind kind, int first_fd, int second_fd)
+{
+    enum contained_filesystem_probe_outcome outcome =
+        CONTAINED_FS_PROBE_UNKNOWN;
+
+    switch (kind) {
+    case CONTAINED_FS_MOUNT_STATX_SAME:
+#if defined(SYS_statx) && defined(STATX_MNT_ID) && defined(AT_EMPTY_PATH)
+        {
+            struct statx first_status;
+            struct statx second_status;
+            long first_result;
+            long second_result;
+
+            memset(&first_status, 0, sizeof(first_status));
+            memset(&second_status, 0, sizeof(second_status));
+            first_result = syscall(
+                SYS_statx, first_fd, "",
+                AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW,
+                STATX_MNT_ID, &first_status);
+            second_result = syscall(
+                SYS_statx, second_fd, "",
+                AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW,
+                STATX_MNT_ID, &second_status);
+            if (first_result == 0 && second_result == 0 &&
+                (first_status.stx_mask & STATX_MNT_ID) != 0 &&
+                (second_status.stx_mask & STATX_MNT_ID) != 0)
+                outcome = first_status.stx_mnt_id ==
+                              second_status.stx_mnt_id
+                    ? CONTAINED_FS_PROBE_TRUE
+                    : CONTAINED_FS_PROBE_FALSE;
+        }
 #endif
-    /* Linux exposed mount IDs through /proc/self/fdinfo before statx grew
-     * STATX_MNT_ID.  Keep cleanup mount-bounded on older kernels, older libc
-     * headers, and seccomp profiles that reject statx. */
-    return fdinfo_mount_id(fd, mount_id);
+        break;
+    case CONTAINED_FS_MOUNT_FDINFO_SAME:
+        {
+            uint64_t first_mount;
+            uint64_t second_mount;
+
+            if (authenticated_fdinfo_mount_id(
+                    first_fd, &first_mount) == 0 &&
+                authenticated_fdinfo_mount_id(
+                    second_fd, &second_mount) == 0)
+                outcome = first_mount == second_mount
+                    ? CONTAINED_FS_PROBE_TRUE
+                    : CONTAINED_FS_PROBE_FALSE;
+        }
+        break;
+    case CONTAINED_FS_EXECUTION:
+#ifdef ST_NOEXEC
+        {
+            struct statfs filesystem;
+            int filesystem_result;
+
+            /* Avoid fstatvfs wrappers which may collapse an unexpected
+             * positive fstatfs result into success after a handled SIGSYS.
+             * Linux exposes the same ST_* mount flags in statfs.f_flags. */
+            memset(&filesystem, 0, sizeof(filesystem));
+            filesystem_result = fstatfs(first_fd, &filesystem);
+            if (filesystem_result == 0)
+                outcome = (filesystem.f_flags & ST_NOEXEC) == 0
+                    ? CONTAINED_FS_PROBE_TRUE
+                    : CONTAINED_FS_PROBE_FALSE;
+        }
+#endif
+        break;
+    default:
+        break;
+    }
+    _exit((int)outcome);
+}
+
+/* Optional filesystem interfaces are particularly likely to be absent from
+ * old seccomp allowlists, some of which use SECCOMP_RET_KILL or TRAP instead
+ * of returning an error.  Execute each probe in an exit-signal-zero clone:
+ * it is COW-isolated, generates no SIGCHLD, and is reaped explicitly with
+ * __WCLONE.  Thus the inherited SIGCHLD action and the complete signal mask
+ * remain byte-for-byte untouched in both parent and child.
+ *
+ * A missing or malformed exit status is simply "unknown" to the caller.
+ * Comparisons happen wholly inside the child, so containment adds no pipe,
+ * socket, shared-memory, or descriptor-lifecycle dependency to extraction. */
+static int contained_filesystem_probe(
+    enum contained_filesystem_probe_kind kind, int first_fd, int second_fd)
+{
+    int child_status = -1;
+    int saved_errno = EIO;
+    long child;
+    long waited;
+
+    if (first_fd < 0 ||
+        (kind != CONTAINED_FS_EXECUTION && second_fd < 0)) {
+        errno = EINVAL;
+        return -1;
+    }
+
+#ifdef SYS_clone
+    child = syscall(SYS_clone, 0, 0, 0, 0, 0);
+#else
+    child = -1;
+    errno = ENOSYS;
+#endif
+    if (child < 0) {
+        if (errno)
+            saved_errno = errno;
+        errno = saved_errno;
+        return -1;
+    }
+    if (child == 0)
+        contained_filesystem_probe_child(kind, first_fd, second_fd);
+
+    do {
+        waited = syscall(SYS_wait4, child, &child_status,
+                         (int)CONTAINED_FS_WAIT_CLONE, NULL);
+    } while (waited < 0 && errno == EINTR);
+    if (waited != child) {
+        if (waited < 0)
+            saved_errno = errno;
+        errno = saved_errno;
+        return -1;
+    }
+    if (!WIFEXITED(child_status)) {
+        errno = EIO;
+        return -1;
+    }
+    switch (WEXITSTATUS(child_status)) {
+    case CONTAINED_FS_PROBE_TRUE:
+        return 1;
+    case CONTAINED_FS_PROBE_FALSE:
+        return 0;
+    default:
+        errno = ENOTSUP;
+        return -1;
+    }
+}
+
+static int directory_fds_are_on_same_mount(int first_fd, int second_fd)
+{
+    /* statx is direct kernel evidence.  Authenticated procfs fdinfo covers
+     * older kernels and sysroots.  Each potentially filtered interface gets
+     * its own disposable child so a fatal denial of the first does not
+     * prevent the independent fallback from being attempted. */
+    int same = contained_filesystem_probe(
+        CONTAINED_FS_MOUNT_STATX_SAME, first_fd, second_fd);
+
+    if (same >= 0)
+        return same;
+    return contained_filesystem_probe(
+        CONTAINED_FS_MOUNT_FDINFO_SAME, first_fd, second_fd);
+}
+
+/* Returns one for executable, zero for a proven noexec mount, and -1 when
+ * the optional query is unavailable or its disposable child was killed. */
+static int directory_execution_support(int fd)
+{
+    return contained_filesystem_probe(CONTAINED_FS_EXECUTION, fd, -1);
 }
 
 #if defined(NSIG)
@@ -251,77 +441,444 @@ static int signal_should_forward(int sig)
 static struct sigaction g_fault_forward_action;
 
 /* ---- tmpdir selection -------------------------------------------- */
+static int mkdirat_with_exact_mode(int dirfd, const char *name, mode_t mode);
+
+#define WORKDIR_CREATE_ATTEMPTS 128U
+#define WORKDIR_RANDOM_BYTES 16U
+
+static int read_exact_fd(int fd, void *buffer, size_t size)
+{
+    unsigned char *bytes = buffer;
+    size_t consumed = 0;
+
+    while (consumed < size) {
+        ssize_t count = read(fd, bytes + consumed, size - consumed);
+
+        if (count > 0) {
+            consumed += (size_t)count;
+            continue;
+        }
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (count == 0)
+            errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
+/* Random names limit collision-based denial of service; mkdirat() is the
+ * operation that establishes ownership atomically, and an existing name is
+ * never opened.  Keep a process-local fallback for old kernels, seccomp, and
+ * chroots without /dev/urandom. */
+static void workdir_random_bytes(unsigned char bytes[WORKDIR_RANDOM_BYTES])
+{
+    /* Prefer the established device interface.  Avoid an optional raw
+     * getrandom probe: inherited seccomp filters may kill unknown syscalls
+     * instead of returning ENOSYS/EPERM. */
+    {
+        int random_fd = open("/dev/urandom",
+                             O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+
+        if (random_fd >= 0) {
+            struct stat status;
+
+            if (fstat(random_fd, &status) == 0 &&
+                S_ISCHR(status.st_mode) && major(status.st_rdev) == 1 &&
+                minor(status.st_rdev) == 9 &&
+                read_exact_fd(random_fd, bytes, WORKDIR_RANDOM_BYTES) == 0) {
+                close(random_fd);
+                return;
+            }
+            close(random_fd);
+        }
+    }
+
+    {
+        uint64_t process = (uint64_t)(unsigned long)getpid();
+        uint64_t first = (process << 32) ^ process ^
+            UINT64_C(0x9e3779b97f4a7c15);
+        uint64_t second = (first << 29) | (first >> 35);
+
+        /* Predictability is harmless here: mkdirat() establishes ownership
+         * atomically.  Do not expose a live pointer in the directory name
+         * merely to make this collision-only fallback look random. */
+        second ^= UINT64_C(0xd1b54a32d192ed03);
+        memcpy(bytes, &first, sizeof(first));
+        memcpy(bytes + sizeof(first), &second, sizeof(second));
+    }
+}
+
+static int workdir_path_component_is_trusted(const struct stat *status)
+{
+    uid_t effective_uid = geteuid();
+
+    if (!status || !S_ISDIR(status->st_mode)) {
+        errno = ENOTDIR;
+        return 0;
+    }
+    /* A directory owner can replace an immediate child even when the sticky
+     * bit excludes other writers.  Every controller of the absolute path
+     * handed to ld.so must therefore be either root or this effective user. */
+    if (status->st_uid != 0 && status->st_uid != effective_uid) {
+        errno = EACCES;
+        return 0;
+    }
+    if ((status->st_mode & (S_IWGRP | S_IWOTH)) != 0 &&
+        (status->st_mode & S_ISVTX) == 0) {
+        errno = EACCES;
+        return 0;
+    }
+    return 1;
+}
+
+static int loader_search_path_is_literal(const char *path)
+{
+    /* glibc accepts both ':' and ';' as list separators and expands dynamic
+     * string tokens beginning with '$'.  Other supported loaders accept at
+     * least the colon form.  There is no portable escaping syntax here. */
+    if (!path || strpbrk(path, ":;$") != NULL) {
+        errno = EINVAL;
+        return 0;
+    }
+    return 1;
+}
+
+static void format_workdir_name(
+    char name[sizeof("dlfreeze.") - 1 + WORKDIR_RANDOM_BYTES * 2 + 1],
+    const unsigned char random_bytes[WORKDIR_RANDOM_BYTES], unsigned attempt)
+{
+    static const char prefix[] = "dlfreeze.";
+    static const char hex[] = "0123456789abcdef";
+    unsigned char varied[WORKDIR_RANDOM_BYTES];
+    size_t offset = sizeof(prefix) - 1;
+
+    memcpy(varied, random_bytes, sizeof(varied));
+    for (size_t i = 0; i < sizeof(attempt); i++)
+        varied[sizeof(varied) - 1 - i] ^=
+            (unsigned char)(attempt >> (i * CHAR_BIT));
+    memcpy(name, prefix, sizeof(prefix) - 1);
+    for (size_t i = 0; i < sizeof(varied); i++) {
+        name[offset++] = hex[varied[i] >> 4];
+        name[offset++] = hex[varied[i] & 0x0f];
+    }
+    name[offset] = '\0';
+}
+
+/* Resolve TMPDIR once, then reopen every component relative to an already
+ * bound descriptor.  A TMPDIR symlink is accepted by recording its canonical
+ * target, but no symlink is trusted while that canonical target is opened. */
+static int open_canonical_directory(const char *candidate, char *canonical,
+                                    size_t canonical_size,
+                                    struct stat *status_out)
+{
+    char resolved[PATH_MAX];
+    char component[NAME_MAX + 1];
+    const char *cursor;
+    size_t resolved_length;
+    int current_fd;
+
+    if (!candidate || candidate[0] != '/') {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!realpath(candidate, resolved))
+        return -1;
+    resolved_length = strlen(resolved);
+    if (resolved_length == 0 || resolved[0] != '/' ||
+        resolved_length >= canonical_size) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    if (!loader_search_path_is_literal(resolved))
+        return -1;
+
+    current_fd = open("/", O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (current_fd < 0)
+        return -1;
+    {
+        struct stat root_status;
+
+        if (fstat(current_fd, &root_status) < 0 ||
+            !workdir_path_component_is_trusted(&root_status)) {
+            int saved_errno = errno;
+
+            close(current_fd);
+            errno = saved_errno;
+            return -1;
+        }
+    }
+    cursor = resolved + 1;
+    while (*cursor) {
+        const char *end = strchr(cursor, '/');
+        size_t length = end ? (size_t)(end - cursor) : strlen(cursor);
+        struct stat next_status;
+        int next_fd;
+
+        if (length == 0 || length > NAME_MAX) {
+            close(current_fd);
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        memcpy(component, cursor, length);
+        component[length] = '\0';
+        next_fd = openat(current_fd, component,
+                         O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        if (next_fd < 0) {
+            int saved_errno = errno;
+
+            close(current_fd);
+            errno = saved_errno;
+            return -1;
+        }
+        if (fstat(next_fd, &next_status) < 0 ||
+            !workdir_path_component_is_trusted(&next_status)) {
+            int saved_errno = errno;
+
+            close(next_fd);
+            close(current_fd);
+            errno = saved_errno;
+            return -1;
+        }
+        close(current_fd);
+        current_fd = next_fd;
+        cursor = end ? end + 1 : cursor + length;
+    }
+
+    {
+        struct stat opened;
+        struct stat path_status;
+
+        if (fstat(current_fd, &opened) < 0 ||
+            fstatat(AT_FDCWD, resolved, &path_status,
+                    AT_SYMLINK_NOFOLLOW) < 0) {
+            int saved_errno = errno;
+
+            close(current_fd);
+            errno = saved_errno;
+            return -1;
+        }
+        if (!workdir_path_component_is_trusted(&opened) ||
+            !workdir_path_component_is_trusted(&path_status)) {
+            int saved_errno = errno;
+
+            close(current_fd);
+            errno = saved_errno;
+            return -1;
+        }
+        if (opened.st_dev != path_status.st_dev ||
+            opened.st_ino != path_status.st_ino) {
+            close(current_fd);
+            errno = ESTALE;
+            return -1;
+        }
+        *status_out = opened;
+    }
+    memcpy(canonical, resolved, resolved_length + 1);
+    return current_fd;
+}
+
+static int directory_fds_are_same_instance(int first_fd, int second_fd)
+{
+    struct stat first_status;
+    struct stat second_status;
+    int same_mount;
+
+    if (fstat(first_fd, &first_status) < 0 ||
+        fstat(second_fd, &second_status) < 0)
+        return 0;
+    if (!S_ISDIR(first_status.st_mode) ||
+        !S_ISDIR(second_status.st_mode) ||
+        first_status.st_dev != second_status.st_dev ||
+        first_status.st_ino != second_status.st_ino) {
+        errno = ESTALE;
+        return 0;
+    }
+    same_mount = directory_fds_are_on_same_mount(first_fd, second_fd);
+    if (same_mount == 0) {
+        errno = ESTALE;
+        return 0;
+    }
+    return 1;
+}
+
+static void remove_created_workdir(int parent_fd, const char *name,
+                                   int workdir_fd, int identity_valid,
+                                   dev_t device, ino_t inode)
+{
+    struct stat current;
+
+    if (workdir_fd >= 0)
+        close(workdir_fd);
+    if (identity_valid &&
+        fstatat(parent_fd, name, &current, AT_SYMLINK_NOFOLLOW) == 0 &&
+        S_ISDIR(current.st_mode) && current.st_dev == device &&
+        current.st_ino == inode)
+        (void)unlinkat(parent_fd, name, AT_REMOVEDIR);
+}
+
+static int make_workdir_in(const char *candidate, char *out, size_t out_sz)
+{
+    unsigned char random_bytes[WORKDIR_RANDOM_BYTES];
+    char canonical[PATH_MAX];
+    char name[sizeof("dlfreeze.") - 1 + WORKDIR_RANDOM_BYTES * 2 + 1];
+    struct stat parent_status;
+    struct stat created_status;
+    struct stat opened_status;
+    int parent_fd;
+    int workdir_fd = -1;
+    int parent_alias_fd = -1;
+    int workdir_alias_fd = -1;
+    int created_identity_valid = 0;
+    int n;
+
+    parent_fd = open_canonical_directory(candidate, canonical,
+                                         sizeof(canonical), &parent_status);
+    if (parent_fd < 0)
+        return -1;
+    {
+        int execution_support = directory_execution_support(parent_fd);
+
+        if (execution_support == 0) {
+            int saved_errno = EACCES;
+
+            close(parent_fd);
+            errno = saved_errno;
+            return -1;
+        }
+    }
+    workdir_random_bytes(random_bytes);
+    for (unsigned attempt = 0; attempt < WORKDIR_CREATE_ATTEMPTS; attempt++) {
+        format_workdir_name(name, random_bytes, attempt);
+        if (mkdirat_with_exact_mode(parent_fd, name, 0700) == 0)
+            goto created;
+        if (errno != EEXIST) {
+            int saved_errno = errno;
+
+            close(parent_fd);
+            errno = saved_errno;
+            return -1;
+        }
+    }
+    close(parent_fd);
+    errno = EEXIST;
+    return -1;
+
+created:
+    memset(&created_status, 0, sizeof(created_status));
+    if (fstatat(parent_fd, name, &created_status,
+                AT_SYMLINK_NOFOLLOW) < 0)
+        goto fail_created;
+    if (!S_ISDIR(created_status.st_mode)) {
+        errno = ESTALE;
+        goto fail_created;
+    }
+    created_identity_valid = 1;
+    workdir_fd = openat(parent_fd, name,
+                        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (workdir_fd < 0 || fstat(workdir_fd, &opened_status) < 0)
+        goto fail_created;
+    if (!S_ISDIR(opened_status.st_mode) ||
+        opened_status.st_dev != created_status.st_dev ||
+        opened_status.st_ino != created_status.st_ino) {
+        errno = ESTALE;
+        goto fail_created;
+    }
+    {
+        int chmod_result;
+
+        do {
+            chmod_result = fchmod(workdir_fd, 0700);
+        } while (chmod_result < 0 && errno == EINTR);
+        if (chmod_result < 0)
+            goto fail_created;
+    }
+    if (fstat(workdir_fd, &opened_status) < 0 ||
+        (opened_status.st_mode & 07777) != 0700)
+        goto fail_created;
+    {
+        int execution_support = directory_execution_support(workdir_fd);
+
+        if (execution_support == 0) {
+            errno = EACCES;
+            goto fail_created;
+        }
+    }
+
+    n = snprintf(out, out_sz, "%s%s%s", canonical,
+                 strcmp(canonical, "/") == 0 ? "" : "/", name);
+    if (n < 0 || (size_t)n >= out_sz) {
+        errno = ENAMETOOLONG;
+        goto fail_created;
+    }
+
+    /* Extraction and cleanup use descriptors, but ld.so and execve require
+     * absolute paths.  Reopen both complete aliases and compare mount
+     * instances as well as inode identities before admitting those paths. */
+    parent_alias_fd = open(canonical,
+                           O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    workdir_alias_fd = open(out,
+                            O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (parent_alias_fd < 0 || workdir_alias_fd < 0 ||
+        !directory_fds_are_same_instance(parent_fd, parent_alias_fd) ||
+        !directory_fds_are_same_instance(workdir_fd, workdir_alias_fd))
+        goto fail_created;
+    close(parent_alias_fd);
+    parent_alias_fd = -1;
+    close(workdir_alias_fd);
+    workdir_alias_fd = -1;
+
+    g_tmp_parent_fd = parent_fd;
+    g_tmpdir_fd = workdir_fd;
+    g_tmpdir_dev = opened_status.st_dev;
+    g_tmpdir_ino = opened_status.st_ino;
+    return 0;
+
+fail_created:
+    {
+        int saved_errno = errno ? errno : EIO;
+        dev_t device = created_status.st_dev;
+        ino_t inode = created_status.st_ino;
+
+        if (parent_alias_fd >= 0)
+            close(parent_alias_fd);
+        if (workdir_alias_fd >= 0)
+            close(workdir_alias_fd);
+        if (workdir_fd >= 0) {
+            struct stat trusted;
+
+            if (fstat(workdir_fd, &trusted) == 0) {
+                device = trusted.st_dev;
+                inode = trusted.st_ino;
+                created_identity_valid = 1;
+            }
+        }
+        remove_created_workdir(parent_fd, name, workdir_fd,
+                               created_identity_valid, device, inode);
+        close(parent_fd);
+        errno = saved_errno;
+        return -1;
+    }
+}
+
 static int make_workdir(char *out, size_t out_sz)
 {
-    static const char tmp_prefix[] = "/tmp/";
-    const char *name;
-    struct stat path_st;
-    mode_t old_umask;
-    int n;
+    const char *tmpdir = NULL;
 
     if (g_tmpdir_fd >= 0 || g_tmp_parent_fd >= 0) {
         errno = EBUSY;
         return -1;
     }
-    g_tmp_parent_fd = open("/tmp", O_RDONLY | O_DIRECTORY | O_CLOEXEC |
-                                   O_NOFOLLOW);
-    if (g_tmp_parent_fd < 0)
-        return -1;
+    if (!g_bootstrap_secure_mode)
+        tmpdir = getenv("TMPDIR");
+    if (tmpdir && tmpdir[0] == '/' &&
+        make_workdir_in(tmpdir, out, out_sz) == 0)
+        return 0;
 
-    n = snprintf(out, out_sz, "/tmp/dlfreeze.XXXXXX");
-    if (n < 0 || (size_t)n >= out_sz) {
-        close(g_tmp_parent_fd);
-        g_tmp_parent_fd = -1;
-        errno = ENAMETOOLONG;
-        return -1;
-    }
-    /* mkdtemp applies the process umask to its requested 0700 mode.  A caller
-     * is allowed to have a maximally restrictive umask, but that must not make
-     * the bootstrap unable to reopen its own extraction root. */
-    old_umask = umask(0077);
-    char *created = mkdtemp(out);
-    int mkdtemp_errno = errno;
-    umask(old_umask);
-    if (!created) {
-        close(g_tmp_parent_fd);
-        g_tmp_parent_fd = -1;
-        errno = mkdtemp_errno;
-        return -1;
-    }
-
-    name = out;
-    if (strncmp(name, tmp_prefix, sizeof(tmp_prefix) - 1) == 0)
-        name += sizeof(tmp_prefix) - 1;
-    g_tmpdir_fd = openat(g_tmp_parent_fd, name,
-                         O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (g_tmpdir_fd < 0 || fstat(g_tmpdir_fd, &path_st) < 0) {
-        int saved_errno = errno;
-
-        if (g_tmpdir_fd >= 0)
-            close(g_tmpdir_fd);
-        g_tmpdir_fd = -1;
-        (void)unlinkat(g_tmp_parent_fd, name, AT_REMOVEDIR);
-        close(g_tmp_parent_fd);
-        g_tmp_parent_fd = -1;
-        errno = saved_errno;
-        return -1;
-    }
-    if (!S_ISDIR(path_st.st_mode)) {
-        close(g_tmpdir_fd);
-        g_tmpdir_fd = -1;
-        (void)unlinkat(g_tmp_parent_fd, name, AT_REMOVEDIR);
-        close(g_tmp_parent_fd);
-        g_tmp_parent_fd = -1;
-        errno = ENOTDIR;
-        return -1;
-    }
-    g_tmpdir_dev = path_st.st_dev;
-    g_tmpdir_ino = path_st.st_ino;
-    g_tmpdir_mount_id_valid =
-        fd_mount_id(g_tmpdir_fd, &g_tmpdir_mount_id) == 0;
-    if (!g_tmpdir_mount_id_valid)
-        g_tmpdir_mount_id = 0;
-    return 0;
+    /* TMPDIR is a preference, not a reason to fail an otherwise-runnable
+     * artifact.  /tmp receives exactly the same admission checks. */
+    return make_workdir_in("/tmp", out, out_sz);
 }
 
 static int mkdirat_with_exact_mode(int dirfd, const char *name, mode_t mode)
@@ -628,10 +1185,8 @@ static int same_file_identity(const struct stat *st, dev_t dev, ino_t ino)
 
 static int directory_is_on_workdir_mount(int fd)
 {
-    uint64_t mount_id;
-
-    return g_tmpdir_mount_id_valid && fd_mount_id(fd, &mount_id) == 0 &&
-           mount_id == g_tmpdir_mount_id;
+    return g_tmpdir_fd >= 0 &&
+           directory_fds_are_on_same_mount(g_tmpdir_fd, fd) == 1;
 }
 
 #define CLEANUP_INITIAL_DEPTH 16
@@ -785,8 +1340,6 @@ static void cleanup_workdir(void)
         close(g_tmp_parent_fd);
         g_tmp_parent_fd = -1;
     }
-    g_tmpdir_mount_id = 0;
-    g_tmpdir_mount_id_valid = 0;
 }
 
 /* ---- extract one embedded blob to a file ------------------------- */
@@ -1666,72 +2219,931 @@ static int embedded_address_aligned(const void *base, uint64_t base_foff,
     return (address + (uintptr_t)relative) % alignment == 0;
 }
 
-static int mapped_range_is_readable(uint64_t start_value, uint64_t size_value)
+#define BS_MAX_INITIAL_ENV_ENTRIES (1U << 20)
+#define BS_MAX_AUXV_ENTRIES 256U
+#define BS_MAX_MAPS_LINE 8192U
+#define BS_MAX_MAPS_ENTRIES 131072U
+#define BS_MAX_SMAPS_LINES (BS_MAX_MAPS_ENTRIES * 64ULL)
+
+struct bs_live_phdr_table {
+    const unsigned char *bytes;
+    uintptr_t live_address;
+    size_t count;
+    size_t entsize;
+};
+
+static int bs_live_phdr_table_from_env(
+    char **envp, struct bs_live_phdr_table *table)
 {
-    extern char **environ;
-    Elf64_auxv_t *auxv;
+    const unsigned char required = 1U | 2U | 4U;
+    unsigned char seen = 0;
+    size_t env_count;
     uintptr_t phdr_address = 0;
     size_t phdr_count = 0;
     size_t phdr_size = 0;
-    uintptr_t load_bias = 0;
-    uint64_t end_value;
+    int terminated = 0;
 
-    if (start_value > UINTPTR_MAX || size_value == 0 ||
-        size_value > UINT64_MAX - start_value)
+    if (!envp || !table)
         return 0;
-    end_value = start_value + size_value;
-
-    /* The kernel supplies the main executable's live program-header table on
-     * the initial stack.  It is a stronger validation source than procfs and
-     * remains available in mount namespaces/chroots without /proc. */
-    char **env = environ;
-    while (env && *env)
-        env++;
-    if (!env)
-        return 0;
-    auxv = (Elf64_auxv_t *)(env + 1);
-    for (; auxv->a_type != AT_NULL; auxv++) {
-        if (auxv->a_type == AT_PHDR)
-            phdr_address = (uintptr_t)auxv->a_un.a_val;
-        else if (auxv->a_type == AT_PHNUM)
-            phdr_count = (size_t)auxv->a_un.a_val;
-        else if (auxv->a_type == AT_PHENT)
-            phdr_size = (size_t)auxv->a_un.a_val;
+    memset(table, 0, sizeof(*table));
+    for (env_count = 0; env_count < BS_MAX_INITIAL_ENV_ENTRIES;
+         env_count++) {
+        if (!envp[env_count])
+            break;
     }
-    if (!phdr_address || phdr_count == 0 || phdr_count > UINT16_MAX ||
+    if (env_count == BS_MAX_INITIAL_ENV_ENTRIES)
+        return 0;
+
+    const unsigned char *auxv_bytes =
+        (const unsigned char *)(envp + env_count + 1);
+    for (size_t i = 0; i < BS_MAX_AUXV_ENTRIES; i++) {
+        Elf64_auxv_t entry;
+
+        memcpy(&entry, auxv_bytes + i * sizeof(entry), sizeof(entry));
+        if (entry.a_type == AT_NULL) {
+            terminated = 1;
+            break;
+        }
+        if (entry.a_type == AT_PHDR) {
+            if (seen & 1U || entry.a_un.a_val > UINTPTR_MAX)
+                return 0;
+            phdr_address = (uintptr_t)entry.a_un.a_val;
+            seen |= 1U;
+        } else if (entry.a_type == AT_PHNUM) {
+            if (seen & 2U || entry.a_un.a_val > SIZE_MAX)
+                return 0;
+            phdr_count = (size_t)entry.a_un.a_val;
+            seen |= 2U;
+        } else if (entry.a_type == AT_PHENT) {
+            if (seen & 4U || entry.a_un.a_val > SIZE_MAX)
+                return 0;
+            phdr_size = (size_t)entry.a_un.a_val;
+            seen |= 4U;
+        }
+    }
+    if (!terminated || seen != required || !phdr_address ||
+        phdr_count == 0 || phdr_count > UINT16_MAX ||
         phdr_size != sizeof(Elf64_Phdr) ||
         phdr_count > (UINTPTR_MAX - phdr_address) / phdr_size)
         return 0;
 
-    const Elf64_Phdr *phdr = (const Elf64_Phdr *)phdr_address;
-    for (size_t i = 0; i < phdr_count; i++) {
-        if (phdr[i].p_type == PT_PHDR &&
-            phdr_address >= phdr[i].p_vaddr) {
-            load_bias = phdr_address - (uintptr_t)phdr[i].p_vaddr;
-            break;
+    table->bytes = (const unsigned char *)phdr_address;
+    table->live_address = phdr_address;
+    table->count = phdr_count;
+    table->entsize = phdr_size;
+    return 1;
+}
+
+static int bs_live_phdr_read(const struct bs_live_phdr_table *table,
+                             size_t index, Elf64_Phdr *phdr)
+{
+    size_t offset;
+    uintptr_t bytes_address;
+
+    if (!table || !phdr || !table->bytes ||
+        table->entsize != sizeof(*phdr) || table->count == 0 ||
+        table->count > UINT16_MAX || index >= table->count ||
+        index > SIZE_MAX / table->entsize)
+        return 0;
+    bytes_address = (uintptr_t)table->bytes;
+    if (table->count >
+            (UINTPTR_MAX - bytes_address) / table->entsize)
+        return 0;
+    offset = index * table->entsize;
+    memcpy(phdr, table->bytes + offset, sizeof(*phdr));
+    return 1;
+}
+
+static int bs_live_phdr_table_size(const struct bs_live_phdr_table *table,
+                                   uint64_t *size_out)
+{
+    if (!table || !size_out || !table->bytes || table->count == 0 ||
+        table->count > UINT16_MAX ||
+        table->entsize != sizeof(Elf64_Phdr) ||
+        table->count > UINT64_MAX / table->entsize)
+        return 0;
+    *size_out = (uint64_t)table->count * table->entsize;
+    return *size_out != 0;
+}
+
+static int bs_load_geometry_valid(const Elf64_Phdr *load)
+{
+    uint64_t alignment;
+
+    if (!load || load->p_type != PT_LOAD ||
+        load->p_filesz > load->p_memsz ||
+        load->p_filesz > UINT64_MAX - load->p_offset ||
+        load->p_memsz > UINT64_MAX - load->p_vaddr)
+        return 0;
+    alignment = load->p_align;
+    if (alignment > 1) {
+        if ((alignment & (alignment - 1)) != 0 ||
+            (load->p_vaddr & (alignment - 1)) !=
+                (load->p_offset & (alignment - 1)))
+            return 0;
+    }
+    return 1;
+}
+
+static int bs_range_within_load_file(const Elf64_Phdr *load,
+                                     uint64_t file_offset,
+                                     uint64_t virtual_address,
+                                     uint64_t size)
+{
+    uint64_t file_delta;
+    uint64_t virtual_delta;
+
+    if (!load || load->p_type != PT_LOAD || !(load->p_flags & PF_R) ||
+        !bs_load_geometry_valid(load) ||
+        file_offset < load->p_offset ||
+        virtual_address < load->p_vaddr)
+        return 0;
+    file_delta = file_offset - load->p_offset;
+    virtual_delta = virtual_address - load->p_vaddr;
+    return file_delta == virtual_delta &&
+           file_delta <= load->p_filesz &&
+           size <= load->p_filesz - file_delta;
+}
+
+static int bs_phdr_segment_geometry_valid(const Elf64_Phdr *phdr,
+                                          uint64_t table_size)
+{
+    uint64_t alignment;
+
+    if (!phdr || phdr->p_type != PT_PHDR || !(phdr->p_flags & PF_R) ||
+        phdr->p_filesz < table_size || phdr->p_memsz < table_size ||
+        phdr->p_filesz > phdr->p_memsz ||
+        phdr->p_filesz > UINT64_MAX - phdr->p_offset ||
+        phdr->p_memsz > UINT64_MAX - phdr->p_vaddr)
+        return 0;
+    alignment = phdr->p_align;
+    if (alignment > 1 &&
+        ((alignment & (alignment - 1)) != 0 ||
+         (phdr->p_vaddr & (alignment - 1)) !=
+             (phdr->p_offset & (alignment - 1))))
+        return 0;
+    return 1;
+}
+
+/* Derive one load bias and prove that the live AT_PHDR table itself has one
+ * readable file-backed PT_LOAD owner.  The mapped-payload compatibility path
+ * may subsequently use p_memsz, but it must not derive an address from an
+ * ambiguous or malformed PT_PHDR. */
+static int bs_live_phdr_load_bias(const struct bs_live_phdr_table *table,
+                                  uint64_t *load_bias_out)
+{
+    Elf64_Phdr phdr_segment;
+    uint64_t table_size;
+    uint64_t load_bias = 0;
+    size_t phdr_segment_count = 0;
+    size_t table_owner_count = 0;
+
+    if (!table || !load_bias_out ||
+        !bs_live_phdr_table_size(table, &table_size) ||
+        table_size > UINTPTR_MAX - table->live_address)
+        return 0;
+    memset(&phdr_segment, 0, sizeof(phdr_segment));
+    for (size_t i = 0; i < table->count; i++) {
+        Elf64_Phdr phdr;
+
+        if (!bs_live_phdr_read(table, i, &phdr))
+            return 0;
+        if (phdr.p_type == PT_LOAD && !bs_load_geometry_valid(&phdr))
+            return 0;
+        if (phdr.p_type == PT_PHDR) {
+            phdr_segment = phdr;
+            phdr_segment_count++;
         }
     }
+    if (phdr_segment_count > 1)
+        return 0;
+
+    if (phdr_segment_count == 1) {
+        if (!bs_phdr_segment_geometry_valid(&phdr_segment, table_size) ||
+            phdr_segment.p_vaddr > table->live_address)
+            return 0;
+        load_bias = (uint64_t)table->live_address - phdr_segment.p_vaddr;
+        if (phdr_segment.p_vaddr > UINT64_MAX - load_bias ||
+            phdr_segment.p_vaddr + load_bias != table->live_address)
+            return 0;
+
+        for (size_t i = 0; i < table->count; i++) {
+            Elf64_Phdr load;
+
+            if (!bs_live_phdr_read(table, i, &load))
+                return 0;
+            if (bs_range_within_load_file(
+                    &load, phdr_segment.p_offset,
+                    phdr_segment.p_vaddr, table_size))
+                table_owner_count++;
+        }
+    } else {
+        uint64_t table_address = (uint64_t)table->live_address;
+
+        /* Fixed-address executables commonly omit PT_PHDR.  Bias zero is
+         * proven only when the live table lies in one readable file extent. */
+        for (size_t i = 0; i < table->count; i++) {
+            Elf64_Phdr load;
+
+            if (!bs_live_phdr_read(table, i, &load))
+                return 0;
+            if (load.p_type != PT_LOAD || !(load.p_flags & PF_R) ||
+                table_address < load.p_vaddr)
+                continue;
+            uint64_t delta = table_address - load.p_vaddr;
+            if (delta <= load.p_filesz &&
+                table_size <= load.p_filesz - delta)
+                table_owner_count++;
+        }
+    }
+    if (table_owner_count != 1)
+        return 0;
+    *load_bias_out = load_bias;
+    return 1;
+}
+
+/* This is the compatibility predicate for using the live payload bytes as
+ * the authority.  It intentionally uses p_memsz: a decompressor may replace
+ * the original mappings yet still leave a valid, readable live payload. */
+static int bs_mapped_range_is_readable(
+    const struct bs_live_phdr_table *table,
+    uint64_t start_value, uint64_t size_value)
+{
+    uint64_t load_bias;
+    uint64_t end_value;
+
+    if (!table || start_value > UINTPTR_MAX || size_value == 0 ||
+        size_value > UINT64_MAX - start_value)
+        return 0;
+    end_value = start_value + size_value;
+    if (!bs_live_phdr_load_bias(table, &load_bias))
+        return 0;
 
     /* Fixed-address static executables need no bias and commonly omit
      * PT_PHDR.  Static PIEs provide PT_PHDR, allowing the same check after
      * relocation by the kernel. */
-    for (size_t i = 0; i < phdr_count; i++) {
+    for (size_t i = 0; i < table->count; i++) {
+        Elf64_Phdr phdr;
         uint64_t segment_start;
         uint64_t segment_end;
 
-        if (phdr[i].p_type != PT_LOAD || !(phdr[i].p_flags & PF_R) ||
-            phdr[i].p_memsz == 0)
+        if (!bs_live_phdr_read(table, i, &phdr))
+            return 0;
+        if (phdr.p_type != PT_LOAD || !(phdr.p_flags & PF_R) ||
+            phdr.p_memsz == 0 || !bs_load_geometry_valid(&phdr))
             continue;
-        if (phdr[i].p_vaddr > UINT64_MAX - load_bias ||
-            phdr[i].p_memsz >
-                UINT64_MAX - (phdr[i].p_vaddr + load_bias))
+        if (phdr.p_vaddr > UINT64_MAX - load_bias ||
+            phdr.p_memsz > UINT64_MAX - (phdr.p_vaddr + load_bias))
             continue;
-        segment_start = phdr[i].p_vaddr + load_bias;
-        segment_end = segment_start + phdr[i].p_memsz;
+        segment_start = phdr.p_vaddr + load_bias;
+        segment_end = segment_start + phdr.p_memsz;
         if (start_value >= segment_start && end_value <= segment_end)
             return 1;
     }
     return 0;
+}
+
+/* Prove that the live payload address is the exact translation of its file
+ * offset through one readable, file-backed PT_LOAD.  This predicate does not
+ * claim that the VMA still belongs to that file; /proc/self/smaps supplies the
+ * second half of that proof before the optional source fd is retained. */
+static int bs_mapped_payload_file_translation(
+    const struct bs_live_phdr_table *table,
+    uint64_t payload_vaddr, uint64_t payload_filesz,
+    uint64_t payload_foff)
+{
+    uint64_t load_bias;
+    size_t payload_owner_count = 0;
+
+    if (!table || payload_vaddr > UINTPTR_MAX || payload_filesz == 0 ||
+        payload_filesz > UINT64_MAX - payload_vaddr ||
+        payload_filesz > UINT64_MAX - payload_foff ||
+        !bs_live_phdr_load_bias(table, &load_bias))
+        return 0;
+
+    for (size_t i = 0; i < table->count; i++) {
+        Elf64_Phdr load;
+        uint64_t delta;
+        uint64_t expected_address;
+
+        if (!bs_live_phdr_read(table, i, &load))
+            return 0;
+        if (load.p_type != PT_LOAD || !(load.p_flags & PF_R) ||
+            payload_foff < load.p_offset)
+            continue;
+        delta = payload_foff - load.p_offset;
+        if (delta > load.p_filesz ||
+            payload_filesz > load.p_filesz - delta ||
+            load.p_vaddr > UINT64_MAX - load_bias ||
+            delta > UINT64_MAX - (load.p_vaddr + load_bias))
+            continue;
+        expected_address = load.p_vaddr + load_bias + delta;
+        if (payload_vaddr == expected_address)
+            payload_owner_count++;
+    }
+    return payload_owner_count == 1;
+}
+
+struct bs_maps_entry {
+    uint64_t start;
+    uint64_t end;
+    uint64_t file_offset;
+    uint64_t dev_major;
+    uint64_t dev_minor;
+    uint64_t inode;
+    int private_readonly;
+};
+
+static int bs_maps_space(unsigned char byte)
+{
+    return byte == ' ' || byte == '\t';
+}
+
+static int bs_maps_digit(unsigned char byte, unsigned base, unsigned *value)
+{
+    unsigned digit;
+
+    if (byte >= '0' && byte <= '9')
+        digit = (unsigned)(byte - '0');
+    else if (byte >= 'a' && byte <= 'f')
+        digit = (unsigned)(byte - 'a') + 10;
+    else if (byte >= 'A' && byte <= 'F')
+        digit = (unsigned)(byte - 'A') + 10;
+    else
+        return 0;
+    if (digit >= base)
+        return 0;
+    *value = digit;
+    return 1;
+}
+
+static int bs_maps_u64(const unsigned char **cursor,
+                       const unsigned char *end, unsigned base,
+                       uint64_t *value_out)
+{
+    const unsigned char *position = *cursor;
+    uint64_t value = 0;
+    size_t digits = 0;
+
+    while (position < end) {
+        unsigned digit;
+
+        if (!bs_maps_digit(*position, base, &digit))
+            break;
+        if (value > (UINT64_MAX - digit) / base)
+            return 0;
+        value = value * base + digit;
+        position++;
+        digits++;
+    }
+    if (digits == 0)
+        return 0;
+    *cursor = position;
+    *value_out = value;
+    return 1;
+}
+
+static int bs_maps_spaces(const unsigned char **cursor,
+                          const unsigned char *end)
+{
+    const unsigned char *position = *cursor;
+
+    if (position == end || !bs_maps_space(*position))
+        return 0;
+    while (position < end && bs_maps_space(*position))
+        position++;
+    *cursor = position;
+    return 1;
+}
+
+static int bs_parse_maps_entry(const unsigned char *line, size_t length,
+                               struct bs_maps_entry *entry)
+{
+    const unsigned char *cursor = line;
+    const unsigned char *end = line + length;
+
+    if (!line || !entry ||
+        !bs_maps_u64(&cursor, end, 16, &entry->start) ||
+        cursor == end || *cursor++ != '-' ||
+        !bs_maps_u64(&cursor, end, 16, &entry->end) ||
+        !bs_maps_spaces(&cursor, end) || end - cursor < 4)
+        return 0;
+    entry->private_readonly =
+        cursor[0] == 'r' && cursor[1] == '-' &&
+        cursor[2] == '-' && cursor[3] == 'p';
+    if ((cursor[0] != 'r' && cursor[0] != '-') ||
+        (cursor[1] != 'w' && cursor[1] != '-') ||
+        (cursor[2] != 'x' && cursor[2] != '-') ||
+        (cursor[3] != 'p' && cursor[3] != 's'))
+        return 0;
+    cursor += 4;
+    if (!bs_maps_spaces(&cursor, end) ||
+        !bs_maps_u64(&cursor, end, 16, &entry->file_offset) ||
+        !bs_maps_spaces(&cursor, end) ||
+        !bs_maps_u64(&cursor, end, 16, &entry->dev_major) ||
+        cursor == end || *cursor++ != ':' ||
+        !bs_maps_u64(&cursor, end, 16, &entry->dev_minor) ||
+        !bs_maps_spaces(&cursor, end) ||
+        !bs_maps_u64(&cursor, end, 10, &entry->inode))
+        return 0;
+    if (cursor != end && !bs_maps_spaces(&cursor, end))
+        return 0;
+    if (entry->start > UINTPTR_MAX || entry->end > UINTPTR_MAX ||
+        entry->start >= entry->end ||
+        entry->end - entry->start > UINT64_MAX - entry->file_offset)
+        return 0;
+    return 1;
+}
+
+/* Return 1 for a line, 0 for clean EOF, and -1 for malformed or oversized
+ * input.  Reading one byte at a time keeps a hostile synthetic stream from
+ * making getline allocate without a bound; procfs maps lines are small. */
+static int bs_read_maps_line(FILE *stream, unsigned char *line,
+                             size_t capacity, size_t *length_out)
+{
+    size_t length = 0;
+
+    if (!stream || !line || capacity == 0 || !length_out)
+        return -1;
+    for (;;) {
+        int byte = fgetc(stream);
+
+        if (byte == EOF) {
+            if (ferror(stream))
+                return -1;
+            if (length == 0)
+                return 0;
+            *length_out = length;
+            return 1;
+        }
+        if (byte == '\0' || length == capacity)
+            return -1;
+        if (byte == '\n') {
+            *length_out = length;
+            return 1;
+        }
+        line[length++] = (unsigned char)byte;
+    }
+}
+
+struct bs_smaps_evidence {
+    int have_header;
+    int relevant;
+    int have_anonymous;
+    int have_swap;
+    int have_vm_flags;
+    int userfaultfd;
+    uint64_t anonymous_kb;
+    uint64_t swap_kb;
+    struct bs_maps_entry entry;
+};
+
+static int bs_smaps_kb_field(const unsigned char *line, size_t length,
+                             const char *field, uint64_t *value_out)
+{
+    const unsigned char *cursor = line;
+    const unsigned char *end = line + length;
+    size_t field_length = strlen(field);
+    uint64_t value;
+
+    if (!line || !field || !value_out || field_length > length ||
+        memcmp(cursor, field, field_length) != 0)
+        return 0;
+    cursor += field_length;
+    if (!bs_maps_spaces(&cursor, end) ||
+        !bs_maps_u64(&cursor, end, 10, &value) ||
+        !bs_maps_spaces(&cursor, end) || end - cursor < 2 ||
+        cursor[0] != 'k' || cursor[1] != 'B')
+        return 0;
+    cursor += 2;
+    while (cursor < end && bs_maps_space(*cursor))
+        cursor++;
+    if (cursor != end)
+        return 0;
+    *value_out = value;
+    return 1;
+}
+
+static int bs_smaps_vm_flags(const unsigned char *line, size_t length,
+                             int *userfaultfd_out)
+{
+    static const char field[] = "VmFlags:";
+    static const char known[][2] = {
+        {'r','d'}, {'w','r'}, {'e','x'}, {'s','h'}, {'m','r'}, {'m','w'},
+        {'m','e'}, {'m','s'}, {'g','d'}, {'p','f'}, {'d','w'}, {'l','o'},
+        {'i','o'}, {'s','r'}, {'r','r'}, {'d','c'}, {'d','e'}, {'a','c'},
+        {'n','r'}, {'h','t'}, {'s','f'}, {'n','l'}, {'a','r'}, {'w','f'},
+        {'d','d'}, {'s','d'}, {'m','m'}, {'h','g'}, {'n','h'}, {'m','g'},
+        {'u','m'}, {'u','w'}, {'u','i'}, {'s','s'}, {'s','l'}, {'l','f'},
+        {'d','p'},
+    };
+    const unsigned char *cursor = line;
+    const unsigned char *end = line + length;
+    int saw_flag = 0;
+    int userfaultfd = 0;
+
+    if (!line || !userfaultfd_out || length < sizeof(field) - 1 ||
+        memcmp(cursor, field, sizeof(field) - 1) != 0)
+        return 0;
+    cursor += sizeof(field) - 1;
+    while (cursor < end) {
+        const unsigned char *token;
+
+        if (!bs_maps_spaces(&cursor, end))
+            return 0;
+        if (cursor == end)
+            break;
+        token = cursor;
+        while (cursor < end && !bs_maps_space(*cursor))
+            cursor++;
+        if (cursor - token != 2)
+            return 0;
+        size_t known_index;
+
+        for (known_index = 0;
+             known_index < sizeof(known) / sizeof(known[0]);
+             known_index++)
+            if (known[known_index][0] == token[0] &&
+                known[known_index][1] == token[1])
+                break;
+        if (known_index == sizeof(known) / sizeof(known[0]))
+            return 0;
+        if (token[0] == 'u' &&
+            (token[1] == 'm' || token[1] == 'w' || token[1] == 'i'))
+            userfaultfd = 1;
+        saw_flag = 1;
+    }
+    if (!saw_flag)
+        return 0;
+    *userfaultfd_out = userfaultfd;
+    return 1;
+}
+
+static int bs_smaps_finish_relevant(
+    const struct bs_smaps_evidence *evidence, uint64_t payload_end,
+    uint64_t *cursor)
+{
+    if (!evidence->relevant)
+        return 1;
+    if (!evidence->have_anonymous || !evidence->have_swap ||
+        !evidence->have_vm_flags || evidence->anonymous_kb != 0 ||
+        evidence->swap_kb != 0 || evidence->userfaultfd)
+        return 0;
+    *cursor = evidence->entry.end < payload_end
+        ? evidence->entry.end : payload_end;
+    return 1;
+}
+
+/* smaps supplies the fact that exact file identity alone cannot: no page in
+ * the live MAP_PRIVATE payload has been replaced by COW or swap state.  Every
+ * required field is positive evidence.  Older, restricted, or malformed
+ * procfs implementations simply decline the optional exact-source path. */
+static int bs_payload_smaps_stream_matches(
+    FILE *stream, const struct stat *executable,
+    uint64_t payload_vaddr, uint64_t payload_filesz,
+    uint64_t payload_foff)
+{
+    unsigned char line[BS_MAX_MAPS_LINE];
+    struct bs_smaps_evidence evidence = {0};
+    uint64_t payload_end;
+    uint64_t cursor;
+    uint64_t previous_end = 0;
+    int have_previous = 0;
+
+    if (!stream || !executable || executable->st_ino == 0 ||
+        payload_vaddr > UINTPTR_MAX || payload_filesz == 0 ||
+        !u64_add_checked(payload_vaddr, payload_filesz, &payload_end) ||
+        payload_end > UINTPTR_MAX ||
+        payload_filesz > UINT64_MAX - payload_foff)
+        return 0;
+    cursor = payload_vaddr;
+
+    for (uint64_t count = 0; count < BS_MAX_SMAPS_LINES; count++) {
+        struct bs_maps_entry entry;
+        size_t length;
+        int line_status = bs_read_maps_line(stream, line, sizeof(line),
+                                            &length);
+
+        if (line_status == 0) {
+            if (!bs_smaps_finish_relevant(&evidence, payload_end, &cursor))
+                return 0;
+            return cursor == payload_end;
+        }
+        if (line_status < 0)
+            return 0;
+
+        size_t header_prefix = 0;
+        unsigned ignored_digit;
+
+        while (header_prefix < length &&
+               bs_maps_digit(line[header_prefix], 16, &ignored_digit))
+            header_prefix++;
+        if (header_prefix != 0 && header_prefix < length &&
+            line[header_prefix] == '-') {
+            if (!bs_parse_maps_entry(line, length, &entry) ||
+                (have_previous && entry.start < previous_end) ||
+                !bs_smaps_finish_relevant(&evidence, payload_end, &cursor))
+                return 0;
+            if (cursor == payload_end)
+                return 1;
+            previous_end = entry.end;
+            have_previous = 1;
+            memset(&evidence, 0, sizeof(evidence));
+            evidence.have_header = 1;
+            evidence.entry = entry;
+
+            if (entry.end <= payload_vaddr || entry.start >= payload_end)
+                continue;
+            if (entry.start > cursor || !entry.private_readonly ||
+                entry.dev_major != (uint64_t)major(executable->st_dev) ||
+                entry.dev_minor != (uint64_t)minor(executable->st_dev) ||
+                entry.inode != (uint64_t)executable->st_ino)
+                return 0;
+
+            uint64_t map_delta = cursor - entry.start;
+            uint64_t payload_delta = cursor - payload_vaddr;
+            uint64_t map_file_offset;
+            uint64_t payload_file_offset;
+
+            if (!u64_add_checked(entry.file_offset, map_delta,
+                                 &map_file_offset) ||
+                !u64_add_checked(payload_foff, payload_delta,
+                                 &payload_file_offset) ||
+                map_file_offset != payload_file_offset)
+                return 0;
+            evidence.relevant = 1;
+            continue;
+        }
+
+        if (!evidence.have_header || !evidence.relevant)
+            continue;
+        if (length >= sizeof("Anonymous:") - 1 &&
+            memcmp(line, "Anonymous:", sizeof("Anonymous:") - 1) == 0) {
+            if (evidence.have_anonymous ||
+                !bs_smaps_kb_field(line, length, "Anonymous:",
+                                   &evidence.anonymous_kb))
+                return 0;
+            evidence.have_anonymous = 1;
+        } else if (length >= sizeof("Swap:") - 1 &&
+                   memcmp(line, "Swap:", sizeof("Swap:") - 1) == 0) {
+            if (evidence.have_swap ||
+                !bs_smaps_kb_field(line, length, "Swap:",
+                                   &evidence.swap_kb))
+                return 0;
+            evidence.have_swap = 1;
+        } else if (length >= sizeof("VmFlags:") - 1 &&
+                   memcmp(line, "VmFlags:", sizeof("VmFlags:") - 1) == 0) {
+            if (evidence.have_vm_flags ||
+                !bs_smaps_vm_flags(line, length, &evidence.userfaultfd))
+                return 0;
+            evidence.have_vm_flags = 1;
+        }
+    }
+    return 0;
+}
+
+struct bs_proc_self_context {
+    int root_fd;
+    int self_fd;
+    dev_t device;
+};
+
+static void bs_proc_self_context_close(struct bs_proc_self_context *context)
+{
+    if (!context)
+        return;
+    if (context->self_fd >= 0)
+        close(context->self_fd);
+    if (context->root_fd >= 0)
+        close(context->root_fd);
+    context->root_fd = -1;
+    context->self_fd = -1;
+    context->device = 0;
+}
+
+static int bs_fd_is_procfs(int fd)
+{
+    struct statfs filesystem;
+
+    return fd >= 0 && fstatfs(fd, &filesystem) == 0 &&
+           (unsigned long)filesystem.f_type ==
+               (unsigned long)PROC_SUPER_MAGIC;
+}
+
+static int bs_proc_entry_status(int fd, dev_t device, mode_t type,
+                                struct stat *status_out)
+{
+    struct stat status;
+
+    if (fd < 0 || fstat(fd, &status) < 0 ||
+        (status.st_mode & S_IFMT) != type || status.st_dev != device ||
+        !bs_fd_is_procfs(fd))
+        return 0;
+    if (status_out)
+        *status_out = status;
+    return 1;
+}
+
+static int bs_proc_pid_component(const char *component, size_t length)
+{
+    if (!component || length == 0 || component[0] == '0')
+        return 0;
+    for (size_t i = 0; i < length; i++)
+        if (component[i] < '0' || component[i] > '9')
+            return 0;
+    return 1;
+}
+
+/* Pin one genuine procfs mount and prove that its `self` magic link resolves
+ * to the same process directory as its bounded numeric target.  Subsequent
+ * entry opens stay relative to that pinned directory, so a fake /proc tree
+ * cannot become payload authority. */
+static int bs_proc_self_context_open_at(
+    const char *proc_root, struct bs_proc_self_context *context)
+{
+    char pid_component[32];
+    struct stat root_status;
+    struct stat self_link_status;
+    struct stat self_status;
+    struct stat pid_status;
+    int self_link_fd = -1;
+    int pid_fd = -1;
+    ssize_t pid_length;
+    int saved_errno = EINVAL;
+
+    if (!proc_root || !context) {
+        errno = EINVAL;
+        return -1;
+    }
+    context->root_fd = -1;
+    context->self_fd = -1;
+    context->device = 0;
+
+    context->root_fd = open(proc_root, O_PATH | O_DIRECTORY | O_CLOEXEC |
+                                       O_NOFOLLOW);
+    if (context->root_fd < 0 || fstat(context->root_fd, &root_status) < 0 ||
+        !S_ISDIR(root_status.st_mode) || !bs_fd_is_procfs(context->root_fd))
+        goto fail;
+    context->device = root_status.st_dev;
+
+    self_link_fd = openat(context->root_fd, "self",
+                          O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    if (!bs_proc_entry_status(self_link_fd, context->device, S_IFLNK,
+                              &self_link_status))
+        goto fail;
+    pid_length = readlinkat(context->root_fd, "self", pid_component,
+                            sizeof(pid_component));
+    if (pid_length <= 0 || (size_t)pid_length >= sizeof(pid_component) ||
+        !bs_proc_pid_component(pid_component, (size_t)pid_length))
+        goto fail;
+    pid_component[pid_length] = '\0';
+
+    context->self_fd = openat(context->root_fd, "self",
+                              O_PATH | O_DIRECTORY | O_CLOEXEC);
+    pid_fd = openat(context->root_fd, pid_component,
+                    O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (!bs_proc_entry_status(context->self_fd, context->device, S_IFDIR,
+                              &self_status) ||
+        !bs_proc_entry_status(pid_fd, context->device, S_IFDIR,
+                              &pid_status) ||
+        self_status.st_dev != pid_status.st_dev ||
+        self_status.st_ino != pid_status.st_ino)
+        goto fail;
+
+    close(pid_fd);
+    close(self_link_fd);
+    return 0;
+
+fail:
+    if (errno)
+        saved_errno = errno;
+    if (pid_fd >= 0)
+        close(pid_fd);
+    if (self_link_fd >= 0)
+        close(self_link_fd);
+    bs_proc_self_context_close(context);
+    errno = saved_errno;
+    return -1;
+}
+
+static int bs_proc_self_executable_open(
+    const struct bs_proc_self_context *context)
+{
+    struct stat link_status;
+    struct stat link_after_status;
+    struct stat executable_status;
+    int link_fd = -1;
+    int link_after_fd = -1;
+    int executable_fd = -1;
+    int saved_errno = EINVAL;
+
+    if (!context || context->root_fd < 0 || context->self_fd < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    link_fd = openat(context->self_fd, "exe",
+                     O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    if (!bs_proc_entry_status(link_fd, context->device, S_IFLNK,
+                              &link_status))
+        goto fail;
+    executable_fd = openat(context->self_fd, "exe", O_RDONLY | O_CLOEXEC);
+    if (executable_fd < 0 || fstat(executable_fd, &executable_status) < 0 ||
+        !S_ISREG(executable_status.st_mode) || executable_status.st_ino == 0)
+        goto fail;
+
+    /* Procfs entries cannot normally be replaced, but verifying the pinned
+     * link again makes mount manipulation fail closed rather than silently
+     * changing which executable the followed open names. */
+    link_after_fd = openat(context->self_fd, "exe",
+                           O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    if (!bs_proc_entry_status(link_after_fd, context->device, S_IFLNK,
+                              &link_after_status) ||
+        link_status.st_dev != link_after_status.st_dev ||
+        link_status.st_ino != link_after_status.st_ino)
+        goto fail;
+
+    close(link_after_fd);
+    close(link_fd);
+    return executable_fd;
+
+fail:
+    if (errno)
+        saved_errno = errno;
+    if (link_after_fd >= 0)
+        close(link_after_fd);
+    if (link_fd >= 0)
+        close(link_fd);
+    if (executable_fd >= 0)
+        close(executable_fd);
+    errno = saved_errno;
+    return -1;
+}
+
+static int bs_verified_proc_self_executable_open_at(const char *proc_root)
+{
+    struct bs_proc_self_context context;
+    int executable_fd;
+    int saved_errno;
+
+    if (bs_proc_self_context_open_at(proc_root, &context) < 0)
+        return -1;
+    executable_fd = bs_proc_self_executable_open(&context);
+    saved_errno = errno;
+    bs_proc_self_context_close(&context);
+    errno = saved_errno;
+    return executable_fd;
+}
+
+static int bs_open_file_backed_payload(
+    uint64_t payload_vaddr, uint64_t payload_filesz,
+    uint64_t payload_foff)
+{
+    struct bs_proc_self_context context;
+    struct stat executable;
+    struct stat smaps_status;
+    FILE *smaps = NULL;
+    int executable_fd = -1;
+    int smaps_fd = -1;
+    int matched = 0;
+
+    if (bs_proc_self_context_open_at("/proc", &context) < 0)
+        return -1;
+    executable_fd = bs_proc_self_executable_open(&context);
+    if (executable_fd < 0 || fstat(executable_fd, &executable) < 0 ||
+        !S_ISREG(executable.st_mode) || executable.st_size < 0 ||
+        executable.st_ino == 0 ||
+        payload_foff > (uint64_t)executable.st_size ||
+        payload_filesz > (uint64_t)executable.st_size - payload_foff)
+        goto out;
+    smaps_fd = openat(context.self_fd, "smaps",
+                      O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (!bs_proc_entry_status(smaps_fd, context.device, S_IFREG,
+                              &smaps_status))
+        goto out;
+    smaps = fdopen(smaps_fd, "r");
+    if (!smaps)
+        goto out;
+    smaps_fd = -1;
+    matched = bs_payload_smaps_stream_matches(
+        smaps, &executable, payload_vaddr, payload_filesz, payload_foff);
+    if (fclose(smaps) < 0)
+        matched = 0;
+    smaps = NULL;
+    if (!matched)
+        goto out;
+
+    bs_proc_self_context_close(&context);
+    return executable_fd;
+
+out:
+    if (smaps)
+        fclose(smaps);
+    if (smaps_fd >= 0)
+        close(smaps_fd);
+    if (executable_fd >= 0)
+        close(executable_fd);
+    bs_proc_self_context_close(&context);
+    return -1;
 }
 
 static int payload_descriptor_numbers_valid(uint64_t payload_vaddr,
@@ -2634,7 +4046,6 @@ out:
 
 enum extraction_fallback_refusal {
     EXTRACTION_FALLBACK_ALLOWED = 0,
-    EXTRACTION_REFUSE_PRELINKED,
     EXTRACTION_REFUSE_DATA,
     EXTRACTION_REFUSE_PATHFUL_DLOPEN,
     EXTRACTION_REFUSE_PATHFUL_NEEDED,
@@ -2680,12 +4091,10 @@ static int manifest_has_unextractable_logical_names(
  * direct-only manifest class cannot accidentally retain one behavior without
  * the other. */
 static enum extraction_fallback_refusal classify_extraction_fallback(
-    int prelinked_payload, int has_data_entries,
-    int has_pathful_dlopen_entries, int has_pathful_needed_entries,
+    int has_data_entries, int has_pathful_dlopen_entries,
+    int has_pathful_needed_entries,
     int has_distinct_logical_names)
 {
-    if (prelinked_payload)
-        return EXTRACTION_REFUSE_PRELINKED;
     if (has_data_entries)
         return EXTRACTION_REFUSE_DATA;
     if (has_pathful_dlopen_entries)
@@ -2701,11 +4110,6 @@ static void report_extraction_fallback_refusal(
     enum extraction_fallback_refusal refusal)
 {
     switch (refusal) {
-    case EXTRACTION_REFUSE_PRELINKED:
-        fprintf(stderr,
-                "dlfreeze: refusing extraction fallback for a prelinked "
-                "direct-load artifact\n");
-        break;
     case EXTRACTION_REFUSE_DATA:
         fprintf(stderr,
                 "dlfreeze: refusing extraction fallback for a captured-file "
@@ -2765,22 +4169,33 @@ int main(int argc, char **argv)
     struct dlfrz_footer ft;
     int from_memory = 0;
     const uint8_t *mem_base = NULL;
+    uint32_t source_flags = 0;
+    struct bs_live_phdr_table live_phdrs;
+    int have_live_phdrs;
+    int mapped_payload_file_backed = 0;
 
     memset(&st, 0, sizeof(st));
-    if (loader_descriptor_numeric_valid &&
-        mapped_range_is_readable(loader_payload_vaddr,
-                                 loader_payload_filesz)) {
+    have_live_phdrs = bs_live_phdr_table_from_env(environ, &live_phdrs);
+    if (loader_descriptor_numeric_valid && have_live_phdrs &&
+        bs_mapped_range_is_readable(&live_phdrs, loader_payload_vaddr,
+                                    loader_payload_filesz)) {
         mem_base = (const uint8_t *)(uintptr_t)loader_payload_vaddr;
         const uint8_t *footer_ptr =
             mem_base + loader_payload_filesz - sizeof(ft);
         memcpy(&ft, footer_ptr, sizeof(ft));
-        if (memcmp(ft.magic, DLFRZ_MAGIC, 8) == 0)
+        if (memcmp(ft.magic, DLFRZ_MAGIC, 8) == 0) {
             from_memory = 1;
+            mapped_payload_file_backed =
+                bs_mapped_payload_file_translation(
+                    &live_phdrs, loader_payload_vaddr,
+                    loader_payload_filesz, loader_payload_foff);
+        }
     }
     if (!from_memory) {
-        /* Pin the actual executable rather than reopening a readlink string;
-         * this remains safe across pathname replacement or unlink. */
-        sfd = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
+        /* Legacy descriptor-less artifacts require procfs for correctness,
+         * not acceleration.  Admit that authority only through a pinned,
+         * positively identified procfs process directory. */
+        sfd = bs_verified_proc_self_executable_open_at("/proc");
         if (sfd < 0) {
             perror("/proc/self/exe");
             return 127;
@@ -2914,9 +4329,11 @@ int main(int argc, char **argv)
         free(ent); free(strtab); close(sfd); return 127;
     }
     if (meta_off != 0) {
-        /* Direct-load mode: try in a child first.  A clean, runtime-relocated
-         * payload may fall back to extraction before application handoff;
-         * a prelinked payload must never be handed back to the system rtld. */
+        /* Direct-load mode: try in a child first when the manifest remains
+         * extraction-representable.  Prelink writes only explicit-addend
+         * RELA RELATIVE destinations; native relocation overwrites those,
+         * while implicit-addend RELR is deliberately replayed only in the
+         * direct child's private mapping. */
         size_t metasz = ft.num_entries * sizeof(struct dlfrz_lib_meta);
         uint64_t fixup_size = 0;
 
@@ -2954,9 +4371,10 @@ int main(int argc, char **argv)
             }
         }
 
-        /* Set up mem/mem_foff for the loader.
-         * Normal path: mmap the entire file.
-         * UPX path: payload is already in virtual memory. */
+        /* Set up mem/mem_foff for the loader.  A current mapped payload stays
+         * authoritative until an optional exact clean file alias is proven
+         * inside the supervised direct child below.  The compatibility map
+         * is itself a newly created clean alias of its verified source fd. */
         const uint8_t *ldr_mem;
         uint64_t ldr_mem_foff;
         int ldr_srcfd;
@@ -2976,6 +4394,7 @@ int main(int argc, char **argv)
             ldr_mem = (const uint8_t *)file_map;
             ldr_mem_foff = 0;
             ldr_srcfd = sfd;
+            source_flags |= DLFRZ_SOURCE_EXACT_CLEAN_FILE;
         }
 
         const uint32_t *runtime_fixups = NULL;
@@ -3005,19 +4424,9 @@ int main(int argc, char **argv)
             return 127;
         }
 
-        int prelinked_payload = 0;
-        for (uint32_t i = 0; i < ft.num_entries; i++) {
-            if (!(metas[i].flags & DLFRZ_FLAG_DATA) &&
-                (metas[i].flags & DLFRZ_FLAG_PRELINKED)) {
-                prelinked_payload = 1;
-                break;
-            }
-        }
-
         const enum extraction_fallback_refusal fallback_refusal =
             classify_extraction_fallback(
-                prelinked_payload, has_data_entries,
-                has_pathful_dlopen_entries,
+                has_data_entries, has_pathful_dlopen_entries,
                 has_pathful_needed_entries,
                 has_unextractable_logical_names);
         const int direct_only_payload =
@@ -3030,7 +4439,16 @@ int main(int argc, char **argv)
          * control semantics.  DLFREEZE_NO_FORK remains a strict diagnostic
          * override for clean fallback-capable artifacts. */
         if (direct_only_payload || bs_env_enabled("DLFREEZE_NO_FORK")) {
-            loader_run(ldr_mem, ldr_mem_foff, ldr_srcfd, metas, ent, strtab,
+            int loader_srcfd = ldr_srcfd;
+
+            /* loader_run owns a nonnegative source fd.  Clear the bootstrap
+             * alias before transfer so a late loader failure cannot make a
+             * reused descriptor number get closed a second time. */
+            ldr_srcfd = -1;
+            if (loader_srcfd == sfd)
+                sfd = -1;
+            loader_run(ldr_mem, ldr_mem_foff, loader_srcfd, source_flags,
+                       metas, ent, strtab,
                        ft.num_entries, runtime_fixups, runtime_fixup_count,
                        -1,
                        argc, argv, environ);
@@ -3079,20 +4497,39 @@ int main(int argc, char **argv)
         }
 
         if (lpid == 0) {
+            uint32_t child_source_flags = source_flags;
+            int child_srcfd = ldr_srcfd;
+            int loader_result;
+
             if (restore_inherited_sigchld(&old_sigchld_action) < 0)
                 _exit(127);
             sigprocmask(SIG_SETMASK, &old_mask, NULL);
             close(handoff_pipe[0]);
+
+            /* This is optional acceleration, so every syscall needed to
+             * establish it runs only after a supervisor boundary exists.
+             * An inherited seccomp RET_KILL/TRAP therefore kills this clean
+             * direct attempt and lets the parent use extraction fallback.
+             * Strict/direct-only in-process paths never make these probes. */
+            if (from_memory && mapped_payload_file_backed) {
+                child_srcfd = bs_open_file_backed_payload(
+                    loader_payload_vaddr, loader_payload_filesz,
+                    loader_payload_foff);
+                if (child_srcfd >= 0)
+                    child_source_flags |= DLFRZ_SOURCE_EXACT_CLEAN_FILE;
+            }
             /* loader_run() does NOT return on success */
-            loader_run(ldr_mem, ldr_mem_foff, ldr_srcfd, metas, ent, strtab,
-                       ft.num_entries, runtime_fixups, runtime_fixup_count,
-                       handoff_pipe[1],
-                       argc, argv, environ);
+            loader_result = loader_run(
+                ldr_mem, ldr_mem_foff, child_srcfd, child_source_flags,
+                metas, ent, strtab,
+                ft.num_entries, runtime_fixups, runtime_fixup_count,
+                handoff_pipe[1], argc, argv, environ);
             close(handoff_pipe[1]);
-            close(sfd);
             if (bs_debug_enabled())
                 fprintf(stderr, "dlfreeze-bootstrap: in-process loader failed\n");
-            _exit(127);
+            _exit(loader_result == DLFRZ_LOADER_RUN_TERMINAL_REFUSAL
+                ? DLFRZ_LOADER_CHILD_TERMINAL_REFUSAL
+                : 127);
         }
 
         close(handoff_pipe[1]);
@@ -3144,13 +4581,15 @@ int main(int argc, char **argv)
             handoff_marker == DLFRZ_HANDOFF_APPLICATION_STARTED;
         int terminal_refusal = handoff_len == 1 &&
             handoff_marker == DLFRZ_HANDOFF_TERMINAL_REFUSAL;
+        int terminal_exit = !application_started && WIFEXITED(lst) &&
+            WEXITSTATUS(lst) == DLFRZ_LOADER_CHILD_TERMINAL_REFUSAL;
 
         if (from_memory == 0 && ldr_mem_foff == 0 && ldr_mem)
             munmap((void *)ldr_mem, st.st_size);
 
         free(metas);
 
-        if (terminal_refusal) {
+        if (terminal_refusal || terminal_exit) {
             free(ent); free(strtab); close(sfd);
             return 127;
         }
@@ -3175,7 +4614,7 @@ int main(int argc, char **argv)
      * temporary extraction prefix cannot retain. */
     enum extraction_fallback_refusal fallback_refusal =
         classify_extraction_fallback(
-            0, has_data_entries, has_pathful_dlopen_entries,
+            has_data_entries, has_pathful_dlopen_entries,
             has_pathful_needed_entries, has_unextractable_logical_names);
     if (fallback_refusal != EXTRACTION_FALLBACK_ALLOWED) {
         report_extraction_fallback_refusal(fallback_refusal);
@@ -3183,9 +4622,9 @@ int main(int argc, char **argv)
         return 127;
     }
 
-    /* 6. create workdir for extraction fallback (/tmp only). */
+    /* 6. create a bound workdir for extraction fallback. */
     if (make_workdir(g_tmpdir, sizeof(g_tmpdir)) < 0) {
-        perror("mkdtemp");
+        perror("dlfreeze-bootstrap: temporary extraction directory");
         free(ent); free(strtab); close(sfd);
         return 127;
     }
@@ -3195,7 +4634,6 @@ int main(int argc, char **argv)
      * silently overwriting an earlier manifest entry. */
     struct extraction_plan_entry *extraction_plan = NULL;
     char *exe_path = NULL;
-    char *exe_identity = NULL;
     char *interp_path = NULL;
     char *system_interp_path = NULL;
     int extraction_failed = 0;
@@ -3277,8 +4715,7 @@ int main(int argc, char **argv)
 
         if (ent[i].flags & DLFRZ_FLAG_MAIN_EXE) {
             exe_path = strdup(item->full_path);
-            exe_identity = strdup(name);
-            if (!exe_path || !exe_identity) {
+            if (!exe_path) {
                 extraction_failed = 1;
                 break;
             }
@@ -3300,14 +4737,14 @@ int main(int argc, char **argv)
             fprintf(stderr,
                     "dlfreeze-bootstrap: no main executable in payload\n");
         cleanup_workdir();
-        free(exe_path); free(exe_identity);
+        free(exe_path);
         free(interp_path); free(system_interp_path);
         return 127;
     }
     if (!exe_path[0]) {
         fprintf(stderr, "dlfreeze-bootstrap: no main executable in payload\n");
         cleanup_workdir();
-        free(exe_path); free(exe_identity);
+        free(exe_path);
         free(interp_path); free(system_interp_path);
         return 127;
     }
@@ -3329,11 +4766,14 @@ int main(int argc, char **argv)
     char **direct_nav = calloc((size_t)argc + 1, sizeof(char *));
     if (!direct_nav) {
         cleanup_workdir();
-        free(exe_path); free(exe_identity);
+        free(exe_path);
         free(interp_path); free(system_interp_path);
         return 127;
     }
-    direct_nav[0] = exe_identity && exe_identity[0] ? exe_identity : exe_path;
+    /* execve(2) treats argv[0] as caller-owned process state.  Preserve the
+     * spelling used to invoke the frozen artifact, including an explicitly
+     * empty value, instead of substituting the pack-time target name. */
+    direct_nav[0] = argc > 0 ? argv[0] : NULL;
     for (int i = 1; i < argc; i++)
         direct_nav[i] = argv[i];
 
@@ -3343,7 +4783,7 @@ int main(int argc, char **argv)
         if (!launcher_nav) {
             free(direct_nav);
             cleanup_workdir();
-            free(exe_path); free(exe_identity);
+            free(exe_path);
             free(interp_path); free(system_interp_path);
             return 127;
         }
@@ -3382,7 +4822,7 @@ int main(int argc, char **argv)
         free(lp);
         cleanup_workdir();
         free(direct_nav); free(launcher_nav);
-        free(exe_path); free(exe_identity);
+        free(exe_path);
         free(interp_path); free(system_interp_path);
         return 127;
     }
@@ -3401,7 +4841,7 @@ int main(int argc, char **argv)
         perror("sigprocmask");
         cleanup_workdir();
         free(direct_nav); free(launcher_nav);
-        free(exe_path); free(exe_identity);
+        free(exe_path);
         free(interp_path); free(system_interp_path);
         return 127;
     }
@@ -3410,7 +4850,7 @@ int main(int argc, char **argv)
         sigprocmask(SIG_SETMASK, &old_mask, NULL);
         cleanup_workdir();
         free(direct_nav); free(launcher_nav);
-        free(exe_path); free(exe_identity);
+        free(exe_path);
         free(interp_path); free(system_interp_path);
         return 127;
     }
@@ -3421,7 +4861,7 @@ int main(int argc, char **argv)
         sigprocmask(SIG_SETMASK, &old_mask, NULL);
         perror("fork"); cleanup_workdir();
         free(direct_nav); free(launcher_nav);
-        free(exe_path); free(exe_identity);
+        free(exe_path);
         free(interp_path); free(system_interp_path);
         return 127;
     }
@@ -3449,7 +4889,7 @@ int main(int argc, char **argv)
         sigprocmask(SIG_SETMASK, &old_mask, NULL);
         cleanup_workdir();
         free(direct_nav); free(launcher_nav);
-        free(exe_path); free(exe_identity);
+        free(exe_path);
         free(interp_path); free(system_interp_path);
         return 127;
     }
@@ -3467,7 +4907,7 @@ int main(int argc, char **argv)
     cleanup_workdir();
     free(direct_nav);
     free(launcher_nav);
-    free(exe_path); free(exe_identity);
+    free(exe_path);
     free(interp_path); free(system_interp_path);
 
     if (wait_failed) {

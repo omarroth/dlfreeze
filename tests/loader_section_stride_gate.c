@@ -4,6 +4,8 @@
 #define GNU_UNIQUE_REGISTRY_INITIAL 32U
 #define GNU_UNIQUE_REGISTRY_MAX 4096U
 #define GNU_UNIQUE_BUCKET_COUNT 1024U
+#define DLFREEZE_RELOCATION_SNAPSHOT_GATE 1
+#define DLFREEZE_EXACT_OBJECT_LOOKUP_GATE 1
 
 /* Exercise the loader's private section-table fallback in its real source. */
 #include "../src/loader.c"
@@ -11,6 +13,26 @@
 static unsigned int gate_pthread_atfork_calls;
 static unsigned int gate_register_atfork_calls;
 static void *gate_register_atfork_token;
+
+struct gate_public_phdr_identity {
+    const Elf64_Phdr *expected;
+    Elf64_Half expected_count;
+    int matches;
+    int invalid;
+};
+
+static int gate_capture_public_phdr(struct dl_phdr_info *info, size_t size,
+                                    void *opaque)
+{
+    struct gate_public_phdr_identity *identity = opaque;
+
+    (void)size;
+    identity->matches++;
+    if (!info || info->dlpi_phdr != identity->expected ||
+        info->dlpi_phnum != identity->expected_count)
+        identity->invalid = 1;
+    return 0;
+}
 
 static int gate_pthread_atfork(void (*prepare)(void), void (*parent)(void),
                                void (*child)(void))
@@ -37,6 +59,7 @@ static int gate_map_embedded_elf_eof(void)
 {
     const size_t entry_size = 256;
     const size_t container_size = 2 * 4096;
+    const size_t reservation_size = 5 * 4096;
     FILE *container = NULL;
     uint8_t *source = MAP_FAILED;
     uint8_t *target = MAP_FAILED;
@@ -45,6 +68,9 @@ static int gate_map_embedded_elf_eof(void)
     struct loaded_obj object = {0};
     Elf64_Ehdr *ehdr;
     Elf64_Phdr *phdr;
+    Elf64_Phdr *public_phdr;
+    const Elf64_Phdr *dlinfo_phdr = NULL;
+    struct gate_public_phdr_identity identity = {0};
     int result = 0;
 
     if (g_page_size != 4096)
@@ -74,7 +100,7 @@ static int gate_map_embedded_elf_eof(void)
     phdr->p_memsz = entry_size;
     phdr->p_align = 4096;
 
-    target = mmap(NULL, 4096, PROT_NONE,
+    target = mmap(NULL, reservation_size, PROT_NONE,
                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (target == MAP_FAILED)
         goto out;
@@ -87,19 +113,59 @@ static int gate_map_embedded_elf_eof(void)
     meta.phdr_num = 1;
     meta.phdr_entsz = sizeof(*phdr);
     meta.flags = DLFRZ_FLAG_SHLIB;
+    object.runtime_reservation = target;
+    object.runtime_reservation_size = reservation_size;
 
-    if (map_object(source, 0, fileno(container), &meta, &entry,
+    if (map_object(source, 0, fileno(container), 0, &meta, &entry,
                    &object, 1) < 0 ||
         memcmp(target, source + 4096, entry_size) != 0)
         goto out;
     for (size_t i = entry_size; i < 4096; i++)
         if (target[i] != 0)
             goto out;
+
+    /* The in-image table is public ABI state and this fixture deliberately
+     * places it in a PF_W PT_LOAD.  Mutating that public view must not change
+     * any loader bounds/protection decision made from the admitted snapshot. */
+    public_phdr = (Elf64_Phdr *)(target + sizeof(*ehdr));
+    if (object.public_phdr != public_phdr || object.phdr == public_phdr ||
+        object.runtime_phdr_mapping != object.phdr ||
+        object.runtime_phdr_mapping_size != sizeof(*phdr))
+        goto out;
+    public_phdr->p_flags = PF_R;
+    public_phdr->p_memsz = 4096;
+    if (object.phdr[0].p_flags != (PF_R | PF_W) ||
+        object.phdr[0].p_memsz != entry_size ||
+        loaded_obj_contains(&object, (uintptr_t)target + entry_size, 1) ||
+        loaded_obj_range_declared_readonly(&object, target, 1))
+        goto out;
+
+    /* All public PHDR APIs retain the native in-image pointer even though
+     * internal parsing now uses a distinct immutable copy. */
+    g_all_objs[0] = object;
+    g_all_objs[0].name = "phdr-snapshot-gate";
+    g_all_objs[0].flags = LDR_FLAG_SHLIB;
+    g_all_objs[0].visible = 1;
+    g_nobj = 1;
+    identity.expected = public_phdr;
+    identity.expected_count = 1;
+    if (my_dl_iterate_phdr_locked(gate_capture_public_phdr, &identity) != 0 ||
+        identity.matches != 1 || identity.invalid ||
+        my_dlinfo(&g_all_objs[0], DLFRZ_RTLD_DI_PHDR, &dlinfo_phdr) != 1 ||
+        dlinfo_phdr != public_phdr ||
+        loaded_obj_public_phdr(&g_all_objs[0]) != public_phdr)
+        goto out;
     result = 1;
 
 out:
+    g_nobj = 0;
+    memset(&g_all_objs[0], 0, sizeof(g_all_objs[0]));
+    if (object.runtime_reservation || object.runtime_phdr_mapping) {
+        dl_release_runtime_mapping(&object);
+        target = MAP_FAILED;
+    }
     if (target != MAP_FAILED)
-        munmap(target, 4096);
+        munmap(target, reservation_size);
     if (source != MAP_FAILED)
         munmap(source, container_size);
     if (container)
@@ -303,8 +369,10 @@ static int gate_unaligned_scalar_relocations(void)
     relocation.r_offset = 257;
     relocation.r_info = ELF64_R_INFO(0, ARCH_RELOC_RELATIVE);
     relocation.r_addend = 0x123;
+    object.rela = &relocation;
+    object.rela_count = 1;
 
-    if (apply_relocs_rela(&object, &relocation, 1, &object, 1,
+    if (apply_relocs_rela(&object, LOADED_RELA_DYNAMIC, &object, 1,
                           RELOC_PASS_ORDINARY) < 0)
         return 0;
     memcpy(&first, image + 257, sizeof(first));
@@ -327,6 +395,160 @@ static int gate_unaligned_scalar_relocations(void)
     memcpy(&second, image + 257 + sizeof(first), sizeof(second));
     return first == UINT64_C(0x1122334455667788) &&
            second == UINT64_C(0x99aabbccddeeff00);
+}
+
+static int gate_relocation_authority_snapshot(void)
+{
+    _Alignas(8) uint8_t image[512] = {0};
+    uint8_t expected[2 * sizeof(Elf64_Rela)];
+    Elf64_Phdr load = {0};
+    struct loaded_obj object = {0};
+    struct loader_readonly_snapshot fixups = {0};
+    Elf64_Rela *rela = (Elf64_Rela *)(void *)(image + 64);
+    Elf64_Rela *jmprel = (Elf64_Rela *)(void *)(image + 88);
+    Elf64_Relr *relr = (Elf64_Relr *)(void *)(image + 96);
+    Elf64_Rela relocation;
+    Elf64_Relr relr_entry;
+    uint32_t fixup_source[2] = {
+        UINT32_C(0x01020304), UINT32_C(0xa0b0c0d0)
+    };
+    uint32_t fixup_value;
+
+    load.p_type = PT_LOAD;
+    load.p_flags = PF_R | PF_W;
+    load.p_filesz = sizeof(image);
+    load.p_memsz = sizeof(image);
+    object.base = (uintptr_t)image;
+    object.phdr = &load;
+    object.phdr_num = 1;
+
+    for (size_t i = 0; i < sizeof(expected); i++)
+        image[64 + i] = (uint8_t)(i + 1);
+    memcpy(expected, image + 64, sizeof(expected));
+
+    /* JMPREL is the second RELA record and RELR aliases bytes within that
+     * record.  One copied union must preserve those exact relationships. */
+    if (publish_loaded_relocation_authority(
+            &object, rela, 2, jmprel, 1, relr, 1) < 0 ||
+        !object.runtime_relocation_mapping ||
+        (const uint8_t *)object.jmprel -
+                (const uint8_t *)object.rela != sizeof(Elf64_Rela) ||
+        (const uint8_t *)object.relr -
+                (const uint8_t *)object.rela != 32)
+        goto fail_object;
+
+    memset(image + 64, 0xa5, sizeof(expected));
+    if (!loaded_rela_read(
+            &object, LOADED_RELA_DYNAMIC, 0, &relocation) ||
+        memcmp(&relocation, expected, sizeof(relocation)) != 0 ||
+        !loaded_rela_read(
+            &object, LOADED_RELA_PLT, 0, &relocation) ||
+        memcmp(&relocation, expected + sizeof(Elf64_Rela),
+               sizeof(relocation)) != 0 ||
+        !loaded_relr_read(&object, 0, &relr_entry) ||
+        memcmp(&relr_entry, expected + 32, sizeof(relr_entry)) != 0)
+        goto fail_object;
+    dl_release_runtime_mapping(&object);
+    if (object.rela || object.jmprel || object.relr ||
+        object.runtime_relocation_mapping)
+        return 0;
+
+    /* A protection failure must publish no pointer and retain no owner. */
+    memset(&object, 0, sizeof(object));
+    object.base = (uintptr_t)image;
+    object.phdr = &load;
+    object.phdr_num = 1;
+    g_loader_snapshot_fail_protect = 1;
+    {
+        int status = publish_loaded_relocation_authority(
+            &object, rela, 2, jmprel, 1, relr, 1);
+
+        g_loader_snapshot_fail_protect = 0;
+        if (status == 0 || object.rela || object.jmprel || object.relr ||
+            object.runtime_relocation_mapping)
+            return 0;
+    }
+
+    /* A relocation authority wholly covered by non-writable PT_LOADs is the
+     * zero-copy fast path. */
+    load.p_flags = PF_R;
+    memset(&object, 0, sizeof(object));
+    object.base = (uintptr_t)image;
+    object.phdr = &load;
+    object.phdr_num = 1;
+    if (publish_loaded_relocation_authority(
+            &object, rela, 2, NULL, 0, NULL, 0) < 0 ||
+        object.rela != rela || object.runtime_relocation_mapping)
+        return 0;
+    dl_release_runtime_mapping(&object);
+
+    /* A writable record may target a later record.  Applying the first one
+     * must not redirect the second, and mutation of a live RELR word must not
+     * redirect its destination either. */
+    memset(image, 0, sizeof(image));
+    load.p_flags = PF_R | PF_W;
+    rela = (Elf64_Rela *)(void *)(image + 64);
+    relr = (Elf64_Relr *)(void *)(image + 160);
+    rela[0].r_offset = 64 + sizeof(Elf64_Rela) +
+        offsetof(Elf64_Rela, r_info);
+    rela[0].r_info = ELF64_R_INFO(0, ARCH_RELOC_RELATIVE);
+    rela[0].r_addend = 0;
+    rela[1].r_offset = 320;
+    rela[1].r_info = ELF64_R_INFO(0, ARCH_RELOC_RELATIVE);
+    rela[1].r_addend = 0x123;
+    *relr = 328;
+    relocation_store_u64(image + 328, 7);
+    relocation_store_u64(image + 400, 9);
+    memset(&object, 0, sizeof(object));
+    object.base = (uintptr_t)image;
+    object.phdr = &load;
+    object.phdr_num = 1;
+    if (publish_loaded_relocation_authority(
+            &object, rela, 2, NULL, 0, relr, 1) < 0)
+        goto fail_object;
+    *relr = 400;
+    if (validate_object_relocations(&object) < 0 ||
+        apply_relocs_rela(
+            &object, LOADED_RELA_DYNAMIC, &object, 1,
+            RELOC_PASS_ORDINARY) < 0 ||
+        walk_relr(&object, 1) < 0 ||
+        relocation_load_u64(image + 320) !=
+            (uint64_t)(uintptr_t)image + UINT64_C(0x123) ||
+        relocation_load_u64(image + 328) !=
+            (uint64_t)(uintptr_t)image + 7 ||
+        relocation_load_u64(image + 400) != 9 ||
+        rela[1].r_info == ELF64_R_INFO(0, ARCH_RELOC_RELATIVE))
+        goto fail_object;
+    dl_release_runtime_mapping(&object);
+
+    /* The compact replay vector has the same immutable lifetime across all
+     * resolver phases and rolls an allocated mapping back on failure. */
+    if (loader_readonly_snapshot_create(
+            fixup_source, sizeof(fixup_source), &fixups) < 0)
+        return 0;
+    fixup_source[0] = 0;
+    memcpy(&fixup_value, fixups.bytes, sizeof(fixup_value));
+    if (fixup_value != UINT32_C(0x01020304)) {
+        loader_readonly_snapshot_release(&fixups);
+        return 0;
+    }
+    loader_readonly_snapshot_release(&fixups);
+    g_loader_snapshot_fail_protect = 1;
+    {
+        int status = loader_readonly_snapshot_create(
+            fixup_source, sizeof(fixup_source), &fixups);
+
+        g_loader_snapshot_fail_protect = 0;
+        if (status == 0 || fixups.bytes || fixups.mapping ||
+            fixups.mapping_size)
+            return 0;
+    }
+    return 1;
+
+fail_object:
+    g_loader_snapshot_fail_protect = 0;
+    dl_release_runtime_mapping(&object);
+    return 0;
 }
 
 static int gate_control_table_alignment(void)
@@ -553,6 +775,25 @@ out:
     return result;
 }
 
+static int gate_gnu_unique_call(
+    struct loaded_obj *objects, int object_count,
+    struct loaded_obj *candidate_owner, const Elf64_Sym *candidate,
+    struct loaded_obj *copy_owner, const Elf64_Sym *copy_definition,
+    struct loaded_obj **selected_owner, const Elf64_Sym **selected_symbol)
+{
+    struct symbol_lookup_query query;
+    uint32_t symbol_index;
+
+    if (!loaded_symbol_table_index(
+            candidate_owner, candidate, &symbol_index) ||
+        !symbol_lookup_query_init_dynsym(
+            candidate_owner, symbol_index, objects, object_count, &query))
+        return -1;
+    return gnu_unique_canonicalize(
+        objects, object_count, &query, candidate_owner, candidate,
+        copy_owner, copy_definition, selected_owner, selected_symbol);
+}
+
 static int gate_gnu_unique_registry(void)
 {
     const unsigned char hash_key[16] = {
@@ -618,9 +859,9 @@ static int gate_gnu_unique_registry(void)
         struct loaded_obj *selected_owner = owner;
 
         symbol = &symbols[i];
-        if (gnu_unique_canonicalize(
-                g_all_objs, g_nobj, strings + symbol->st_name,
-                owner, symbol, NULL, NULL, &selected_owner, &symbol) < 0 ||
+        if (gate_gnu_unique_call(
+                g_all_objs, g_nobj, owner, symbol, NULL, NULL,
+                &selected_owner, &symbol) < 0 ||
             selected_owner != owner || symbol != &symbols[i])
             goto out;
     }
@@ -628,9 +869,9 @@ static int gate_gnu_unique_registry(void)
         struct loaded_obj *selected_owner = owner;
 
         symbol = &symbols[GNU_UNIQUE_REGISTRY_MAX + 1];
-        if (gnu_unique_canonicalize(
-                g_all_objs, g_nobj, strings + symbol->st_name,
-                owner, symbol, NULL, NULL, &selected_owner, &symbol) >= 0)
+        if (gate_gnu_unique_call(
+                g_all_objs, g_nobj, owner, symbol, NULL, NULL,
+                &selected_owner, &symbol) >= 0)
             goto out;
     }
 
@@ -642,11 +883,106 @@ static int gate_gnu_unique_registry(void)
         struct loaded_obj *selected_owner = owner;
 
         symbol = &symbols[GNU_UNIQUE_REGISTRY_MAX + 1];
-        if (gnu_unique_canonicalize(
-                g_all_objs, g_nobj, strings + symbol->st_name,
-                owner, symbol, NULL, NULL, &selected_owner, &symbol) < 0 ||
+        if (gate_gnu_unique_call(
+                g_all_objs, g_nobj, owner, symbol, NULL, NULL,
+                &selected_owner, &symbol) < 0 ||
             selected_owner != owner ||
             symbol != &symbols[GNU_UNIQUE_REGISTRY_MAX + 1])
+            goto out;
+    }
+
+    /* A registry record remains name-sticky, but every use must revalidate
+     * its current bounded name and exact definition contract.  A writable
+     * DYNSYM/STRTAB mutation therefore fails closed instead of returning a
+     * stale owner or scanning beyond DT_STRSZ. */
+    symbols[2].st_name = symbols[1].st_name;
+    for (unsigned int mutation = 0; mutation < 5; mutation++) {
+        struct symbol_lookup_query query;
+        struct loaded_obj *selected_owner = owner;
+
+        symbols[1].st_info = ELF64_ST_INFO(STB_GNU_UNIQUE, STT_OBJECT);
+        symbols[1].st_other = STV_DEFAULT;
+        symbols[1].st_shndx = 1;
+        symbols[2].st_info = ELF64_ST_INFO(STB_GNU_UNIQUE, STT_OBJECT);
+        symbols[2].st_other = STV_DEFAULT;
+        symbols[2].st_shndx = 1;
+        strings[string_bytes - 1] = '\0';
+        if (!gnu_unique_registry_rewind(0))
+            goto out;
+        symbol = &symbols[1];
+        if (gate_gnu_unique_call(
+                g_all_objs, 1, owner, symbol, NULL, NULL,
+                &selected_owner, &symbol) < 0 ||
+            !symbol_lookup_query_init_dynsym(
+                owner, 2, g_all_objs, 1, &query))
+            goto out;
+
+        switch (mutation) {
+        case 0:
+            symbols[1].st_name = (uint32_t)(string_bytes - 1);
+            strings[string_bytes - 1] = 'X';
+            break;
+        case 1:
+            symbols[1].st_info = ELF64_ST_INFO(STB_GLOBAL, STT_OBJECT);
+            break;
+        case 2:
+            symbols[1].st_info = ELF64_ST_INFO(STB_GNU_UNIQUE, STT_FUNC);
+            break;
+        case 3:
+            symbols[1].st_other = STV_HIDDEN;
+            break;
+        default:
+            symbols[1].st_shndx = SHN_UNDEF;
+            break;
+        }
+        selected_owner = owner;
+        symbol = &symbols[2];
+        if (gnu_unique_canonicalize(
+                g_all_objs, 1, &query, owner, symbol, NULL, NULL,
+                &selected_owner, &symbol) >= 0)
+            goto out;
+        symbols[1].st_name = symbols[2].st_name;
+    }
+
+    /* COPY registration intentionally stores the executable's ordinary
+     * GLOBAL definition.  Distinguish that record kind from a normal unique
+     * owner, then enforce the exact COPY contract on later use. */
+    g_all_objs[1] = g_all_objs[0];
+    g_all_objs[0].flags |= LDR_FLAG_MAIN_EXE;
+    g_all_objs[1].flags &= ~LDR_FLAG_MAIN_EXE;
+    symbols[1].st_name = symbols[2].st_name;
+    symbols[1].st_info = ELF64_ST_INFO(STB_GLOBAL, STT_OBJECT);
+    symbols[1].st_other = STV_DEFAULT;
+    symbols[1].st_shndx = 1;
+    symbols[2].st_info = ELF64_ST_INFO(STB_GNU_UNIQUE, STT_OBJECT);
+    symbols[2].st_other = STV_DEFAULT;
+    symbols[2].st_shndx = 1;
+    if (!gnu_unique_registry_rewind(0))
+        goto out;
+    g_nobj = 2;
+    {
+        struct loaded_obj *selected_owner = &g_all_objs[1];
+
+        symbol = &symbols[2];
+        if (gate_gnu_unique_call(
+                g_all_objs, g_nobj, &g_all_objs[1], symbol,
+                &g_all_objs[0], &symbols[1],
+                &selected_owner, &symbol) != 1 ||
+            selected_owner != &g_all_objs[1] || symbol != &symbols[2])
+            goto out;
+        selected_owner = &g_all_objs[1];
+        symbol = &symbols[2];
+        if (gate_gnu_unique_call(
+                g_all_objs, g_nobj, &g_all_objs[1], symbol, NULL, NULL,
+                &selected_owner, &symbol) != 1 ||
+            selected_owner != &g_all_objs[0] || symbol != &symbols[1])
+            goto out;
+        symbols[1].st_info = ELF64_ST_INFO(STB_WEAK, STT_OBJECT);
+        selected_owner = &g_all_objs[1];
+        symbol = &symbols[2];
+        if (gate_gnu_unique_call(
+                g_all_objs, g_nobj, &g_all_objs[1], symbol, NULL, NULL,
+                &selected_owner, &symbol) >= 0)
             goto out;
     }
 
@@ -654,13 +990,17 @@ static int gate_gnu_unique_registry(void)
      * scope, and therefore must not consume registry capacity. */
     gnu_unique_registry_reset();
     g_is_musl_runtime = 1;
+    g_nobj = 1;
+    symbols[1].st_info = ELF64_ST_INFO(STB_GNU_UNIQUE, STT_OBJECT);
+    symbols[1].st_other = STV_DEFAULT;
+    symbols[1].st_shndx = 1;
     {
         struct loaded_obj *selected_owner = owner;
 
         symbol = &symbols[1];
-        if (gnu_unique_canonicalize(
-                g_all_objs, g_nobj, strings + symbol->st_name,
-                owner, symbol, NULL, NULL, &selected_owner, &symbol) != 0 ||
+        if (gate_gnu_unique_call(
+                g_all_objs, g_nobj, owner, symbol, NULL, NULL,
+                &selected_owner, &symbol) != 0 ||
             selected_owner != owner || symbol != &symbols[1] ||
             g_gnu_unique_count != 0)
             goto out;
@@ -685,13 +1025,13 @@ int main(void)
     Elf64_Shdr strtab = {0};
     Elf64_Shdr symtab = {0};
     Elf64_Shdr data_section = {0};
-    Elf64_Sym symbols[2] = {{0}};
+    Elf64_Sym symbols[3] = {{0}};
     Elf64_Phdr load = {0};
     struct loaded_obj object = {0};
-    const char strings[] = "\0stride_symbol\0";
+    const char strings[] = "\0stride_symbol\0stride_second\0";
     const uint64_t base = UINT64_C(0x100000);
-    uint8_t fake_rtld_global;
-    uint8_t fake_rtld_global_ro;
+    static uint8_t fake_rtld_global;
+    static uint8_t fake_rtld_global_ro;
     struct {
         char *environment[1];
         Elf64_auxv_t auxiliary[2];
@@ -746,6 +1086,11 @@ int main(void)
     symbols[1].st_shndx = 3;
     symbols[1].st_value = UINT64_C(0x2345);
     symbols[1].st_size = sizeof(uint64_t);
+    symbols[2].st_name = 1 + sizeof("stride_symbol");
+    symbols[2].st_info = ELF64_ST_INFO(STB_LOCAL, STT_OBJECT);
+    symbols[2].st_shndx = 3;
+    symbols[2].st_value = UINT64_C(0x3456);
+    symbols[2].st_size = sizeof(uint32_t);
     memcpy(image + string_offset, strings, sizeof(strings));
     memcpy(image + symbol_offset, symbols, sizeof(symbols));
 
@@ -765,6 +1110,78 @@ int main(void)
                 &object, "stride_symbol", sizeof(uint64_t), &address) != 1 ||
             address != base + symbols[1].st_value)
             return 1;
+    }
+    {
+        struct exact_elf_object_lookup lookups[] = {
+            {
+                .name = "stride_symbol",
+                .expected_size = sizeof(uint64_t),
+            },
+            {
+                .name = "stride_second",
+                .expected_size = sizeof(uint32_t),
+            },
+            {
+                .name = "stride_missing",
+                .expected_size = sizeof(uintptr_t),
+            },
+        };
+        Elf64_Sym saved_second = symbols[2];
+
+        /* Three requests share one traversal of the padded section table and
+         * its two non-null symbol records. */
+        g_exact_elf_object_symbol_visits = 0;
+        if (lookup_exact_elf_object_addrs(
+                &object, lookups,
+                sizeof(lookups) / sizeof(lookups[0])) != 0 ||
+            lookups[0].state != 1 ||
+            lookups[0].address != base + symbols[1].st_value ||
+            lookups[1].state != 1 ||
+            lookups[1].address != base + symbols[2].st_value ||
+            lookups[2].state != 0 || lookups[2].address != 0 ||
+            g_exact_elf_object_symbol_visits != 2)
+            return 103;
+
+        /* A malformed match poisons only that request while the batch still
+         * records independent valid and absent results. */
+        lookups[0].expected_size = sizeof(uint32_t);
+        g_exact_elf_object_symbol_visits = 0;
+        if (lookup_exact_elf_object_addrs(
+                &object, lookups,
+                sizeof(lookups) / sizeof(lookups[0])) != -1 ||
+            lookups[0].state != -1 || lookups[0].address != 0 ||
+            lookups[1].state != 1 ||
+            lookups[1].address != base + symbols[2].st_value ||
+            lookups[2].state != 0 ||
+            g_exact_elf_object_symbol_visits != 2)
+            return 104;
+        lookups[0].expected_size = sizeof(uint64_t);
+
+        /* Preserve the singular lookup's duplicate rule: identical aliases
+         * are harmless, but two different addresses are ambiguous. */
+        symbols[2] = symbols[1];
+        memcpy(image + symbol_offset, symbols, sizeof(symbols));
+        if (lookup_exact_elf_object_addrs(&object, lookups, 1) != 0 ||
+            lookups[0].state != 1 ||
+            lookups[0].address != base + symbols[1].st_value)
+            return 105;
+        symbols[2].st_value++;
+        memcpy(image + symbol_offset, symbols, sizeof(symbols));
+        if (lookup_exact_elf_object_addrs(&object, lookups, 1) != -1 ||
+            lookups[0].state != -1 || lookups[0].address != 0)
+            return 106;
+        symbols[2] = saved_second;
+        memcpy(image + symbol_offset, symbols, sizeof(symbols));
+
+        /* Invalid symbol-table geometry remains a global structural error. */
+        symtab.sh_entsize = sizeof(Elf64_Sym) + 1;
+        memcpy(image + section_offset + 2 * SECTION_STRIDE,
+               &symtab, sizeof(symtab));
+        if (lookup_exact_elf_object_addrs(&object, lookups, 1) != -1)
+            return 107;
+        symtab.sh_entsize = sizeof(Elf64_Sym);
+        memcpy(image + section_offset + 2 * SECTION_STRIDE,
+               &symtab, sizeof(symtab));
     }
 
     /* A full table must report failure instead of probing forever. */
@@ -812,9 +1229,9 @@ int main(void)
     memcpy(property_note, &property_header, sizeof(property_header));
     memcpy(property_note + sizeof(property_header), "GNU\0", 4);
 #if defined(__x86_64__)
-    property_type = GNU_PROPERTY_X86_FEATURE_1_AND;
+    property_type = DLFRZ_GNU_PROPERTY_X86_FEATURE_1_AND;
 #else
-    property_type = GNU_PROPERTY_AARCH64_FEATURE_1_AND;
+    property_type = DLFRZ_GNU_PROPERTY_AARCH64_FEATURE_1_AND;
 #endif
     memcpy(property_note + 16, &property_type, sizeof(property_type));
     memcpy(property_note + 20, &property_size, sizeof(property_size));
@@ -847,6 +1264,23 @@ int main(void)
     memcpy(image + 256 + 24, &property_value, sizeof(property_value));
     if (parse_loaded_gnu_properties(&object) == 0)
         return 13;
+#if defined(__aarch64__)
+    {
+        struct loaded_obj gcs_object = {0};
+        const uintptr_t gcs_capability = (uintptr_t)1 << 32;
+
+        gcs_object.visible = 1;
+        gcs_object.gnu_property_feature_1_seen = 1;
+        gcs_object.gnu_property_feature_1 =
+            DLFRZ_GNU_PROPERTY_AARCH64_FEATURE_1_GCS;
+        if (!startup_gnu_properties_admitted(
+                &gcs_object, 1, gcs_capability, 0))
+            return 101;
+        if (startup_gnu_properties_admitted(
+                &gcs_object, 1, 0, gcs_capability))
+            return 102;
+    }
+#endif
 
     /* Loader-private libc calls must come from the selected provider, name a
      * default ordinary function, and fit wholly in one executable PT_LOAD. */
@@ -1044,6 +1478,8 @@ int main(void)
         return 31;
     if (!gate_unaligned_scalar_relocations())
         return 32;
+    if (!gate_relocation_authority_snapshot())
+        return 40;
     if (!gate_control_table_alignment())
         return 33;
     if (!gate_gnu_hash_chain_stays_file_backed())

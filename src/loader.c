@@ -28,6 +28,7 @@
 #include <limits.h>
 #include <pthread.h>
 #include <signal.h>
+#include <poll.h>
 #include <locale.h>
 #include <dlfcn.h>
 #include <sys/utsname.h>
@@ -67,6 +68,7 @@ static char *ldr_strrchr(const char *, int);
 
 #include "common.h"
 #include "dynamic_semantics.h"
+#include "gnu_properties.h"
 #include "glibc_layout.h"
 #include "libc_semantics.h"
 #include "musl_layout.h"
@@ -133,48 +135,6 @@ typedef Elf64_Xword Elf64_Relr;
 #endif
 #ifndef PT_GNU_PROPERTY
 #define PT_GNU_PROPERTY 0x6474e553
-#endif
-#ifndef NT_GNU_PROPERTY_TYPE_0
-#define NT_GNU_PROPERTY_TYPE_0 5
-#endif
-#ifndef GNU_PROPERTY_STACK_SIZE
-#define GNU_PROPERTY_STACK_SIZE 1
-#endif
-#ifndef GNU_PROPERTY_NO_COPY_ON_PROTECTED
-#define GNU_PROPERTY_NO_COPY_ON_PROTECTED 2
-#endif
-#ifndef GNU_PROPERTY_1_NEEDED
-#define GNU_PROPERTY_1_NEEDED 0xb0008000
-#endif
-#ifndef GNU_PROPERTY_X86_FEATURE_1_AND
-#define GNU_PROPERTY_X86_FEATURE_1_AND 0xc0000002
-#endif
-#ifndef GNU_PROPERTY_X86_ISA_1_NEEDED
-#define GNU_PROPERTY_X86_ISA_1_NEEDED 0xc0008002
-#endif
-#ifndef GNU_PROPERTY_X86_ISA_1_USED
-#define GNU_PROPERTY_X86_ISA_1_USED 0xc0010002
-#endif
-#ifndef GNU_PROPERTY_X86_ISA_1_BASELINE
-#define GNU_PROPERTY_X86_ISA_1_BASELINE (1U << 0)
-#endif
-#ifndef GNU_PROPERTY_X86_FEATURE_1_IBT
-#define GNU_PROPERTY_X86_FEATURE_1_IBT (1U << 0)
-#endif
-#ifndef GNU_PROPERTY_X86_FEATURE_1_SHSTK
-#define GNU_PROPERTY_X86_FEATURE_1_SHSTK (1U << 1)
-#endif
-#ifndef GNU_PROPERTY_AARCH64_FEATURE_1_AND
-#define GNU_PROPERTY_AARCH64_FEATURE_1_AND 0xc0000000
-#endif
-#ifndef GNU_PROPERTY_AARCH64_FEATURE_1_BTI
-#define GNU_PROPERTY_AARCH64_FEATURE_1_BTI (1U << 0)
-#endif
-#ifndef GNU_PROPERTY_AARCH64_FEATURE_1_PAC
-#define GNU_PROPERTY_AARCH64_FEATURE_1_PAC (1U << 1)
-#endif
-#ifndef GNU_PROPERTY_AARCH64_FEATURE_1_GCS
-#define GNU_PROPERTY_AARCH64_FEATURE_1_GCS (1U << 2)
 #endif
 #ifndef SYS_faccessat2
 /* Linux assigned faccessat2 syscall 439 on both supported architectures.
@@ -422,21 +382,6 @@ static int glibc_private_register_pair_path(
 #ifndef DF_1_PIE
 #define DF_1_PIE 0x08000000
 #endif
-#ifndef DF_1_NOW
-#define DF_1_NOW 0x00000001
-#endif
-#ifndef DF_1_NODELETE
-#define DF_1_NODELETE 0x00000008
-#endif
-#ifndef DF_1_ORIGIN
-#define DF_1_ORIGIN 0x00000080
-#endif
-#ifndef DF_1_NODUMP
-#define DF_1_NODUMP 0x00001000
-#endif
-#ifndef DF_1_NODIRECT
-#define DF_1_NODIRECT 0x00020000
-#endif
 #ifndef DF_SYMBOLIC
 #define DF_SYMBOLIC 0x00000002
 #endif
@@ -639,7 +584,10 @@ static int glibc_private_register_pair_path(
       return tp;
   }
   static inline int arch_set_tp(uintptr_t tp) {
-      __asm__ volatile("msr tpidr_el0, %0" :: "r"(tp));
+      /* Publishing the target TCB/DTV is also a compiler ordering boundary:
+       * no initialization access may move past the TP switch, and no target
+       * TLS access may move before it. */
+      __asm__ volatile("msr tpidr_el0, %0" :: "r"(tp) : "memory");
       return 0;
   }
   static inline uintptr_t arch_get_tp_syscall(void) {
@@ -722,8 +670,15 @@ static int loader_munmap(void *address, size_t length)
         arch_raw_syscall2(SYS_munmap, (long)address, (long)length));
 }
 
+#ifdef DLFREEZE_PROTECTION_LIFECYCLE_GATE
+static size_t g_loader_mprotect_calls;
+#endif
+
 static int loader_mprotect(void *address, size_t length, int prot)
 {
+#ifdef DLFREEZE_PROTECTION_LIFECYCLE_GATE
+    g_loader_mprotect_calls++;
+#endif
     return (int)loader_syscall_result(
         arch_raw_syscall3(SYS_mprotect, (long)address, (long)length, prot));
 }
@@ -769,12 +724,6 @@ static int loader_stat(const char *path, struct stat *status)
     return (int)loader_syscall_result(
         arch_raw_syscall4(SYS_newfstatat, AT_FDCWD, (long)path,
                           (long)status, 0));
-}
-
-static off_t loader_lseek(int fd, off_t offset, int whence)
-{
-    return (off_t)loader_syscall_result(
-        arch_raw_syscall3(SYS_lseek, fd, (long)offset, whence));
 }
 
 static void loader_exit(int status) __attribute__((noreturn));
@@ -852,14 +801,14 @@ static void *ldr_memset(void *destination, int value, size_t length)
     pattern |= pattern << 32;
     while (length >= 16) {
         __asm__ volatile("stp %1, %1, [%0], #16"
-                         : "+r"(dst)
+                         : "+&r"(dst)
                          : "r"(pattern)
                          : "memory");
         length -= 16;
     }
     while (length != 0) {
         __asm__ volatile("strb %w1, [%0], #1"
-                         : "+r"(dst)
+                         : "+&r"(dst)
                          : "r"((unsigned int)byte)
                          : "memory");
         length--;
@@ -883,19 +832,189 @@ static int ldr_memcmp(const void *left, const void *right, size_t length)
     return 0;
 }
 
+#define LDR_MEMCHR_WORD_BATCH 4U
+#define LDR_MEMCHR_VECTOR_BYTES 16U
+#define LDR_MEMCHR_VECTOR_BATCH 4U
+
+typedef unsigned char ldr_byte_vector
+    __attribute__((__vector_size__(LDR_MEMCHR_VECTOR_BYTES), __may_alias__));
+
+union ldr_byte_vector_view {
+    ldr_byte_vector vector;
+    unsigned char bytes[LDR_MEMCHR_VECTOR_BYTES];
+};
+
+static inline size_t
+ldr_byte_vector_match_index(ldr_byte_vector chunk,
+                            ldr_byte_vector pattern,
+                            unsigned char byte)
+{
+#if defined(__x86_64__)
+    unsigned int mask;
+
+    (void)byte;
+    /* SSE2 is part of the x86-64 baseline.  pmovmskb both tests the complete
+     * vector and preserves byte order, so ctz identifies the exact first
+     * match without a second memory read. */
+    __asm__ volatile(
+        "pcmpeqb %2, %0\n\t"
+        "pmovmskb %0, %1"
+        : "+x"(chunk), "=r"(mask)
+        : "x"(pattern)
+        : "cc");
+    return mask != 0 ? (size_t)__builtin_ctz(mask)
+                     : LDR_MEMCHR_VECTOR_BYTES;
+#elif defined(__aarch64__)
+    union ldr_byte_vector_view original = { .vector = chunk };
+    unsigned int any;
+
+    /* Advanced SIMD is part of the AArch64 baseline.  Reduce the equality
+     * vector before doing the rare first-byte selection in scalar code. */
+    __asm__ volatile(
+        "cmeq %0.16b, %0.16b, %2.16b\n\t"
+        "umaxv %b0, %0.16b\n\t"
+        "umov %w1, %0.b[0]"
+        : "+w"(chunk), "=r"(any)
+        : "w"(pattern));
+    if (any == 0)
+        return LDR_MEMCHR_VECTOR_BYTES;
+    for (size_t i = 0; i < LDR_MEMCHR_VECTOR_BYTES; i++)
+        if (original.bytes[i] == byte)
+            return i;
+    return LDR_MEMCHR_VECTOR_BYTES;
+#endif
+}
+
+#ifdef DLFREEZE_MEMCHR_COMPLEXITY_GATE
+static size_t g_ldr_memchr_word_loads;
+static size_t g_ldr_memchr_byte_loads;
+static size_t g_ldr_memchr_vector_loads;
+static size_t g_ldr_memchr_vector_batch_iterations;
+static size_t g_ldr_memchr_batch_iterations;
+static size_t g_ldr_memchr_single_word_iterations;
+#define LDR_MEMCHR_COUNT(counter) ((counter)++)
+#else
+#define LDR_MEMCHR_COUNT(counter) ((void)0)
+#endif
+
 static void *ldr_memchr(const void *memory, int value, size_t length)
 {
     const volatile unsigned char *cursor = memory;
+    typedef uintptr_t ldr_alias_word __attribute__((__may_alias__));
+    const size_t word_size = sizeof(ldr_alias_word);
+    const ldr_alias_word ones = UINTPTR_MAX / UINT8_MAX;
+    const ldr_alias_word high_bits = ones << 7;
+    const ldr_alias_word pattern = ones * (unsigned char)value;
+    const volatile unsigned char *candidate_cursor = NULL;
     unsigned char byte = (unsigned char)value;
+    ldr_byte_vector vector_pattern = {
+        byte, byte, byte, byte, byte, byte, byte, byte,
+        byte, byte, byte, byte, byte, byte, byte, byte
+    };
 
-    while (length-- != 0) {
-        const volatile unsigned char *current = cursor++;
+#define LDR_MEMCHR_TEST_VECTOR(offset)                                    \
+    do {                                                                 \
+        ldr_byte_vector chunk =                                          \
+            *(const volatile ldr_byte_vector *)(const void *)            \
+                (cursor + (offset));                                     \
+        size_t match = ldr_byte_vector_match_index(                       \
+            chunk, vector_pattern, byte);                                \
+                                                                         \
+        LDR_MEMCHR_COUNT(g_ldr_memchr_vector_loads);                     \
+        if (match != LDR_MEMCHR_VECTOR_BYTES)                            \
+            return (void *)(uintptr_t)(cursor + (offset) + match);       \
+    } while (0)
 
-        if (*current == byte)
-            return (void *)(uintptr_t)current;
+#define LDR_MEMCHR_TEST_WORD(offset)                                      \
+    do {                                                                 \
+        ldr_alias_word word =                                            \
+            *(const volatile ldr_alias_word *)(const void *)             \
+                (cursor + (offset));                                     \
+        ldr_alias_word candidate = word ^ pattern;                       \
+                                                                         \
+        LDR_MEMCHR_COUNT(g_ldr_memchr_word_loads);                       \
+        if (((candidate - ones) & ~candidate & high_bits) != 0) {        \
+            candidate_cursor = cursor + (offset);                        \
+            goto confirm_candidate;                                     \
+        }                                                                \
+    } while (0)
+
+    _Static_assert((sizeof(ldr_alias_word) &
+                    (sizeof(ldr_alias_word) - 1)) == 0,
+                   "loader word size must be a power of two");
+    _Static_assert(sizeof(ldr_byte_vector) == LDR_MEMCHR_VECTOR_BYTES,
+                   "loader vector size mismatch");
+    _Static_assert((LDR_MEMCHR_VECTOR_BYTES &
+                    (LDR_MEMCHR_VECTOR_BYTES - 1U)) == 0,
+                   "loader vector size must be a power of two");
+    /* Peel only bytes inside the requested span.  The aligned word loop
+     * below likewise runs only when a complete word remains, so neither the
+     * leading nor trailing page may be touched outside [memory, length). */
+    while (length != 0 &&
+           ((uintptr_t)cursor & (LDR_MEMCHR_VECTOR_BYTES - 1U)) != 0) {
+        LDR_MEMCHR_COUNT(g_ldr_memchr_byte_loads);
+        if (*cursor == byte)
+            return (void *)(uintptr_t)cursor;
+        cursor++;
+        length--;
+    }
+    /* Both supported ELF64 architectures provide a baseline 16-byte vector
+     * ISA (SSE2 on x86-64, Advanced SIMD on AArch64).  Four independent,
+     * aligned vector probes cut the work of the multi-MiB target-image scans
+     * without reading beyond the caller's span.  The match mask or bounded
+     * scalar confirmation identifies the first byte independent of endian. */
+    while (length >= LDR_MEMCHR_VECTOR_BATCH *
+                         LDR_MEMCHR_VECTOR_BYTES) {
+        LDR_MEMCHR_COUNT(g_ldr_memchr_vector_batch_iterations);
+        LDR_MEMCHR_TEST_VECTOR(0U * LDR_MEMCHR_VECTOR_BYTES);
+        LDR_MEMCHR_TEST_VECTOR(1U * LDR_MEMCHR_VECTOR_BYTES);
+        LDR_MEMCHR_TEST_VECTOR(2U * LDR_MEMCHR_VECTOR_BYTES);
+        LDR_MEMCHR_TEST_VECTOR(3U * LDR_MEMCHR_VECTOR_BYTES);
+        cursor += LDR_MEMCHR_VECTOR_BATCH * LDR_MEMCHR_VECTOR_BYTES;
+        length -= LDR_MEMCHR_VECTOR_BATCH * LDR_MEMCHR_VECTOR_BYTES;
+    }
+    /* Four independent, in-bounds word probes amortize loop bookkeeping on
+     * long no-match spans.  Each probe is still performed in address order,
+     * and the batch is entered only when all four words are within length. */
+    while (length >= LDR_MEMCHR_WORD_BATCH * word_size) {
+        LDR_MEMCHR_COUNT(g_ldr_memchr_batch_iterations);
+        LDR_MEMCHR_TEST_WORD(0U * word_size);
+        LDR_MEMCHR_TEST_WORD(1U * word_size);
+        LDR_MEMCHR_TEST_WORD(2U * word_size);
+        LDR_MEMCHR_TEST_WORD(3U * word_size);
+        cursor += LDR_MEMCHR_WORD_BATCH * word_size;
+        length -= LDR_MEMCHR_WORD_BATCH * word_size;
+    }
+    while (length >= word_size) {
+        LDR_MEMCHR_COUNT(g_ldr_memchr_single_word_iterations);
+        LDR_MEMCHR_TEST_WORD(0);
+        cursor += word_size;
+        length -= word_size;
+    }
+    while (length != 0) {
+        LDR_MEMCHR_COUNT(g_ldr_memchr_byte_loads);
+        if (*cursor == byte)
+            return (void *)(uintptr_t)cursor;
+        cursor++;
+        length--;
     }
     return NULL;
+
+confirm_candidate:
+    /* The word predicate guarantees at least one exact byte match.  Keep the
+     * confirmation bytewise so its first result is independent of endian. */
+    for (size_t i = 0; i < word_size; i++) {
+        LDR_MEMCHR_COUNT(g_ldr_memchr_byte_loads);
+        if (candidate_cursor[i] == byte)
+            return (void *)(uintptr_t)(candidate_cursor + i);
+    }
+    return NULL;
+
+#undef LDR_MEMCHR_TEST_WORD
+#undef LDR_MEMCHR_TEST_VECTOR
 }
+
+#undef LDR_MEMCHR_COUNT
 
 static size_t ldr_strlen(const char *string)
 {
@@ -1011,7 +1130,6 @@ static void relocation_store_u64_pair(void *address,
 #define write    loader_write
 #define pread    loader_pread
 #define fstat    loader_fstat
-#define lseek    loader_lseek
 #define _exit    loader_exit
 
 /* Debug verbosity — enabled by DLFREEZE_DEBUG=1 env var.
@@ -1050,6 +1168,10 @@ static size_t g_kernel_minsigstksz;
 static int g_kernel_clktck;
 static uintptr_t g_kernel_hwcap;
 static uintptr_t g_kernel_hwcap2;
+/* Architecture-specific libc matchers publish the exact target GLRO fields
+ * which implement the public AT_HWCAP/AT_HWCAP2 contract. */
+static struct dlfrz_glibc_getauxval_contract g_glibc_getauxval_contract;
+static int g_glibc_getauxval_contract_ready;
 #if defined(__aarch64__)
 /* AArch64 glibc substitutes the kernel's AT_PLATFORM string unchanged in
  * dynamic search paths.  Retain a loader-owned bounded snapshot across the
@@ -1167,6 +1289,7 @@ struct aarch64_tlsdesc_arg {
 #define AARCH64_TLSDESC_ARGS_PER_PAGE 127
 
 extern uintptr_t dlfreeze_aarch64_tlsdesc_static(void *);
+extern uintptr_t dlfreeze_aarch64_tlsdesc_undefweak(void *);
 extern uintptr_t dlfreeze_aarch64_tlsdesc_dynamic(void *);
 static int64_t dlfreeze_aarch64_tlsdesc_resolve_c(void *arg_in);
 static void *runtime_tls_get_addr(uintptr_t tp, unsigned long modid,
@@ -1190,6 +1313,20 @@ __asm__(
     "\tldr x0, [x0, #8]\n"
     "\tret\n"
     ".size dlfreeze_aarch64_tlsdesc_static, .-dlfreeze_aarch64_tlsdesc_static\n"
+    /* Undefined weak TLS has absolute address A, not TP+A.  The ordinary
+     * TLSDESC call sequence adds TP to the resolver result, so return A-TP.
+     * Preserve x1 even though this leaf needs it as a temporary. */
+    ".global dlfreeze_aarch64_tlsdesc_undefweak\n"
+    ".hidden dlfreeze_aarch64_tlsdesc_undefweak\n"
+    ".type dlfreeze_aarch64_tlsdesc_undefweak, %function\n"
+    "dlfreeze_aarch64_tlsdesc_undefweak:\n"
+    "\tstr x1, [sp, #-16]!\n"
+    "\tldr x1, [x0, #8]\n"
+    "\tmrs x0, tpidr_el0\n"
+    "\tsub x0, x1, x0\n"
+    "\tldr x1, [sp], #16\n"
+    "\tret\n"
+    ".size dlfreeze_aarch64_tlsdesc_undefweak, .-dlfreeze_aarch64_tlsdesc_undefweak\n"
     /* Dynamic TLSDESC resolver.  AArch64 TLSDESC ABI: only x0 (and the
      * flags) may be clobbered; all other GPRs and FP registers must be
      * preserved.  Route every lookup through the checked C resolver: an
@@ -1310,12 +1447,14 @@ struct x86_64_tlsdesc_arg {
 };
 
 #define X86_64_TLSDESC_ARGS_PER_PAGE 255
+#define X86_64_TLSDESC_XSAVE_MAX_SIZE (64U * 1024U)
 
 /* x86_64 TLSDESC ABI: caller does `lea desc(%rip), %rax; call *(%rax)`.
  * Resolver may clobber %rax and the flags only; all other registers
  * (including arg registers) must be preserved.  Returns the TP offset
  * (i.e. value to be combined as `%fs:(%rax)`) in %rax. */
 extern uintptr_t dlfreeze_x86_64_tlsdesc_static(void *);
+extern uintptr_t dlfreeze_x86_64_tlsdesc_undefweak(void *);
 extern uintptr_t dlfreeze_x86_64_tlsdesc_dynamic(void *);
 static int64_t dlfreeze_x86_64_tlsdesc_resolve_c(void *arg_in);
 
@@ -1327,6 +1466,22 @@ struct x86_64_tlsdesc_page {
 
 static struct x86_64_tlsdesc_page *g_x86_64_tlsdesc_pages;
 
+/* The dynamic resolver is entered under the TLSDESC calling convention,
+ * which preserves every register except RAX and the condition flags.  The
+ * nested C slow path can reach target-libc allocation code selected for the
+ * current CPU, so FXSAVE alone is insufficient when the kernel has enabled
+ * AVX or newer user state.  These values are admitted from CPUID/XCR0 before
+ * any target code runs.  A zero size selects the architectural FXSAVE
+ * fallback on kernels which have not enabled XSAVE.  Keep the objects even
+ * though their only readers are the assembly trampoline below. */
+static uint32_t g_x86_64_tlsdesc_xsave_size __attribute__((used));
+static uint32_t g_x86_64_tlsdesc_xsave_mask_low __attribute__((used));
+static uint32_t g_x86_64_tlsdesc_xsave_mask_high __attribute__((used));
+
+#ifdef DLFREEZE_TLSDESC_XSTATE_GATE
+static int g_x86_64_tlsdesc_xstate_gate_clobber;
+#endif
+
 __asm__(
     ".text\n"
     ".global dlfreeze_x86_64_tlsdesc_static\n"
@@ -1336,6 +1491,16 @@ __asm__(
     "\tmovq 8(%rax), %rax\n"
     "\tret\n"
     ".size dlfreeze_x86_64_tlsdesc_static, .-dlfreeze_x86_64_tlsdesc_static\n"
+    /* The caller adds %fs:0 after this resolver returns.  Subtract TP here so
+     * an undefined weak TLS symbol has the ELF address S(=0)+A. */
+    ".global dlfreeze_x86_64_tlsdesc_undefweak\n"
+    ".hidden dlfreeze_x86_64_tlsdesc_undefweak\n"
+    ".type dlfreeze_x86_64_tlsdesc_undefweak, @function\n"
+    "dlfreeze_x86_64_tlsdesc_undefweak:\n"
+    "\tmovq 8(%rax), %rax\n"
+    "\tsubq %fs:0, %rax\n"
+    "\tret\n"
+    ".size dlfreeze_x86_64_tlsdesc_undefweak, .-dlfreeze_x86_64_tlsdesc_undefweak\n"
     ".global dlfreeze_x86_64_tlsdesc_dynamic\n"
     ".hidden dlfreeze_x86_64_tlsdesc_dynamic\n"
     ".type dlfreeze_x86_64_tlsdesc_dynamic, @function\n"
@@ -1349,16 +1514,50 @@ __asm__(
     "\tpushq %r10\n"
     "\tpushq %r11\n"
     "\tpushq %rbx\n"
+    "\tpushq %rbp\n"
+    "\tpushq %r12\n"
     "\tmovq 8(%rax), %rdi\n"
-    /* The bootstrap is built for baseline x86-64/SSE2.  FXSAVE preserves
-     * every FP/SIMD state component that such nested C code may modify,
-     * including x87, MXCSR, and XMM0-XMM15.  Legacy SSE instructions leave
-     * wider AVX register lanes untouched. */
+    "\tmovq %rsp, %rbp\n"
+    "\tmovl g_x86_64_tlsdesc_xsave_size(%rip), %r12d\n"
+    "\ttestl %r12d, %r12d\n"
+    "\tjz 1f\n"
+    /* XSAVE requires 64-byte alignment.  Reserve the admitted enabled-state
+     * size plus alignment slack below the saved GPRs, leaving RSP 16-byte
+     * aligned for the nested SysV call.  XSAVE does not promise to overwrite
+     * reserved header bytes, and XRSTOR requires them to be zero. */
+    "\taddq $63, %r12\n"
+    "\tsubq %r12, %rsp\n"
+    "\tandq $-64, %rsp\n"
+    "\txorl %eax, %eax\n"
+    "\tmovq %rax, 512(%rsp)\n"
+    "\tmovq %rax, 520(%rsp)\n"
+    "\tmovq %rax, 528(%rsp)\n"
+    "\tmovq %rax, 536(%rsp)\n"
+    "\tmovq %rax, 544(%rsp)\n"
+    "\tmovq %rax, 552(%rsp)\n"
+    "\tmovq %rax, 560(%rsp)\n"
+    "\tmovq %rax, 568(%rsp)\n"
+    "\tmovl g_x86_64_tlsdesc_xsave_mask_low(%rip), %eax\n"
+    "\tmovl g_x86_64_tlsdesc_xsave_mask_high(%rip), %edx\n"
+    "\txsave64 (%rsp)\n"
+    "\tcall dlfreeze_x86_64_tlsdesc_resolve_c\n"
+    "\tmovq %rax, %rbx\n"
+    "\tmovl g_x86_64_tlsdesc_xsave_mask_low(%rip), %eax\n"
+    "\tmovl g_x86_64_tlsdesc_xsave_mask_high(%rip), %edx\n"
+    "\txrstor64 (%rsp)\n"
+    "\tmovq %rbx, %rax\n"
+    "\tjmp 2f\n"
+    /* Without OSXSAVE, userspace cannot use AVX state and the bootstrap's
+     * baseline-SSE2 C path is completely covered by the legacy image. */
+    "1:\n"
     "\tsubq $512, %rsp\n"
     "\tfxsave64 (%rsp)\n"
     "\tcall dlfreeze_x86_64_tlsdesc_resolve_c\n"
     "\tfxrstor64 (%rsp)\n"
-    "\taddq $512, %rsp\n"
+    "2:\n"
+    "\tmovq %rbp, %rsp\n"
+    "\tpopq %r12\n"
+    "\tpopq %rbp\n"
     "\tpopq %rbx\n"
     "\tpopq %r11\n"
     "\tpopq %r10\n"
@@ -1396,9 +1595,18 @@ enum frozen_runtime {
 };
 
 /* ---- error output (no stdio — bootstrap may break after TLS swap) ----- */
+static int g_loader_diagnostics_suppressed;
+
 static void ldr_msg(const char *s)
 {
-    if (s) write(STDERR_FILENO, s, strlen(s));
+    if (!g_loader_diagnostics_suppressed && s)
+        write(STDERR_FILENO, s, strlen(s));
+}
+
+static void ldr_msg_n(const char *s, size_t length)
+{
+    if (!g_loader_diagnostics_suppressed && s && length)
+        write(STDERR_FILENO, s, length);
 }
 
 /* Debug-only output — silent unless DLFREEZE_DEBUG is set. */
@@ -2099,10 +2307,15 @@ static size_t g_tls_static_extent;
  * This cannot use pthread mutexes: the callbacks below are themselves part
  * of the target libc's rtld-facing implementation, and a compiler-emitted
  * atomic helper could still belong to the bootstrap runtime after the target
- * thread pointer is installed.  The state is one atomically-published pair:
- * low 32 bits are the owning Linux TID, high 32 bits the recursion depth.
- * That also makes same-thread signal re-entry safe between acquisition and
- * the first instruction in the critical section. */
+ * thread pointer is installed.  The state is one atomically-published word:
+ * low 32 bits are the owning Linux TID, the next 31 bits are the recursion
+ * depth, and the high bit records that a waiter has existed.  Keeping the
+ * contention bit in the same compare-exchanged word as ownership prevents a
+ * first waiter from racing an unlock and sleeping without a corresponding
+ * wake.  The sticky bit also lets the uncontended startup path avoid a futex
+ * syscall on every outer unlock.  The combined word makes same-thread signal
+ * re-entry safe between acquisition and the first instruction in the
+ * critical section. */
 struct runtime_loader_lock {
     volatile uint64_t state;
     volatile uint32_t process_id;
@@ -2110,9 +2323,41 @@ struct runtime_loader_lock {
 
 static struct runtime_loader_lock g_runtime_loader_lock;
 static uint64_t g_runtime_loader_atfork_sigmask;
+typedef uint32_t runtime_loader_lock_token;
+static runtime_loader_lock_token g_runtime_loader_atfork_token;
+
+/* Target code first reaches the dlfcn shims from the resolver relocation
+ * passes, before target libc process/thread initialization is complete.
+ * Publish the already-validated startup graph for read-only queries at that
+ * boundary, but do not let a resolver activate a dormant scope or begin a
+ * filesystem-backed load.  Those mutations need the complete target malloc,
+ * pthread-key, atfork, errno, and finalizer services established below.
+ *
+ * This is an atomic publication state rather than an inference from g_nobj:
+ * g_nobj is also the append cursor of a live dlopen transaction, and a
+ * partially initialized loader must never look like a writable namespace. */
+enum runtime_loader_phase {
+    RUNTIME_LOADER_PHASE_RESET = 0,
+    RUNTIME_LOADER_PHASE_STARTUP_READONLY,
+    RUNTIME_LOADER_PHASE_RUNNING
+};
+
+static volatile uint32_t g_runtime_loader_phase;
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+static volatile uint64_t g_runtime_loader_lock_acquisitions;
+static volatile uint64_t g_runtime_loader_futex_waits;
+static volatile uint64_t g_runtime_loader_futex_wakes;
+static volatile uint64_t g_runtime_loader_futex_woken;
+static volatile uint64_t g_runtime_loader_tid_revalidations;
+#endif
 
 #define RUNTIME_LOCK_OWNER(state) ((uint32_t)(state))
-#define RUNTIME_LOCK_DEPTH(state) ((uint32_t)((state) >> 32))
+#define RUNTIME_LOCK_CONTENDED UINT64_C(0x8000000000000000)
+#define RUNTIME_LOCK_DEPTH_MAX UINT32_C(0x7fffffff)
+#define RUNTIME_LOCK_DEPTH(state) \
+    ((uint32_t)(((state) >> 32) & RUNTIME_LOCK_DEPTH_MAX))
+#define RUNTIME_LOCK_CONTENTION(state) \
+    ((state) & RUNTIME_LOCK_CONTENDED)
 #define RUNTIME_LOCK_STATE(owner, depth) \
     (((uint64_t)(depth) << 32) | (uint32_t)(owner))
 
@@ -2209,7 +2454,7 @@ static uint64_t runtime_atomic_compare_exchange64(
     __asm__ volatile("lock cmpxchgq %2, %1"
                      : "+a"(observed), "+m"(*address)
                      : "r"(desired)
-                     : "memory");
+                     : "cc", "memory");
     return observed;
 #elif defined(__aarch64__)
     uint64_t observed;
@@ -2236,28 +2481,93 @@ static uint64_t runtime_atomic_compare_exchange64(
 #endif
 }
 
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+static void runtime_loader_gate_counter_increment(
+    volatile uint64_t *counter)
+{
+    uint64_t value;
+
+    do {
+        value = runtime_atomic_load64(counter);
+    } while (runtime_atomic_compare_exchange64(
+                 counter, value, value + 1) != value);
+}
+#endif
+
+static int runtime_loader_kernel_id_value(long value, uint32_t *id_out)
+{
+    if (!id_out || value <= 0 || (unsigned long)value > UINT32_MAX)
+        return 0;
+    *id_out = (uint32_t)value;
+    return 1;
+}
+
+static uint32_t runtime_loader_kernel_id(long syscall_number)
+{
+    long value = arch_raw_syscall0(syscall_number);
+    uint32_t id;
+
+    if (!runtime_loader_kernel_id_value(value, &id))
+        loader_exit(127);
+    return id;
+}
+
 static void runtime_loader_lock_initialize(void)
 {
-    uint32_t process_id = (uint32_t)arch_raw_syscall0(SYS_getpid);
+    uint32_t process_id = runtime_loader_kernel_id(SYS_getpid);
 
     runtime_atomic_store64(&g_runtime_loader_lock.state, 0);
     runtime_atomic_store32(&g_runtime_loader_lock.process_id, process_id);
 }
 
-static void runtime_loader_lock_acquire(void)
+/* The returned token is proof that this call acquired one recursion level.
+ * Keep it in the acquiring control flow and pass it to the matching release;
+ * this avoids a second gettid syscall without deriving thread identity from
+ * any target-libc TCB layout.  A normal fork may change the Linux TID while
+ * an outer loader operation remains active, so release revalidates a stale
+ * token on that exceptional path. */
+static runtime_loader_lock_token runtime_loader_lock_acquire(void)
 {
-    uint32_t process_id = (uint32_t)arch_raw_syscall0(SYS_getpid);
-    uint32_t tid = (uint32_t)arch_raw_syscall0(SYS_gettid);
+    uint32_t tid = runtime_loader_kernel_id(SYS_gettid);
+    uint32_t process_id = runtime_atomic_load32(
+        &g_runtime_loader_lock.process_id);
 
-    /* A raw clone/fork which bypasses pthread_atfork must not inherit a lock
-     * owned by a vanished thread.  Normal target-libc fork is additionally
-     * serialized by the handlers below, which protects the data snapshot as
-     * well as the lock word itself. */
-    if (runtime_atomic_load32(&g_runtime_loader_lock.process_id) !=
-        process_id) {
-        runtime_atomic_store64(&g_runtime_loader_lock.state, 0);
-        runtime_atomic_store32(&g_runtime_loader_lock.process_id,
-                               process_id);
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+    runtime_loader_gate_counter_increment(
+        &g_runtime_loader_lock_acquisitions);
+#endif
+
+    /* The thread-group leader's TID is its PID.  Equality with the cached
+     * process ID therefore proves the overwhelmingly common startup thread
+     * is still in the initialized process without another syscall.  A
+     * non-leader (or a raw-fork child carrying the parent's cache) validates
+     * with getpid before it can inspect or wait on inherited ownership. */
+    if (process_id != tid) {
+        uint32_t current_process_id =
+            runtime_loader_kernel_id(SYS_getpid);
+
+        /* A raw clone/fork which bypasses pthread_atfork must not inherit a
+         * lock owned by a vanished thread.  Normal target-libc fork is also
+         * serialized by the handlers below, protecting the data snapshot as
+         * well as the lock word itself. */
+        if (process_id != current_process_id) {
+            uint64_t inherited_state = runtime_atomic_load64(
+                &g_runtime_loader_lock.state);
+
+            /* An unlocked sticky contention bit has no surviving waiter and
+             * is safe to discard.  Live ownership is different: the child
+             * may be inside an outer loader operation, or its vanished
+             * parent thread may have been mutating the snapshot.  Never let
+             * a nested child operation erase that evidence and run effects.
+             * A forking owner can first unwind its carried outer token; the
+             * next acquisition will then repair this PID cache safely. */
+            if (RUNTIME_LOCK_OWNER(inherited_state) != 0 ||
+                RUNTIME_LOCK_DEPTH(inherited_state) != 0)
+                loader_exit(127);
+            runtime_atomic_store64(&g_runtime_loader_lock.state, 0);
+            runtime_atomic_store32(&g_runtime_loader_lock.process_id,
+                                   current_process_id);
+        }
     }
 
     for (;;) {
@@ -2268,12 +2578,31 @@ static void runtime_loader_lock_acquire(void)
         uint64_t desired;
 
         if (owner == tid) {
-            if (depth == UINT32_MAX)
+            if (depth == RUNTIME_LOCK_DEPTH_MAX)
                 loader_exit(127);
-            desired = RUNTIME_LOCK_STATE(tid, depth + 1);
+            desired = RUNTIME_LOCK_CONTENTION(state) |
+                      RUNTIME_LOCK_STATE(tid, depth + 1);
         } else if (owner == 0) {
-            desired = RUNTIME_LOCK_STATE(tid, 1);
+            desired = RUNTIME_LOCK_CONTENTION(state) |
+                      RUNTIME_LOCK_STATE(tid, 1);
         } else {
+            /* Publish the first wait in the ownership word before entering
+             * the kernel.  If unlock wins this CAS, the retry observes a
+             * changed/free owner; if this CAS wins, unlock must observe the
+             * sticky bit and wake.  The futex itself watches only the low
+             * owner word, which this high-bit transition leaves unchanged. */
+            if (!RUNTIME_LOCK_CONTENTION(state)) {
+                desired = state | RUNTIME_LOCK_CONTENDED;
+                if (runtime_atomic_compare_exchange64(
+                        &g_runtime_loader_lock.state,
+                        state, desired) != state)
+                    continue;
+                state = desired;
+            }
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+            runtime_loader_gate_counter_increment(
+                &g_runtime_loader_futex_waits);
+#endif
             long wait_result = arch_raw_syscall6(
                 SYS_futex, (long)&g_runtime_loader_lock.state,
                 FUTEX_WAIT_PRIVATE, owner, 0, 0, 0);
@@ -2289,13 +2618,13 @@ static void runtime_loader_lock_acquire(void)
         }
         if (runtime_atomic_compare_exchange64(
                 &g_runtime_loader_lock.state, state, desired) == state)
-            return;
+            return tid;
     }
 }
 
-static void runtime_loader_lock_release(void)
+static void runtime_loader_lock_release(runtime_loader_lock_token token)
 {
-    uint32_t tid = (uint32_t)arch_raw_syscall0(SYS_gettid);
+    uint32_t tid = token;
 
     for (;;) {
         uint64_t state = runtime_atomic_load64(
@@ -2304,21 +2633,52 @@ static void runtime_loader_lock_release(void)
         uint32_t depth = RUNTIME_LOCK_DEPTH(state);
         uint64_t desired;
 
-        if (owner != tid || depth == 0)
+        if (owner != tid) {
+            /* pthread_atfork's child callback rewrites ownership to the
+             * child's TID while retaining an outer recursion level.  Only
+             * that fork-crossing path needs another identity syscall. */
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+            runtime_loader_gate_counter_increment(
+                &g_runtime_loader_tid_revalidations);
+#endif
+            tid = runtime_loader_kernel_id(SYS_gettid);
+            if (owner != tid)
+                loader_exit(127);
+        }
+        if (depth == 0)
             loader_exit(127);
-        desired = depth == 1 ? 0 : RUNTIME_LOCK_STATE(tid, depth - 1);
+        desired = RUNTIME_LOCK_CONTENTION(state);
+        if (depth != 1)
+            desired |= RUNTIME_LOCK_STATE(tid, depth - 1);
         if (runtime_atomic_compare_exchange64(
                 &g_runtime_loader_lock.state, state, desired) != state)
             continue;
-        if (desired == 0) {
+        if (depth == 1 && RUNTIME_LOCK_CONTENTION(state)) {
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+            runtime_loader_gate_counter_increment(
+                &g_runtime_loader_futex_wakes);
+#endif
             long wake_result = arch_raw_syscall6(
                 SYS_futex, (long)&g_runtime_loader_lock.state,
                 FUTEX_WAKE_PRIVATE, 1, 0, 0, 0);
             if (wake_result < 0)
                 loader_exit(127);
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+            if (wake_result > 0)
+                runtime_loader_gate_counter_increment(
+                    &g_runtime_loader_futex_woken);
+#endif
         }
         return;
     }
+}
+
+/* Some target-private callback ABIs split lock and unlock into unrelated
+ * void calls and provide no caller-owned storage for the acquisition token.
+ * Keep that narrow adapter's ownership check as strong as the old path. */
+static void runtime_loader_lock_release_current(void)
+{
+    runtime_loader_lock_release(runtime_loader_kernel_id(SYS_gettid));
 }
 
 /* Register these through the target runtime's atfork backend.  musl exports
@@ -2338,7 +2698,7 @@ static void runtime_loader_atfork_prepare(void)
                           (long)&all_signals, (long)&old_signals,
                           sizeof(old_signals)) < 0)
         loader_exit(127);
-    runtime_loader_lock_acquire();
+    g_runtime_loader_atfork_token = runtime_loader_lock_acquire();
     g_runtime_loader_atfork_sigmask = old_signals;
 }
 
@@ -2346,7 +2706,7 @@ static void runtime_loader_atfork_parent(void)
 {
     uint64_t old_signals = g_runtime_loader_atfork_sigmask;
 
-    runtime_loader_lock_release();
+    runtime_loader_lock_release(g_runtime_loader_atfork_token);
     if (arch_raw_syscall4(SYS_rt_sigprocmask, SIG_SETMASK,
                           (long)&old_signals, 0,
                           sizeof(old_signals)) < 0)
@@ -2358,8 +2718,8 @@ static void runtime_loader_atfork_child(void)
     uint64_t old_signals = g_runtime_loader_atfork_sigmask;
     uint64_t state = runtime_atomic_load64(&g_runtime_loader_lock.state);
     uint32_t depth = RUNTIME_LOCK_DEPTH(state);
-    uint32_t process_id = (uint32_t)arch_raw_syscall0(SYS_getpid);
-    uint32_t tid = (uint32_t)arch_raw_syscall0(SYS_gettid);
+    uint32_t process_id = runtime_loader_kernel_id(SYS_getpid);
+    uint32_t tid = runtime_loader_kernel_id(SYS_gettid);
 
     /* Drop the recursion level acquired by prepare, retaining any outer
      * loader operation when fork was called from one of its constructors. */
@@ -2550,13 +2910,13 @@ static void glro_dl_mcount(uintptr_t from, uintptr_t to)
 static void glro_dl_lock_recursive(void *lock)
 {
     (void)lock;
-    runtime_loader_lock_acquire();
+    (void)runtime_loader_lock_acquire();
 }
 
 static void glro_dl_unlock_recursive(void *lock)
 {
     (void)lock;
-    runtime_loader_lock_release();
+    runtime_loader_lock_release_current();
 }
 
 static int glro_dl_make_stack_executable(const void *stack_endp)
@@ -2606,124 +2966,58 @@ static uint64_t x86_xgetbv0(void)
     return ((uint64_t)xcr0_high << 32) | xcr0_low;
 }
 
-static int x86_cache_geometry_size(uint64_t line_size,
-                                   uint64_t partitions, uint64_t ways,
-                                   uint64_t sets, uint64_t *size_out)
+/* Admit the exact standard-format XSAVE image needed for the user state
+ * enabled by this kernel.  Do not silently fall back to FXSAVE after the OS
+ * advertises XSAVE: target libc may then legally execute AVX, AVX-512, AMX,
+ * or future instructions whose state the legacy image cannot preserve. */
+static int initialize_x86_tlsdesc_xstate(void)
 {
-    uint64_t size = line_size;
+    uint32_t cpuid_eax;
+    uint32_t cpuid_ebx;
+    uint32_t cpuid_ecx;
+    uint32_t cpuid_edx;
+    uint32_t max_leaf;
+    uint64_t xcr0;
+    uint64_t supported;
 
-    if (!size_out || !line_size || !partitions || !ways || !sets ||
-        partitions > UINT64_MAX / size)
+    g_x86_64_tlsdesc_xsave_size = 0;
+    g_x86_64_tlsdesc_xsave_mask_low = 0;
+    g_x86_64_tlsdesc_xsave_mask_high = 0;
+
+    x86_cpuid_count(0, 0, &cpuid_eax, &cpuid_ebx,
+                    &cpuid_ecx, &cpuid_edx);
+    max_leaf = cpuid_eax;
+    if (max_leaf < 1)
+        return 1;
+
+    x86_cpuid_count(1, 0, &cpuid_eax, &cpuid_ebx,
+                    &cpuid_ecx, &cpuid_edx);
+    if ((cpuid_ecx & ((1U << 26) | (1U << 27))) !=
+        ((1U << 26) | (1U << 27)))
+        return 1;
+    if (max_leaf < UINT32_C(0x0d))
         return 0;
-    size *= partitions;
-    if (ways > UINT64_MAX / size)
+
+    xcr0 = x86_xgetbv0();
+    x86_cpuid_count(UINT32_C(0x0d), 0, &cpuid_eax, &cpuid_ebx,
+                    &cpuid_ecx, &cpuid_edx);
+    supported = ((uint64_t)cpuid_edx << 32) | cpuid_eax;
+
+    /* A standard XSAVE area consists of the 512-byte legacy region and
+     * 64-byte header.  X87 and SSE are mandatory process state on x86-64;
+     * every requested bit must also be enumerated by CPUID.0DH. */
+    if ((xcr0 & UINT64_C(0x3)) != UINT64_C(0x3) ||
+        (xcr0 & ~supported) != 0 ||
+        cpuid_ebx < 512U + 64U ||
+        cpuid_ebx > X86_64_TLSDESC_XSAVE_MAX_SIZE)
         return 0;
-    size *= ways;
-    if (sets > UINT64_MAX / size)
-        return 0;
-    *size_out = size * sets;
+
+    g_x86_64_tlsdesc_xsave_mask_low = (uint32_t)xcr0;
+    g_x86_64_tlsdesc_xsave_mask_high = (uint32_t)(xcr0 >> 32);
+    /* Publish size last: the assembly resolver treats a nonzero size as the
+     * validity flag for the two mask words. */
+    g_x86_64_tlsdesc_xsave_size = cpuid_ebx;
     return 1;
-}
-
-static void x86_detect_cache_sizes(uint32_t max_leaf, uint32_t max_ext_leaf,
-                                   size_t *data_cache_size,
-                                   size_t *shared_cache_size)
-{
-    uint64_t detected_l1_data = 32u * 1024u;
-    uint64_t detected_shared = 2u * 1024u * 1024u;
-
-    if (max_leaf >= 4) {
-        for (uint32_t cache_index = 0; cache_index < 32; cache_index++) {
-            uint32_t cpuid_eax;
-            uint32_t cpuid_ebx;
-            uint32_t cpuid_ecx;
-            uint32_t cpuid_edx;
-            uint32_t cache_type;
-            uint32_t cache_level;
-            uint64_t line_size;
-            uint64_t partitions;
-            uint64_t ways;
-            uint64_t sets;
-            uint64_t cache_size;
-
-            x86_cpuid_count(4, cache_index, &cpuid_eax, &cpuid_ebx,
-                            &cpuid_ecx, &cpuid_edx);
-            (void)cpuid_edx;
-            cache_type = cpuid_eax & 0x1fu;
-            if (cache_type == 0)
-                break;
-            cache_level = (cpuid_eax >> 5) & 0x7u;
-            line_size = (cpuid_ebx & 0xfffu) + 1u;
-            partitions = ((cpuid_ebx >> 12) & 0x3ffu) + 1u;
-            ways = ((cpuid_ebx >> 22) & 0x3ffu) + 1u;
-            sets = (uint64_t)cpuid_ecx + 1u;
-            if (!x86_cache_geometry_size(line_size, partitions, ways, sets,
-                                         &cache_size))
-                continue;
-
-            if (cache_type == 1 && cache_level == 1 && cache_size > 0)
-                detected_l1_data = cache_size;
-            if (cache_level >= 2 && cache_size > detected_shared)
-                detected_shared = cache_size;
-        }
-    }
-
-    if (max_ext_leaf >= 0x8000001du) {
-        for (uint32_t cache_index = 0; cache_index < 32; cache_index++) {
-            uint32_t cpuid_eax;
-            uint32_t cpuid_ebx;
-            uint32_t cpuid_ecx;
-            uint32_t cpuid_edx;
-            uint32_t cache_type;
-            uint32_t cache_level;
-            uint64_t line_size;
-            uint64_t partitions;
-            uint64_t ways;
-            uint64_t sets;
-            uint64_t cache_size;
-
-            x86_cpuid_count(0x8000001du, cache_index, &cpuid_eax,
-                            &cpuid_ebx, &cpuid_ecx, &cpuid_edx);
-            (void)cpuid_edx;
-            cache_type = cpuid_eax & 0x1fu;
-            if (cache_type == 0)
-                break;
-            cache_level = (cpuid_eax >> 5) & 0x7u;
-            line_size = (cpuid_ebx & 0xfffu) + 1u;
-            partitions = ((cpuid_ebx >> 12) & 0x3ffu) + 1u;
-            ways = ((cpuid_ebx >> 22) & 0x3ffu) + 1u;
-            sets = (uint64_t)cpuid_ecx + 1u;
-            if (!x86_cache_geometry_size(line_size, partitions, ways, sets,
-                                         &cache_size))
-                continue;
-
-            if (cache_type == 1 && cache_level == 1 && cache_size > 0)
-                detected_l1_data = cache_size;
-            if (cache_level >= 2 && cache_size > detected_shared)
-                detected_shared = cache_size;
-        }
-    } else if (max_ext_leaf >= 0x80000006u) {
-        uint32_t cpuid_eax;
-        uint32_t cpuid_ebx;
-        uint32_t cpuid_ecx;
-        uint32_t cpuid_edx;
-        uint64_t l2_size;
-        uint64_t l3_size;
-
-        x86_cpuid_count(0x80000006u, 0, &cpuid_eax, &cpuid_ebx,
-                        &cpuid_ecx, &cpuid_edx);
-        (void)cpuid_eax;
-        (void)cpuid_ebx;
-        l2_size = ((uint64_t)(cpuid_ecx >> 16) & 0xffffu) * 1024u;
-        l3_size = ((uint64_t)(cpuid_edx >> 18) & 0x3fffu) * 512u * 1024u;
-        if (l2_size > detected_shared)
-            detected_shared = l2_size;
-        if (l3_size > detected_shared)
-            detected_shared = l3_size;
-    }
-
-    *data_cache_size = (size_t)detected_l1_data;
-    *shared_cache_size = (size_t)detected_shared;
 }
 
 static uint32_t x86_detect_isa_1(uint32_t max_leaf, uint32_t max_ext_leaf)
@@ -2793,37 +3087,16 @@ static uint32_t x86_detect_isa_1(uint32_t max_leaf, uint32_t max_ext_leaf)
 static int x86_cpuf_offset_ok(int offset, size_t width)
 {
     uint64_t base = g_glibc_x86_cpu_contract.cpu_features_offset;
+    uint64_t object_size =
+        g_glibc_x86_cpu_contract.layout.object_size;
 
     return g_glibc_x86_cpu_contract_ready && offset >= 0 &&
-           base <= GLRO_SIZE && (size_t)offset <= GLRO_SIZE - base &&
-           width <= GLRO_SIZE - base - (size_t)offset;
+           base <= GLRO_SIZE && object_size <= GLRO_SIZE - base &&
+           (uint64_t)offset <= object_size &&
+           (uint64_t)width <= object_size - (uint64_t)offset;
 }
 
-static void x86_cpuf_store_u32(int offset, uint32_t value)
-{
-    uint64_t base = g_glibc_x86_cpu_contract.cpu_features_offset;
-
-    if (!x86_cpuf_offset_ok(offset, sizeof(value))) {
-        ldr_msg("dlfreeze-loader: invalid target x86 CPU contract\n");
-        _exit(127);
-    }
-    memcpy(g_fake_rtld_global_ro + (size_t)base + (size_t)offset,
-           &value, sizeof(value));
-}
-
-static void x86_cpuf_store_size(int offset, size_t value)
-{
-    uint64_t base = g_glibc_x86_cpu_contract.cpu_features_offset;
-
-    if (!x86_cpuf_offset_ok(offset, sizeof(value))) {
-        ldr_msg("dlfreeze-loader: invalid target x86 CPU contract\n");
-        _exit(127);
-    }
-    memcpy(g_fake_rtld_global_ro + (size_t)base + (size_t)offset,
-           &value, sizeof(value));
-}
-
-static void init_x86_cpu_features(void)
+static void init_x86_loader_isa(void)
 {
     const struct dlfrz_glibc_x86_cpu_layout *layout =
         &g_glibc_x86_cpu_contract.layout;
@@ -2833,23 +3106,16 @@ static void init_x86_cpu_features(void)
     uint32_t cpuid_edx;
     uint32_t max_leaf;
     uint32_t max_ext_leaf = 0;
-    size_t data_cache_size = 32u * 1024u;
-    size_t shared_cache_size = 2u * 1024u * 1024u;
-    size_t non_temporal_threshold;
-    size_t rep_movsb_stop_threshold;
-    size_t object_size;
 
     if (!g_glibc_x86_cpu_contract_ready ||
-        layout->rep_stosb_threshold < 0 ||
-        !x86_cpuf_offset_ok(layout->rep_stosb_threshold,
-                            sizeof(size_t))) {
+        layout->object_size > SIZE_MAX ||
+        !x86_cpuf_offset_ok(0, (size_t)layout->object_size)) {
         ldr_msg("dlfreeze-loader: missing target x86 CPU contract\n");
         _exit(127);
     }
-    object_size = (size_t)layout->rep_stosb_threshold + sizeof(size_t);
     memset(g_fake_rtld_global_ro +
                (size_t)g_glibc_x86_cpu_contract.cpu_features_offset,
-           0, object_size);
+           0, (size_t)layout->object_size);
 
     x86_cpuid_count(0, 0, &cpuid_eax, &cpuid_ebx, &cpuid_ecx, &cpuid_edx);
     max_leaf = cpuid_eax;
@@ -2857,47 +3123,7 @@ static void init_x86_cpu_features(void)
                     &cpuid_ecx, &cpuid_edx);
     if (cpuid_eax >= UINT32_C(0x80000000))
         max_ext_leaf = cpuid_eax;
-
-    /* A zero kind asks the target wrapper to run its private initializer.
-     * Mark the already initialized synthetic object as the generic kind,
-     * while leaving every optional CPUID/active-feature word zero.  This
-     * keeps target IFUNC selection on architectural fallback variants and
-     * avoids recreating release-private feature policy. */
-    x86_cpuf_store_u32(X86_CPUF_BASIC_KIND,
-                       g_glibc_x86_cpu_contract.generic_kind);
-
     g_x86_isa_1 = x86_detect_isa_1(max_leaf, max_ext_leaf);
-    x86_detect_cache_sizes(max_leaf, max_ext_leaf, &data_cache_size,
-                           &shared_cache_size);
-    if (shared_cache_size < data_cache_size)
-        shared_cache_size = data_cache_size;
-    non_temporal_threshold = shared_cache_size - shared_cache_size / 4u;
-    if (non_temporal_threshold < 1024u * 1024u)
-        non_temporal_threshold = 1024u * 1024u;
-    rep_movsb_stop_threshold =
-        shared_cache_size > SIZE_MAX / 4u ? SIZE_MAX :
-        shared_cache_size * 4u;
-    if (rep_movsb_stop_threshold < 4u * 1024u * 1024u)
-        rep_movsb_stop_threshold = 4u * 1024u * 1024u;
-
-    /* These are the exact member locations covered by the target
-     * initializer-write witness.  Zero feature words select generic IFUNCs;
-     * the remaining values only provide safe baseline XSAVE and string/mem
-     * operation geometry to those implementations. */
-    /* With XSAVE absent from the published active-feature words, the only
-     * usable state image is the architectural 512-byte FXSAVE legacy area. */
-    x86_cpuf_store_size(layout->xsave_state_size, 512);
-    x86_cpuf_store_size(layout->data_cache_size, data_cache_size);
-    x86_cpuf_store_size(layout->shared_cache_size, shared_cache_size);
-    x86_cpuf_store_size(layout->non_temporal_threshold,
-                        non_temporal_threshold);
-    if (layout->memset_non_temporal_threshold >= 0)
-        x86_cpuf_store_size(layout->memset_non_temporal_threshold,
-                            non_temporal_threshold);
-    x86_cpuf_store_size(layout->rep_movsb_threshold, 2048);
-    x86_cpuf_store_size(layout->rep_movsb_stop_threshold,
-                        rep_movsb_stop_threshold);
-    x86_cpuf_store_size(layout->rep_stosb_threshold, 2048);
 }
 #endif /* __x86_64__ */
 
@@ -2947,7 +3173,7 @@ static void fixup_rtld_for_glibc(const struct glibc_ver_offsets *o)
         (uintptr_t)g_fake_link_map;
 
 #if defined(__x86_64__)
-    init_x86_cpu_features();
+    init_x86_loader_isa();
 #endif
 
     /* Install glibc's complete static-loader hook only at an exact validated
@@ -3149,6 +3375,9 @@ detect_glibc_offsets_from_interp(const uint8_t *mem, uint64_t mem_foff,
                                   const struct dlfrz_lib_meta *metas,
                                   uint32_t num_entries)
 {
+    memset(&g_glibc_getauxval_contract, 0,
+           sizeof(g_glibc_getauxval_contract));
+    g_glibc_getauxval_contract_ready = 0;
 #if defined(__x86_64__)
     memset(&g_glibc_x86_cpu_contract, 0,
            sizeof(g_glibc_x86_cpu_contract));
@@ -3165,6 +3394,8 @@ detect_glibc_offsets_from_interp(const uint8_t *mem, uint64_t mem_foff,
     size_t elf_size;
     struct dlfrz_elf64_dyn_view view;
     struct dlfrz_glibc_rtld_identity identity;
+    int development_release;
+    int release_minor;
 
     if (entries[idx].data_offset < mem_foff ||
         entries[idx].data_size > SIZE_MAX)
@@ -3173,7 +3404,12 @@ detect_glibc_offsets_from_interp(const uint8_t *mem, uint64_t mem_foff,
     elf_size = (size_t)entries[idx].data_size;
     if (elf_size < sizeof(Elf64_Ehdr))
         return NULL;
-    if (dlfrz_glibc_is_development_release(elf, elf_size)) {
+    if (!dlfrz_glibc_elf_release_profile(
+            elf, elf_size, &release_minor, &development_release)) {
+        ldr_dbg("[loader] invalid glibc release ELF identity\n");
+        return NULL;
+    }
+    if (development_release) {
         ldr_dbg("[loader] refusing glibc development snapshot\n");
         return NULL;
     }
@@ -3193,12 +3429,7 @@ detect_glibc_offsets_from_interp(const uint8_t *mem, uint64_t mem_foff,
     size_t gl_size = (size_t)identity.global_size;
     uint64_t glro_vaddr = identity.global_ro_vaddr;
 
-    if (glibc_minor < 0)
-        glibc_minor = scan_glibc_2_minor((const char *)elf, elf_size);
     {
-        int release_minor =
-            dlfrz_glibc_stable_release_minor((const char *)elf, elf_size);
-
         /* A highest GLIBC_2.* symbol version is only an ABI floor.  It must
          * never substitute for a positive runtime release identity, even in
          * a stale or post-packaging-mutated direct artifact. */
@@ -3355,15 +3586,46 @@ static int embedded_glibc_libc_release_matches(
     uint32_t num_entries, int interpreter_minor)
 {
     int found = 0;
+#if defined(__x86_64__)
+    struct dlfrz_glibc_getauxval_contract aux_contract;
+    struct dlfrz_glibc_rtld_identity interp_identity;
+    const unsigned char *interp_elf = NULL;
+    size_t interp_elf_size = 0;
+#endif
 
     if (!mem || !entries || !metas || interpreter_minor < 0)
         return 0;
+#if defined(__x86_64__)
+    memset(&aux_contract, 0, sizeof(aux_contract));
+    memset(&interp_identity, 0, sizeof(interp_identity));
+    for (uint32_t i = 0; i < num_entries; i++) {
+        uint64_t delta;
+
+        if (!(metas[i].flags & LDR_FLAG_INTERP))
+            continue;
+        if (interp_elf || entries[i].data_offset < mem_foff ||
+            entries[i].data_size > SIZE_MAX)
+            return 0;
+        delta = entries[i].data_offset - mem_foff;
+        if (delta > UINTPTR_MAX - (uintptr_t)mem)
+            return 0;
+        interp_elf = (const unsigned char *)
+            ((uintptr_t)mem + (uintptr_t)delta);
+        interp_elf_size = (size_t)entries[i].data_size;
+    }
+    if (!interp_elf ||
+        !dlfrz_glibc_rtld_identity(
+            interp_elf, interp_elf_size, &interp_identity) ||
+        interp_identity.machine != EM_X86_64)
+        return 0;
+#endif
     for (uint32_t i = 0; i < num_entries; i++) {
         const struct dlfrz_entry *entry = &entries[i];
         struct dlfrz_elf64_dyn_view view;
         const unsigned char *elf;
         uint64_t delta;
         const char *soname;
+        int development_release;
         int libc_minor;
 
         if (metas[i].flags & (LDR_FLAG_INTERP | LDR_FLAG_DATA))
@@ -3382,19 +3644,44 @@ static int embedded_glibc_libc_release_matches(
                  (size_t)view.soname_offset;
         if (strcmp(soname, "libc.so.6") != 0)
             continue;
-        if (found || dlfrz_glibc_is_development_release(
-                         elf, (size_t)entry->data_size))
+        if (!dlfrz_glibc_elf_release_profile(
+                elf, (size_t)entry->data_size,
+                &libc_minor, &development_release) ||
+            found || development_release)
             return 0;
-        libc_minor = dlfrz_glibc_stable_release_minor(
-            elf, (size_t)entry->data_size);
         if (libc_minor != interpreter_minor ||
             (g_glibc_dlfcn_hook_offset >= 0 &&
              !dlfrz_glibc_dlfcn_hook_consumer_valid(
                  elf, (size_t)entry->data_size,
-                 g_glibc_dlfcn_hook_offset, NULL)))
+                 g_glibc_dlfcn_hook_offset, NULL))
+#if defined(__x86_64__)
+            || !dlfrz_glibc_x86_getauxval_contract_valid(
+                   elf, (size_t)entry->data_size,
+                   interp_identity.global_ro_size,
+                   &aux_contract, NULL)
+#endif
+            )
             return 0;
         found = 1;
     }
+#if defined(__x86_64__)
+    if (!found || !g_glibc_x86_cpu_contract_ready ||
+        aux_contract.hwcap_offset + sizeof(uint64_t) >
+            g_glibc_x86_cpu_contract.cpu_features_offset ||
+        g_glibc_x86_cpu_contract.cpu_features_offset > UINT64_MAX -
+            g_glibc_x86_cpu_contract.layout.object_size ||
+        g_glibc_x86_cpu_contract.cpu_features_offset +
+                g_glibc_x86_cpu_contract.layout.object_size >
+            aux_contract.hwcap2_offset ||
+        (interpreter_minor >= 38 &&
+         !dlfrz_glibc_x86_cpu_hwcap2_association_valid(
+             interp_elf, interp_elf_size,
+             interp_identity.global_ro_vaddr,
+             &g_glibc_x86_cpu_contract, &aux_contract, NULL)))
+        return 0;
+    g_glibc_getauxval_contract = aux_contract;
+    g_glibc_getauxval_contract_ready = 1;
+#endif
     return found;
 }
 
@@ -3908,13 +4195,7 @@ static void tls_runtime_fatal(const char *reason)
 /* __tls_get_addr — GD/LD TLS model accessor.
  * Looks up the DTV entry for the module and adds the offset. */
 struct tls_index { unsigned long ti_module; unsigned long ti_offset; };
-static void *stub_tls_get_addr(struct tls_index *ti)
-{
-    if (!ti)
-        return NULL;
-    return runtime_tls_get_addr(arch_get_tp(), ti->ti_module,
-                                ti->ti_offset);
-}
+static void *stub_tls_get_addr(struct tls_index *ti);
 
 /* Table of stub symbols — searched during resolution */
 struct stub_sym {
@@ -4105,6 +4386,18 @@ struct loaded_version_index {
 struct loaded_symbol_name_key {
     uint64_t fingerprint;
     size_t length;
+    uint32_t gnu_hash;
+    uint32_t dynstr_offset;
+};
+
+/* A loader-owned exact-name work index.  Bucket and chain entries are
+ * dynamic-symbol indices; zero is both STN_UNDEF and the empty-link marker,
+ * so only indices 1..symbol_count-1 are inserted.  The complete mapping is
+ * made read-only before publication. */
+struct loaded_symbol_name_index {
+    uint32_t bucket_mask;
+    uint32_t symbol_count;
+    uint32_t links[]; /* bucket heads, followed by next[symbol_count] */
 };
 
 struct loaded_version_name_entry {
@@ -4120,6 +4413,18 @@ struct loaded_version_name_index {
 
 _Static_assert(DL_VERSION_PAGE_COUNT == 128U,
                "version page geometry must cover every 15-bit index");
+
+enum loaded_rela_table {
+    LOADED_RELA_DYNAMIC,
+    LOADED_RELA_PLT,
+    LOADED_RELA_TABLE_COUNT
+};
+
+enum loaded_relr_replay_state {
+    LOADED_RELR_UNADMITTED = 0,
+    LOADED_RELR_ADMITTED,
+    LOADED_RELR_REPLAYED
+};
 
 struct loaded_obj {
     const char       *name;
@@ -4139,8 +4444,30 @@ struct loaded_obj {
     const char       *dynstr;
     size_t            dynstr_size;
     uint32_t          dynsym_count;
+    /* Whole-table admission proofs.  These counts describe only validated
+     * file-backed geometry; they do not imply that the table bytes are
+     * immutable. */
+    uint32_t          dynsym_admitted_count;
+    uint32_t          versym_admitted_count;
     const uint32_t   *gnu_hash;
     const uint32_t   *sysv_hash;
+    /* Hash metadata in a non-writable PT_LOAD is immutable after ELF
+     * admission.  Retain its completely validated geometry so relocation
+     * and dlsym lookups do not rescan program headers for every query.  A
+     * table with any PF_W overlap leaves its cache flag clear and continues
+     * through the current-byte validation path. */
+    const uint64_t   *gnu_hash_cached_bloom;
+    const uint32_t   *gnu_hash_cached_buckets;
+    uintptr_t         gnu_hash_cached_chain_addr;
+    uint32_t          gnu_hash_cached_nbuckets;
+    uint32_t          gnu_hash_cached_symoffset;
+    uint32_t          gnu_hash_cached_bloom_size;
+    uint32_t          gnu_hash_cached_bloom_shift;
+    uint32_t          gnu_hash_cached_chain_count;
+    const uint32_t   *sysv_hash_cached_buckets;
+    const uint32_t   *sysv_hash_cached_chains;
+    uint32_t          sysv_hash_cached_nbuckets;
+    uint32_t          sysv_hash_cached_nchain;
     const uint16_t   *versym;
     const Elf64_Verdef *verdef;
     uint32_t          verdef_count;
@@ -4149,10 +4476,21 @@ struct loaded_obj {
     const struct loaded_version_index *version_index;
     const struct loaded_version_name_index *version_name_index;
     const struct loaded_symbol_name_key *symbol_name_keys;
+    const struct loaded_symbol_name_index *symbol_name_index;
 
     /* Bounded PT_DYNAMIC view, including its terminating DT_NULL entry. */
     const Elf64_Dyn  *dynamic;
     size_t            dynamic_count;
+    /* Loader-owned semantic snapshot.  PT_DYNAMIC remains exposed through
+     * link_map for native introspection, but post-admission policy must not be
+     * redirected by later writes to its tags/values.  Immutable DT_STRTAB
+     * strings are referenced directly; writable ones are copied together into
+     * the read-only mapping below. */
+    const char       *admitted_soname;
+    const char       *admitted_rpath;
+    const char       *admitted_runpath;
+    uint64_t          admitted_dynamic_flags;
+    uint64_t          admitted_dynamic_flags_1;
 
     /* Relocations */
     const Elf64_Rela *rela;
@@ -4162,6 +4500,12 @@ struct loaded_obj {
     size_t            jmprel_count;
     const Elf64_Relr *relr;
     size_t            relr_count;
+    /* DT_RELR bytes are either declared read-only or copied into the
+     * loader's read-only relocation authority.  Admission validates every
+     * decoded destination against the immutable PT_LOAD snapshot before any
+     * graph-wide relocation effect.  Replay may then use those same bytes
+     * without repeating a program-header scan for every destination. */
+    uint8_t           relr_replay_state;
 
     /* Init / Fini */
     void           (**preinit_array)(void);
@@ -4177,8 +4521,12 @@ struct loaded_obj {
     /* Entry point (exe only) */
     uint64_t          entry;
 
-    /* Program headers (for dl_iterate_phdr / _dl_find_object) */
+    /* Program headers used as loader authority are always an immutable,
+     * loader-owned admission snapshot.  public_phdr preserves native ABI
+     * identity: it names the mapped in-image table when one exists, otherwise
+     * the same owned snapshot published by AT_PHDR/dlinfo/dl_iterate_phdr. */
     const Elf64_Phdr *phdr;
+    const Elf64_Phdr *public_phdr;
     uint16_t          phdr_num;
     uintptr_t         map_start;   /* base + vaddr_lo (first mapped byte) */
     uintptr_t         map_end;     /* base + vaddr_hi (past-the-end) */
@@ -4192,8 +4540,9 @@ struct loaded_obj {
      * is ABI-defined and remains valid because g_all_objs is append-only. */
     struct link_map   public_link_map;
 
-    /* Whole lazy-load reservation, used to discard an unsuccessful dlopen
-     * transaction without leaving partially mapped dependency objects. */
+    /* Exact embedded-object reservation, including its four trailing guards.
+     * Startup mapping records ownership here too; lazy-load transactions use
+     * it to discard partially mapped dependency objects on rollback. */
     void             *runtime_reservation;
     size_t            runtime_reservation_size;
     void             *runtime_phdr_mapping;
@@ -4204,6 +4553,10 @@ struct loaded_obj {
     size_t            runtime_version_mapping_size;
     void             *runtime_symbol_name_mapping;
     size_t            runtime_symbol_name_mapping_size;
+    void             *runtime_dynamic_semantic_mapping;
+    size_t            runtime_dynamic_semantic_mapping_size;
+    void             *runtime_relocation_mapping;
+    size_t            runtime_relocation_mapping_size;
     uint64_t          runtime_dev;
     uint64_t          runtime_ino;
     int               runtime_identity_valid;
@@ -4220,6 +4573,11 @@ struct loaded_obj {
     uint8_t           relocation_scope_root_valid;
     uint8_t           needed_by_valid;
     uint8_t           visible;
+    uint8_t           dynstr_readonly;
+    uint8_t           dynsym_readonly;
+    uint8_t           versym_readonly;
+    uint8_t           gnu_hash_view_cached;
+    uint8_t           sysv_hash_view_cached;
     /* glibc implements DT_SYMBOLIC/DF_SYMBOLIC by searching this DSO before
      * its ordinary relocation scope.  musl currently ignores both tags, so
      * this is target-runtime state rather than an ELF-format property alone. */
@@ -4244,7 +4602,18 @@ struct loaded_obj {
  * DSOs are free to use arbitrary deployment paths and hostile objects may
  * deliberately borrow libc's conventional name. */
 static const struct loaded_obj *g_target_musl_libc_obj;
+/* Published only after the startup libc passes the complete target-derived
+ * glibc contract.  Runtime shims must retain that admitted provider identity
+ * instead of rescanning mutable PT_DYNAMIC/DT_SONAME bytes after target code
+ * can run. */
+static const struct loaded_obj *g_target_glibc_libc_obj;
 static void dl_release_runtime_mapping(struct loaded_obj *obj);
+
+static const Elf64_Phdr *loaded_obj_public_phdr(
+    const struct loaded_obj *obj)
+{
+    return obj ? obj->public_phdr : NULL;
+}
 
 enum unique_default_symbol_status {
     UNIQUE_DEFAULT_SYMBOL_MALFORMED = -1,
@@ -4257,13 +4626,16 @@ static const Elf64_Sym *lookup_linear(const struct loaded_obj *obj,
 static int unique_default_exported_symbol(
     const struct loaded_obj *obj, const char *name,
     const Elf64_Sym **symbol_out);
-static int lookup_exact_elf_object_addr(const struct loaded_obj *obj,
-                                        const char *name,
-                                        size_t expected_size,
-                                        uintptr_t *address_out);
+static int __attribute__((unused)) lookup_exact_elf_object_addr(
+    const struct loaded_obj *obj, const char *name,
+    size_t expected_size, uintptr_t *address_out);
 static int dl_object_is_visible(const struct loaded_obj *obj);
 static int dl_loaded_dependency_matches(const struct loaded_obj *obj,
                                         const char *needed);
+struct symbol_lookup_query;
+static int dl_loaded_dependency_matches_query(
+    const struct loaded_obj *obj,
+    const struct symbol_lookup_query *needed);
 static const struct loaded_version_entry *loaded_version_index_entry(
     const struct loaded_obj *obj, uint16_t version_index);
 static int loaded_symbol_table_index(const struct loaded_obj *obj,
@@ -4420,12 +4792,20 @@ static int loaded_obj_file_contains(const struct loaded_obj *obj,
     return 0;
 }
 
+#ifdef DLFREEZE_RELR_REPLAY_GATE
+static size_t g_loaded_obj_vaddr_pointer_calls;
+#endif
+
 static int loaded_obj_vaddr_pointer(const struct loaded_obj *obj,
                                     uint64_t vaddr, size_t size,
                                     uint32_t required_flags,
                                     void **pointer_out)
 {
     uintptr_t addr;
+
+#ifdef DLFREEZE_RELR_REPLAY_GATE
+    g_loaded_obj_vaddr_pointer_calls++;
+#endif
 
     if (!obj || vaddr > UINTPTR_MAX - obj->base)
         return 0;
@@ -4452,6 +4832,45 @@ static int loaded_obj_vaddr_pointer(const struct loaded_obj *obj,
         }
     }
     return 0;
+}
+
+/* Return true only when the complete range is covered by a PT_LOAD and no
+ * overlapping PT_LOAD declares it writable.  The direct loader may
+ * temporarily map segments writable while relocating, so query-cache
+ * immutability follows the ELF protection contract rather than transient
+ * mmap permissions. */
+static int loaded_obj_range_declared_readonly(
+    const struct loaded_obj *obj, const void *range, size_t size)
+{
+    uintptr_t start;
+    uintptr_t end;
+    int covered = 0;
+
+    if (!obj || !obj->phdr || !range || size == 0)
+        return 0;
+    start = (uintptr_t)range;
+    if (size > UINTPTR_MAX - start)
+        return 0;
+    end = start + size;
+    for (uint16_t i = 0; i < obj->phdr_num; i++) {
+        const Elf64_Phdr *ph = &obj->phdr[i];
+        uintptr_t segment_start;
+        uintptr_t segment_end;
+
+        if (ph->p_type != PT_LOAD || ph->p_memsz > UINTPTR_MAX ||
+            ph->p_vaddr > UINTPTR_MAX - obj->base)
+            continue;
+        segment_start = (uintptr_t)obj->base + (uintptr_t)ph->p_vaddr;
+        if ((uintptr_t)ph->p_memsz > UINTPTR_MAX - segment_start)
+            continue;
+        segment_end = segment_start + (uintptr_t)ph->p_memsz;
+        if (start < segment_end && segment_start < end &&
+            (ph->p_flags & PF_W) != 0)
+            return 0;
+        if (start >= segment_start && end <= segment_end)
+            covered = 1;
+    }
+    return covered;
 }
 
 /* Match the native GNU_RELRO page contract.  The start is rounded down, but
@@ -4544,12 +4963,276 @@ static int property_align_up(size_t value, size_t alignment, size_t *out)
     return 1;
 }
 
-static int property_u32(const uint8_t *data, size_t size, uint32_t *value)
+#ifdef DLFREEZE_RELOCATION_SNAPSHOT_GATE
+static int g_loader_snapshot_fail_protect;
+#endif
+
+static int loader_snapshot_protect(void *mapping, size_t mapping_size)
 {
-    if (size != sizeof(*value))
+#ifdef DLFREEZE_RELOCATION_SNAPSHOT_GATE
+    if (g_loader_snapshot_fail_protect)
+        return -1;
+#endif
+    return mprotect(mapping, mapping_size, PROT_READ);
+}
+
+struct loader_readonly_snapshot {
+    const uint8_t *bytes;
+    void *mapping;
+    size_t mapping_size;
+};
+
+static void loader_readonly_snapshot_release(
+    struct loader_readonly_snapshot *snapshot)
+{
+    if (!snapshot)
+        return;
+    if (snapshot->mapping && snapshot->mapping_size)
+        (void)munmap(snapshot->mapping, snapshot->mapping_size);
+    memset(snapshot, 0, sizeof(*snapshot));
+}
+
+static int loader_readonly_snapshot_create(
+    const void *source, size_t size,
+    struct loader_readonly_snapshot *snapshot)
+{
+    void *mapping;
+
+    if (!snapshot || snapshot->mapping || snapshot->mapping_size ||
+        snapshot->bytes)
+        return -1;
+    if (size == 0)
         return 0;
-    memcpy(value, data, sizeof(*value));
+    if (!source)
+        return -1;
+    mapping = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapping == MAP_FAILED)
+        return -1;
+    memcpy(mapping, source, size);
+    if (loader_snapshot_protect(mapping, size) < 0) {
+        (void)munmap(mapping, size);
+        return -1;
+    }
+    snapshot->bytes = mapping;
+    snapshot->mapping = mapping;
+    snapshot->mapping_size = size;
+    return 0;
+}
+
+static size_t loaded_rela_table_count(
+    const struct loaded_obj *obj, enum loaded_rela_table table)
+{
+    if (!obj)
+        return 0;
+    if (table == LOADED_RELA_DYNAMIC)
+        return obj->rela_count;
+    if (table == LOADED_RELA_PLT)
+        return obj->jmprel_count;
+    return 0;
+}
+
+static int loaded_rela_read(const struct loaded_obj *obj,
+                            enum loaded_rela_table table,
+                            size_t index, Elf64_Rela *relocation_out)
+{
+    const Elf64_Rela *relocations;
+    size_t count;
+
+    if (!obj || !relocation_out)
+        return 0;
+    if (table == LOADED_RELA_DYNAMIC) {
+        relocations = obj->rela;
+        count = obj->rela_count;
+    } else if (table == LOADED_RELA_PLT) {
+        relocations = obj->jmprel;
+        count = obj->jmprel_count;
+    } else {
+        return 0;
+    }
+    if (!relocations || index >= count)
+        return 0;
+    memcpy(relocation_out,
+           (const uint8_t *)relocations + index * sizeof(*relocation_out),
+           sizeof(*relocation_out));
     return 1;
+}
+
+static int loaded_relr_read(const struct loaded_obj *obj, size_t index,
+                            Elf64_Relr *relocation_out)
+{
+    if (!obj || !obj->relr || !relocation_out || index >= obj->relr_count)
+        return 0;
+    memcpy(relocation_out,
+           (const uint8_t *)obj->relr + index * sizeof(*relocation_out),
+           sizeof(*relocation_out));
+    return 1;
+}
+
+struct loaded_relocation_span {
+    const uint8_t *source;
+    size_t size;
+    uintptr_t start;
+    uintptr_t end;
+    unsigned int parent;
+    int active;
+    int needs_copy;
+};
+
+static unsigned int loaded_relocation_span_root(
+    const struct loaded_relocation_span *spans, unsigned int index)
+{
+    while (spans[index].parent != index)
+        index = spans[index].parent;
+    return index;
+}
+
+/* Relocation records remain policy input through validation, prelink replay,
+ * and resolver phases.  A writable relocation may itself target a later
+ * record, so the loader must establish one immutable, overlap-coherent view
+ * before applying anything.  Immutable PT_LOAD tables stay direct; only an
+ * overlap-connected component containing mutable bytes is copied. */
+static int publish_loaded_relocation_authority(
+    struct loaded_obj *obj,
+    const Elf64_Rela *rela, size_t rela_count,
+    const Elf64_Rela *jmprel, size_t jmprel_count,
+    const Elf64_Relr *relr, size_t relr_count)
+{
+    const void *sources[3] = { rela, jmprel, relr };
+    const size_t counts[3] = { rela_count, jmprel_count, relr_count };
+    const size_t widths[3] = {
+        sizeof(Elf64_Rela), sizeof(Elf64_Rela), sizeof(Elf64_Relr)
+    };
+    struct loaded_relocation_span spans[3] = {{0}};
+    uintptr_t component_start[3] = {0};
+    uintptr_t component_end[3] = {0};
+    size_t component_offset[3] = {0};
+    int component_needs_copy[3] = {0};
+    const void *published[3] = { rela, jmprel, relr };
+    size_t mapping_size = 0;
+    uint8_t *mapping = MAP_FAILED;
+
+    if (!obj || obj->rela || obj->rela_count || obj->jmprel ||
+        obj->jmprel_count || obj->relr || obj->relr_count ||
+        obj->runtime_relocation_mapping ||
+        obj->runtime_relocation_mapping_size)
+        return -1;
+
+    for (unsigned int i = 0; i < 3; i++) {
+        size_t bytes;
+        uintptr_t start;
+
+        if (counts[i] == 0) {
+            published[i] = NULL;
+            continue;
+        }
+        if (!sources[i] ||
+            __builtin_mul_overflow(counts[i], widths[i], &bytes))
+            return -1;
+        start = (uintptr_t)sources[i];
+        if (bytes > UINTPTR_MAX - start)
+            return -1;
+        spans[i].source = sources[i];
+        spans[i].size = bytes;
+        spans[i].start = start;
+        spans[i].end = start + bytes;
+        spans[i].parent = i;
+        spans[i].active = 1;
+        spans[i].needs_copy = !loaded_obj_range_declared_readonly(
+            obj, sources[i], bytes);
+    }
+
+    for (unsigned int i = 0; i < 3; i++) {
+        if (!spans[i].active)
+            continue;
+        for (unsigned int j = i + 1; j < 3; j++) {
+            unsigned int left;
+            unsigned int right;
+
+            if (!spans[j].active || spans[i].start >= spans[j].end ||
+                spans[j].start >= spans[i].end)
+                continue;
+            left = loaded_relocation_span_root(spans, i);
+            right = loaded_relocation_span_root(spans, j);
+            if (left != right)
+                spans[right].parent = left;
+        }
+    }
+
+    for (unsigned int i = 0; i < 3; i++) {
+        unsigned int root;
+
+        if (!spans[i].active)
+            continue;
+        root = loaded_relocation_span_root(spans, i);
+        if (component_end[root] == 0 ||
+            spans[i].start < component_start[root])
+            component_start[root] = spans[i].start;
+        if (spans[i].end > component_end[root])
+            component_end[root] = spans[i].end;
+        if (spans[i].needs_copy)
+            component_needs_copy[root] = 1;
+    }
+
+    for (unsigned int i = 0; i < 3; i++) {
+        size_t component_size;
+        size_t aligned;
+
+        if (!spans[i].active || spans[i].parent != i ||
+            !component_needs_copy[i])
+            continue;
+        if (component_end[i] < component_start[i] ||
+            component_end[i] - component_start[i] > SIZE_MAX)
+            return -1;
+        component_size = (size_t)(component_end[i] - component_start[i]);
+        if (!property_align_up(mapping_size, _Alignof(Elf64_Rela),
+                               &aligned) ||
+            component_size > SIZE_MAX - aligned)
+            return -1;
+        component_offset[i] = aligned;
+        mapping_size = aligned + component_size;
+    }
+
+    if (mapping_size != 0) {
+        mapping = mmap(NULL, mapping_size, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mapping == MAP_FAILED)
+            return -1;
+        for (unsigned int i = 0; i < 3; i++) {
+            if (!spans[i].active || spans[i].parent != i ||
+                !component_needs_copy[i])
+                continue;
+            memcpy(mapping + component_offset[i],
+                   (const void *)component_start[i],
+                   (size_t)(component_end[i] - component_start[i]));
+        }
+        if (loader_snapshot_protect(mapping, mapping_size) < 0) {
+            (void)munmap(mapping, mapping_size);
+            return -1;
+        }
+        for (unsigned int i = 0; i < 3; i++) {
+            unsigned int root;
+
+            if (!spans[i].active)
+                continue;
+            root = loaded_relocation_span_root(spans, i);
+            if (component_needs_copy[root])
+                published[i] = mapping + component_offset[root] +
+                    (spans[i].start - component_start[root]);
+        }
+    }
+
+    obj->rela = published[0];
+    obj->rela_count = rela_count;
+    obj->jmprel = published[1];
+    obj->jmprel_count = jmprel_count;
+    obj->relr = published[2];
+    obj->relr_count = relr_count;
+    if (mapping != MAP_FAILED) {
+        obj->runtime_relocation_mapping = mapping;
+        obj->runtime_relocation_mapping_size = mapping_size;
+    }
+    return 0;
 }
 
 /* Parse the canonical ELF64 GNU-property note.  Loader-affecting properties
@@ -4557,6 +5240,7 @@ static int property_u32(const uint8_t *data, size_t size, uint32_t *value)
  * semantics and requirements this loader cannot enforce are rejected. */
 static int parse_loaded_gnu_properties(struct loaded_obj *obj)
 {
+    struct dlfrz_gnu_property_profile profile = {0, 0};
     unsigned int property_segments = 0;
 
     obj->gnu_property_feature_1_seen = 0;
@@ -4564,8 +5248,6 @@ static int parse_loaded_gnu_properties(struct loaded_obj *obj)
     for (uint16_t i = 0; i < obj->phdr_num; i++) {
         const Elf64_Phdr *ph = &obj->phdr[i];
         const uint8_t *bytes;
-        size_t cursor = 0;
-        unsigned int property_notes = 0;
 
         if (ph->p_type != PT_GNU_PROPERTY)
             continue;
@@ -4574,108 +5256,12 @@ static int parse_loaded_gnu_properties(struct loaded_obj *obj)
             !loaded_obj_file_vaddr_pointer(
                 obj, ph->p_vaddr, (size_t)ph->p_filesz, (void **)&bytes))
             return -1;
-
-        while (cursor < (size_t)ph->p_filesz) {
-            Elf64_Nhdr header;
-            size_t name_bytes;
-            size_t desc_bytes;
-            size_t desc_start;
-            size_t desc_end;
-            size_t property_cursor;
-            uint32_t previous_type = 0;
-            int have_previous = 0;
-
-            if (sizeof(header) > (size_t)ph->p_filesz - cursor)
-                return -1;
-            memcpy(&header, bytes + cursor, sizeof(header));
-            cursor += sizeof(header);
-            if (!property_align_up(header.n_namesz, 4, &name_bytes) ||
-                name_bytes > (size_t)ph->p_filesz - cursor ||
-                header.n_namesz != 4 ||
-                memcmp(bytes + cursor, "GNU\0", 4) != 0)
-                return -1;
-            cursor += name_bytes;
-            if (!property_align_up(header.n_descsz, 4, &desc_bytes) ||
-                desc_bytes > (size_t)ph->p_filesz - cursor ||
-                header.n_type != NT_GNU_PROPERTY_TYPE_0 ||
-                ++property_notes != 1)
-                return -1;
-            desc_start = cursor;
-            if (header.n_descsz > SIZE_MAX - desc_start)
-                return -1;
-            desc_end = desc_start + (size_t)header.n_descsz;
-            property_cursor = desc_start;
-            while (property_cursor < desc_end) {
-                uint32_t type;
-                uint32_t data_size;
-                uint32_t value;
-                size_t padded_size;
-                const uint8_t *data;
-
-                if (desc_end - property_cursor < 2 * sizeof(uint32_t))
-                    return -1;
-                memcpy(&type, bytes + property_cursor, sizeof(type));
-                memcpy(&data_size,
-                       bytes + property_cursor + sizeof(type),
-                       sizeof(data_size));
-                property_cursor += 2 * sizeof(uint32_t);
-                if (!property_align_up(data_size, 8, &padded_size) ||
-                    padded_size > desc_end - property_cursor ||
-                    (have_previous && type <= previous_type))
-                    return -1;
-                data = bytes + property_cursor;
-                previous_type = type;
-                have_previous = 1;
-
-                if (type == GNU_PROPERTY_STACK_SIZE ||
-                    type == GNU_PROPERTY_NO_COPY_ON_PROTECTED) {
-                    return -1;
-                } else if (type == GNU_PROPERTY_1_NEEDED) {
-                    if (!property_u32(data, data_size, &value) || value != 0)
-                        return -1;
-#if defined(__x86_64__)
-                } else if (type == GNU_PROPERTY_X86_FEATURE_1_AND) {
-                    if (!property_u32(data, data_size, &value) ||
-                        (value & ~(GNU_PROPERTY_X86_FEATURE_1_IBT |
-                                   GNU_PROPERTY_X86_FEATURE_1_SHSTK)) != 0 ||
-                        obj->gnu_property_feature_1_seen)
-                        return -1;
-                    obj->gnu_property_feature_1 = value;
-                    obj->gnu_property_feature_1_seen = 1;
-                } else if (type == GNU_PROPERTY_X86_ISA_1_NEEDED) {
-                    if (!property_u32(data, data_size, &value) ||
-                        (value & ~GNU_PROPERTY_X86_ISA_1_BASELINE) != 0)
-                        return -1;
-                } else if (type == GNU_PROPERTY_X86_ISA_1_USED ||
-                           type == UINT32_C(0xc0010001)) {
-                    if (!property_u32(data, data_size, &value))
-                        return -1;
-                } else if (type == UINT32_C(0xc0008001)) {
-                    if (!property_u32(data, data_size, &value) || value != 0)
-                        return -1;
-#elif defined(__aarch64__)
-                } else if (type == GNU_PROPERTY_AARCH64_FEATURE_1_AND) {
-                    if (!property_u32(data, data_size, &value) ||
-                        (value & ~(GNU_PROPERTY_AARCH64_FEATURE_1_BTI |
-                                   GNU_PROPERTY_AARCH64_FEATURE_1_PAC |
-                                   GNU_PROPERTY_AARCH64_FEATURE_1_GCS)) != 0 ||
-                        obj->gnu_property_feature_1_seen)
-                        return -1;
-                    obj->gnu_property_feature_1 = value;
-                    obj->gnu_property_feature_1_seen = 1;
-#endif
-                } else {
-                    return -1;
-                }
-                property_cursor += padded_size;
-            }
-            if (property_cursor != desc_end)
-                return -1;
-            cursor += desc_bytes;
-        }
-        if (cursor != (size_t)ph->p_filesz || property_notes != 1)
+        if (!dlfrz_gnu_property_segment_parse(
+                bytes, (size_t)ph->p_filesz, &profile))
             return -1;
     }
+    obj->gnu_property_feature_1_seen = profile.feature_1_seen;
+    obj->gnu_property_feature_1 = profile.feature_1;
     return 0;
 }
 
@@ -4701,9 +5287,9 @@ static uint32_t x86_supported_cet_features(void)
                      :
                      : "memory");
     if (edx & (UINT32_C(1) << 20))
-        features |= GNU_PROPERTY_X86_FEATURE_1_IBT;
+        features |= DLFRZ_GNU_PROPERTY_X86_FEATURE_1_IBT;
     if (ecx & (UINT32_C(1) << 7))
-        features |= GNU_PROPERTY_X86_FEATURE_1_SHSTK;
+        features |= DLFRZ_GNU_PROPERTY_X86_FEATURE_1_SHSTK;
     return features;
 }
 #endif
@@ -4713,8 +5299,8 @@ static int startup_gnu_properties_admitted(struct loaded_obj *objs, int nobj,
                                             uintptr_t hwcap2)
 {
 #if defined(__x86_64__)
-    uint32_t enabled = GNU_PROPERTY_X86_FEATURE_1_IBT |
-                       GNU_PROPERTY_X86_FEATURE_1_SHSTK;
+    uint32_t enabled = DLFRZ_GNU_PROPERTY_X86_FEATURE_1_IBT |
+                       DLFRZ_GNU_PROPERTY_X86_FEATURE_1_SHSTK;
     int have_visible = 0;
 
     (void)hwcap;
@@ -4730,20 +5316,20 @@ static int startup_gnu_properties_admitted(struct loaded_obj *objs, int nobj,
         return 0;
 #elif defined(__aarch64__)
     const uintptr_t hwcap_paca = (uintptr_t)1 << 30;
-    const uintptr_t hwcap_gcs = (uintptr_t)1 << 32;
     const uintptr_t hwcap2_bti = (uintptr_t)1 << 17;
+    const uintptr_t hwcap2_gcs = (uintptr_t)1 << 32;
 
     for (int i = 0; i < nobj; i++) {
         uint32_t feature = objs[i].gnu_property_feature_1;
 
-        if ((feature & GNU_PROPERTY_AARCH64_FEATURE_1_BTI) &&
+        if ((feature & DLFRZ_GNU_PROPERTY_AARCH64_FEATURE_1_BTI) &&
             (hwcap2 & hwcap2_bti))
             return 0;
-        if ((feature & GNU_PROPERTY_AARCH64_FEATURE_1_PAC) &&
+        if ((feature & DLFRZ_GNU_PROPERTY_AARCH64_FEATURE_1_PAC) &&
             (hwcap & hwcap_paca))
             return 0;
-        if ((feature & GNU_PROPERTY_AARCH64_FEATURE_1_GCS) &&
-            (hwcap & hwcap_gcs))
+        if ((feature & DLFRZ_GNU_PROPERTY_AARCH64_FEATURE_1_GCS) &&
+            (hwcap2 & hwcap2_gcs))
             return 0;
     }
 #endif
@@ -4877,9 +5463,11 @@ static void record_object_init(struct loaded_obj *obj)
 
 static void run_loader_finalizers(void)
 {
-    runtime_loader_lock_acquire();
+    runtime_loader_lock_token lock_token =
+        runtime_loader_lock_acquire();
+
     if (g_fini_running) {
-        runtime_loader_lock_release();
+        runtime_loader_lock_release(lock_token);
         return;
     }
     g_fini_running = 1;
@@ -4892,7 +5480,7 @@ static void run_loader_finalizers(void)
         if (obj->fini_func)
             obj->fini_func();
     }
-    runtime_loader_lock_release();
+    runtime_loader_lock_release(lock_token);
 }
 
 static void run_loader_finalizers_cxa(void *unused)
@@ -5031,8 +5619,6 @@ static int musl_got_slot_relocates_to_symbol(
     const struct loaded_obj *obj, uintptr_t slot,
     const Elf64_Sym *symbol)
 {
-    const Elf64_Rela *tables[] = { obj->rela, obj->jmprel };
-    const size_t counts[] = { obj->rela_count, obj->jmprel_count };
     uintptr_t symbol_address;
     uintptr_t table_address;
     size_t table_bytes;
@@ -5053,10 +5639,16 @@ static int musl_got_slot_relocates_to_symbol(
         (uint64_t)((symbol_address - table_address) / sizeof(Elf64_Sym));
     offset = (uint64_t)(slot - obj->base);
 
-    for (size_t t = 0; t < sizeof(tables) / sizeof(tables[0]); t++) {
-        for (size_t i = 0; i < counts[t]; i++) {
-            const Elf64_Rela *rel = &tables[t][i];
+    for (enum loaded_rela_table table = LOADED_RELA_DYNAMIC;
+         table < LOADED_RELA_TABLE_COUNT; table++) {
+        size_t count = loaded_rela_table_count(obj, table);
 
+        for (size_t i = 0; i < count; i++) {
+            Elf64_Rela relocation;
+            const Elf64_Rela *rel = &relocation;
+
+            if (!loaded_rela_read(obj, table, i, &relocation))
+                return 0;
             if (rel->r_offset != offset)
                 continue;
             if (ELF64_R_TYPE(rel->r_info) != ARCH_RELOC_GLOB_DAT ||
@@ -8196,10 +8788,29 @@ static int g_global_scope_root = -1;
 static uint16_t g_global_scope_indices[MAX_TOTAL_OBJS];
 static uint16_t g_global_scope_count;
 
+/* Immutable TLS metadata for modules published by the direct loader.  A native
+ * __tls_get_addr does not enter the loader when the calling thread already
+ * has a populated DTV slot; doing so here would put a syscall-based recursive
+ * lock on every general/local-dynamic TLS access.  Objects are never unloaded,
+ * so a module ID, TLS extent, and any startup-assigned TP-relative offset
+ * become immutable at transaction publication.  The signed offset is retained
+ * as a publication invariant and is written before the release-published
+ * extent + 1.  It is not independent address authority: every fast lookup,
+ * including a startup static-TLS module, must first admit the current thread's
+ * DTV capacity and populated slot.  Missing slots, unpublished transaction
+ * modules, and DTV growth continue through the serialized slow path below. */
+struct runtime_tls_fast_entry {
+    volatile uint64_t extent_plus_one;
+    volatile uint64_t static_tpoff_bits;
+};
+
+static struct runtime_tls_fast_entry
+    g_runtime_tls_fast[MAX_TOTAL_OBJS + 1];
+
 /* glibc deliberately exposes the main executable as an empty name in its
  * public link_map and dl_iterate_phdr views.  musl exposes the executable
  * path there.  obj->name retains the path for identity, $ORIGIN, diagnostics,
- * argv[0], and dladdr on both runtimes. */
+ * and dladdr on both runtimes; argv[0] remains caller-owned process state. */
 static const char *dl_public_object_name(const struct loaded_obj *obj)
 {
     if (!obj)
@@ -8399,27 +9010,49 @@ static int dl_global_scope_contains(uint16_t index)
 static int dl_append_lookup_scope_to_global(struct loaded_obj *root,
                                             int nobj)
 {
+    uint8_t present[MAX_TOTAL_OBJS];
     uint16_t additional = 0;
 
+    if (nobj <= 0 || nobj > MAX_TOTAL_OBJS ||
+        g_global_scope_count > MAX_TOTAL_OBJS)
+        return -1;
     if (!root->lookup_scope_valid && dl_build_lookup_scope(root, nobj) < 0)
         return -1;
+    memset(present, 0, sizeof(present));
+    for (uint16_t i = 0; i < g_global_scope_count; i++) {
+        uint16_t index = g_global_scope_indices[i];
+
+        if (index >= (uint16_t)nobj)
+            return -1;
+        present[index] = 1;
+    }
     for (uint16_t i = 0; i < root->lookup_scope_count; i++) {
         uint16_t index = root->lookup_scope_indices[i];
 
-        if (index >= nobj)
+        if (index >= (uint16_t)nobj)
             return -1;
-        if (!dl_global_scope_contains(index))
+        if (!present[index]) {
+            present[index] = 1;
             additional++;
+        }
     }
     if (additional > MAX_TOTAL_OBJS - g_global_scope_count)
         return -1;
+
+    /* Re-seed the bitmap with the preexisting scope.  The second ordered
+     * pass then appends each new object exactly once without repeated scans
+     * of the growing global list. */
+    memset(present, 0, sizeof(present));
+    for (uint16_t i = 0; i < g_global_scope_count; i++)
+        present[g_global_scope_indices[i]] = 1;
     for (uint16_t i = 0; i < root->lookup_scope_count; i++) {
         uint16_t index = root->lookup_scope_indices[i];
 
-        if (dl_global_scope_contains(index))
+        if (present[index])
             continue;
         if (g_global_scope_count >= MAX_TOTAL_OBJS)
             return -1;
+        present[index] = 1;
         g_global_scope_indices[g_global_scope_count++] = index;
     }
     return 0;
@@ -9216,6 +9849,10 @@ static int dl_transaction_tls_address(uintptr_t tp, unsigned long modid,
 
 static void *runtime_tls_get_addr_locked(uintptr_t tp, unsigned long modid,
                                          unsigned long ti_offset)
+    __attribute__((noinline, cold));
+
+static void *runtime_tls_get_addr_locked(uintptr_t tp, unsigned long modid,
+                                         unsigned long ti_offset)
 {
     struct loaded_obj *obj = NULL;
     void *address;
@@ -9266,15 +9903,96 @@ static void *runtime_tls_get_addr_locked(uintptr_t tp, unsigned long modid,
     return address;
 }
 
+static inline __attribute__((always_inline)) int
+runtime_tls_get_addr_fast(uintptr_t tp, unsigned long modid,
+                          unsigned long ti_offset, void **result_out)
+{
+    struct runtime_tls_fast_entry *entry;
+    uint64_t extent_plus_one;
+    uintptr_t *dtv;
+    uintptr_t tls_base = 0;
+    uint64_t address;
+
+    /* Fast path for an already-published module with a slot admitted by this
+     * thread's DTV header.  A known startup TP offset cannot bypass that
+     * header: supported libc thread paths may expose a conservative DTV which
+     * the slow path must grow and seed before __tls_get_addr returns. */
+    if (tp && modid != 0 && modid <= MAX_TOTAL_OBJS) {
+        entry = &g_runtime_tls_fast[modid];
+        extent_plus_one = runtime_atomic_load64(&entry->extent_plus_one);
+        if (extent_plus_one != 0 &&
+            (uint64_t)ti_offset < extent_plus_one) {
+            if (g_is_musl_runtime) {
+                size_t capacity;
+
+                dtv = *(uintptr_t **)musl_thread_dtv_slot(tp);
+                capacity = dtv ? dtv[0] : 0;
+                if (capacity <= MAX_TOTAL_OBJS && modid <= capacity)
+                    tls_base = dtv[modid];
+            } else {
+                size_t capacity;
+
+                dtv = *(uintptr_t **)(tp + TCB_OFF_DTV);
+                if (glibc_dtv_capacity(dtv, &capacity) && dtv &&
+                    modid <= capacity) {
+                    uintptr_t candidate = dtv[(size_t)modid * 2];
+
+                    if (glibc_tls_slot_allocated(candidate))
+                        tls_base = candidate;
+                }
+            }
+            if (tls_base &&
+                u64_add_checked(tls_base, (uint64_t)ti_offset, &address) &&
+                address <= UINTPTR_MAX) {
+                *result_out = (void *)(uintptr_t)address;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static void *runtime_tls_get_addr_slow(uintptr_t tp, unsigned long modid,
+                                       unsigned long ti_offset)
+    __attribute__((noinline, cold));
+
+static void *runtime_tls_get_addr_slow(uintptr_t tp, unsigned long modid,
+                                       unsigned long ti_offset)
+{
+    void *result;
+    runtime_loader_lock_token lock_token =
+        runtime_loader_lock_acquire();
+
+    result = runtime_tls_get_addr_locked(tp, modid, ti_offset);
+    runtime_loader_lock_release(lock_token);
+    return result;
+}
+
 static void *runtime_tls_get_addr(uintptr_t tp, unsigned long modid,
                                   unsigned long ti_offset)
 {
     void *result;
 
-    runtime_loader_lock_acquire();
-    result = runtime_tls_get_addr_locked(tp, modid, ti_offset);
-    runtime_loader_lock_release();
-    return result;
+    if (runtime_tls_get_addr_fast(tp, modid, ti_offset, &result))
+        return result;
+    return runtime_tls_get_addr_slow(tp, modid, ti_offset);
+}
+
+static void *stub_tls_get_addr(struct tls_index *ti)
+{
+    uintptr_t tp;
+    unsigned long modid;
+    unsigned long offset;
+    void *result;
+
+    if (!ti)
+        return NULL;
+    tp = arch_get_tp();
+    modid = ti->ti_module;
+    offset = ti->ti_offset;
+    if (runtime_tls_get_addr_fast(tp, modid, offset, &result))
+        return result;
+    return runtime_tls_get_addr_slow(tp, modid, offset);
 }
 
 #if defined(__x86_64__)
@@ -9282,6 +10000,14 @@ static int64_t dlfreeze_x86_64_tlsdesc_resolve_c(void *arg_in) __attribute__((us
 static int64_t dlfreeze_x86_64_tlsdesc_resolve_c(void *arg_in)
 {
     struct x86_64_tlsdesc_arg *arg = (struct x86_64_tlsdesc_arg *)arg_in;
+#ifdef DLFREEZE_TLSDESC_XSTATE_GATE
+    if (g_x86_64_tlsdesc_xstate_gate_clobber) {
+        /* The isolated ABI gate deliberately models target code selected for
+         * AVX.  Production builds do not contain this branch. */
+        __asm__ volatile("vpxor %%ymm0, %%ymm0, %%ymm0" ::: "ymm0");
+        return (int64_t)arg->offset;
+    }
+#endif
     uintptr_t tp = arch_get_tp();
     uintptr_t tls_addr = (uintptr_t)runtime_tls_get_addr(
         tp, (unsigned long)arg->modid, (unsigned long)arg->offset);
@@ -9406,14 +10132,15 @@ static void *stub_dl_allocate_tls_init_locked(void *mem)
 static void *stub_dl_allocate_tls_init(void *mem, bool main_thread)
 {
     void *result;
+    runtime_loader_lock_token lock_token;
 
     /* glibc added this argument in 2.34.  Older callers leave the second
      * argument register unspecified, so the cross-version shim must not
      * inspect it. */
     (void)main_thread;
-    runtime_loader_lock_acquire();
+    lock_token = runtime_loader_lock_acquire();
     result = stub_dl_allocate_tls_init_locked(mem);
-    runtime_loader_lock_release();
+    runtime_loader_lock_release(lock_token);
     return result;
 }
 
@@ -9527,10 +10254,11 @@ fail_dtv:
 static void *stub_dl_allocate_tls(void *mem)
 {
     void *result;
+    runtime_loader_lock_token lock_token =
+        runtime_loader_lock_acquire();
 
-    runtime_loader_lock_acquire();
     result = stub_dl_allocate_tls_locked(mem);
-    runtime_loader_lock_release();
+    runtime_loader_lock_release(lock_token);
     return result;
 }
 
@@ -9568,9 +10296,11 @@ static void stub_dl_deallocate_tls_locked(void *mem, bool dealloc_tcb)
 
 static void stub_dl_deallocate_tls(void *mem, bool dealloc_tcb)
 {
-    runtime_loader_lock_acquire();
+    runtime_loader_lock_token lock_token =
+        runtime_loader_lock_acquire();
+
     stub_dl_deallocate_tls_locked(mem, dealloc_tcb);
-    runtime_loader_lock_release();
+    runtime_loader_lock_release(lock_token);
 }
 
 /* ---- _dl_find_object implementation ---------------------------------- */
@@ -9581,10 +10311,11 @@ static void stub_dl_deallocate_tls(void *mem, bool dealloc_tcb)
 static int glro_dl_find_object(void *pc, void *result)
 {
     uintptr_t addr = (uintptr_t)pc;
+    runtime_loader_lock_token lock_token;
 
     if (!result)
         return -1;
-    runtime_loader_lock_acquire();
+    lock_token = runtime_loader_lock_acquire();
     dl_refresh_public_link_maps();
     for (int i = 0; i < g_nobj; i++) {
         uintptr_t map_start;
@@ -9612,11 +10343,11 @@ static int glro_dl_find_object(void *pc, void *result)
             *(void **)(r + 24) = &g_all_objs[i].public_link_map;
             *(void **)(r + 32) = (void *)g_all_objs[i].eh_frame_hdr;
             *(void **)(r + 40) = (void *)g_all_objs[i].sframe;
-            runtime_loader_lock_release();
+            runtime_loader_lock_release(lock_token);
             return 0;
         }
     }
-    runtime_loader_lock_release();
+    runtime_loader_lock_release(lock_token);
     return -1;
 }
 
@@ -9632,10 +10363,68 @@ static size_t g_initial_library_path_mapping_size;
 static const uint8_t *g_frozen_mem;
 static uint64_t g_frozen_mem_foff;
 static int g_frozen_srcfd;
+static uint32_t g_frozen_source_flags;
 static const struct dlfrz_lib_meta *g_frozen_metas;
 static const struct dlfrz_entry *g_frozen_entries;
 static const char *g_frozen_strtab;
 static uint32_t g_frozen_num_entries;
+
+static enum runtime_loader_phase runtime_loader_phase(void)
+{
+    uint32_t phase = runtime_atomic_load32(&g_runtime_loader_phase);
+
+    if (phase > RUNTIME_LOADER_PHASE_RUNNING)
+        loader_exit(127);
+    return (enum runtime_loader_phase)phase;
+}
+
+/* All startup graph fields consumed by dlfcn are complete before this call.
+ * The release store is the sole publication point visible to resolver-time
+ * callbacks (including callbacks reached on another thread). */
+static void runtime_loader_publish_startup_graph(
+    int nobj, int argc, char **argv, char **envp)
+{
+    if (nobj <= 0 || nobj > MAX_TOTAL_OBJS ||
+        runtime_loader_phase() != RUNTIME_LOADER_PHASE_RESET ||
+        g_nobj != 0)
+        loader_exit(127);
+
+    g_nobj = nobj;
+    g_argc = argc;
+    g_argv = argv;
+    g_envp = envp;
+    runtime_loader_lock_initialize();
+    dl_refresh_public_link_maps();
+    runtime_atomic_store32(&g_runtime_loader_phase,
+                           RUNTIME_LOADER_PHASE_STARTUP_READONLY);
+}
+
+static void runtime_loader_enable_mutation(void)
+{
+    runtime_loader_lock_token lock_token =
+        runtime_loader_lock_acquire();
+
+    if (runtime_loader_phase() !=
+            RUNTIME_LOADER_PHASE_STARTUP_READONLY ||
+        g_nobj <= 0 || g_nobj > MAX_TOTAL_OBJS)
+        loader_exit(127);
+    runtime_atomic_store32(&g_runtime_loader_phase,
+                           RUNTIME_LOADER_PHASE_RUNNING);
+    runtime_loader_lock_release(lock_token);
+}
+
+/* The bootstrap transfers ownership of an optional frozen-image source fd
+ * to loader_run.  Keep it through every startup mapping consumer, including
+ * the target tunable service and TLS setup, then remove it before any target
+ * resolver or constructor can observe loader-private descriptors. */
+static void release_frozen_source_fd_after_tls(void)
+{
+    int fd = g_frozen_srcfd;
+
+    g_frozen_srcfd = -1;
+    if (fd >= 0)
+        (void)arch_raw_close(fd);
+}
 
 static const char *dl_manifest_logical_name(
     const struct dlfrz_entry *entries, const char *strtab, uint32_t index)
@@ -9928,9 +10717,27 @@ struct vfs_entry {
     uint32_t        flags;
 };
 
+/* Immutable lookup index for the ordinary ELF entries in the manifest.
+ * Runtime VFS probes commonly miss the captured DATA table before asking
+ * whether the same path names an embedded ELF.  Keep that second lookup
+ * keyed and bounded too: scanning the full manifest for every host-path miss
+ * otherwise multiplies application filesystem traffic by manifest size. */
+struct frozen_elf_path_entry {
+    const char *path;
+    size_t path_length;
+    uint64_t path_hash;
+    uint32_t manifest_index;
+};
+
 static struct vfs_entry *g_vfs_table;
 static size_t g_vfs_table_size;
 static size_t g_vfs_count;
+static struct frozen_elf_path_entry *g_frozen_elf_path_table;
+static size_t g_frozen_elf_path_table_size;
+static size_t g_frozen_elf_path_count;
+#ifdef DLFREEZE_VFS_COMPLEXITY_GATE
+static size_t g_frozen_elf_lookup_probes;
+#endif
 static uint64_t g_vfs_hash_key[2];
 static int g_vfs_hash_key_ready;
 static uint64_t g_symbol_name_fingerprint_seed;
@@ -9998,6 +10805,7 @@ typedef int (*dirfd_fn)(void *);
 typedef void (*rewinddir_fn)(void *);
 typedef long (*telldir_fn)(void *);
 typedef void (*seekdir_fn)(void *, long);
+typedef int (*fcntl_fn)(int, int, ...);
 static fopen_fn  g_real_fopen;
 static fdopen_fn g_real_fdopen;
 static opendir_fn g_real_opendir;
@@ -10010,6 +10818,7 @@ static dirfd_fn g_real_dirfd;
 static rewinddir_fn g_real_rewinddir;
 static telldir_fn g_real_telldir;
 static seekdir_fn g_real_seekdir;
+static fcntl_fn g_real_fcntl;
 
 struct vfs_hash_state {
     uint64_t v0;
@@ -10161,6 +10970,115 @@ static int vfs_table_capacity(size_t count, size_t element_size,
     return 0;
 }
 
+static void frozen_elf_index_reset(void)
+{
+    free(g_frozen_elf_path_table);
+    g_frozen_elf_path_table = NULL;
+    g_frozen_elf_path_table_size = 0;
+    g_frozen_elf_path_count = 0;
+#ifdef DLFREEZE_VFS_COMPLEXITY_GATE
+    g_frozen_elf_lookup_probes = 0;
+#endif
+}
+
+/* Entries are inserted in manifest order.  A pathname may legitimately be
+ * both an object's logical name and another entry's canonical name.  The old
+ * linear lookup returned the lowest manifest index in that case, so retain
+ * the first slot instead of rejecting or replacing a duplicate alias. */
+static int frozen_elf_index_insert(const char *path,
+                                   uint32_t manifest_index)
+{
+    size_t path_length;
+    uint64_t path_hash;
+    size_t index;
+    size_t probes;
+
+    if (!path || !path[0] || !g_frozen_elf_path_table ||
+        g_frozen_elf_path_table_size == 0 || !g_vfs_hash_key_ready)
+        return -1;
+    path_length = strlen(path);
+    path_hash = vfs_hash_n(path, path_length);
+    index = (size_t)path_hash & (g_frozen_elf_path_table_size - 1);
+    for (probes = 0; probes < g_frozen_elf_path_table_size; probes++) {
+        struct frozen_elf_path_entry *entry =
+            &g_frozen_elf_path_table[index];
+
+        if (!entry->path)
+            break;
+        if (entry->path_hash == path_hash &&
+            entry->path_length == path_length &&
+            memcmp(entry->path, path, path_length) == 0) {
+            if (manifest_index < entry->manifest_index)
+                entry->manifest_index = manifest_index;
+            return 0;
+        }
+        index = (index + 1) & (g_frozen_elf_path_table_size - 1);
+    }
+    if (probes == g_frozen_elf_path_table_size)
+        return -1;
+    g_frozen_elf_path_table[index].path = path;
+    g_frozen_elf_path_table[index].path_length = path_length;
+    g_frozen_elf_path_table[index].path_hash = path_hash;
+    g_frozen_elf_path_table[index].manifest_index = manifest_index;
+    g_frozen_elf_path_count++;
+    return 0;
+}
+
+static int frozen_elf_index_init(const struct dlfrz_entry *entries,
+                                 const char *strtab,
+                                 uint32_t num_entries)
+{
+    size_t candidate_count = 0;
+    size_t table_size = 0;
+
+    frozen_elf_index_reset();
+    if ((!entries || !strtab) && num_entries != 0)
+        return -1;
+    for (uint32_t i = 0; i < num_entries; i++) {
+        if (entries[i].flags & DLFRZ_FLAG_DATA)
+            continue;
+        if (i > (uint32_t)INT_MAX || candidate_count == SIZE_MAX)
+            return -1;
+        candidate_count++;
+        if (entries[i].logical_name_offset != 0) {
+            if (candidate_count == SIZE_MAX)
+                return -1;
+            candidate_count++;
+        }
+    }
+    if (candidate_count != 0 && !g_vfs_hash_key_ready)
+        return -1;
+    if (vfs_table_capacity(candidate_count,
+                           sizeof(*g_frozen_elf_path_table),
+                           &table_size) < 0)
+        return -1;
+    if (table_size != 0) {
+        g_frozen_elf_path_table = calloc(
+            table_size, sizeof(*g_frozen_elf_path_table));
+        if (!g_frozen_elf_path_table)
+            return -1;
+        g_frozen_elf_path_table_size = table_size;
+    }
+    for (uint32_t i = 0; i < num_entries; i++) {
+        const char *canonical;
+
+        if (entries[i].flags & DLFRZ_FLAG_DATA)
+            continue;
+        canonical = strtab + entries[i].name_offset;
+        if (frozen_elf_index_insert(canonical, i) < 0)
+            goto fail;
+        if (entries[i].logical_name_offset != 0 &&
+            frozen_elf_index_insert(
+                strtab + entries[i].logical_name_offset, i) < 0)
+            goto fail;
+    }
+    return 0;
+
+fail:
+    frozen_elf_index_reset();
+    return -1;
+}
+
 static void vfs_reset_dirs(void);
 static int vfs_init_dirs(void);
 static int vfs_dir_exists(const char *path);
@@ -10178,6 +11096,7 @@ static int vfs_init(const uint8_t *mem, uint64_t mem_foff,
     g_vfs_table = NULL;
     g_vfs_table_size = 0;
     g_vfs_count = 0;
+    frozen_elf_index_reset();
     vfs_reset_dirs();
 
     for (uint32_t i = 0; i < num_entries; i++)
@@ -10186,13 +11105,15 @@ static int vfs_init(const uint8_t *mem, uint64_t mem_foff,
 
     if (data_count != 0 && !g_vfs_hash_key_ready)
         return -1;
+    if (frozen_elf_index_init(entries, strtab, num_entries) < 0)
+        goto fail;
     if (vfs_table_capacity(data_count, sizeof(*g_vfs_table),
                            &table_size) < 0)
-        return -1;
+        goto fail;
     if (table_size != 0) {
         g_vfs_table = calloc(table_size, sizeof(*g_vfs_table));
         if (!g_vfs_table)
-            return -1;
+            goto fail;
         g_vfs_table_size = table_size;
     }
 
@@ -10245,6 +11166,7 @@ fail:
     g_vfs_table = NULL;
     g_vfs_table_size = 0;
     g_vfs_count = 0;
+    frozen_elf_index_reset();
     return -1;
 }
 
@@ -10682,8 +11604,12 @@ struct vfs_dir_handle {
 };
 
 struct vfs_dirfd_map {
-    int  fd;
-    char path[PATH_MAX];
+    int    fd;
+    dev_t  placeholder_dev;
+    ino_t  placeholder_ino;
+    dev_t  placeholder_rdev;
+    mode_t placeholder_type;
+    char   path[PATH_MAX];
 };
 
 static struct vfs_dirfd_map *g_vfs_dirfd_maps;
@@ -10691,17 +11617,37 @@ static size_t g_vfs_dirfd_map_count;
 static size_t g_vfs_dirfd_map_capacity;
 static struct vfs_dir_handle *g_vfs_dir_handles;
 
-static void vfs_dirfd_lock(void)
+static int vfs_stat_identity_equal(const struct stat *left,
+                                   const struct stat *right)
+{
+    return left && right &&
+           left->st_dev == right->st_dev &&
+           left->st_ino == right->st_ino &&
+           left->st_rdev == right->st_rdev &&
+           (left->st_mode & S_IFMT) == (right->st_mode & S_IFMT);
+}
+
+static int vfs_dirfd_map_identity_matches(
+    const struct vfs_dirfd_map *mapping, const struct stat *status)
+{
+    return mapping && status && S_ISDIR(status->st_mode) &&
+           mapping->placeholder_dev == status->st_dev &&
+           mapping->placeholder_ino == status->st_ino &&
+           mapping->placeholder_rdev == status->st_rdev &&
+           mapping->placeholder_type == (status->st_mode & S_IFMT);
+}
+
+static runtime_loader_lock_token vfs_dirfd_lock(void)
 {
     /* VFS callbacks may run from constructors while lazy loading already
      * owns the loader lock, so this must share its recursive semantics.
      * Sharing the lock also gives pthread_atfork a coherent VFS snapshot. */
-    runtime_loader_lock_acquire();
+    return runtime_loader_lock_acquire();
 }
 
-static void vfs_dirfd_unlock(void)
+static void vfs_dirfd_unlock(runtime_loader_lock_token token)
 {
-    runtime_loader_lock_release();
+    runtime_loader_lock_release(token);
 }
 
 /* The caller holds vfs_dirfd_lock().  Never dereference the untrusted DIR
@@ -10749,8 +11695,25 @@ static struct vfs_dir_handle *vfs_alloc_dir_handle(void)
     return mapping;
 }
 
-static int remember_vfs_dirfd(int fd, const char *path)
+/* The caller holds vfs_dirfd_lock(). */
+static void remove_vfs_dirfd_map_locked(size_t slot)
 {
+    if (slot >= g_vfs_dirfd_map_count)
+        return;
+    g_vfs_dirfd_map_count--;
+    if (slot != g_vfs_dirfd_map_count) {
+        /* Keep this explicitly loader-owned: this callback runs after the
+         * target thread pointer has replaced the bootstrap runtime's. */
+        ldr_memcpy(&g_vfs_dirfd_maps[slot],
+                   &g_vfs_dirfd_maps[g_vfs_dirfd_map_count],
+                   sizeof(g_vfs_dirfd_maps[slot]));
+    }
+}
+
+/* The caller holds vfs_dirfd_lock(). */
+static int remember_vfs_dirfd_locked(int fd, const char *path)
+{
+    struct stat placeholder_status;
     size_t path_len;
     size_t slot;
 
@@ -10761,8 +11724,13 @@ static int remember_vfs_dirfd(int fd, const char *path)
         set_loader_errno(ENAMETOOLONG);
         return -1;
     }
+    if (VFS_SYSCALL(SYS_fstat, fd, &placeholder_status) < 0)
+        return -1;
+    if (!S_ISDIR(placeholder_status.st_mode)) {
+        set_loader_errno(ENOTDIR);
+        return -1;
+    }
 
-    vfs_dirfd_lock();
     for (slot = 0; slot < g_vfs_dirfd_map_count; slot++) {
         if (g_vfs_dirfd_maps[slot].fd == fd)
             break;
@@ -10797,26 +11765,52 @@ static int remember_vfs_dirfd(int fd, const char *path)
     }
 
     g_vfs_dirfd_maps[slot].fd = fd;
+    g_vfs_dirfd_maps[slot].placeholder_dev = placeholder_status.st_dev;
+    g_vfs_dirfd_maps[slot].placeholder_ino = placeholder_status.st_ino;
+    g_vfs_dirfd_maps[slot].placeholder_rdev = placeholder_status.st_rdev;
+    g_vfs_dirfd_maps[slot].placeholder_type =
+        placeholder_status.st_mode & S_IFMT;
     memcpy(g_vfs_dirfd_maps[slot].path, path, path_len + 1);
-    vfs_dirfd_unlock();
     return 0;
 
 no_memory:
-    vfs_dirfd_unlock();
     set_loader_errno(ENOMEM);
     return -1;
 }
 
-static int lookup_vfs_dirfd(int fd, char *path, size_t path_size)
+static int remember_vfs_dirfd(int fd, const char *path)
+{
+    int result;
+    runtime_loader_lock_token lock_token;
+
+    lock_token = vfs_dirfd_lock();
+    result = remember_vfs_dirfd_locked(fd, path);
+    vfs_dirfd_unlock(lock_token);
+    return result;
+}
+
+/* The caller holds vfs_dirfd_lock(). */
+static int lookup_vfs_dirfd_locked(int fd, char *path, size_t path_size)
 {
     int found = 0;
 
     if (!path || path_size == 0)
         return 0;
-    vfs_dirfd_lock();
     for (size_t i = 0; i < g_vfs_dirfd_map_count; i++) {
+        struct stat current_status;
+
         if (g_vfs_dirfd_maps[i].fd != fd)
             continue;
+        /* Descriptor numbers are process-global and may be replaced through
+         * dup2/dup3 without passing through vfs_close().  Treat the recorded
+         * VFS path as provenance only while the live descriptor still names
+         * the exact directory placeholder which established that mapping. */
+        if (VFS_SYSCALL(SYS_fstat, fd, &current_status) < 0 ||
+            !vfs_dirfd_map_identity_matches(&g_vfs_dirfd_maps[i],
+                                            &current_status)) {
+            remove_vfs_dirfd_map_locked(i);
+            break;
+        }
         size_t len = strlen(g_vfs_dirfd_maps[i].path);
 
         if (len < path_size) {
@@ -10825,31 +11819,32 @@ static int lookup_vfs_dirfd(int fd, char *path, size_t path_size)
         }
         break;
     }
-    vfs_dirfd_unlock();
     return found;
 }
 
-static void forget_vfs_dirfd(int fd)
+static int lookup_vfs_dirfd(int fd, char *path, size_t path_size)
+{
+    int result;
+    runtime_loader_lock_token lock_token;
+
+    lock_token = vfs_dirfd_lock();
+    result = lookup_vfs_dirfd_locked(fd, path, path_size);
+    vfs_dirfd_unlock(lock_token);
+    return result;
+}
+
+/* The caller holds vfs_dirfd_lock(). */
+static void forget_vfs_dirfd_locked(int fd)
 {
     if (fd < 0)
         return;
 
-    vfs_dirfd_lock();
     for (size_t i = 0; i < g_vfs_dirfd_map_count; i++) {
         if (g_vfs_dirfd_maps[i].fd != fd)
             continue;
-        g_vfs_dirfd_map_count--;
-        if (i != g_vfs_dirfd_map_count) {
-            /* Spell this as a loader-owned copy: optimizing a large struct
-             * assignment may otherwise synthesize a bootstrap-libc memcpy
-             * in this runtime VFS callback. */
-            ldr_memcpy(&g_vfs_dirfd_maps[i],
-                       &g_vfs_dirfd_maps[g_vfs_dirfd_map_count],
-                       sizeof(g_vfs_dirfd_maps[i]));
-        }
+        remove_vfs_dirfd_map_locked(i);
         break;
     }
-    vfs_dirfd_unlock();
 }
 
 static int resolve_vfs_path_at(int dirfd, const char *path,
@@ -10870,6 +11865,9 @@ static int resolve_vfs_path_at(int dirfd, const char *path,
         if (len <= 0 || (size_t)len > sizeof(base) || base[0] != '/')
             return 0;
     } else {
+        struct stat before_status;
+        struct stat path_status;
+        struct stat after_status;
         size_t position = 0;
 
         /* Synthetic VFS directory descriptors already carry their canonical
@@ -10884,11 +11882,26 @@ static int resolve_vfs_path_at(int dirfd, const char *path,
             vfs_append_decimal(proc_path, sizeof(proc_path), &position,
                                (unsigned long)dirfd) < 0)
             return 0;
+        if (VFS_SYSCALL(SYS_fstat, dirfd, &before_status) < 0 ||
+            !S_ISDIR(before_status.st_mode))
+            return 0;
         len = VFS_SYSCALL(SYS_readlinkat, AT_FDCWD, proc_path,
                           base, sizeof(base) - 1);
         if (len < 0 || (size_t)len >= sizeof(base))
             return 0;
         base[len] = '\0';
+        /* A procfs magic-link rendering is only path provenance when it is
+         * absolute and still resolves to the directory held by dirfd.  The
+         * second fstat also rejects a concurrent dup2/dup3 replacement which
+         * occurred while the pathname identity was being admitted. */
+        if (base[0] != '/' ||
+            VFS_SYSCALL(SYS_newfstatat, AT_FDCWD, base,
+                        &path_status, 0) < 0 ||
+            VFS_SYSCALL(SYS_fstat, dirfd, &after_status) < 0 ||
+            !S_ISDIR(path_status.st_mode) ||
+            !vfs_stat_identity_equal(&before_status, &path_status) ||
+            !vfs_stat_identity_equal(&before_status, &after_status))
+            return 0;
     }
 
     return loader_join_path(resolved, resolved_sz, base, path);
@@ -10913,6 +11926,7 @@ static void *vfs_opendir(const char *path)
                    vfs_dir_exists(lookup_path));
     int fd = -1;
     struct vfs_dir_handle *h;
+    runtime_loader_lock_token lock_token;
 
     if (!has_vfs && g_real_opendir)
         return g_real_opendir(path);
@@ -10942,9 +11956,9 @@ static void *vfs_opendir(const char *path)
         h->phase = 0;
         vfs_dbg_op("opendir", lookup_path, "virtual");
     }
-    vfs_dirfd_lock();
+    lock_token = vfs_dirfd_lock();
     vfs_register_dir_handle_locked(h);
-    vfs_dirfd_unlock();
+    vfs_dirfd_unlock(lock_token);
     return (void *)h;
 }
 
@@ -10953,6 +11967,7 @@ static void *vfs_fdopendir(int fd)
     char mapped[PATH_MAX];
     int has_mapping = lookup_vfs_dirfd(fd, mapped, sizeof(mapped));
     struct vfs_dir_handle *h;
+    runtime_loader_lock_token lock_token;
 
     if (fd < 0) {
         set_loader_errno(EBADF);
@@ -10960,6 +11975,20 @@ static void *vfs_fdopendir(int fd)
     }
     if (!has_mapping && g_real_fdopendir)
         return g_real_fdopendir(fd);
+    if (has_mapping) {
+        long status_flags = VFS_SYSCALL(SYS_fcntl, fd, F_GETFL, 0);
+
+        /* fdopendir consumes only a descriptor which is readable as a
+         * directory.  O_PATH is valid for openat but not getdents, and must
+         * not acquire stronger semantics merely because enumeration is
+         * virtual. */
+        if (status_flags < 0 || (status_flags & O_PATH) != 0 ||
+            (status_flags & O_ACCMODE) != O_RDONLY) {
+            if (status_flags >= 0)
+                set_loader_errno(EBADF);
+            return NULL;
+        }
+    }
 
     h = vfs_alloc_dir_handle();
     if (!h) {
@@ -10977,9 +12006,9 @@ static void *vfs_fdopendir(int fd)
         h->phase = 0;
         vfs_dbg_op("fdopendir", mapped, "virtual");
     }
-    vfs_dirfd_lock();
+    lock_token = vfs_dirfd_lock();
     vfs_register_dir_handle_locked(h);
-    vfs_dirfd_unlock();
+    vfs_dirfd_unlock(lock_token);
     return (void *)h;
 }
 
@@ -11173,19 +12202,20 @@ static struct dirent *vfs_readdir(void *dirp)
 {
     struct vfs_dir_handle *handle;
     struct dirent *result;
+    runtime_loader_lock_token lock_token;
 
     if (!dirp) {
         set_loader_errno(EBADF);
         return NULL;
     }
-    vfs_dirfd_lock();
+    lock_token = vfs_dirfd_lock();
     handle = vfs_find_dir_handle_locked(dirp);
     if (handle) {
         result = vfs_readdir_fake_locked(handle);
-        vfs_dirfd_unlock();
+        vfs_dirfd_unlock(lock_token);
         return result;
     }
-    vfs_dirfd_unlock();
+    vfs_dirfd_unlock(lock_token);
 
     if (g_real_readdir)
         return (struct dirent *)g_real_readdir(dirp);
@@ -11198,33 +12228,34 @@ static int vfs_closedir(void *dirp)
     struct vfs_dir_handle *h;
     int result = 0;
     int saved_errno = 0;
+    runtime_loader_lock_token lock_token;
 
     if (!dirp) {
         set_loader_errno(EBADF);
         return -1;
     }
-    vfs_dirfd_lock();
+    lock_token = vfs_dirfd_lock();
     h = vfs_find_dir_handle_locked(dirp);
     if (!h) {
-        vfs_dirfd_unlock();
+        vfs_dirfd_unlock(lock_token);
         if (g_real_closedir)
             return g_real_closedir(dirp);
         set_loader_errno(EBADF);
         return -1;
     }
     if (!vfs_unregister_dir_handle_locked(h)) {
-        vfs_dirfd_unlock();
+        vfs_dirfd_unlock(lock_token);
         set_loader_errno(EBADF);
         return -1;
     }
     if (h->fd_compat >= 0) {
-        forget_vfs_dirfd(h->fd_compat);
+        forget_vfs_dirfd_locked(h->fd_compat);
         result = (int)VFS_SYSCALL(SYS_close, h->fd_compat);
         if (result < 0)
             saved_errno = loader_errno_value();
     }
     VFS_SYSCALL(SYS_munmap, h, sizeof(*h));
-    vfs_dirfd_unlock();
+    vfs_dirfd_unlock(lock_token);
     if (result < 0)
         set_loader_errno(saved_errno);
     return result;
@@ -11247,19 +12278,20 @@ static void vfs_rewinddir_fake_locked(struct vfs_dir_handle *h)
 static void vfs_rewinddir(void *dirp)
 {
     struct vfs_dir_handle *h;
+    runtime_loader_lock_token lock_token;
 
     if (!dirp) {
         set_loader_errno(EBADF);
         return;
     }
-    vfs_dirfd_lock();
+    lock_token = vfs_dirfd_lock();
     h = vfs_find_dir_handle_locked(dirp);
     if (h) {
         vfs_rewinddir_fake_locked(h);
-        vfs_dirfd_unlock();
+        vfs_dirfd_unlock(lock_token);
         return;
     }
-    vfs_dirfd_unlock();
+    vfs_dirfd_unlock(lock_token);
 
     if (g_real_rewinddir) {
         g_real_rewinddir(dirp);
@@ -11272,19 +12304,20 @@ static long vfs_telldir(void *dirp)
 {
     struct vfs_dir_handle *h;
     long result;
+    runtime_loader_lock_token lock_token;
 
     if (!dirp) {
         set_loader_errno(EBADF);
         return -1;
     }
-    vfs_dirfd_lock();
+    lock_token = vfs_dirfd_lock();
     h = vfs_find_dir_handle_locked(dirp);
     if (h) {
         result = (long)h->result.d_off;
-        vfs_dirfd_unlock();
+        vfs_dirfd_unlock(lock_token);
         return result;
     }
-    vfs_dirfd_unlock();
+    vfs_dirfd_unlock(lock_token);
 
     if (g_real_telldir)
         return g_real_telldir(dirp);
@@ -11296,15 +12329,16 @@ static void vfs_seekdir(void *dirp, long loc)
 {
     struct vfs_dir_handle *h;
     uint32_t tag;
+    runtime_loader_lock_token lock_token;
 
     if (!dirp) {
         set_loader_errno(EBADF);
         return;
     }
-    vfs_dirfd_lock();
+    lock_token = vfs_dirfd_lock();
     h = vfs_find_dir_handle_locked(dirp);
     if (!h) {
-        vfs_dirfd_unlock();
+        vfs_dirfd_unlock(lock_token);
         if (g_real_seekdir) {
             g_real_seekdir(dirp, loc);
             return;
@@ -11314,7 +12348,7 @@ static void vfs_seekdir(void *dirp, long loc)
     }
     if (loc == 0) {
         vfs_rewinddir_fake_locked(h);
-        vfs_dirfd_unlock();
+        vfs_dirfd_unlock(lock_token);
         return;
     }
 
@@ -11324,7 +12358,7 @@ static void vfs_seekdir(void *dirp, long loc)
         h->scan_pos = (uint32_t)loc;
         h->gd_pos = 0;
         h->gd_len = 0;
-        vfs_dirfd_unlock();
+        vfs_dirfd_unlock(lock_token);
         return;
     }
 
@@ -11335,22 +12369,23 @@ static void vfs_seekdir(void *dirp, long loc)
         if (h->vfs_path)
             h->phase = -1;
     }
-    vfs_dirfd_unlock();
+    vfs_dirfd_unlock(lock_token);
 }
 
 static int vfs_dirfd(void *dirp)
 {
     struct vfs_dir_handle *h;
     int result;
+    runtime_loader_lock_token lock_token;
 
     if (!dirp) {
         set_loader_errno(EBADF);
         return -1;
     }
-    vfs_dirfd_lock();
+    lock_token = vfs_dirfd_lock();
     h = vfs_find_dir_handle_locked(dirp);
     if (!h) {
-        vfs_dirfd_unlock();
+        vfs_dirfd_unlock(lock_token);
         if (g_real_dirfd)
             return g_real_dirfd(dirp);
         set_loader_errno(EBADF);
@@ -11361,11 +12396,11 @@ static int vfs_dirfd(void *dirp)
                                   O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
 
         if (fd >= 0) {
-            if (remember_vfs_dirfd(fd, h->vfs_path) < 0) {
+            if (remember_vfs_dirfd_locked(fd, h->vfs_path) < 0) {
                 int saved_errno = loader_errno_value();
 
                 VFS_SYSCALL(SYS_close, fd);
-                vfs_dirfd_unlock();
+                vfs_dirfd_unlock(lock_token);
                 set_loader_errno(saved_errno);
                 return -1;
             } else {
@@ -11374,12 +12409,12 @@ static int vfs_dirfd(void *dirp)
         }
     }
     if (h->fd_compat < 0) {
-        vfs_dirfd_unlock();
+        vfs_dirfd_unlock(lock_token);
         set_loader_errno(EBADF);
         return -1;
     }
     result = h->fd_compat;
-    vfs_dirfd_unlock();
+    vfs_dirfd_unlock(lock_token);
     return result;
 }
 
@@ -11403,6 +12438,28 @@ static int vfs_seal_memfd(int fd)
     return 0;
 }
 
+static int vfs_observable_open_status_mask(void)
+{
+    int mask = O_APPEND | O_NONBLOCK;
+
+#ifdef O_ASYNC
+    mask |= O_ASYNC;
+#endif
+#ifdef O_DIRECT
+    mask |= O_DIRECT;
+#endif
+#ifdef O_NOATIME
+    mask |= O_NOATIME;
+#endif
+#ifdef O_DSYNC
+    mask |= O_DSYNC;
+#endif
+#ifdef O_SYNC
+    mask |= O_SYNC;
+#endif
+    return mask;
+}
+
 static int vfs_reopen_memfd(int fd, int flags)
 {
     const char prefix[] = "/proc/self/fd/";
@@ -11411,6 +12468,10 @@ static int vfs_reopen_memfd(int fd, int flags)
     int reopen_flags;
     int result;
     int saved_errno;
+    long descriptor_flags;
+    long status_flags;
+    struct stat original_status;
+    struct stat reopened_status;
 
     /* memfd_create() always returns an O_RDWR open file description.  Neither
      * F_SETFL nor dup can change its access mode, so returning that descriptor
@@ -11419,6 +12480,13 @@ static int vfs_reopen_memfd(int fd, int flags)
      * create the requested read-only or O_PATH description.  Linux has no
      * fd-only reopen operation for an anonymous file; if procfs is unavailable
      * this fails closed instead of leaking the original writable descriptor. */
+
+    if (VFS_SYSCALL(SYS_fstat, fd, &original_status) < 0) {
+        saved_errno = loader_errno_value();
+        VFS_SYSCALL(SYS_close, fd);
+        set_loader_errno(saved_errno);
+        return -1;
+    }
 
     memcpy(path, prefix, sizeof(prefix) - 1);
     if (vfs_append_decimal(path, sizeof(path), &pos,
@@ -11431,13 +12499,59 @@ static int vfs_reopen_memfd(int fd, int flags)
     reopen_flags = (flags & O_PATH) ? O_PATH : O_RDONLY;
     reopen_flags |= flags & O_CLOEXEC;
     if (!(flags & O_PATH))
-        reopen_flags |= flags & (O_APPEND | O_NONBLOCK);
+        reopen_flags |= flags & vfs_observable_open_status_mask();
     result = (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, path,
                               reopen_flags, 0);
     if (result < 0) {
         saved_errno = loader_errno_value();
         VFS_SYSCALL(SYS_close, fd);
         set_loader_errno(saved_errno);
+        return -1;
+    }
+
+    if (VFS_SYSCALL(SYS_fstat, result, &reopened_status) < 0) {
+        saved_errno = loader_errno_value();
+        VFS_SYSCALL(SYS_close, result);
+        VFS_SYSCALL(SYS_close, fd);
+        set_loader_errno(saved_errno);
+        return -1;
+    }
+    if (!vfs_stat_identity_equal(&original_status, &reopened_status)) {
+        VFS_SYSCALL(SYS_close, result);
+        VFS_SYSCALL(SYS_close, fd);
+        set_loader_errno(EIO);
+        return -1;
+    }
+
+    status_flags = VFS_SYSCALL(SYS_fcntl, result, F_GETFL, 0);
+    if (status_flags < 0) {
+        saved_errno = loader_errno_value();
+        VFS_SYSCALL(SYS_close, result);
+        VFS_SYSCALL(SYS_close, fd);
+        set_loader_errno(saved_errno);
+        return -1;
+    }
+    descriptor_flags = VFS_SYSCALL(SYS_fcntl, result, F_GETFD, 0);
+    if (descriptor_flags < 0) {
+        saved_errno = loader_errno_value();
+        VFS_SYSCALL(SYS_close, result);
+        VFS_SYSCALL(SYS_close, fd);
+        set_loader_errno(saved_errno);
+        return -1;
+    }
+    /* Linux ignores ordinary status flags on an O_PATH open.  Otherwise the
+     * reopened description must expose exactly the requested access class,
+     * append/nonblocking state, and close-on-exec descriptor state. */
+    if ((status_flags & (O_ACCMODE | O_PATH)) !=
+            ((flags & O_PATH) ? O_PATH : O_RDONLY) ||
+        (status_flags & vfs_observable_open_status_mask()) !=
+            ((flags & O_PATH) ? 0 :
+             (flags & vfs_observable_open_status_mask())) ||
+        (descriptor_flags & FD_CLOEXEC) !=
+            ((flags & O_CLOEXEC) ? FD_CLOEXEC : 0)) {
+        VFS_SYSCALL(SYS_close, result);
+        VFS_SYSCALL(SYS_close, fd);
+        set_loader_errno(EPROTO);
         return -1;
     }
     VFS_SYSCALL(SYS_close, fd);
@@ -11497,6 +12611,21 @@ static int vfs_serve_memfd(const struct vfs_entry *ve, const char *path,
 
 static int vfs_regular_open_error(int flags)
 {
+    unsigned int known = O_ACCMODE | O_CREAT | O_EXCL | O_TRUNC |
+                         O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW | O_PATH |
+                         (unsigned int)vfs_observable_open_status_mask();
+
+#ifdef O_NOCTTY
+    known |= O_NOCTTY;
+#endif
+#ifdef O_LARGEFILE
+    known |= O_LARGEFILE;
+#endif
+#ifdef O_TMPFILE
+    known |= O_TMPFILE;
+#endif
+    if ((unsigned int)flags & ~known)
+        return ENOTSUP;
     if (flags & O_DIRECTORY)
         return ENOTDIR;
     if (flags & O_PATH)
@@ -11510,8 +12639,133 @@ static int vfs_regular_open_error(int flags)
 
 static int vfs_close(int fd)
 {
-    forget_vfs_dirfd(fd);
-    return (int)VFS_SYSCALL(SYS_close, fd);
+    int result;
+    runtime_loader_lock_token lock_token;
+
+    /* Mapping removal and kernel close are one registry transaction.  A
+     * concurrent relative lookup must observe either the live virtual
+     * descriptor or the completed close/reuse, never an unregistered live
+     * placeholder which would resolve as the host directory. */
+    lock_token = vfs_dirfd_lock();
+    forget_vfs_dirfd_locked(fd);
+    result = (int)VFS_SYSCALL(SYS_close, fd);
+    vfs_dirfd_unlock(lock_token);
+    return result;
+}
+
+enum vfs_dup_operation {
+    VFS_DUP,
+    VFS_DUP2,
+    VFS_DUP3,
+    VFS_FCNTL_DUP
+};
+
+static int vfs_duplicate_fd(int oldfd, int newfd, int flags,
+                            enum vfs_dup_operation operation)
+{
+    char mapped[PATH_MAX];
+    int has_mapping;
+    int result;
+    runtime_loader_lock_token lock_token;
+
+    /* Public duplication APIs participate in the same transaction as lookup
+     * and close.  This both propagates a synthetic directory's logical path
+     * and removes a replaced destination mapping even when the replacement
+     * happens to be another open description for the same host inode. */
+    lock_token = vfs_dirfd_lock();
+    has_mapping = lookup_vfs_dirfd_locked(oldfd, mapped, sizeof(mapped));
+    if (operation == VFS_DUP)
+        result = (int)VFS_SYSCALL(SYS_dup, oldfd);
+    else if (operation == VFS_DUP2) {
+        /* AArch64 intentionally has no dup2 syscall.  dup3 is equivalent for
+         * distinct descriptors; preserve dup2(oldfd, oldfd)'s validation and
+         * success contract explicitly. */
+        if (oldfd == newfd)
+            result = VFS_SYSCALL(SYS_fcntl, oldfd, F_GETFD, 0) < 0
+                ? -1 : oldfd;
+        else
+            result = (int)VFS_SYSCALL(SYS_dup3, oldfd, newfd, 0);
+    }
+    else if (operation == VFS_DUP3)
+        result = (int)VFS_SYSCALL(SYS_dup3, oldfd, newfd, flags);
+    else
+        result = (int)VFS_SYSCALL(SYS_fcntl, oldfd, flags, newfd);
+
+    if (result >= 0 && result != oldfd) {
+        int mapping_error = 0;
+
+        forget_vfs_dirfd_locked(result);
+        if (has_mapping && remember_vfs_dirfd_locked(result, mapped) < 0)
+            mapping_error = loader_errno_value();
+        if (mapping_error) {
+            VFS_SYSCALL(SYS_close, result);
+            result = -1;
+            set_loader_errno(mapping_error);
+        }
+    }
+    vfs_dirfd_unlock(lock_token);
+    return result;
+}
+
+static int vfs_dup(int oldfd)
+{
+    return vfs_duplicate_fd(oldfd, -1, 0, VFS_DUP);
+}
+
+static int vfs_dup2(int oldfd, int newfd)
+{
+    return vfs_duplicate_fd(oldfd, newfd, 0, VFS_DUP2);
+}
+
+static int vfs_dup3(int oldfd, int newfd, int flags)
+{
+    return vfs_duplicate_fd(oldfd, newfd, flags, VFS_DUP3);
+}
+
+/* The target ABIs pass fcntl's optional third argument in one machine word.
+ * Supplying that word to the real variadic implementation for no-argument
+ * commands is harmless; it lets non-duplication commands retain the target
+ * libc's exact emulation and errno behavior. */
+static int vfs_fcntl(int fd, int command, long argument)
+{
+    if (command == F_DUPFD
+#ifdef F_DUPFD_CLOEXEC
+        || command == F_DUPFD_CLOEXEC
+#endif
+       )
+        return vfs_duplicate_fd(fd, (int)argument, command,
+                                VFS_FCNTL_DUP);
+    if (g_real_fcntl)
+        return g_real_fcntl(fd, command, argument);
+    return (int)VFS_SYSCALL(SYS_fcntl, fd, command, argument);
+}
+
+static int vfs_open_directory_placeholder(const char *lookup_path, int flags,
+                                          int mode, const char *operation)
+{
+    int fd;
+
+#ifdef O_TMPFILE
+    if ((flags & O_TMPFILE) == O_TMPFILE) {
+        set_loader_errno(EROFS);
+        return -1;
+    }
+#endif
+    /* Opening an existing real directory with the caller's exact flags gives
+     * the descriptor the same observable access, status, and CLOEXEC state.
+     * The pathname is only a kernel placeholder; the registry below remains
+     * authoritative for every VFS-relative operation. */
+    fd = (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, "/", flags, mode);
+    if (fd >= 0 && remember_vfs_dirfd(fd, lookup_path) < 0) {
+        int saved_errno = loader_errno_value();
+
+        VFS_SYSCALL(SYS_close, fd);
+        set_loader_errno(saved_errno);
+        return -1;
+    }
+    if (fd >= 0)
+        vfs_dbg_op(operation, lookup_path, "dir-virtual");
+    return fd;
 }
 
 static int vfs_open(const char *path, int flags, int mode)
@@ -11524,22 +12778,12 @@ static int vfs_open(const char *path, int flags, int mode)
      * normal host-filesystem semantics; a trace is evidence about exact
      * lookups, not proof that an entire parent directory was snapshotted. */
     if (lookup_path && lookup_path[0] == '/') {
-        int is_write = (flags & 3) != 0 /* O_WRONLY or O_RDWR */;
         /* Directory path captured in VFS: serve virtually (no FS touch). */
-        if (!is_write && vfs_dir_exists(lookup_path)) {
+        if (vfs_dir_exists(lookup_path)) {
             const struct vfs_entry *ve = vfs_lookup(lookup_path);
             if (!ve || vfs_is_directory_entry(ve)) {
-                int fd = (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, "/",
-                                         O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
-                if (fd >= 0 && remember_vfs_dirfd(fd, lookup_path) < 0) {
-                    int saved_errno = loader_errno_value();
-
-                    VFS_SYSCALL(SYS_close, fd);
-                    set_loader_errno(saved_errno);
-                    return -1;
-                }
-                vfs_dbg_op("open", lookup_path, "dir-virtual");
-                return fd;
+                return vfs_open_directory_placeholder(
+                    lookup_path, flags, mode, "open");
             }
         }
         const struct vfs_entry *ve = vfs_lookup(lookup_path);
@@ -11570,7 +12814,7 @@ static int vfs_open(const char *path, int flags, int mode)
             vfs_dbg_op("open", lookup_path, "elf");
             return frozen_elf_serve_memfd(lookup_path, flags);
         }
-        if (!is_write) {
+        if ((flags & O_ACCMODE) == O_RDONLY) {
             return (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, path, flags, mode);
         }
     }
@@ -11586,25 +12830,15 @@ static int vfs_openat(int dirfd, const char *path, int flags, int mode)
         lookup_path = resolved;
 
     if (lookup_path && lookup_path[0] == '/') {
-        int is_write = (flags & 3) != 0 /* O_WRONLY or O_RDWR */;
         /* Serve captured directories purely from VFS: avoid touching the
          * host filesystem whenever the VFS already knows the directory.
          * This applies to both explicit O_DIRECTORY opens and plain
          * O_RDONLY opens that happen to target a directory path. */
-        if (!is_write && vfs_dir_exists(lookup_path)) {
+        if (vfs_dir_exists(lookup_path)) {
             const struct vfs_entry *ve = vfs_lookup(lookup_path);
             if (!ve || vfs_is_directory_entry(ve)) {
-                int fd = (int)VFS_SYSCALL(SYS_openat, AT_FDCWD, "/",
-                                         O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
-                if (fd >= 0 && remember_vfs_dirfd(fd, lookup_path) < 0) {
-                    int saved_errno = loader_errno_value();
-
-                    VFS_SYSCALL(SYS_close, fd);
-                    set_loader_errno(saved_errno);
-                    return -1;
-                }
-                vfs_dbg_op("openat", lookup_path, "dir-virtual");
-                return fd;
+                return vfs_open_directory_placeholder(
+                    lookup_path, flags, mode, "openat");
             }
         }
         const struct vfs_entry *ve = vfs_lookup(lookup_path);
@@ -11636,7 +12870,7 @@ static int vfs_openat(int dirfd, const char *path, int flags, int mode)
             vfs_dbg_op("openat", lookup_path, "elf");
             return frozen_elf_serve_memfd(lookup_path, flags);
         }
-        if (!is_write) {
+        if ((flags & O_ACCMODE) == O_RDONLY) {
             return (int)VFS_SYSCALL(SYS_openat, dirfd, path, flags, mode);
         }
         vfs_dbg_op("openat", lookup_path, "syscall");
@@ -11775,17 +13009,35 @@ static void *vfs_fopen(const char *path, const char *mode)
 /* Return the frozen ELF index for path, or -1 if not found. */
 static int frozen_elf_find(const char *path)
 {
-    if (!g_frozen_metas || !g_frozen_entries || !g_frozen_strtab)
+    size_t path_length;
+    uint64_t path_hash;
+    size_t index;
+
+    if (!path || !g_frozen_metas || !g_frozen_entries ||
+        !g_frozen_strtab || !g_frozen_elf_path_table ||
+        g_frozen_elf_path_table_size == 0 ||
+        g_frozen_elf_path_count == 0 || !g_vfs_hash_key_ready)
         return -1;
-    for (uint32_t i = 0; i < g_frozen_num_entries; i++) {
-        if (g_frozen_metas[i].flags & LDR_FLAG_DATA)
-            continue;
-        const char *ename =
-            g_frozen_strtab + g_frozen_entries[i].name_offset;
-        const char *logical = dl_manifest_logical_name(
-            g_frozen_entries, g_frozen_strtab, i);
-        if (strcmp(ename, path) == 0 || strcmp(logical, path) == 0)
-            return (int)i;
+    path_length = strlen(path);
+    path_hash = vfs_hash_n(path, path_length);
+    index = (size_t)path_hash & (g_frozen_elf_path_table_size - 1);
+    for (size_t probes = 0;
+         probes < g_frozen_elf_path_table_size; probes++) {
+        const struct frozen_elf_path_entry *entry =
+            &g_frozen_elf_path_table[index];
+
+#ifdef DLFREEZE_VFS_COMPLEXITY_GATE
+        if (g_frozen_elf_lookup_probes != SIZE_MAX)
+            g_frozen_elf_lookup_probes++;
+#endif
+        if (!entry->path)
+            return -1;
+        if (entry->path_hash == path_hash &&
+            entry->path_length == path_length &&
+            memcmp(entry->path, path, path_length) == 0 &&
+            entry->manifest_index < g_frozen_num_entries)
+            return (int)entry->manifest_index;
+        index = (index + 1) & (g_frozen_elf_path_table_size - 1);
     }
     return -1;
 }
@@ -12166,7 +13418,29 @@ struct symbol_lookup_query {
     uint64_t keyed_hash;
     uint32_t gnu_hash;
     uint32_t sysv_hash;
+    uint8_t keyed_hash_valid;
+    uint8_t keyed_hash_deferred;
+    uint8_t sysv_hash_valid;
+    uint8_t sysv_hash_deferred;
 };
+
+/* A deferred hash is permitted only for a name whose owning object's
+ * DT_STRTAB was proved immutable.  Arbitrary caller strings and PF_W-backed
+ * names are hashed while their bytes are being admitted. */
+static int symbol_lookup_query_keyed_hash(
+    const struct symbol_lookup_query *query, uint64_t *hash_out)
+{
+    if (!query || !query->name || !hash_out || !g_vfs_hash_key_ready)
+        return 0;
+    if (query->keyed_hash_valid) {
+        *hash_out = query->keyed_hash;
+        return 1;
+    }
+    if (!query->keyed_hash_deferred)
+        return 0;
+    *hash_out = vfs_hash_n(query->name, query->key.length);
+    return 1;
+}
 
 #define RESOLVE_CACHE_SIZE 65536U  /* must be power-of-two */
 
@@ -12185,14 +13459,86 @@ struct sym_cache_ent {
     uint64_t    value;
 };
 
+/* Relocation replay asks the same requester symbol question many times: one
+ * symbol can own thousands of ABS slots, and the graph-wide ordinary/IFUNC
+ * phases revisit every slot.  Cache only the selected ELF definition (never
+ * an IFUNC resolver result) and only for a completely immutable lookup scope.
+ * COPY lookup has different requester-skipping semantics and is therefore a
+ * separate key.  Entries are epoch-scoped so a recursive dlopen publication
+ * invalidates later resolver lookups before they can reuse an old scope. */
+#define RELOCATION_DEFINITION_CACHE_SIZE 16384U
+#define RELOCATION_DEFINITION_CACHE_MAX_ENTRIES \
+    (RELOCATION_DEFINITION_CACHE_SIZE / 2U)
+
+_Static_assert((RELOCATION_DEFINITION_CACHE_SIZE &
+                (RELOCATION_DEFINITION_CACHE_SIZE - 1)) == 0,
+               "relocation definition cache must be a power of two");
+
+struct relocation_definition_cache_ent {
+    uint32_t epoch;
+    uint32_t reference_symbol_index;
+    uint32_t definition_symbol_index;
+    uint16_t requester_index;
+    uint16_t definition_owner_index;
+    uint16_t object_count;
+    uint8_t skip_requester;
+    uint8_t found;
+    uint8_t ifunc_classification_valid;
+    uint8_t is_ifunc;
+};
+
+enum relocation_scope_immutability_state {
+    RELOCATION_SCOPE_IMMUTABILITY_UNKNOWN = 0,
+    RELOCATION_SCOPE_MUTABLE = 1,
+    RELOCATION_SCOPE_IMMUTABLE = 2,
+};
+
+/* The metadata proof is shared by every relocation-definition entry for a
+ * requester.  Keep it beside the epoch-scoped caches rather than in
+ * loaded_obj: it describes one transient lookup graph, not the ELF object
+ * itself.  object_count and relocation_scope_root defend transaction-time
+ * callers against reusing a proof while a new graph is being assembled. */
+struct relocation_scope_immutability_ent {
+    uint32_t epoch;
+    uint16_t object_count;
+    uint16_t relocation_scope_root;
+    uint8_t state;
+};
+
 static struct sym_cache_ent g_sym_cache[RESOLVE_CACHE_SIZE];
+static struct relocation_definition_cache_ent
+    g_relocation_definition_cache[RELOCATION_DEFINITION_CACHE_SIZE];
+static struct relocation_scope_immutability_ent
+    g_relocation_scope_immutability[MAX_TOTAL_OBJS];
+static uint32_t g_relocation_definition_cache_entries;
 static uint32_t g_cache_epoch = 1;
+
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+static size_t g_symbol_query_forward_bytes;
+static size_t g_symbol_query_reverse_bytes;
+static size_t g_symbol_query_sysv_bytes;
+static size_t g_symbol_name_radix_sorts;
+static size_t g_version_key_admission_visits;
+static size_t g_versym_value_reads;
+static size_t g_dladdr_gnu_chain_visits;
+static size_t g_relocation_definition_cache_hits;
+static size_t g_relocation_definition_cache_stores;
+static size_t g_relocation_definition_scope_scans;
+static size_t g_relocation_ifunc_cache_hits;
+static size_t g_relocation_validation_calls;
+static int g_symbol_name_index_force_allocation_fallback;
+#endif
 
 static void clear_resolution_caches(void)
 {
     g_cache_epoch++;
+    g_relocation_definition_cache_entries = 0;
     if (g_cache_epoch == 0) {
         memset(g_sym_cache, 0, sizeof(g_sym_cache));
+        memset(g_relocation_definition_cache, 0,
+               sizeof(g_relocation_definition_cache));
+        memset(g_relocation_scope_immutability, 0,
+               sizeof(g_relocation_scope_immutability));
         g_cache_epoch = 1;
     }
 }
@@ -12201,15 +13547,16 @@ static void clear_resolution_caches(void)
 static int sym_cache_lookup(const struct symbol_lookup_query *query,
                             uint64_t *out)
 {
+    uint64_t keyed_hash;
     uint32_t idx;
 
-    if (!query || !g_vfs_hash_key_ready)
+    if (!symbol_lookup_query_keyed_hash(query, &keyed_hash))
         return 0;
-    idx = (uint32_t)query->keyed_hash & (RESOLVE_CACHE_SIZE - 1);
+    idx = (uint32_t)keyed_hash & (RESOLVE_CACHE_SIZE - 1);
     for (uint32_t n = 0; n < RESOLVE_CACHE_SIZE; n++) {
         struct sym_cache_ent *e = &g_sym_cache[idx];
         if (e->epoch != g_cache_epoch || e->state == CACHE_EMPTY) return 0;
-        if (e->keyed_hash == query->keyed_hash && e->name &&
+        if (e->keyed_hash == keyed_hash && e->name &&
             e->name_length == query->key.length &&
             memcmp(e->name, query->name, e->name_length + 1) == 0) {
             if (e->state == CACHE_FOUND) { *out = e->value; return 1; }
@@ -12228,19 +13575,21 @@ static void sym_cache_store_canonical(
                                       const struct symbol_lookup_query *query,
                                       uint8_t state, uint64_t value)
 {
+    uint64_t keyed_hash;
     uint32_t idx;
 
-    if (!name || !query || !g_vfs_hash_key_ready)
+    if (!name ||
+        !symbol_lookup_query_keyed_hash(query, &keyed_hash))
         return;
-    idx = (uint32_t)query->keyed_hash & (RESOLVE_CACHE_SIZE - 1);
+    idx = (uint32_t)keyed_hash & (RESOLVE_CACHE_SIZE - 1);
     for (uint32_t n = 0; n < RESOLVE_CACHE_SIZE; n++) {
         struct sym_cache_ent *e = &g_sym_cache[idx];
         if (e->epoch != g_cache_epoch || e->state == CACHE_EMPTY ||
-            (e->keyed_hash == query->keyed_hash && e->name &&
+            (e->keyed_hash == keyed_hash && e->name &&
              e->name_length == query->key.length &&
              memcmp(e->name, name, e->name_length + 1) == 0)) {
             e->name = name;
-            e->keyed_hash = query->keyed_hash;
+            e->keyed_hash = keyed_hash;
             e->name_length = query->key.length;
             e->epoch = g_cache_epoch;
             e->state = state;
@@ -12277,6 +13626,48 @@ static uint32_t sysv_hash_calc(const char *name)
     return h;
 }
 
+static uint32_t sysv_hash_calc_n(const char *name, size_t length)
+{
+    uint32_t h = 0;
+
+    for (size_t i = 0; i < length; i++) {
+        uint32_t high;
+
+        h = (h << 4) + (uint8_t)name[i];
+        high = h & UINT32_C(0xf0000000);
+        if (high)
+            h ^= high >> 24;
+        h &= ~high;
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+        g_symbol_query_sysv_bytes++;
+#endif
+    }
+    return h;
+}
+
+/* Immutable object-owned names defer the legacy SysV hash until a lookup
+ * actually reaches an object which has DT_HASH but no DT_GNU_HASH.  Cache
+ * that one bounded calculation in the stack-local query so a scope with
+ * several SysV-only objects cannot multiply work by the name length. */
+static int symbol_lookup_query_sysv_hash(
+    struct symbol_lookup_query *query, uint32_t *hash_out)
+{
+    if (!query || !query->name || !hash_out)
+        return 0;
+    if (query->sysv_hash_valid) {
+        *hash_out = query->sysv_hash;
+        return 1;
+    }
+    if (!query->sysv_hash_deferred)
+        return 0;
+    query->sysv_hash =
+        sysv_hash_calc_n(query->name, query->key.length);
+    query->sysv_hash_valid = 1;
+    query->sysv_hash_deferred = 0;
+    *hash_out = query->sysv_hash;
+    return 1;
+}
+
 static uint64_t symbol_name_fingerprint_n(const char *name, size_t length)
 {
     uint64_t fingerprint = g_symbol_name_fingerprint_seed;
@@ -12284,6 +13675,9 @@ static uint64_t symbol_name_fingerprint_n(const char *name, size_t length)
     while (length != 0) {
         uint64_t byte = (uint8_t)name[--length];
 
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+        g_symbol_query_reverse_bytes++;
+#endif
         fingerprint =
             (fingerprint ^ (byte + UINT64_C(0x100))) *
             g_symbol_name_fingerprint_multiplier;
@@ -12291,23 +13685,187 @@ static uint64_t symbol_name_fingerprint_n(const char *name, size_t length)
     return fingerprint;
 }
 
+struct symbol_lookup_forward_state {
+    struct vfs_hash_state keyed;
+    uint32_t gnu_hash;
+    uint32_t sysv_hash;
+    uint8_t keyed_hash_enabled;
+};
+
+static void symbol_lookup_forward_init(
+    struct symbol_lookup_forward_state *state, int defer_keyed_hash)
+{
+    state->keyed_hash_enabled =
+        g_vfs_hash_key_ready && !defer_keyed_hash;
+    if (state->keyed_hash_enabled)
+        vfs_hash_init(&state->keyed);
+    state->gnu_hash = 5381;
+    state->sysv_hash = 0;
+}
+
+static void symbol_lookup_forward_update(
+    struct symbol_lookup_forward_state *state, uint8_t byte)
+{
+    uint32_t high;
+
+    if (state->keyed_hash_enabled)
+        vfs_hash_update_byte(&state->keyed, byte);
+    state->gnu_hash =
+        (state->gnu_hash << 5) + state->gnu_hash + byte;
+    state->sysv_hash = (state->sysv_hash << 4) + byte;
+    high = state->sysv_hash & UINT32_C(0xf0000000);
+    if (high)
+        state->sysv_hash ^= high >> 24;
+    state->sysv_hash &= ~high;
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+    g_symbol_query_forward_bytes++;
+#endif
+}
+
+static void symbol_lookup_query_finish(
+    const char *name, size_t length,
+    const struct loaded_symbol_name_key *known_key,
+    const struct symbol_lookup_forward_state *state,
+    struct symbol_lookup_query *query)
+{
+    query->name = name;
+    query->key.length = length;
+    query->key.fingerprint = known_key
+        ? known_key->fingerprint
+        : symbol_name_fingerprint_n(name, length);
+    query->key.gnu_hash = state->gnu_hash;
+    query->key.dynstr_offset = UINT32_MAX;
+    query->keyed_hash = state->keyed_hash_enabled
+        ? vfs_hash_final(&state->keyed) : 0;
+    query->keyed_hash_valid = state->keyed_hash_enabled;
+    query->keyed_hash_deferred = known_key != NULL;
+    query->gnu_hash = state->gnu_hash;
+    query->sysv_hash = state->sysv_hash;
+    query->sysv_hash_valid = 1;
+    query->sysv_hash_deferred = 0;
+}
+
+/* The caller must first prove that known_key->length plus its terminating
+ * NUL is readable.  Reject an early/missing terminator instead of allowing a
+ * malformed object-owned key to turn a bounded query into strlen(). */
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+static int symbol_lookup_query_init_known_key(
+    const char *name, const struct loaded_symbol_name_key *known_key,
+    struct symbol_lookup_query *query)
+{
+    struct symbol_lookup_forward_state state;
+
+    if (!name || !known_key || !query || known_key->length == SIZE_MAX)
+        return 0;
+    symbol_lookup_forward_init(&state, 1);
+    for (size_t i = 0; i < known_key->length; i++) {
+        uint8_t byte = (uint8_t)name[i];
+
+        if (byte == 0)
+            return 0;
+        symbol_lookup_forward_update(&state, byte);
+    }
+    if (name[known_key->length] != '\0')
+        return 0;
+    symbol_lookup_query_finish(
+        name, known_key->length, known_key, &state, query);
+    return 1;
+}
+#endif
+
 static int symbol_lookup_query_init(const char *name,
                                     struct symbol_lookup_query *query)
 {
-    size_t length;
+    struct symbol_lookup_forward_state state;
+    const uint8_t *cursor;
+    size_t length = 0;
 
     if (!name || !query)
         return 0;
-    length = strlen(name);
-    if (length == SIZE_MAX)
-        return 0;
-    query->name = name;
-    query->key.length = length;
-    query->key.fingerprint = symbol_name_fingerprint_n(name, length);
-    query->keyed_hash = vfs_hash_n(name, length);
-    query->gnu_hash = gnu_hash_calc(name);
-    query->sysv_hash = sysv_hash_calc(name);
+    symbol_lookup_forward_init(&state, 0);
+    cursor = (const uint8_t *)name;
+    while (*cursor != 0) {
+        if (length == SIZE_MAX)
+            return 0;
+        symbol_lookup_forward_update(&state, *cursor++);
+        length++;
+    }
+    symbol_lookup_query_finish(name, length, NULL, &state, query);
     return 1;
+}
+
+static int symbol_lookup_query_init_bounded_current(
+    const char *name, size_t capacity, struct symbol_lookup_query *query)
+{
+    struct symbol_lookup_forward_state state;
+
+    if (!name || !query || capacity == 0)
+        return 0;
+    symbol_lookup_forward_init(&state, 0);
+    for (size_t length = 0; length < capacity; length++) {
+        uint8_t byte = (uint8_t)name[length];
+
+        if (byte == 0) {
+            symbol_lookup_query_finish(
+                name, length, NULL, &state, query);
+            return 1;
+        }
+        symbol_lookup_forward_update(&state, byte);
+    }
+    return 0;
+}
+
+static int symbol_lookup_query_eq_cstr(
+    const struct symbol_lookup_query *query, const char *value)
+{
+    size_t i;
+
+    if (!query || !query->name || !value)
+        return 0;
+    for (i = 0; i < query->key.length; i++) {
+        if (value[i] == '\0' || value[i] != query->name[i])
+            return 0;
+    }
+    return value[i] == '\0' && query->name[i] == '\0';
+}
+
+static int symbol_lookup_query_has_slash(
+    const struct symbol_lookup_query *query)
+{
+    if (!query || !query->name)
+        return 0;
+    for (size_t i = 0; i < query->key.length; i++)
+        if (query->name[i] == '/')
+            return 1;
+    return 0;
+}
+
+static int symbol_lookup_query_starts_with(
+    const struct symbol_lookup_query *query, size_t offset,
+    const char *prefix)
+{
+    size_t length;
+
+    if (!query || !query->name || !prefix ||
+        offset > query->key.length)
+        return 0;
+    length = strlen(prefix);
+    return length <= query->key.length - offset &&
+           memcmp(query->name + offset, prefix, length) == 0;
+}
+
+static int symbol_lookup_query_is_musl_reserved_soname(
+    const struct symbol_lookup_query *query)
+{
+    if (!symbol_lookup_query_starts_with(query, 0, "lib"))
+        return 0;
+    return symbol_lookup_query_starts_with(query, 3, "c.") ||
+           symbol_lookup_query_starts_with(query, 3, "pthread.") ||
+           symbol_lookup_query_starts_with(query, 3, "rt.") ||
+           symbol_lookup_query_starts_with(query, 3, "m.") ||
+           symbol_lookup_query_starts_with(query, 3, "dl.") ||
+           symbol_lookup_query_starts_with(query, 3, "util.") ||
+           symbol_lookup_query_starts_with(query, 3, "xnet.");
 }
 
 static int elf_strtab_name_eq(const char *strtab, size_t strtab_size,
@@ -12325,15 +13883,17 @@ static int mapped_array_contains(const struct loaded_obj *obj,
     return loaded_obj_contains(obj, addr, bytes);
 }
 
-static int mapped_advance(const struct loaded_obj *obj, uintptr_t *addr,
-                          size_t count, size_t element_size)
+static int file_backed_advance(const struct loaded_obj *obj,
+                               uintptr_t *addr, size_t count,
+                               size_t element_size)
 {
     size_t bytes;
 
-    if (!mapped_array_contains(obj, *addr, count, element_size))
+    if (count != 0 && element_size > SIZE_MAX / count)
         return 0;
     bytes = count * element_size;
-    if (*addr > UINTPTR_MAX - bytes)
+    if (!loaded_obj_file_contains(obj, *addr, bytes) ||
+        *addr > UINTPTR_MAX - bytes)
         return 0;
     *addr += bytes;
     return 1;
@@ -12357,17 +13917,36 @@ struct gnu_hash_view {
     const uint64_t *bloom;
     const uint32_t *buckets;
     uintptr_t chain_addr;
+    uint32_t chain_count;
+    uint8_t chain_count_valid;
 };
 
 static int get_gnu_hash_view(const struct loaded_obj *obj,
                              struct gnu_hash_view *view)
 {
-    const uint32_t *header = obj->gnu_hash;
+    const uint32_t *header;
     uintptr_t cursor;
 
+    if (!obj || !view)
+        return 0;
+    if (obj->gnu_hash_view_cached) {
+        view->nbuckets = obj->gnu_hash_cached_nbuckets;
+        view->symoffset = obj->gnu_hash_cached_symoffset;
+        view->bloom_size = obj->gnu_hash_cached_bloom_size;
+        view->bloom_shift = obj->gnu_hash_cached_bloom_shift;
+        view->bloom = obj->gnu_hash_cached_bloom;
+        view->buckets = obj->gnu_hash_cached_buckets;
+        view->chain_addr = obj->gnu_hash_cached_chain_addr;
+        view->chain_count = obj->gnu_hash_cached_chain_count;
+        view->chain_count_valid = 1;
+        return 1;
+    }
+
+    header = obj->gnu_hash;
     if (!header ||
         !address_has_alignment((uintptr_t)header, _Alignof(uint64_t)) ||
-        !mapped_array_contains(obj, (uintptr_t)header, 4, sizeof(uint32_t)))
+        !loaded_obj_file_contains(obj, (uintptr_t)header,
+                                  4 * sizeof(uint32_t)))
         return 0;
 
     view->nbuckets = header[0];
@@ -12380,12 +13959,16 @@ static int get_gnu_hash_view(const struct loaded_obj *obj,
 
     cursor = (uintptr_t)(header + 4);
     view->bloom = (const uint64_t *)cursor;
-    if (!mapped_advance(obj, &cursor, view->bloom_size, sizeof(uint64_t)))
+    if (!file_backed_advance(
+            obj, &cursor, view->bloom_size, sizeof(uint64_t)))
         return 0;
     view->buckets = (const uint32_t *)cursor;
-    if (!mapped_advance(obj, &cursor, view->nbuckets, sizeof(uint32_t)))
+    if (!file_backed_advance(
+            obj, &cursor, view->nbuckets, sizeof(uint32_t)))
         return 0;
     view->chain_addr = cursor;
+    view->chain_count = 0;
+    view->chain_count_valid = 0;
     return 1;
 }
 
@@ -12402,11 +13985,77 @@ static int gnu_hash_chain_value(const struct loaded_obj *obj,
     if (chain_index > (UINTPTR_MAX - view->chain_addr) / sizeof(uint32_t))
         return 0;
     addr = view->chain_addr + chain_index * sizeof(uint32_t);
+    if (view->chain_count_valid) {
+        if (chain_index >= view->chain_count)
+            return 0;
+        *value = *(const uint32_t *)addr;
+        return 1;
+    }
     if (!address_has_alignment(addr, _Alignof(uint32_t)) ||
         !loaded_obj_file_contains(obj, addr, sizeof(uint32_t)))
         return 0;
     *value = *(const uint32_t *)addr;
     return 1;
+}
+
+/* Publish only geometry whose complete file-backed table has already passed
+ * parse_dynamic's bucket/chain validation and whose ELF protection contract
+ * makes every byte immutable.  Exact chain_count remains part of the cached
+ * view: bytes which merely happen to follow the admitted table must never
+ * become valid chain entries. */
+static void cache_validated_gnu_hash_view(
+    struct loaded_obj *obj, const struct gnu_hash_view *view,
+    uint32_t symbol_count)
+{
+    uintptr_t expected;
+    size_t bloom_bytes;
+    size_t bucket_bytes;
+    size_t chain_bytes;
+    size_t table_bytes;
+    uint32_t chain_count;
+
+    if (!obj || !view || obj->gnu_hash_view_cached || !obj->gnu_hash ||
+        view->nbuckets == 0 || view->bloom_size == 0 ||
+        view->bloom_shift >= 32 || symbol_count < view->symoffset)
+        return;
+    chain_count = symbol_count - view->symoffset;
+    if (__builtin_mul_overflow((size_t)view->bloom_size,
+                               sizeof(uint64_t), &bloom_bytes) ||
+        __builtin_mul_overflow((size_t)view->nbuckets,
+                               sizeof(uint32_t), &bucket_bytes) ||
+        __builtin_mul_overflow((size_t)chain_count,
+                               sizeof(uint32_t), &chain_bytes) ||
+        __builtin_add_overflow(4 * sizeof(uint32_t), bloom_bytes,
+                               &table_bytes) ||
+        __builtin_add_overflow(table_bytes, bucket_bytes, &table_bytes) ||
+        __builtin_add_overflow(table_bytes, chain_bytes, &table_bytes) ||
+        (uintptr_t)obj->gnu_hash > UINTPTR_MAX - 4 * sizeof(uint32_t))
+        return;
+    expected = (uintptr_t)obj->gnu_hash + 4 * sizeof(uint32_t);
+    if ((uintptr_t)view->bloom != expected ||
+        expected > UINTPTR_MAX - bloom_bytes)
+        return;
+    expected += bloom_bytes;
+    if ((uintptr_t)view->buckets != expected ||
+        expected > UINTPTR_MAX - bucket_bytes)
+        return;
+    expected += bucket_bytes;
+    if (view->chain_addr != expected || view->chain_count_valid ||
+        !loaded_obj_file_contains(obj, (uintptr_t)obj->gnu_hash,
+                                  table_bytes) ||
+        !loaded_obj_range_declared_readonly(
+            obj, obj->gnu_hash, table_bytes))
+        return;
+
+    obj->gnu_hash_cached_nbuckets = view->nbuckets;
+    obj->gnu_hash_cached_symoffset = view->symoffset;
+    obj->gnu_hash_cached_bloom_size = view->bloom_size;
+    obj->gnu_hash_cached_bloom_shift = view->bloom_shift;
+    obj->gnu_hash_cached_bloom = view->bloom;
+    obj->gnu_hash_cached_buckets = view->buckets;
+    obj->gnu_hash_cached_chain_addr = view->chain_addr;
+    obj->gnu_hash_cached_chain_count = chain_count;
+    obj->gnu_hash_view_cached = 1;
 }
 
 static uint32_t gnu_hash_symbol_count_loaded(const struct loaded_obj *obj)
@@ -12454,12 +14103,24 @@ struct sysv_hash_view {
 static int get_sysv_hash_view(const struct loaded_obj *obj,
                               struct sysv_hash_view *view)
 {
-    const uint32_t *header = obj->sysv_hash;
+    const uint32_t *header;
     uintptr_t cursor;
 
+    if (!obj || !view)
+        return 0;
+    if (obj->sysv_hash_view_cached) {
+        view->nbuckets = obj->sysv_hash_cached_nbuckets;
+        view->nchain = obj->sysv_hash_cached_nchain;
+        view->buckets = obj->sysv_hash_cached_buckets;
+        view->chains = obj->sysv_hash_cached_chains;
+        return 1;
+    }
+
+    header = obj->sysv_hash;
     if (!header ||
         !address_has_alignment((uintptr_t)header, _Alignof(uint32_t)) ||
-        !mapped_array_contains(obj, (uintptr_t)header, 2, sizeof(uint32_t)))
+        !loaded_obj_file_contains(obj, (uintptr_t)header,
+                                  2 * sizeof(uint32_t)))
         return 0;
     view->nbuckets = header[0];
     view->nchain = header[1];
@@ -12468,12 +14129,52 @@ static int get_sysv_hash_view(const struct loaded_obj *obj,
 
     cursor = (uintptr_t)(header + 2);
     view->buckets = (const uint32_t *)cursor;
-    if (!mapped_advance(obj, &cursor, view->nbuckets, sizeof(uint32_t)))
+    if (!file_backed_advance(
+            obj, &cursor, view->nbuckets, sizeof(uint32_t)))
         return 0;
     view->chains = (const uint32_t *)cursor;
-    if (!mapped_array_contains(obj, cursor, view->nchain, sizeof(uint32_t)))
+    if (!file_backed_advance(
+            obj, &cursor, view->nchain, sizeof(uint32_t)))
         return 0;
     return 1;
+}
+
+static void cache_validated_sysv_hash_view(
+    struct loaded_obj *obj, const struct sysv_hash_view *view)
+{
+    uintptr_t expected;
+    size_t bucket_bytes;
+    size_t chain_bytes;
+    size_t table_bytes;
+
+    if (!obj || !view || obj->sysv_hash_view_cached || !obj->sysv_hash ||
+        view->nbuckets == 0 || view->nchain == 0 ||
+        __builtin_mul_overflow((size_t)view->nbuckets,
+                               sizeof(uint32_t), &bucket_bytes) ||
+        __builtin_mul_overflow((size_t)view->nchain,
+                               sizeof(uint32_t), &chain_bytes) ||
+        __builtin_add_overflow(2 * sizeof(uint32_t), bucket_bytes,
+                               &table_bytes) ||
+        __builtin_add_overflow(table_bytes, chain_bytes, &table_bytes) ||
+        (uintptr_t)obj->sysv_hash > UINTPTR_MAX - 2 * sizeof(uint32_t))
+        return;
+    expected = (uintptr_t)obj->sysv_hash + 2 * sizeof(uint32_t);
+    if ((uintptr_t)view->buckets != expected ||
+        expected > UINTPTR_MAX - bucket_bytes)
+        return;
+    expected += bucket_bytes;
+    if ((uintptr_t)view->chains != expected ||
+        !loaded_obj_file_contains(obj, (uintptr_t)obj->sysv_hash,
+                                  table_bytes) ||
+        !loaded_obj_range_declared_readonly(
+            obj, obj->sysv_hash, table_bytes))
+        return;
+
+    obj->sysv_hash_cached_nbuckets = view->nbuckets;
+    obj->sysv_hash_cached_nchain = view->nchain;
+    obj->sysv_hash_cached_buckets = view->buckets;
+    obj->sysv_hash_cached_chains = view->chains;
+    obj->sysv_hash_view_cached = 1;
 }
 
 static const Elf64_Sym *loaded_dynsym(const struct loaded_obj *obj,
@@ -12481,8 +14182,16 @@ static const Elf64_Sym *loaded_dynsym(const struct loaded_obj *obj,
 {
     uintptr_t addr;
 
-    if (!obj->dynsym || index >= obj->dynsym_count ||
-        index > (UINTPTR_MAX - (uintptr_t)obj->dynsym) / sizeof(Elf64_Sym))
+    if (!obj || !obj->dynsym || index >= obj->dynsym_count)
+        return NULL;
+    /* parse_dynamic admitted this complete, aligned, file-backed span.  The
+     * proof concerns geometry only: PF_W entries are still read from the
+     * live table on every call. */
+    if (obj->dynsym_admitted_count == obj->dynsym_count &&
+        obj->dynsym_admitted_count != 0)
+        return &obj->dynsym[index];
+    if (index >
+        (UINTPTR_MAX - (uintptr_t)obj->dynsym) / sizeof(Elf64_Sym))
         return NULL;
     addr = (uintptr_t)obj->dynsym + (size_t)index * sizeof(Elf64_Sym);
     if (!address_has_alignment(addr, _Alignof(Elf64_Sym)) ||
@@ -12496,8 +14205,16 @@ static int loaded_versym_value(const struct loaded_obj *obj, uint32_t index,
 {
     uintptr_t addr;
 
-    if (!obj->versym)
+    if (!obj || !value || !obj->versym || index >= obj->dynsym_count)
         return 0;
+    if (obj->versym_admitted_count == obj->dynsym_count &&
+        obj->versym_admitted_count != 0) {
+        *value = obj->versym[index];
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+        g_versym_value_reads++;
+#endif
+        return 1;
+    }
     if (index > (UINTPTR_MAX - (uintptr_t)obj->versym) / sizeof(uint16_t))
         return 0;
     addr = (uintptr_t)obj->versym + (size_t)index * sizeof(uint16_t);
@@ -12505,6 +14222,9 @@ static int loaded_versym_value(const struct loaded_obj *obj, uint32_t index,
         !mapped_array_contains(obj, addr, 1, sizeof(uint16_t)))
         return 0;
     *value = *(const uint16_t *)addr;
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+    g_versym_value_reads++;
+#endif
     return 1;
 }
 
@@ -12627,6 +14347,127 @@ static void loaded_symbol_name_refs_sort(
     }
 }
 
+#define LOADED_SYMBOL_NAME_RADIX_MIN 256U
+#define LOADED_SYMBOL_NAME_RADIX_BUCKETS 256U
+
+static uint32_t loaded_symbol_name_index_bucket(
+    uint64_t fingerprint, uint32_t bucket_mask)
+{
+    /* Fold both randomized halves before selecting a power-of-two bucket.
+     * Correctness never depends on this work hash: candidates still receive
+     * an exact bounded byte comparison. */
+    fingerprint ^= fingerprint >> 32;
+    return (uint32_t)fingerprint & bucket_mask;
+}
+
+/* Keep separate chaining at an average load of at most two without making
+ * the optional accelerator dominate the existing per-symbol key storage.
+ * Return zero when the derived layout is not representable; callers retain
+ * the complete live-table scan in that case. */
+static int loaded_symbol_name_index_geometry(
+    uint32_t symbol_count, size_t base_mapping_size,
+    size_t *index_offset_out, size_t *mapping_size_out,
+    uint32_t *bucket_mask_out)
+{
+    size_t candidate_count;
+    size_t desired_buckets;
+    size_t bucket_count = 1;
+    size_t index_offset;
+    size_t link_count;
+    size_t link_bytes;
+    size_t index_size;
+
+    if (!index_offset_out || !mapping_size_out || !bucket_mask_out ||
+        symbol_count <= 1)
+        return 0;
+    candidate_count = (size_t)symbol_count - 1U;
+    desired_buckets = candidate_count / 2U + candidate_count % 2U;
+    while (bucket_count < desired_buckets) {
+        if (bucket_count > SIZE_MAX / 2U)
+            return 0;
+        bucket_count *= 2U;
+    }
+    if (bucket_count == 0 || bucket_count - 1U > UINT32_MAX ||
+        !property_align_up(
+            base_mapping_size, _Alignof(struct loaded_symbol_name_index),
+            &index_offset) ||
+        __builtin_add_overflow(bucket_count, (size_t)symbol_count,
+                               &link_count) ||
+        __builtin_mul_overflow(link_count, sizeof(uint32_t), &link_bytes) ||
+        __builtin_add_overflow(sizeof(struct loaded_symbol_name_index),
+                               link_bytes, &index_size) ||
+        __builtin_add_overflow(index_offset, index_size,
+                               mapping_size_out))
+        return 0;
+    *index_offset_out = index_offset;
+    *bucket_mask_out = (uint32_t)(bucket_count - 1U);
+    return 1;
+}
+
+/* Four stable byte-wise passes sort the uint32_t string offsets without the
+ * branchy O(N log N) heap walk.  The caller may lend the not-yet-published
+ * key mapping as scratch: all destination pointers are merely copied during
+ * sorting, and no key is dereferenced until the mapping has been cleared and
+ * its version-page header restored. */
+static int loaded_symbol_name_refs_radix_sort(
+    struct loaded_symbol_name_ref *refs, size_t count,
+    void *scratch_mapping, size_t scratch_size)
+{
+    struct loaded_symbol_name_ref *source = refs;
+    struct loaded_symbol_name_ref *destination = scratch_mapping;
+    size_t refs_bytes;
+    size_t counts_offset;
+    size_t counts_bytes =
+        LOADED_SYMBOL_NAME_RADIX_BUCKETS * sizeof(size_t);
+    size_t *next;
+
+    if (!refs || !scratch_mapping || count < LOADED_SYMBOL_NAME_RADIX_MIN ||
+        __builtin_mul_overflow(count, sizeof(*refs), &refs_bytes))
+        return 0;
+    counts_offset = refs_bytes;
+    if (counts_offset % _Alignof(size_t)) {
+        size_t padding = _Alignof(size_t) -
+            counts_offset % _Alignof(size_t);
+
+        if (__builtin_add_overflow(counts_offset, padding,
+                                   &counts_offset))
+            return 0;
+    }
+    if (counts_offset > scratch_size ||
+        counts_bytes > scratch_size - counts_offset)
+        return 0;
+    next = (size_t *)((uint8_t *)scratch_mapping + counts_offset);
+
+    for (unsigned int pass = 0; pass < sizeof(uint32_t); pass++) {
+        unsigned int shift = pass * 8U;
+        size_t total = 0;
+
+        memset(next, 0, counts_bytes);
+        for (size_t i = 0; i < count; i++)
+            next[(source[i].offset >> shift) & UINT32_C(0xff)]++;
+        for (size_t bucket = 0;
+             bucket < LOADED_SYMBOL_NAME_RADIX_BUCKETS; bucket++) {
+            size_t bucket_count = next[bucket];
+
+            next[bucket] = total;
+            total += bucket_count;
+        }
+        for (size_t i = 0; i < count; i++) {
+            uint32_t bucket =
+                (source[i].offset >> shift) & UINT32_C(0xff);
+
+            destination[next[bucket]++] = source[i];
+        }
+        {
+            struct loaded_symbol_name_ref *temporary = source;
+
+            source = destination;
+            destination = temporary;
+        }
+    }
+    return source == refs;
+}
+
 /* Compute the key for every referenced string-table suffix in one reverse
  * pass.  A hostile table may point N symbols at N overlapping suffixes of
  * one long string; hashing every suffix independently would be quadratic.
@@ -12637,11 +14478,16 @@ static int build_loaded_symbol_name_keys(struct loaded_obj *obj)
     uint8_t *mapping = MAP_FAILED;
     struct loaded_symbol_name_key *keys;
     struct loaded_version_name_index *version_keys = NULL;
+    struct loaded_symbol_name_index *name_index = NULL;
     struct loaded_symbol_name_ref *refs = MAP_FAILED;
     size_t keys_size;
+    size_t dynsym_size;
+    size_t versym_size = 0;
+    size_t base_mapping_size;
     size_t mapping_size;
     size_t version_offset = 0;
     size_t version_size = 0;
+    size_t name_index_offset = 0;
     size_t populated_version_pages = 0;
     size_t refs_count;
     size_t refs_size;
@@ -12649,6 +14495,14 @@ static int build_loaded_symbol_name_keys(struct loaded_obj *obj)
     size_t remaining;
     size_t suffix_length = 0;
     uint64_t fingerprint = g_symbol_name_fingerprint_seed;
+    uint32_t gnu_hash = UINT32_C(5381);
+    uint32_t gnu_power = UINT32_C(1);
+    uint32_t name_index_bucket_mask = 0;
+    int dynstr_readonly;
+    int dynsym_readonly;
+    int versym_readonly;
+    int have_name_index = 0;
+    int used_radix_sort = 0;
     int result = -1;
 
     if (!obj || !obj->dynsym || !obj->dynstr || obj->dynsym_count == 0 ||
@@ -12656,8 +14510,19 @@ static int build_loaded_symbol_name_keys(struct loaded_obj *obj)
         obj->version_name_index || obj->runtime_symbol_name_mapping)
         return -1;
     if (__builtin_mul_overflow((size_t)obj->dynsym_count, sizeof(*keys),
-                               &keys_size))
+                               &keys_size) ||
+        __builtin_mul_overflow((size_t)obj->dynsym_count,
+                               sizeof(Elf64_Sym), &dynsym_size) ||
+        (obj->versym &&
+         __builtin_mul_overflow((size_t)obj->dynsym_count,
+                                sizeof(uint16_t), &versym_size)))
         return -1;
+    dynstr_readonly = loaded_obj_range_declared_readonly(
+        obj, obj->dynstr, obj->dynstr_size);
+    dynsym_readonly = loaded_obj_range_declared_readonly(
+        obj, obj->dynsym, dynsym_size);
+    versym_readonly = obj->versym &&
+        loaded_obj_range_declared_readonly(obj, obj->versym, versym_size);
     refs_count = obj->dynsym_count;
     if (obj->version_index) {
         size_t version_entries_size;
@@ -12684,32 +14549,64 @@ static int build_loaded_symbol_name_keys(struct loaded_obj *obj)
                                        &version_offset))
                 return -1;
         }
-        for (uint32_t version = 2;
-             version <= DL_VERSION_INDEX_MASK; version++) {
-            const struct loaded_version_entry *entry =
-                loaded_version_index_entry(obj, (uint16_t)version);
-            size_t additional = 0;
+        for (uint32_t page = 0; page < DL_VERSION_PAGE_COUNT; page++) {
+            uint32_t first;
+            uint32_t limit;
 
-            if (!entry)
+            if (obj->version_index->page_slots[page] == 0)
                 continue;
-            if (entry->flags & DL_VERSION_ENTRY_DEFINED)
-                additional++;
-            if (entry->flags & DL_VERSION_ENTRY_NEEDED)
-                additional += 2;
-            if (__builtin_add_overflow(refs_count, additional,
-                                       &refs_count))
-                return -1;
+            first = page << DL_VERSION_PAGE_BITS;
+            limit = first + DL_VERSION_PAGE_ENTRIES;
+            if (first < 2)
+                first = 2;
+            for (uint32_t version = first; version < limit; version++) {
+                const struct loaded_version_entry *entry =
+                    loaded_version_index_entry(obj, (uint16_t)version);
+                size_t additional = 0;
+
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+                g_version_key_admission_visits++;
+#endif
+                if (!entry)
+                    continue;
+                if (entry->flags & DL_VERSION_ENTRY_DEFINED)
+                    additional++;
+                if (entry->flags & DL_VERSION_ENTRY_NEEDED)
+                    additional += 2;
+                if (__builtin_add_overflow(refs_count, additional,
+                                           &refs_count))
+                    return -1;
+            }
         }
     }
     if (version_size == 0)
-        mapping_size = keys_size;
+        base_mapping_size = keys_size;
     else if (__builtin_add_overflow(version_offset, version_size,
-                                    &mapping_size))
+                                    &base_mapping_size))
         return -1;
+    mapping_size = base_mapping_size;
+    if (dynstr_readonly && dynsym_readonly &&
+        loaded_symbol_name_index_geometry(
+            obj->dynsym_count, base_mapping_size, &name_index_offset,
+            &mapping_size, &name_index_bucket_mask))
+        have_name_index = 1;
     if (__builtin_mul_overflow(refs_count, sizeof(*refs), &refs_size))
         return -1;
-    mapping = mmap(NULL, mapping_size, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+    if (!(have_name_index &&
+          g_symbol_name_index_force_allocation_fallback))
+#endif
+        mapping = mmap(NULL, mapping_size, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapping == MAP_FAILED && have_name_index) {
+        /* Exact-name indexing is only an accelerator.  Its additional
+         * address-space requirement must never reject an object whose
+         * mandatory symbol/version key mapping remains representable. */
+        have_name_index = 0;
+        mapping_size = base_mapping_size;
+        mapping = mmap(NULL, mapping_size, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    }
     if (mapping == MAP_FAILED)
         return -1;
     keys = (struct loaded_symbol_name_key *)mapping;
@@ -12720,6 +14617,9 @@ static int build_loaded_symbol_name_keys(struct loaded_obj *obj)
         memcpy(version_keys->page_slots, obj->version_index->page_slots,
                sizeof(version_keys->page_slots));
     }
+    if (have_name_index)
+        name_index = (struct loaded_symbol_name_index *)(
+            mapping + name_index_offset);
     refs = mmap(NULL, refs_size, PROT_READ | PROT_WRITE,
                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (refs == MAP_FAILED)
@@ -12735,38 +14635,69 @@ static int build_loaded_symbol_name_keys(struct loaded_obj *obj)
         ref_index++;
     }
     if (obj->version_index) {
-        for (uint32_t version = 2;
-             version <= DL_VERSION_INDEX_MASK; version++) {
-            const struct loaded_version_entry *entry =
-                loaded_version_index_entry(obj, (uint16_t)version);
-            struct loaded_version_name_entry *destination =
-                loaded_version_name_index_entry_mutable(
-                    version_keys, (uint16_t)version);
+        for (uint32_t page = 0; page < DL_VERSION_PAGE_COUNT; page++) {
+            uint32_t first;
+            uint32_t limit;
 
-            if (!entry)
+            if (obj->version_index->page_slots[page] == 0)
                 continue;
-            if (!destination)
-                goto out;
-            if (entry->flags & DL_VERSION_ENTRY_DEFINED) {
-                if (entry->definition_name >= obj->dynstr_size)
+            first = page << DL_VERSION_PAGE_BITS;
+            limit = first + DL_VERSION_PAGE_ENTRIES;
+            if (first < 2)
+                first = 2;
+            for (uint32_t version = first; version < limit; version++) {
+                const struct loaded_version_entry *entry =
+                    loaded_version_index_entry(obj, (uint16_t)version);
+                struct loaded_version_name_entry *destination =
+                    loaded_version_name_index_entry_mutable(
+                        version_keys, (uint16_t)version);
+
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+                g_version_key_admission_visits++;
+#endif
+                if (!entry)
+                    continue;
+                if (!destination)
                     goto out;
-                refs[ref_index].offset = entry->definition_name;
-                refs[ref_index++].destination = &destination->definition;
-            }
-            if (entry->flags & DL_VERSION_ENTRY_NEEDED) {
-                if (entry->needed_name >= obj->dynstr_size ||
-                    entry->provider_name >= obj->dynstr_size)
-                    goto out;
-                refs[ref_index].offset = entry->needed_name;
-                refs[ref_index++].destination = &destination->needed;
-                refs[ref_index].offset = entry->provider_name;
-                refs[ref_index++].destination = &destination->provider;
+                if (entry->flags & DL_VERSION_ENTRY_DEFINED) {
+                    if (entry->definition_name >= obj->dynstr_size)
+                        goto out;
+                    refs[ref_index].offset = entry->definition_name;
+                    refs[ref_index++].destination =
+                        &destination->definition;
+                }
+                if (entry->flags & DL_VERSION_ENTRY_NEEDED) {
+                    if (entry->needed_name >= obj->dynstr_size ||
+                        entry->provider_name >= obj->dynstr_size)
+                        goto out;
+                    refs[ref_index].offset = entry->needed_name;
+                    refs[ref_index++].destination = &destination->needed;
+                    refs[ref_index].offset = entry->provider_name;
+                    refs[ref_index++].destination =
+                        &destination->provider;
+                }
             }
         }
     }
     if (ref_index != refs_count)
         goto out;
-    loaded_symbol_name_refs_sort(refs, refs_count);
+    used_radix_sort = loaded_symbol_name_refs_radix_sort(
+        refs, refs_count, mapping, mapping_size);
+    if (used_radix_sort) {
+        /* Radix scratch occupied the uninitialized key mapping.  Restore its
+         * zero state and the only header bytes needed by version-key lookup
+         * before following any retained destination pointer. */
+        memset(mapping, 0, mapping_size);
+        if (version_keys)
+            memcpy(version_keys->page_slots,
+                   obj->version_index->page_slots,
+                   sizeof(version_keys->page_slots));
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+        g_symbol_name_radix_sorts++;
+#endif
+    } else {
+        loaded_symbol_name_refs_sort(refs, refs_count);
+    }
 
     remaining = refs_count;
     for (size_t position = obj->dynstr_size; position != 0;) {
@@ -12775,6 +14706,8 @@ static int build_loaded_symbol_name_keys(struct loaded_obj *obj)
         if (byte == 0) {
             fingerprint = g_symbol_name_fingerprint_seed;
             suffix_length = 0;
+            gnu_hash = UINT32_C(5381);
+            gnu_power = UINT32_C(1);
         } else {
             if (suffix_length == SIZE_MAX - 1)
                 goto out;
@@ -12782,19 +14715,59 @@ static int build_loaded_symbol_name_keys(struct loaded_obj *obj)
             fingerprint =
                 (fingerprint ^ ((uint64_t)byte + UINT64_C(0x100))) *
                 g_symbol_name_fingerprint_multiplier;
+            /* For a suffix of length L, H = 5381*33^L + body.  Prepending
+             * byte c gives H' = H + (5381*32+c)*33^L modulo 2^32. */
+            gnu_hash += (UINT32_C(5381) * UINT32_C(32) + byte) *
+                        gnu_power;
+            gnu_power *= UINT32_C(33);
         }
         while (remaining != 0 && refs[remaining - 1].offset == position) {
             refs[remaining - 1].destination->fingerprint = fingerprint;
             refs[remaining - 1].destination->length = suffix_length;
+            refs[remaining - 1].destination->gnu_hash = gnu_hash;
+            refs[remaining - 1].destination->dynstr_offset =
+                (uint32_t)position;
             remaining--;
         }
     }
-    if (remaining != 0 || mprotect(mapping, mapping_size, PROT_READ) < 0)
+    if (remaining != 0)
+        goto out;
+    if (name_index) {
+        size_t bucket_count =
+            (size_t)name_index_bucket_mask + 1U;
+        uint32_t *bucket_heads;
+        uint32_t *next;
+
+        /* Radix sorting may have borrowed any uninitialized part of the
+         * mapping as scratch.  Clear the complete optional tail before
+         * publishing its header and links. */
+        memset(name_index, 0, mapping_size - name_index_offset);
+        name_index->bucket_mask = name_index_bucket_mask;
+        name_index->symbol_count = obj->dynsym_count;
+        bucket_heads = name_index->links;
+        next = bucket_heads + bucket_count;
+        /* Prepending indices in reverse order preserves the original
+         * ascending DYNSYM order within every exact-name chain. */
+        for (uint32_t i = obj->dynsym_count; i > 1U;) {
+            uint32_t bucket;
+
+            i--;
+            bucket = loaded_symbol_name_index_bucket(
+                keys[i].fingerprint, name_index_bucket_mask);
+            next[i] = bucket_heads[bucket];
+            bucket_heads[bucket] = i;
+        }
+    }
+    if (mprotect(mapping, mapping_size, PROT_READ) < 0)
         goto out;
     obj->symbol_name_keys = keys;
     obj->version_name_index = version_keys;
+    obj->symbol_name_index = name_index;
     obj->runtime_symbol_name_mapping = mapping;
     obj->runtime_symbol_name_mapping_size = mapping_size;
+    obj->dynstr_readonly = dynstr_readonly ? 1 : 0;
+    obj->dynsym_readonly = dynsym_readonly ? 1 : 0;
+    obj->versym_readonly = versym_readonly ? 1 : 0;
     mapping = MAP_FAILED;
     result = 0;
 
@@ -12804,6 +14777,144 @@ out:
     if (mapping != MAP_FAILED)
         (void)munmap(mapping, mapping_size);
     return result;
+}
+
+static int loaded_object_name_capacity(const struct loaded_obj *obj,
+                                       const char *name,
+                                       size_t *capacity_out)
+{
+    uintptr_t table;
+    uintptr_t address;
+    size_t offset;
+    size_t remaining;
+
+    if (!obj || !obj->dynstr || !name || !capacity_out)
+        return 0;
+    table = (uintptr_t)obj->dynstr;
+    address = (uintptr_t)name;
+    if (address < table)
+        return 0;
+    offset = (size_t)(address - table);
+    if (offset >= obj->dynstr_size)
+        return 0;
+    remaining = obj->dynstr_size - offset;
+    *capacity_out = remaining;
+    return 1;
+}
+
+static int loaded_object_name_query_init(
+    const struct loaded_obj *obj, const char *name,
+    const struct loaded_symbol_name_key *key,
+    struct symbol_lookup_query *query)
+{
+    uintptr_t key_address;
+    uintptr_t mapping_address;
+    uintptr_t name_address;
+    uintptr_t table_address;
+    size_t key_offset;
+    size_t name_offset;
+    size_t remaining;
+
+    if (!obj || !key || !query || !obj->runtime_symbol_name_mapping ||
+        obj->runtime_symbol_name_mapping_size < sizeof(*key) ||
+        !loaded_object_name_capacity(obj, name, &remaining))
+        return 0;
+    key_address = (uintptr_t)key;
+    mapping_address = (uintptr_t)obj->runtime_symbol_name_mapping;
+    if (key_address < mapping_address)
+        return 0;
+    key_offset = (size_t)(key_address - mapping_address);
+    if (key_offset > obj->runtime_symbol_name_mapping_size - sizeof(*key))
+        return 0;
+    table_address = (uintptr_t)obj->dynstr;
+    name_address = (uintptr_t)name;
+    name_offset = (size_t)(name_address - table_address);
+    if (name_offset > UINT32_MAX ||
+        key->dynstr_offset != (uint32_t)name_offset ||
+        key->length == SIZE_MAX || key->length >= remaining)
+        return 0;
+
+    /* The mapping is loader-owned, complete, and read-only; the offset binds
+     * this key to the exact admitted string-table suffix.  No target byte
+     * needs to be read again merely to reconstruct its lookup work. */
+    query->name = name;
+    query->key = *key;
+    query->keyed_hash = 0;
+    query->gnu_hash = key->gnu_hash;
+    query->sysv_hash = 0;
+    query->keyed_hash_valid = 0;
+    query->keyed_hash_deferred = 1;
+    query->sysv_hash_valid = 0;
+    query->sysv_hash_deferred = 1;
+    return 1;
+}
+
+static int symbol_lookup_query_init_object_name(
+    const struct loaded_obj *obj, const char *name,
+    const struct loaded_symbol_name_key *key,
+    struct symbol_lookup_query *query)
+{
+    size_t capacity;
+
+    /* Precomputed fingerprints describe admission-time string bytes.  A
+     * PF_W DT_STRTAB must rebuild every query field from the current string
+     * even when its length happens to be unchanged.  Callers independently
+     * suppress a per-symbol key when PF_W DT_SYMTAB can redirect st_name. */
+    if (!obj || !name || !query ||
+        !loaded_object_name_capacity(obj, name, &capacity))
+        return 0;
+    if (obj->dynstr_readonly && key)
+        return loaded_object_name_query_init(obj, name, key, query);
+    return symbol_lookup_query_init_bounded_current(
+        name, capacity, query);
+}
+
+static int loaded_object_name_query_current(
+    const struct loaded_obj *obj, const char *name,
+    struct symbol_lookup_query *query)
+{
+    return symbol_lookup_query_init_object_name(
+        obj, name, NULL, query);
+}
+
+static void ldr_msg_symbol_query(const struct symbol_lookup_query *query)
+{
+    if (query && query->name)
+        ldr_msg_n(query->name, query->key.length);
+}
+
+static void ldr_err_symbol_query(
+    const char *context, const struct symbol_lookup_query *query)
+{
+    ldr_msg("dlfreeze-loader: ");
+    ldr_msg(context);
+    if (query && query->name) {
+        ldr_msg(": ");
+        ldr_msg_symbol_query(query);
+    }
+    ldr_msg("\n");
+}
+
+static int symbol_lookup_query_init_dynsym(
+    const struct loaded_obj *obj, uint32_t symbol_index,
+    const struct loaded_obj *objects, int object_count,
+    struct symbol_lookup_query *query)
+{
+    const struct loaded_symbol_name_key *key = NULL;
+    const Elf64_Sym *symbol;
+    const char *name;
+
+    (void)objects;
+    (void)object_count;
+
+    if (!obj || !query || symbol_index >= obj->dynsym_count ||
+        !(symbol = loaded_dynsym(obj, symbol_index)) ||
+        !(name = loaded_symbol_name(obj, symbol)))
+        return 0;
+    if (obj->symbol_name_keys && obj->dynstr_readonly &&
+        obj->dynsym_readonly)
+        key = &obj->symbol_name_keys[symbol_index];
+    return symbol_lookup_query_init_object_name(obj, name, key, query);
 }
 
 #ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
@@ -12828,6 +14939,31 @@ static int loaded_name_key_eq(const char *value,
     return memcmp(value, query->name, key->length + 1) == 0;
 }
 
+static int loaded_object_name_eq_query(
+    const struct loaded_obj *obj, const char *value,
+    const struct loaded_symbol_name_key *key,
+    const struct symbol_lookup_query *query)
+{
+    size_t capacity;
+    struct symbol_lookup_query current;
+
+    if (!obj || !value || !query)
+        return 0;
+    if (obj->dynstr_readonly && key)
+        return loaded_name_key_eq(value, key, query);
+    if (!loaded_object_name_capacity(obj, value, &capacity) ||
+        !symbol_lookup_query_init_bounded_current(
+            value, capacity, &current) ||
+        current.key.length != query->key.length ||
+        current.key.fingerprint != query->key.fingerprint ||
+        current.gnu_hash != query->gnu_hash)
+        return 0;
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+    g_symbol_name_full_compare_bytes += query->key.length + 1;
+#endif
+    return memcmp(value, query->name, query->key.length + 1) == 0;
+}
+
 static int loaded_symbol_name_eq_query(
     const struct loaded_obj *obj, const Elf64_Sym *sym,
     const struct symbol_lookup_query *query)
@@ -12840,14 +14976,15 @@ static int loaded_symbol_name_eq_query(
 #ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
     g_symbol_name_candidate_checks++;
 #endif
-    if (obj->symbol_name_keys &&
+    if (obj->dynstr_readonly && obj->dynsym_readonly &&
+        obj->symbol_name_keys &&
         loaded_symbol_table_index(obj, sym, &index)) {
         const struct loaded_symbol_name_key *key =
             &obj->symbol_name_keys[index];
 
-        return loaded_name_key_eq(value, key, query);
+        return loaded_object_name_eq_query(obj, value, key, query);
     }
-    return loaded_name_key_eq(value, NULL, query);
+    return loaded_object_name_eq_query(obj, value, NULL, query);
 }
 
 /* glibc gives STB_GNU_UNIQUE definitions namespace-wide identity even when
@@ -12889,6 +15026,15 @@ struct gnu_unique_registry_entry {
     uint32_t symbol_index;
     uint32_t owner_index;
     uint32_t previous_plus_one;
+    uint8_t kind;
+    uint8_t binding;
+    uint8_t type;
+    uint8_t visibility;
+};
+
+enum gnu_unique_registry_kind {
+    GNU_UNIQUE_REGISTRY_NORMAL = 1,
+    GNU_UNIQUE_REGISTRY_COPY = 2
 };
 
 static struct gnu_unique_registry_entry *g_gnu_unique_registry;
@@ -13153,19 +15299,19 @@ static int gnu_loaded_name_registry_add(struct loaded_obj *obj,
     return 1;
 }
 
-static int gnu_loaded_name_registry_matches(
-    const struct loaded_obj *obj, const char *name)
+static int gnu_loaded_name_registry_matches_query(
+    const struct loaded_obj *obj,
+    const struct symbol_lookup_query *query)
 {
-    uint32_t hash;
     uint32_t link;
     int owner_index;
 
-    if (!obj || !name || !name[0] || strchr(name, '/') ||
+    if (!obj || !query || !query->name || query->key.length == 0 ||
+        symbol_lookup_query_has_slash(query) ||
         !dl_object_table_index(obj, g_nobj, &owner_index))
         return 0;
-    hash = gnu_hash_calc(name);
     link = g_gnu_loaded_name_buckets[
-        hash & (GNU_LOADED_NAME_BUCKET_COUNT - 1)];
+        query->gnu_hash & (GNU_LOADED_NAME_BUCKET_COUNT - 1)];
     while (link != 0) {
         const struct gnu_loaded_name_entry *entry;
 
@@ -13174,9 +15320,9 @@ static int gnu_loaded_name_registry_matches(
         entry = &g_gnu_loaded_names[link - 1];
         if (!entry->name || entry->owner_index >= (uint32_t)g_nobj)
             return 0;
-        if (entry->hash == hash &&
+        if (entry->hash == query->gnu_hash &&
             entry->owner_index == (uint32_t)owner_index &&
-            strcmp(entry->name, name) == 0)
+            symbol_lookup_query_eq_cstr(query, entry->name))
             return 1;
         link = entry->previous_plus_one;
     }
@@ -13217,7 +15363,8 @@ static int loaded_symbol_table_index(const struct loaded_obj *obj,
  * selected DSO definition, but records the executable's COPY definition as
  * the canonical owner for later non-COPY lookups. */
 static int gnu_unique_canonicalize(
-    struct loaded_obj *objs, int nobj, const char *name,
+    struct loaded_obj *objs, int nobj,
+    const struct symbol_lookup_query *query,
     struct loaded_obj *candidate_owner, const Elf64_Sym *candidate,
     struct loaded_obj *copy_owner, const Elf64_Sym *copy_definition,
     struct loaded_obj **owner_out, const Elf64_Sym **symbol_out)
@@ -13226,13 +15373,13 @@ static int gnu_unique_canonicalize(
     const Elf64_Sym *registered_symbol;
     uint32_t candidate_owner_index;
     uint32_t candidate_symbol_index;
-    struct symbol_lookup_query query;
+    uint64_t query_keyed_hash;
     uint32_t link;
     int is_copy = copy_owner != NULL;
     int owner_index;
 
     if (!owner_out || !symbol_out || !candidate_owner || !candidate ||
-        !name || !symbol_lookup_query_init(name, &query) ||
+        !query || !query->name ||
         !g_vfs_hash_key_ready)
         return -1;
     *owner_out = candidate_owner;
@@ -13245,17 +15392,26 @@ static int gnu_unique_canonicalize(
         ELF64_ST_BIND(candidate->st_info) != STB_GNU_UNIQUE)
         return 0;
     if (nobj <= 0 || nobj > MAX_TOTAL_OBJS ||
+        !symbol_lookup_query_keyed_hash(query, &query_keyed_hash) ||
         !dl_object_table_index(candidate_owner, nobj, &owner_index) ||
         !loaded_symbol_table_index(candidate_owner, candidate,
-                                   &candidate_symbol_index))
+                                   &candidate_symbol_index) ||
+        candidate->st_shndx == SHN_UNDEF ||
+        (ELF64_ST_VISIBILITY(candidate->st_other) != STV_DEFAULT &&
+         ELF64_ST_VISIBILITY(candidate->st_other) != STV_PROTECTED) ||
+        !loaded_symbol_name_eq_query(candidate_owner, candidate, query))
         return -1;
     candidate_owner_index = (uint32_t)owner_index;
 
     link = g_gnu_unique_buckets[
-        (uint32_t)query.keyed_hash & (GNU_UNIQUE_BUCKET_COUNT - 1)];
+        (uint32_t)query_keyed_hash & (GNU_UNIQUE_BUCKET_COUNT - 1)];
     while (link != 0) {
         const struct gnu_unique_registry_entry *entry;
-        const char *registered_name;
+        struct symbol_lookup_query registered_query;
+        uint64_t registered_keyed_hash;
+        unsigned int registered_binding;
+        unsigned int registered_type;
+        unsigned int registered_visibility;
 
         if (link > g_gnu_unique_count)
             return -1;
@@ -13266,19 +15422,40 @@ static int gnu_unique_canonicalize(
         registered_owner = &objs[entry->owner_index];
         registered_symbol = loaded_dynsym(
             registered_owner, entry->symbol_index);
-        registered_name = registered_symbol
-            ? loaded_symbol_name(registered_owner, registered_symbol) : NULL;
         if (!registered_symbol ||
-            registered_symbol->st_shndx == SHN_UNDEF || !registered_name)
+            registered_symbol->st_shndx == SHN_UNDEF ||
+            !symbol_lookup_query_init_dynsym(
+                registered_owner, entry->symbol_index, objs, nobj,
+                &registered_query) ||
+            !symbol_lookup_query_keyed_hash(
+                &registered_query, &registered_keyed_hash))
             return -1;
-        if (entry->keyed_hash == query.keyed_hash &&
-            entry->name_length == query.key.length &&
-            memcmp(registered_name, name, query.key.length + 1) == 0) {
-            /* A TLS relocation cannot safely consume an ordinary canonical
-             * definition (or vice versa).  Valid GNU-unique ODR definitions
-             * agree on this fundamental storage class. */
-            if ((ELF64_ST_TYPE(registered_symbol->st_info) == STT_TLS) !=
-                (ELF64_ST_TYPE(candidate->st_info) == STT_TLS))
+        registered_binding = ELF64_ST_BIND(registered_symbol->st_info);
+        registered_type = ELF64_ST_TYPE(registered_symbol->st_info);
+        registered_visibility =
+            ELF64_ST_VISIBILITY(registered_symbol->st_other);
+        if (registered_keyed_hash != entry->keyed_hash ||
+            registered_query.key.length != entry->name_length ||
+            registered_binding != entry->binding ||
+            registered_type != entry->type ||
+            registered_visibility != entry->visibility ||
+            (registered_visibility != STV_DEFAULT &&
+             registered_visibility != STV_PROTECTED) ||
+            (entry->kind == GNU_UNIQUE_REGISTRY_NORMAL
+                 ? registered_binding != STB_GNU_UNIQUE
+                 : entry->kind != GNU_UNIQUE_REGISTRY_COPY ||
+                   registered_binding != STB_GLOBAL ||
+                   !(registered_owner->flags & LDR_FLAG_MAIN_EXE)))
+            return -1;
+        if (entry->keyed_hash == query_keyed_hash &&
+            entry->name_length == query->key.length &&
+            loaded_object_name_eq_query(
+                registered_owner, registered_query.name, NULL, query)) {
+            /* Registry identity is sticky and name-only after ordinary
+             * scope/version selection, but incompatible storage contracts
+             * can never share one canonical definition. */
+            if (registered_type !=
+                ELF64_ST_TYPE(candidate->st_info))
                 return -1;
             if (!is_copy) {
                 *owner_out = registered_owner;
@@ -13305,7 +15482,16 @@ static int gnu_unique_canonicalize(
             !dl_object_table_index(copy_owner, nobj, &copy_owner_index) ||
             !loaded_symbol_table_index(copy_owner, copy_definition,
                                        &copy_symbol_index) ||
-            copy_definition->st_shndx == SHN_UNDEF)
+            copy_definition->st_shndx == SHN_UNDEF ||
+            !(copy_owner->flags & LDR_FLAG_MAIN_EXE) ||
+            ELF64_ST_BIND(copy_definition->st_info) != STB_GLOBAL ||
+            ELF64_ST_TYPE(copy_definition->st_info) !=
+                ELF64_ST_TYPE(candidate->st_info) ||
+            (ELF64_ST_VISIBILITY(copy_definition->st_other) != STV_DEFAULT &&
+             ELF64_ST_VISIBILITY(copy_definition->st_other) !=
+                 STV_PROTECTED) ||
+            !loaded_symbol_name_eq_query(
+                copy_owner, copy_definition, query))
             return -1;
         candidate_owner_index = (uint32_t)copy_owner_index;
         candidate_symbol_index = copy_symbol_index;
@@ -13316,13 +15502,24 @@ static int gnu_unique_canonicalize(
         struct gnu_unique_registry_entry *entry =
             &g_gnu_unique_registry[g_gnu_unique_count];
         uint32_t bucket =
-            (uint32_t)query.keyed_hash & (GNU_UNIQUE_BUCKET_COUNT - 1);
+            (uint32_t)query_keyed_hash & (GNU_UNIQUE_BUCKET_COUNT - 1);
 
-        entry->keyed_hash = query.keyed_hash;
-        entry->name_length = query.key.length;
+        entry->keyed_hash = query_keyed_hash;
+        entry->name_length = query->key.length;
         entry->symbol_index = candidate_symbol_index;
         entry->owner_index = candidate_owner_index;
         entry->previous_plus_one = g_gnu_unique_buckets[bucket];
+        entry->kind = is_copy ? GNU_UNIQUE_REGISTRY_COPY
+                              : GNU_UNIQUE_REGISTRY_NORMAL;
+        entry->binding = is_copy
+            ? ELF64_ST_BIND(copy_definition->st_info)
+            : ELF64_ST_BIND(candidate->st_info);
+        entry->type = is_copy
+            ? ELF64_ST_TYPE(copy_definition->st_info)
+            : ELF64_ST_TYPE(candidate->st_info);
+        entry->visibility = is_copy
+            ? ELF64_ST_VISIBILITY(copy_definition->st_other)
+            : ELF64_ST_VISIBILITY(candidate->st_other);
         g_gnu_unique_count++;
         g_gnu_unique_buckets[bucket] = (uint32_t)g_gnu_unique_count;
     }
@@ -13406,7 +15603,7 @@ static const Elf64_Sym *lookup_gnu_hash_query(
 }
 
 static const Elf64_Sym *lookup_sysv_hash_query(
-    const struct loaded_obj *obj, const struct symbol_lookup_query *query)
+    const struct loaded_obj *obj, struct symbol_lookup_query *query)
 {
     struct sysv_hash_view view;
     uint32_t idx;
@@ -13415,9 +15612,9 @@ static const Elf64_Sym *lookup_sysv_hash_query(
     uint32_t hash;
 
     if (!query || !obj->dynsym || !obj->dynstr ||
-        !get_sysv_hash_view(obj, &view))
+        !get_sysv_hash_view(obj, &view) ||
+        !symbol_lookup_query_sysv_hash(query, &hash))
         return NULL;
-    hash = query->sysv_hash;
 
     idx = view.buckets[hash % view.nbuckets];
     for (uint32_t steps = 0; idx != STN_UNDEF && steps < view.nchain;
@@ -13483,7 +15680,7 @@ static const Elf64_Sym *lookup_linear_external_query(
 }
 
 static const Elf64_Sym *lookup_object_symbol_query(
-    const struct loaded_obj *obj, const struct symbol_lookup_query *query)
+    const struct loaded_obj *obj, struct symbol_lookup_query *query)
 {
     if (obj->gnu_hash)
         return lookup_gnu_hash_query(obj, query);
@@ -13516,6 +15713,91 @@ static const Elf64_Sym *lookup_object_symbol(const struct loaded_obj *obj,
     return lookup_object_symbol_query(obj, &query);
 }
 
+struct loaded_symbol_name_index_view {
+    const uint32_t *bucket_heads;
+    const uint32_t *next;
+    uint32_t bucket_mask;
+};
+
+/* Return one for a complete loader-owned view, zero when the optional index
+ * was not allocated, and minus one for an inconsistent published view. */
+static int loaded_symbol_name_index_view_init(
+    const struct loaded_obj *obj,
+    struct loaded_symbol_name_index_view *view)
+{
+    const struct loaded_symbol_name_index *index;
+    uintptr_t mapping_address;
+    uintptr_t index_address;
+    size_t index_offset;
+    size_t bucket_count;
+    size_t link_count;
+    size_t link_bytes;
+    size_t required_size;
+
+    if (!obj || !view)
+        return -1;
+    memset(view, 0, sizeof(*view));
+    index = obj->symbol_name_index;
+    if (!index)
+        return 0;
+    if (!obj->dynstr_readonly || !obj->dynsym_readonly ||
+        !obj->symbol_name_keys || !obj->runtime_symbol_name_mapping ||
+        obj->runtime_symbol_name_mapping_size < sizeof(*index))
+        return -1;
+    mapping_address = (uintptr_t)obj->runtime_symbol_name_mapping;
+    index_address = (uintptr_t)index;
+    if (index_address < mapping_address ||
+        !address_has_alignment(
+            index_address, _Alignof(struct loaded_symbol_name_index)))
+        return -1;
+    index_offset = (size_t)(index_address - mapping_address);
+    if (index_offset >
+        obj->runtime_symbol_name_mapping_size - sizeof(*index) ||
+        index->symbol_count != obj->dynsym_count ||
+        index->bucket_mask == UINT32_MAX)
+        return -1;
+    bucket_count = (size_t)index->bucket_mask + 1U;
+    if (bucket_count == 0 ||
+        (bucket_count & (bucket_count - 1U)) != 0 ||
+        __builtin_add_overflow(bucket_count,
+                               (size_t)index->symbol_count, &link_count) ||
+        __builtin_mul_overflow(link_count, sizeof(uint32_t), &link_bytes) ||
+        __builtin_add_overflow(sizeof(*index), link_bytes, &required_size) ||
+        required_size >
+            obj->runtime_symbol_name_mapping_size - index_offset)
+        return -1;
+    view->bucket_heads = index->links;
+    view->next = index->links + bucket_count;
+    view->bucket_mask = index->bucket_mask;
+    return 1;
+}
+
+static int unique_default_symbol_consider(
+    const struct loaded_obj *obj, uint32_t index,
+    const struct symbol_lookup_query *query,
+    const Elf64_Sym **selected)
+{
+    const Elf64_Sym *symbol = loaded_dynsym(obj, index);
+    const char *symbol_name;
+    int hidden;
+
+    if (!symbol || !(symbol_name = loaded_symbol_name(obj, symbol)))
+        return -1;
+    if (!loaded_symbol_name_eq_query(obj, symbol, query) ||
+        symbol->st_shndx == SHN_UNDEF ||
+        ELF64_ST_BIND(symbol->st_info) == STB_LOCAL ||
+        !symbol_visible_outside_object(symbol))
+        return 0;
+    if (!symbol_hidden(obj, index, &hidden))
+        return -1;
+    if (hidden)
+        return 0;
+    if (*selected)
+        return -1;
+    *selected = symbol;
+    return 0;
+}
+
 /* Loader-private calls and layout witnesses need a stronger identity than
  * ordinary ELF lookup order.  Inspect the complete bounded DYNSYM table,
  * admit exactly one externally visible non-compatibility definition, and
@@ -13527,7 +15809,9 @@ static int unique_default_exported_symbol(
     const Elf64_Sym **symbol_out)
 {
     const Elf64_Sym *selected = NULL;
+    struct loaded_symbol_name_index_view index_view;
     struct symbol_lookup_query query;
+    int index_status;
 
     if (symbol_out)
         *symbol_out = NULL;
@@ -13535,25 +15819,34 @@ static int unique_default_exported_symbol(
         !symbol_lookup_query_init(name, &query))
         return UNIQUE_DEFAULT_SYMBOL_MALFORMED;
 
-    for (uint32_t i = 1; i < obj->dynsym_count; i++) {
-        const Elf64_Sym *symbol = loaded_dynsym(obj, i);
-        const char *symbol_name;
-        int hidden;
+    index_status = loaded_symbol_name_index_view_init(obj, &index_view);
+    if (index_status < 0)
+        return UNIQUE_DEFAULT_SYMBOL_MALFORMED;
+    if (index_status > 0) {
+        uint32_t link = index_view.bucket_heads[
+            loaded_symbol_name_index_bucket(
+                query.key.fingerprint, index_view.bucket_mask)];
+        uint32_t steps = 0;
 
-        if (!symbol || !(symbol_name = loaded_symbol_name(obj, symbol)))
+        while (link != 0 && steps < obj->dynsym_count) {
+            uint32_t next;
+
+            if (link >= obj->dynsym_count)
+                return UNIQUE_DEFAULT_SYMBOL_MALFORMED;
+            next = index_view.next[link];
+            if (unique_default_symbol_consider(
+                    obj, link, &query, &selected) < 0)
+                return UNIQUE_DEFAULT_SYMBOL_MALFORMED;
+            link = next;
+            steps++;
+        }
+        if (link != 0)
             return UNIQUE_DEFAULT_SYMBOL_MALFORMED;
-        if (!loaded_symbol_name_eq_query(obj, symbol, &query) ||
-            symbol->st_shndx == SHN_UNDEF ||
-            ELF64_ST_BIND(symbol->st_info) == STB_LOCAL ||
-            !symbol_visible_outside_object(symbol))
-            continue;
-        if (!symbol_hidden(obj, i, &hidden))
-            return UNIQUE_DEFAULT_SYMBOL_MALFORMED;
-        if (hidden)
-            continue;
-        if (selected)
-            return UNIQUE_DEFAULT_SYMBOL_MALFORMED;
-        selected = symbol;
+    } else {
+        for (uint32_t i = 1; i < obj->dynsym_count; i++)
+            if (unique_default_symbol_consider(
+                    obj, i, &query, &selected) < 0)
+                return UNIQUE_DEFAULT_SYMBOL_MALFORMED;
     }
 
     if (!selected)
@@ -13589,7 +15882,7 @@ static int classify_dlsym_candidate(const struct loaded_obj *obj,
 }
 
 static const Elf64_Sym *lookup_dlsym_symbol_query(
-    const struct loaded_obj *obj, const struct symbol_lookup_query *query)
+    const struct loaded_obj *obj, struct symbol_lookup_query *query)
 {
     const Elf64_Sym *versioned = NULL;
     unsigned int versioned_count = 0;
@@ -13648,11 +15941,13 @@ static const Elf64_Sym *lookup_dlsym_symbol_query(
 
     if (obj->sysv_hash) {
         struct sysv_hash_view view;
+        uint32_t hash;
         uint32_t idx;
 
-        if (!get_sysv_hash_view(obj, &view))
+        if (!get_sysv_hash_view(obj, &view) ||
+            !symbol_lookup_query_sysv_hash(query, &hash))
             return NULL;
-        idx = view.buckets[query->sysv_hash % view.nbuckets];
+        idx = view.buckets[hash % view.nbuckets];
         for (uint32_t steps = 0; idx != STN_UNDEF && steps < view.nchain;
              steps++) {
             const Elf64_Sym *sym;
@@ -13714,6 +16009,13 @@ static const Elf64_Sym *lookup_dlsym_symbol_query(
 static const struct loaded_obj *vfs_target_libc(struct loaded_obj *objs,
                                                 int nobj)
 {
+    if (!g_is_musl_runtime && g_target_glibc_libc_obj) {
+        for (int i = 0; i < nobj; i++)
+            if (&objs[i] == g_target_glibc_libc_obj &&
+                dl_object_is_visible(&objs[i]))
+                return &objs[i];
+        return NULL;
+    }
     for (int i = 0; i < nobj; i++) {
         const struct loaded_obj *obj = &objs[i];
 
@@ -13728,17 +16030,9 @@ static const struct loaded_obj *vfs_target_libc(struct loaded_obj *objs,
                 return obj;
             continue;
         }
-        for (size_t d = 0; d < obj->dynamic_count; d++) {
-            const char *soname;
-
-            if (obj->dynamic[d].d_tag != DT_SONAME ||
-                obj->dynamic[d].d_un.d_val > UINT32_MAX)
-                continue;
-            soname = loaded_dynstr_value(
-                obj, (uint32_t)obj->dynamic[d].d_un.d_val);
-            if (soname && strcmp(soname, "libc.so.6") == 0)
-                return obj;
-        }
+        if (obj->admitted_soname &&
+            strcmp(obj->admitted_soname, "libc.so.6") == 0)
+            return obj;
     }
     return NULL;
 }
@@ -13943,10 +16237,12 @@ static int initialize_target_libc_helpers(struct loaded_obj *objs, int nobj)
         libc_obj, "rewinddir", NULL);
     g_real_telldir = (telldir_fn)vfs_libc_function(libc_obj, "telldir", NULL);
     g_real_seekdir = (seekdir_fn)vfs_libc_function(libc_obj, "seekdir", NULL);
+    g_real_fcntl = (fcntl_fn)vfs_libc_function(libc_obj, "fcntl", "fcntl64");
     if (!g_real_fopen || !g_real_fdopen || !g_real_opendir ||
         !g_real_fdopendir || !g_real_readdir || !g_real_malloc ||
         !g_real_realpath || !g_real_closedir || !g_real_dirfd ||
-        !g_real_rewinddir || !g_real_telldir || !g_real_seekdir)
+        !g_real_rewinddir || !g_real_telldir || !g_real_seekdir ||
+        !g_real_fcntl)
         return -1;
 
     if (g_debug) {
@@ -14038,6 +16334,76 @@ static int elf_strtab_name_eq(const char *strtab, size_t strtab_size,
     return off + i < strtab_size && strtab[off + i] == '\0';
 }
 
+struct symbol_version_snapshot {
+    const char *version;
+    const char *provider;
+    const struct loaded_symbol_name_key *version_key;
+    const struct loaded_symbol_name_key *provider_key;
+    uint16_t raw;
+    uint16_t index;
+};
+
+static int symbol_version_snapshot_from_raw(
+    const struct loaded_obj *obj, uint16_t raw,
+    struct symbol_version_snapshot *snapshot)
+{
+    const struct loaded_version_entry *entry;
+    const struct loaded_version_name_entry *key_entry = NULL;
+    uint16_t index = raw & DL_VERSION_INDEX_MASK;
+
+    if (!obj || !snapshot)
+        return -1;
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->raw = raw;
+    snapshot->index = index;
+    if (index <= VER_NDX_GLOBAL)
+        return 0;
+    entry = loaded_version_index_entry(obj, index);
+    if (!entry)
+        return -1;
+    if (obj->dynstr_readonly && obj->version_name_index)
+        key_entry = loaded_version_name_index_entry(obj, index);
+
+    /* VERNEED wins for executable COPY definitions.  The normalized index
+     * is a loader-owned load-time snapshot; only VERSYM and the referenced
+     * DT_STRTAB bytes remain live ELF metadata. */
+    if (entry->flags & DL_VERSION_ENTRY_NEEDED) {
+        snapshot->version = loaded_dynstr_value(obj, entry->needed_name);
+        snapshot->provider = loaded_dynstr_value(obj, entry->provider_name);
+        if (key_entry) {
+            snapshot->version_key = &key_entry->needed;
+            snapshot->provider_key = &key_entry->provider;
+        }
+        return snapshot->version && snapshot->provider ? 1 : -1;
+    }
+    if (entry->flags & DL_VERSION_ENTRY_DEFINED) {
+        snapshot->version = loaded_dynstr_value(
+            obj, entry->definition_name);
+        if (key_entry)
+            snapshot->version_key = &key_entry->definition;
+        return snapshot->version ? 1 : -1;
+    }
+    return -1;
+}
+
+static int symbol_version_snapshot_load(
+    const struct loaded_obj *obj, uint32_t sym_index,
+    struct symbol_version_snapshot *snapshot)
+{
+    uint16_t raw;
+
+    if (!obj || !snapshot)
+        return -1;
+    memset(snapshot, 0, sizeof(*snapshot));
+    if (!obj->versym)
+        return 0;
+    if (sym_index >= obj->dynsym_count ||
+        !loaded_versym_value(obj, sym_index, &raw))
+        return -1;
+    return symbol_version_snapshot_from_raw(obj, raw, snapshot);
+}
+
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
 static const char *defined_symbol_version(const struct loaded_obj *obj,
                                           uint32_t sym_index)
 {
@@ -14084,6 +16450,7 @@ static int needed_symbol_version(const struct loaded_obj *obj,
         *provider_out = loaded_dynstr_value(obj, entry->provider_name);
     return *version_out && (!provider_out || *provider_out) ? 1 : -1;
 }
+#endif
 
 /* Resolve the version attached to any dynsym entry by version-index table
  * membership.  VERNEED is intentionally checked first for executable COPY
@@ -14092,57 +16459,14 @@ static int symbol_version_name(const struct loaded_obj *obj,
                                uint32_t sym_index,
                                const char **version_out)
 {
-    uint16_t raw_version;
-    uint16_t version_index;
-    const char *defined_version;
-    int needed;
+    struct symbol_version_snapshot snapshot;
+    int status;
 
     *version_out = NULL;
-    if (!obj->versym)
-        return 0;
-    if (sym_index >= obj->dynsym_count ||
-        !loaded_versym_value(obj, sym_index, &raw_version))
-        return -1;
-    version_index = raw_version & 0x7fff;
-    if (version_index <= 1)
-        return 0;
-
-    needed = needed_symbol_version(
-        obj, version_index, version_out, NULL);
-    if (needed != 0)
-        return needed;
-
-    defined_version = defined_symbol_version(obj, sym_index);
-    if (!defined_version)
-        return -1;
-    *version_out = defined_version;
-    return 1;
-}
-
-static const struct loaded_symbol_name_key *symbol_version_name_key(
-    const struct loaded_obj *obj, uint32_t sym_index)
-{
-    const struct loaded_version_entry *entry;
-    const struct loaded_version_name_entry *key_entry;
-    uint16_t raw_version;
-    uint16_t version_index;
-
-    if (!obj->versym || !obj->version_index || !obj->version_name_index ||
-        sym_index >= obj->dynsym_count ||
-        !loaded_versym_value(obj, sym_index, &raw_version))
-        return NULL;
-    version_index = raw_version & DL_VERSION_INDEX_MASK;
-    if (version_index <= VER_NDX_GLOBAL)
-        return NULL;
-    entry = loaded_version_index_entry(obj, version_index);
-    key_entry = loaded_version_name_index_entry(obj, version_index);
-    if (!entry || !key_entry)
-        return NULL;
-    if (entry->flags & DL_VERSION_ENTRY_NEEDED)
-        return &key_entry->needed;
-    if (entry->flags & DL_VERSION_ENTRY_DEFINED)
-        return &key_entry->definition;
-    return NULL;
+    status = symbol_version_snapshot_load(obj, sym_index, &snapshot);
+    if (status > 0)
+        *version_out = snapshot.version;
+    return status;
 }
 
 /* Return 1 and the requested/defined version name for a versioned
@@ -14150,33 +16474,39 @@ static const struct loaded_symbol_name_key *symbol_version_name_key(
 static int relocation_symbol_version(const struct loaded_obj *obj,
                                      uint32_t sym_index,
                                      const char **version_out,
+                                     const struct loaded_symbol_name_key
+                                         **version_key_out,
                                      int *hidden_out,
-                                     const char **provider_out)
+                                     const char **provider_out,
+                                     const struct loaded_symbol_name_key
+                                         **provider_key_out)
 {
-    uint16_t raw_version = 0;
+    struct symbol_version_snapshot snapshot;
     int status;
 
+    if (version_out)
+        *version_out = NULL;
+    if (version_key_out)
+        *version_key_out = NULL;
     if (hidden_out)
         *hidden_out = 0;
     if (provider_out)
         *provider_out = NULL;
-    status = symbol_version_name(obj, sym_index, version_out);
+    if (provider_key_out)
+        *provider_key_out = NULL;
+    status = symbol_version_snapshot_load(obj, sym_index, &snapshot);
     if (status <= 0)
         return status;
-    if (!loaded_versym_value(obj, sym_index, &raw_version))
-        return -1;
+    if (version_out)
+        *version_out = snapshot.version;
+    if (version_key_out)
+        *version_key_out = snapshot.version_key;
     if (hidden_out)
-        *hidden_out = (raw_version & 0x8000) != 0;
-    if (provider_out) {
-        const char *needed_version = NULL;
-        int needed = needed_symbol_version(
-            obj, raw_version & 0x7fff, &needed_version, provider_out);
-
-        if (needed < 0)
-            return -1;
-        if (needed > 0 && strcmp(needed_version, *version_out) != 0)
-            return -1;
-    }
+        *hidden_out = (snapshot.raw & UINT16_C(0x8000)) != 0;
+    if (provider_out)
+        *provider_out = snapshot.provider;
+    if (provider_key_out)
+        *provider_key_out = snapshot.provider_key;
     return status;
 }
 
@@ -14196,19 +16526,18 @@ static int classify_versioned_candidate(
     const struct loaded_obj *obj, uint32_t sym_index,
     const struct symbol_lookup_query *version_query,
     int allow_unversioned, int required_hidden,
-    const char *required_provider)
+    const struct symbol_lookup_query *required_provider)
 {
-    const char *candidate_version = NULL;
-    const struct loaded_symbol_name_key *candidate_key;
-    uint16_t raw_version;
-    int status = symbol_version_name(obj, sym_index, &candidate_version);
+    struct symbol_version_snapshot snapshot;
+    int status = symbol_version_snapshot_load(
+        obj, sym_index, &snapshot);
 
     if (status < 0)
         return VERSIONED_CANDIDATE_INVALID;
     if (status > 0) {
-        candidate_key = symbol_version_name_key(obj, sym_index);
-        return loaded_name_key_eq(
-                   candidate_version, candidate_key, version_query)
+        return loaded_object_name_eq_query(
+                   obj, snapshot.version, snapshot.version_key,
+                   version_query)
             ? VERSIONED_CANDIDATE_EXACT : VERSIONED_CANDIDATE_NONE;
     }
     if (!allow_unversioned)
@@ -14217,24 +16546,22 @@ static int classify_versioned_candidate(
         /* The named VERNEED provider itself must carry the requested
          * version definition.  Earlier unversioned interposers may match. */
         if (required_provider &&
-            dl_loaded_dependency_matches(obj, required_provider))
+            dl_loaded_dependency_matches_query(obj, required_provider))
             return VERSIONED_CANDIDATE_INVALID;
         return VERSIONED_CANDIDATE_EXACT;
     }
-    if (required_hidden ||
-        !loaded_versym_value(obj, sym_index, &raw_version))
-        return required_hidden ? VERSIONED_CANDIDATE_NONE
-                               : VERSIONED_CANDIDATE_INVALID;
-    return (raw_version & 0x7fff) <= 1 &&
-           (raw_version & 0x8000) == 0
+    if (required_hidden)
+        return VERSIONED_CANDIDATE_NONE;
+    return snapshot.index <= VER_NDX_GLOBAL &&
+           (snapshot.raw & UINT16_C(0x8000)) == 0
         ? VERSIONED_CANDIDATE_FALLBACK : VERSIONED_CANDIDATE_NONE;
 }
 
 static const Elf64_Sym *lookup_versioned_symbol_mode_query(
-    const struct loaded_obj *obj, const struct symbol_lookup_query *query,
+    const struct loaded_obj *obj, struct symbol_lookup_query *query,
     const struct symbol_lookup_query *version_query,
     int allow_unversioned, int required_hidden,
-    const char *required_provider)
+    const struct symbol_lookup_query *required_provider)
 {
     const Elf64_Sym *fallback = NULL;
     unsigned int fallback_count = 0;
@@ -14301,10 +16628,11 @@ static const Elf64_Sym *lookup_versioned_symbol_mode_query(
 
     if (obj->sysv_hash) {
         struct sysv_hash_view view;
-        uint32_t hash = query->sysv_hash;
+        uint32_t hash;
         uint32_t idx;
 
-        if (!get_sysv_hash_view(obj, &view))
+        if (!get_sysv_hash_view(obj, &view) ||
+            !symbol_lookup_query_sysv_hash(query, &hash))
             return NULL;
         idx = view.buckets[hash % view.nbuckets];
         for (uint32_t steps = 0; idx != STN_UNDEF && steps < view.nchain;
@@ -14364,33 +16692,23 @@ static const Elf64_Sym *lookup_versioned_symbol_mode_query(
     return fallback_count == 1 ? fallback : NULL;
 }
 
-static const Elf64_Sym *lookup_versioned_symbol_mode(
-    const struct loaded_obj *obj, const char *name, const char *version,
-    int allow_unversioned, int required_hidden,
-    const char *required_provider)
-{
-    struct symbol_lookup_query query;
-    struct symbol_lookup_query version_query;
-
-    return symbol_lookup_query_init(name, &query) &&
-           symbol_lookup_query_init(version, &version_query)
-        ? lookup_versioned_symbol_mode_query(
-            obj, &query, &version_query, allow_unversioned, required_hidden,
-            required_provider) : NULL;
-}
-
 static const Elf64_Sym *finish_relocation_definition(
     struct loaded_obj *requester, const Elf64_Sym *reference,
-    const char *name, struct loaded_obj *objs, int nobj, int copy_lookup,
+    const struct symbol_lookup_query *query,
+    struct loaded_obj *objs, int nobj, int copy_lookup,
     struct loaded_obj *candidate_owner, const Elf64_Sym *candidate,
-    struct loaded_obj **owner_out)
+    struct loaded_obj **owner_out, int *cacheable_out)
 {
     struct loaded_obj *owner = candidate_owner;
     const Elf64_Sym *symbol = candidate;
 
+    if (cacheable_out)
+        *cacheable_out = candidate && reference &&
+            ELF64_ST_BIND(candidate->st_info) != STB_GNU_UNIQUE &&
+            ELF64_ST_BIND(reference->st_info) != STB_GNU_UNIQUE;
     if (!candidate_owner || !candidate ||
         gnu_unique_canonicalize(
-            objs, nobj, name, candidate_owner, candidate,
+            objs, nobj, query, candidate_owner, candidate,
             copy_lookup ? requester : NULL,
             copy_lookup ? reference : NULL, &owner, &symbol) < 0)
         return NULL;
@@ -14402,19 +16720,29 @@ static const Elf64_Sym *finish_relocation_definition(
 static const Elf64_Sym *lookup_relocation_definition(
         struct loaded_obj *requester, uint32_t sym_index,
         struct loaded_obj *objs, int nobj, int skip_requester,
-        struct loaded_obj **owner_out)
+        struct loaded_obj **owner_out);
+
+static const Elf64_Sym *lookup_relocation_definition_uncached(
+        struct loaded_obj *requester, uint32_t sym_index,
+        struct loaded_obj *objs, int nobj, int skip_requester,
+        struct loaded_obj **owner_out, int *cacheable_out)
 {
     const Elf64_Sym *reference;
-    const char *name;
     const char *version;
     const char *required_provider = NULL;
+    const struct loaded_symbol_name_key *version_key = NULL;
+    const struct loaded_symbol_name_key *provider_key = NULL;
     struct symbol_lookup_query query;
     struct symbol_lookup_query version_query;
+    struct symbol_lookup_query provider_query;
+    const struct symbol_lookup_query *required_provider_query = NULL;
     int required_hidden = 0;
     int versioned;
 
     if (owner_out)
         *owner_out = NULL;
+    if (cacheable_out)
+        *cacheable_out = 0;
 
     if (!requester->dynsym || !requester->dynstr ||
         sym_index == 0 || sym_index >= requester->dynsym_count)
@@ -14423,16 +16751,26 @@ static const Elf64_Sym *lookup_relocation_definition(
     if (!reference)
         return NULL;
 
-    name = loaded_symbol_name(requester, reference);
-    if (!name || !symbol_lookup_query_init(name, &query))
+    if (!symbol_lookup_query_init_dynsym(
+            requester, sym_index, objs, nobj, &query))
         return NULL;
     versioned = relocation_symbol_version(
-        requester, sym_index, &version, &required_hidden,
-        &required_provider);
-    if (versioned < 0 ||
-        (versioned > 0 &&
-         !symbol_lookup_query_init(version, &version_query)))
+        requester, sym_index, &version, &version_key, &required_hidden,
+        &required_provider, &provider_key);
+    if (versioned < 0)
         return NULL;
+    if (versioned > 0) {
+        if (!symbol_lookup_query_init_object_name(
+                requester, version, version_key, &version_query))
+            return NULL;
+        if (required_provider) {
+            if (!symbol_lookup_query_init_object_name(
+                    requester, required_provider, provider_key,
+                    &provider_query))
+                return NULL;
+            required_provider_query = &provider_query;
+        }
+    }
 
     /* Hidden/internal definitions never leave their object, and protected
      * definitions are visible to others but cannot be preempted inside the
@@ -14441,6 +16779,9 @@ static const Elf64_Sym *lookup_relocation_definition(
     if (!skip_requester && symbol_must_bind_locally(reference)) {
         if (owner_out)
             *owner_out = requester;
+        if (cacheable_out)
+            *cacheable_out =
+                ELF64_ST_BIND(reference->st_info) != STB_GNU_UNIQUE;
         return reference;
     }
 
@@ -14451,13 +16792,13 @@ static const Elf64_Sym *lookup_relocation_definition(
         const Elf64_Sym *candidate = versioned
             ? lookup_versioned_symbol_mode_query(
                 requester, &query, &version_query, 1, required_hidden,
-                required_provider)
+                required_provider_query)
             : lookup_object_symbol_query(requester, &query);
 
         if (candidate) {
             return finish_relocation_definition(
-                requester, reference, name, objs, nobj, 0,
-                requester, candidate, owner_out);
+                requester, reference, &query, objs, nobj, 0,
+                requester, candidate, owner_out, cacheable_out);
         }
     }
 
@@ -14489,12 +16830,13 @@ static const Elf64_Sym *lookup_relocation_definition(
             candidate = versioned
                 ? lookup_versioned_symbol_mode_query(
                     &objs[index], &query, &version_query, 1, required_hidden,
-                    required_provider)
+                    required_provider_query)
                 : lookup_object_symbol_query(&objs[index], &query);
             if (candidate) {
                 return finish_relocation_definition(
-                    requester, reference, name, objs, nobj,
-                    skip_requester, &objs[index], candidate, owner_out);
+                    requester, reference, &query, objs, nobj,
+                    skip_requester, &objs[index], candidate, owner_out,
+                    cacheable_out);
             }
         }
         return NULL;
@@ -14509,38 +16851,65 @@ static const Elf64_Sym *lookup_relocation_definition(
         candidate = versioned
             ? lookup_versioned_symbol_mode_query(
                 &objs[i], &query, &version_query, 1, required_hidden,
-                required_provider)
+                required_provider_query)
             : lookup_object_symbol_query(&objs[i], &query);
         if (candidate) {
             return finish_relocation_definition(
-                requester, reference, name, objs, nobj, skip_requester,
-                &objs[i], candidate, owner_out);
+                requester, reference, &query, objs, nobj, skip_requester,
+                &objs[i], candidate, owner_out, cacheable_out);
         }
     }
     return NULL;
 }
 
-/* Look up a private ABI descriptor whose representation is part of the
- * contract being validated.  It must not reinterpret a same-named function,
- * absolute symbol, debug-only value, or undersized object as live target
- * data.  Old split-libpthread
- * builds keep these descriptors as LOCAL symbols in .symtab, so binding is
- * intentionally not restricted here; the caller scopes the containing ELF
- * object by its validated ABI SONAME instead. */
-static int lookup_exact_elf_object_addr(const struct loaded_obj *obj,
-                                        const char *name,
-                                        size_t expected_size,
-                                        uintptr_t *address_out)
+/* One immutable object can carry a family of private ABI descriptors.  Keep
+ * the independent result for each requested representation while walking
+ * every section and symbol record only once.  A malformed matching symbol
+ * poisons its request even if another table later publishes a valid match;
+ * this is the same fail-closed rule as the singular lookup below. */
+struct exact_elf_object_lookup {
+    const char *name;
+    size_t expected_size;
+    uintptr_t address;
+    int state;
+};
+
+#ifdef DLFREEZE_EXACT_OBJECT_LOOKUP_GATE
+static size_t g_exact_elf_object_symbol_visits;
+#endif
+
+static int lookup_exact_elf_object_addrs(
+    const struct loaded_obj *obj,
+    struct exact_elf_object_lookup *lookups, size_t lookup_count)
 {
     const Elf64_Ehdr *ehdr;
     const uint8_t *shdrs;
-    uintptr_t selected = 0;
-    int found = 0;
+    size_t common_prefix_length;
+    int malformed = 0;
 
-    if (!obj || !name || !address_out || expected_size == 0 ||
+    if (!obj || !lookups || lookup_count == 0 ||
         !obj->elf || obj->elf_size < sizeof(*ehdr))
         return -1;
-    *address_out = 0;
+    for (size_t i = 0; i < lookup_count; i++) {
+        if (!lookups[i].name || lookups[i].expected_size == 0)
+            return -1;
+        lookups[i].address = 0;
+        lookups[i].state = 0;
+    }
+    /* Most descriptor families share a long namespace prefix.  Derive it
+     * from the request set so unrelated symbol names are rejected once,
+     * rather than repeating the same leading-byte comparisons for every
+     * member of the family.  The exact-name check below remains authoritative
+     * for the candidates which pass this accelerator. */
+    common_prefix_length = strlen(lookups[0].name);
+    for (size_t i = 1; i < lookup_count; i++) {
+        size_t shared = 0;
+
+        while (shared < common_prefix_length &&
+               lookups[i].name[shared] == lookups[0].name[shared])
+            shared++;
+        common_prefix_length = shared;
+    }
     ehdr = (const Elf64_Ehdr *)obj->elf;
     if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0 ||
         ehdr->e_ident[EI_CLASS] != ELFCLASS64 ||
@@ -14582,49 +16951,107 @@ static int lookup_exact_elf_object_addr(const struct loaded_obj *obj,
         sym_count = sym_sh.sh_size / sym_sh.sh_entsize;
         for (size_t i = 1; i < sym_count; i++) {
             Elf64_Sym sym;
-            Elf64_Shdr value_sh;
-            uint64_t section_offset;
-            uintptr_t address;
-            void *mapped_address;
 
             memcpy(&sym,
                    obj->elf + sym_sh.sh_offset + i * sym_sh.sh_entsize,
                    sizeof(sym));
-            if (sym.st_name == 0 ||
-                !elf_strtab_name_eq(
-                    (const char *)(obj->elf + str_sh.sh_offset),
-                    str_sh.sh_size, sym.st_name, name))
+#ifdef DLFREEZE_EXACT_OBJECT_LOOKUP_GATE
+            g_exact_elf_object_symbol_visits++;
+#endif
+            if (sym.st_name == 0)
                 continue;
-            if (ELF64_ST_TYPE(sym.st_info) != STT_OBJECT ||
-                sym.st_size != expected_size ||
-                sym.st_shndx >= SHN_LORESERVE ||
-                sym.st_shndx >= ehdr->e_shnum)
-                return -1;
-            memcpy(&value_sh,
-                   shdrs + (size_t)sym.st_shndx * ehdr->e_shentsize,
-                   sizeof(value_sh));
-            if ((value_sh.sh_flags & SHF_ALLOC) == 0 ||
-                sym.st_value < value_sh.sh_addr)
-                return -1;
-            section_offset = sym.st_value - value_sh.sh_addr;
-            if (section_offset > value_sh.sh_size ||
-                expected_size > value_sh.sh_size - section_offset ||
-                sym.st_value > UINTPTR_MAX - obj->base)
-                return -1;
-            address = (uintptr_t)obj->base + (uintptr_t)sym.st_value;
-            if (!loaded_obj_vaddr_pointer(
-                    obj, sym.st_value, expected_size, PF_R,
-                    &mapped_address) ||
-                (uintptr_t)mapped_address != address ||
-                (found && selected != address))
-                return -1;
-            selected = address;
-            found = 1;
+            if (common_prefix_length != 0 &&
+                (sym.st_name >= str_sh.sh_size ||
+                 common_prefix_length > str_sh.sh_size - sym.st_name ||
+                 memcmp(obj->elf + str_sh.sh_offset + sym.st_name,
+                        lookups[0].name, common_prefix_length) != 0))
+                continue;
+            for (size_t request = 0; request < lookup_count; request++) {
+                struct exact_elf_object_lookup *lookup =
+                    &lookups[request];
+                Elf64_Shdr value_sh;
+                uint64_t section_offset;
+                uintptr_t address;
+                void *mapped_address;
+
+                if (lookup->state < 0 ||
+                    !elf_strtab_name_eq(
+                        (const char *)(obj->elf + str_sh.sh_offset),
+                        str_sh.sh_size, sym.st_name, lookup->name))
+                    continue;
+                if (ELF64_ST_TYPE(sym.st_info) != STT_OBJECT ||
+                    sym.st_size != lookup->expected_size ||
+                    sym.st_shndx >= SHN_LORESERVE ||
+                    sym.st_shndx >= ehdr->e_shnum) {
+                    lookup->address = 0;
+                    lookup->state = -1;
+                    malformed = 1;
+                    continue;
+                }
+                memcpy(&value_sh,
+                       shdrs + (size_t)sym.st_shndx * ehdr->e_shentsize,
+                       sizeof(value_sh));
+                if ((value_sh.sh_flags & SHF_ALLOC) == 0 ||
+                    sym.st_value < value_sh.sh_addr) {
+                    lookup->address = 0;
+                    lookup->state = -1;
+                    malformed = 1;
+                    continue;
+                }
+                section_offset = sym.st_value - value_sh.sh_addr;
+                if (section_offset > value_sh.sh_size ||
+                    lookup->expected_size >
+                        value_sh.sh_size - section_offset ||
+                    sym.st_value > UINTPTR_MAX - obj->base) {
+                    lookup->address = 0;
+                    lookup->state = -1;
+                    malformed = 1;
+                    continue;
+                }
+                address = (uintptr_t)obj->base +
+                          (uintptr_t)sym.st_value;
+                if (!loaded_obj_vaddr_pointer(
+                        obj, sym.st_value, lookup->expected_size, PF_R,
+                        &mapped_address) ||
+                    (uintptr_t)mapped_address != address ||
+                    (lookup->state > 0 && lookup->address != address)) {
+                    lookup->address = 0;
+                    lookup->state = -1;
+                    malformed = 1;
+                    continue;
+                }
+                lookup->address = address;
+                lookup->state = 1;
+            }
         }
     }
-    if (found)
-        *address_out = selected;
-    return found;
+    return malformed ? -1 : 0;
+}
+
+/* Look up a private ABI descriptor whose representation is part of the
+ * contract being validated.  It must not reinterpret a same-named function,
+ * absolute symbol, debug-only value, or undersized object as live target
+ * data.  Old split-libpthread builds keep these descriptors as LOCAL symbols
+ * in .symtab, so binding is intentionally not restricted here; the caller
+ * scopes the containing ELF object by its validated ABI SONAME instead. */
+static int __attribute__((unused)) lookup_exact_elf_object_addr(
+    const struct loaded_obj *obj, const char *name,
+    size_t expected_size, uintptr_t *address_out)
+{
+    struct exact_elf_object_lookup lookup = {
+        .name = name,
+        .expected_size = expected_size,
+    };
+
+    if (!obj || !name || !address_out || expected_size == 0 ||
+        !obj->elf || obj->elf_size < sizeof(Elf64_Ehdr))
+        return -1;
+    *address_out = 0;
+    if (lookup_exact_elf_object_addrs(obj, &lookup, 1) < 0)
+        return -1;
+    if (lookup.state > 0)
+        *address_out = lookup.address;
+    return lookup.state;
 }
 
 /* glibc publishes these constants for libthread_db.  They describe the
@@ -14648,17 +17075,13 @@ struct glibc_thread_contract {
 };
 
 static int glibc_thread_db_field_read(
-    const struct loaded_obj *obj, const char *name, uint32_t expected_bits,
+    const struct exact_elf_object_lookup *lookup, uint32_t expected_bits,
     struct glibc_thread_db_field *field)
 {
-    uintptr_t address;
-    int status;
-
-    status = lookup_exact_elf_object_addr(
-        obj, name, sizeof(*field), &address);
-    if (status <= 0)
-        return status;
-    memcpy(field, (const void *)(uintptr_t)address, sizeof(*field));
+    if (!lookup || !field || lookup->state <= 0)
+        return lookup ? lookup->state : -1;
+    memcpy(field, (const void *)(uintptr_t)lookup->address,
+           sizeof(*field));
     if (field->element_bits != expected_bits || field->element_count != 1)
         return -1;
     return 1;
@@ -14669,19 +17092,9 @@ static int glibc_thread_contract_object(const struct loaded_obj *obj)
     if (!obj || !dl_object_is_visible(obj) ||
         (obj->flags & (LDR_FLAG_MAIN_EXE | LDR_FLAG_DATA)))
         return 0;
-    for (size_t d = 0; d < obj->dynamic_count; d++) {
-        const char *soname;
-
-        if (obj->dynamic[d].d_tag != DT_SONAME ||
-            obj->dynamic[d].d_un.d_val > UINT32_MAX)
-            continue;
-        soname = loaded_dynstr_value(
-            obj, (uint32_t)obj->dynamic[d].d_un.d_val);
-        if (soname && (strcmp(soname, "libc.so.6") == 0 ||
-                       strcmp(soname, "libpthread.so.0") == 0))
-            return 1;
-    }
-    return 0;
+    return obj->admitted_soname &&
+        (strcmp(obj->admitted_soname, "libc.so.6") == 0 ||
+         strcmp(obj->admitted_soname, "libpthread.so.0") == 0);
 }
 
 static int glibc_thread_contract_from_object(
@@ -14700,6 +17113,19 @@ static int glibc_thread_contract_from_object(
         "_thread_db_rtld_global__dl_stack_used";
     static const char stack_user_name[] =
         "_thread_db_rtld_global__dl_stack_user";
+    enum glibc_thread_lookup_index {
+        GLIBC_THREAD_LOOKUP_SIZE = 0,
+        GLIBC_THREAD_LOOKUP_TID,
+        GLIBC_THREAD_LOOKUP_LIST,
+        GLIBC_THREAD_LOOKUP_DTVP,
+        GLIBC_THREAD_LOOKUP_DTV_ARRAY,
+        GLIBC_THREAD_LOOKUP_DTV_COUNTER,
+        GLIBC_THREAD_LOOKUP_DTV_VALUE,
+        GLIBC_THREAD_LOOKUP_MODID,
+        GLIBC_THREAD_LOOKUP_STACK_USED,
+        GLIBC_THREAD_LOOKUP_STACK_USER,
+        GLIBC_THREAD_LOOKUP_COUNT,
+    };
     struct glibc_thread_db_field tid;
     struct glibc_thread_db_field list;
     struct glibc_thread_db_field dtvp;
@@ -14712,33 +17138,73 @@ static int glibc_thread_contract_from_object(
     uintptr_t size_address;
     uint32_t pthread_size;
     uintptr_t dtv_array_address;
-    int states[10];
+    struct exact_elf_object_lookup lookups[GLIBC_THREAD_LOOKUP_COUNT];
+    int states[GLIBC_THREAD_LOOKUP_COUNT];
     int present = 0;
 
-    states[0] = lookup_exact_elf_object_addr(
-        obj, size_name, sizeof(pthread_size), &size_address);
-    states[1] = glibc_thread_db_field_read(obj, tid_name, 32, &tid);
-    states[2] = glibc_thread_db_field_read(
-        obj, list_name, 2 * sizeof(uintptr_t) * CHAR_BIT, &list);
-    states[3] = glibc_thread_db_field_read(
-        obj, dtvp_name, sizeof(uintptr_t) * CHAR_BIT, &dtvp);
-    states[4] = lookup_exact_elf_object_addr(
-        obj, dtv_array_name, sizeof(dtv_array), &dtv_array_address);
-    if (states[4] > 0)
+    /* Assign only the two request inputs.  The batch routine initializes its
+     * result fields before reading them.  A large aggregate initializer here
+     * can be lowered to an external memset by otherwise-supported compilers,
+     * which would violate the loader's post-target-TLS import contract. */
+    lookups[GLIBC_THREAD_LOOKUP_SIZE].name = size_name;
+    lookups[GLIBC_THREAD_LOOKUP_SIZE].expected_size = sizeof(pthread_size);
+    lookups[GLIBC_THREAD_LOOKUP_TID].name = tid_name;
+    lookups[GLIBC_THREAD_LOOKUP_TID].expected_size = sizeof(tid);
+    lookups[GLIBC_THREAD_LOOKUP_LIST].name = list_name;
+    lookups[GLIBC_THREAD_LOOKUP_LIST].expected_size = sizeof(list);
+    lookups[GLIBC_THREAD_LOOKUP_DTVP].name = dtvp_name;
+    lookups[GLIBC_THREAD_LOOKUP_DTVP].expected_size = sizeof(dtvp);
+    lookups[GLIBC_THREAD_LOOKUP_DTV_ARRAY].name = dtv_array_name;
+    lookups[GLIBC_THREAD_LOOKUP_DTV_ARRAY].expected_size = sizeof(dtv_array);
+    lookups[GLIBC_THREAD_LOOKUP_DTV_COUNTER].name = dtv_counter_name;
+    lookups[GLIBC_THREAD_LOOKUP_DTV_COUNTER].expected_size =
+        sizeof(dtv_counter);
+    lookups[GLIBC_THREAD_LOOKUP_DTV_VALUE].name = dtv_value_name;
+    lookups[GLIBC_THREAD_LOOKUP_DTV_VALUE].expected_size = sizeof(dtv_value);
+    lookups[GLIBC_THREAD_LOOKUP_MODID].name = modid_name;
+    lookups[GLIBC_THREAD_LOOKUP_MODID].expected_size = sizeof(modid);
+    lookups[GLIBC_THREAD_LOOKUP_STACK_USED].name = stack_used_name;
+    lookups[GLIBC_THREAD_LOOKUP_STACK_USED].expected_size =
+        sizeof(stack_used);
+    lookups[GLIBC_THREAD_LOOKUP_STACK_USER].name = stack_user_name;
+    lookups[GLIBC_THREAD_LOOKUP_STACK_USER].expected_size =
+        sizeof(stack_user);
+
+    if (lookup_exact_elf_object_addrs(
+            obj, lookups, GLIBC_THREAD_LOOKUP_COUNT) < 0)
+        return -1;
+    states[GLIBC_THREAD_LOOKUP_SIZE] =
+        lookups[GLIBC_THREAD_LOOKUP_SIZE].state;
+    size_address = lookups[GLIBC_THREAD_LOOKUP_SIZE].address;
+    states[GLIBC_THREAD_LOOKUP_TID] = glibc_thread_db_field_read(
+        &lookups[GLIBC_THREAD_LOOKUP_TID], 32, &tid);
+    states[GLIBC_THREAD_LOOKUP_LIST] = glibc_thread_db_field_read(
+        &lookups[GLIBC_THREAD_LOOKUP_LIST],
+        2 * sizeof(uintptr_t) * CHAR_BIT, &list);
+    states[GLIBC_THREAD_LOOKUP_DTVP] = glibc_thread_db_field_read(
+        &lookups[GLIBC_THREAD_LOOKUP_DTVP],
+        sizeof(uintptr_t) * CHAR_BIT, &dtvp);
+    states[GLIBC_THREAD_LOOKUP_DTV_ARRAY] =
+        lookups[GLIBC_THREAD_LOOKUP_DTV_ARRAY].state;
+    dtv_array_address = lookups[GLIBC_THREAD_LOOKUP_DTV_ARRAY].address;
+    if (states[GLIBC_THREAD_LOOKUP_DTV_ARRAY] > 0)
         memcpy(&dtv_array, (const void *)dtv_array_address,
                sizeof(dtv_array));
-    states[5] = glibc_thread_db_field_read(
-        obj, dtv_counter_name, sizeof(size_t) * CHAR_BIT, &dtv_counter);
-    states[6] = glibc_thread_db_field_read(
-        obj, dtv_value_name, sizeof(uintptr_t) * CHAR_BIT, &dtv_value);
-    states[7] = glibc_thread_db_field_read(obj, modid_name,
-                                           sizeof(size_t) * CHAR_BIT, &modid);
-    states[8] = glibc_thread_db_field_read(
-        obj, stack_used_name, 2 * sizeof(uintptr_t) * CHAR_BIT,
-        &stack_used);
-    states[9] = glibc_thread_db_field_read(
-        obj, stack_user_name, 2 * sizeof(uintptr_t) * CHAR_BIT,
-        &stack_user);
+    states[GLIBC_THREAD_LOOKUP_DTV_COUNTER] = glibc_thread_db_field_read(
+        &lookups[GLIBC_THREAD_LOOKUP_DTV_COUNTER],
+        sizeof(size_t) * CHAR_BIT, &dtv_counter);
+    states[GLIBC_THREAD_LOOKUP_DTV_VALUE] = glibc_thread_db_field_read(
+        &lookups[GLIBC_THREAD_LOOKUP_DTV_VALUE],
+        sizeof(uintptr_t) * CHAR_BIT, &dtv_value);
+    states[GLIBC_THREAD_LOOKUP_MODID] = glibc_thread_db_field_read(
+        &lookups[GLIBC_THREAD_LOOKUP_MODID],
+        sizeof(size_t) * CHAR_BIT, &modid);
+    states[GLIBC_THREAD_LOOKUP_STACK_USED] = glibc_thread_db_field_read(
+        &lookups[GLIBC_THREAD_LOOKUP_STACK_USED],
+        2 * sizeof(uintptr_t) * CHAR_BIT, &stack_used);
+    states[GLIBC_THREAD_LOOKUP_STACK_USER] = glibc_thread_db_field_read(
+        &lookups[GLIBC_THREAD_LOOKUP_STACK_USER],
+        2 * sizeof(uintptr_t) * CHAR_BIT, &stack_user);
     for (size_t i = 0; i < sizeof(states) / sizeof(states[0]); i++) {
         if (states[i] < 0)
             return -1;
@@ -15214,43 +17680,40 @@ static int glibc_aarch64_libc_object(const struct loaded_obj *obj)
     if (!obj || !dl_object_is_visible(obj) ||
         (obj->flags & (LDR_FLAG_MAIN_EXE | LDR_FLAG_DATA)))
         return 0;
-    for (size_t d = 0; d < obj->dynamic_count; d++) {
-        const char *soname;
-
-        if (obj->dynamic[d].d_tag != DT_SONAME ||
-            obj->dynamic[d].d_un.d_val > UINT32_MAX)
-            continue;
-        soname = loaded_dynstr_value(
-            obj, (uint32_t)obj->dynamic[d].d_un.d_val);
-        return soname && strcmp(soname, "libc.so.6") == 0;
-    }
-    return 0;
+    return obj->admitted_soname &&
+           strcmp(obj->admitted_soname, "libc.so.6") == 0;
 }
 
 static int glibc_aarch64_relocation_names(
     const struct loaded_obj *obj, uint64_t offset, const char *name)
 {
-    const Elf64_Rela *tables[] = { obj->rela, obj->jmprel };
-    size_t counts[] = { obj->rela_count, obj->jmprel_count };
+    struct symbol_lookup_query query;
     unsigned int matches = 0;
 
-    for (size_t t = 0; t < sizeof(tables) / sizeof(tables[0]); t++) {
-        for (size_t i = 0; i < counts[t]; i++) {
-            const Elf64_Rela *rel = &tables[t][i];
+    if (!symbol_lookup_query_init(name, &query))
+        return 0;
+
+    for (enum loaded_rela_table table = LOADED_RELA_DYNAMIC;
+         table < LOADED_RELA_TABLE_COUNT; table++) {
+        size_t count = loaded_rela_table_count(obj, table);
+
+        for (size_t i = 0; i < count; i++) {
+            Elf64_Rela relocation;
+            const Elf64_Rela *rel = &relocation;
             uint32_t symbol_index;
             const Elf64_Sym *symbol;
-            const char *symbol_name;
 
+            if (!loaded_rela_read(obj, table, i, &relocation))
+                return 0;
             if (rel->r_offset != offset ||
                 ELF64_R_TYPE(rel->r_info) != ARCH_RELOC_GLOB_DAT ||
                 rel->r_addend != 0)
                 continue;
             symbol_index = ELF64_R_SYM(rel->r_info);
             symbol = loaded_dynsym(obj, symbol_index);
-            symbol_name = loaded_symbol_name(obj, symbol);
             if (!symbol || symbol->st_shndx != SHN_UNDEF ||
                 ELF64_ST_TYPE(symbol->st_info) != STT_OBJECT ||
-                !symbol_name || strcmp(symbol_name, name) != 0)
+                !loaded_symbol_name_eq_query(obj, symbol, &query))
                 return 0;
             matches++;
         }
@@ -16084,25 +18547,30 @@ static int glibc_target_rtld_got_slot(
     const struct loaded_obj *libc_obj, const char *name,
     uint64_t *slot_vaddr_out)
 {
-    const Elf64_Rela *tables[] = { libc_obj->rela, libc_obj->jmprel };
-    const size_t counts[] = { libc_obj->rela_count, libc_obj->jmprel_count };
+    struct symbol_lookup_query query;
     uint64_t selected = 0;
     unsigned int matches = 0;
 
-    if (!libc_obj || !name || !slot_vaddr_out)
+    if (!libc_obj || !name || !slot_vaddr_out ||
+        !symbol_lookup_query_init(name, &query))
         return 0;
-    for (size_t t = 0; t < sizeof(tables) / sizeof(tables[0]); t++) {
-        for (size_t i = 0; i < counts[t]; i++) {
-            const Elf64_Rela *rel = &tables[t][i];
-            const Elf64_Sym *symbol;
-            const char *symbol_name;
+    for (enum loaded_rela_table table = LOADED_RELA_DYNAMIC;
+         table < LOADED_RELA_TABLE_COUNT; table++) {
+        size_t count = loaded_rela_table_count(libc_obj, table);
 
+        for (size_t i = 0; i < count; i++) {
+            Elf64_Rela relocation;
+            const Elf64_Rela *rel = &relocation;
+            const Elf64_Sym *symbol;
+
+            if (!loaded_rela_read(libc_obj, table, i, &relocation))
+                return 0;
             if (ELF64_R_TYPE(rel->r_info) != ARCH_RELOC_GLOB_DAT ||
                 rel->r_addend != 0)
                 continue;
             symbol = loaded_dynsym(libc_obj, ELF64_R_SYM(rel->r_info));
-            symbol_name = loaded_symbol_name(libc_obj, symbol);
-            if (!symbol_name || strcmp(symbol_name, name) != 0)
+            if (!loaded_symbol_name_eq_query(
+                    libc_obj, symbol, &query))
                 continue;
             if (!symbol || symbol->st_shndx != SHN_UNDEF ||
                 ELF64_ST_TYPE(symbol->st_info) != STT_OBJECT ||
@@ -16169,27 +18637,31 @@ static int glibc_target_defined_object_got_slot(
     size_t expected_size, uint64_t *slot_vaddr_out,
     const Elf64_Sym **symbol_out)
 {
-    const Elf64_Rela *tables[] = { libc_obj->rela, libc_obj->jmprel };
-    const size_t counts[] = { libc_obj->rela_count, libc_obj->jmprel_count };
+    struct symbol_lookup_query query;
     const Elf64_Sym *selected_symbol = NULL;
     uint64_t selected_slot = 0;
     unsigned int matches = 0;
 
     if (!libc_obj || !name || expected_size == 0 || !slot_vaddr_out ||
-        !symbol_out)
+        !symbol_out || !symbol_lookup_query_init(name, &query))
         return 0;
-    for (size_t t = 0; t < sizeof(tables) / sizeof(tables[0]); t++) {
-        for (size_t i = 0; i < counts[t]; i++) {
-            const Elf64_Rela *rel = &tables[t][i];
-            const Elf64_Sym *symbol;
-            const char *symbol_name;
+    for (enum loaded_rela_table table = LOADED_RELA_DYNAMIC;
+         table < LOADED_RELA_TABLE_COUNT; table++) {
+        size_t count = loaded_rela_table_count(libc_obj, table);
 
+        for (size_t i = 0; i < count; i++) {
+            Elf64_Rela relocation;
+            const Elf64_Rela *rel = &relocation;
+            const Elf64_Sym *symbol;
+
+            if (!loaded_rela_read(libc_obj, table, i, &relocation))
+                return 0;
             if (ELF64_R_TYPE(rel->r_info) != ARCH_RELOC_GLOB_DAT ||
                 rel->r_addend != 0)
                 continue;
             symbol = loaded_dynsym(libc_obj, ELF64_R_SYM(rel->r_info));
-            symbol_name = loaded_symbol_name(libc_obj, symbol);
-            if (!symbol_name || strcmp(symbol_name, name) != 0)
+            if (!loaded_symbol_name_eq_query(
+                    libc_obj, symbol, &query))
                 continue;
             if (!symbol || symbol->st_shndx == SHN_UNDEF ||
                 symbol->st_shndx >= SHN_LORESERVE ||
@@ -18447,6 +20919,8 @@ static int initialize_glibc_thread_contract(struct loaded_obj *objs, int nobj)
 #endif
     int found = 0;
 
+    g_target_glibc_libc_obj = NULL;
+
     for (int i = 0; i < nobj; i++) {
         struct glibc_thread_contract candidate;
         int status;
@@ -18548,6 +21022,7 @@ static int initialize_glibc_thread_contract(struct loaded_obj *objs, int nobj)
     if (g_glibc_has_link_map_tls_dtor_count)
         g_glibc_link_map_tls_dtor_off = tls_dtor_offset;
 
+    g_target_glibc_libc_obj = libc_obj;
     g_glibc_thread_contract_valid = 1;
     if (g_debug) {
         ldr_dbg_hex("[loader] target pthread size=0x", g_glibc_pthread_size);
@@ -18601,6 +21076,12 @@ static const struct stub_sym g_overrides[] = {
  * Intercept file open/stat operations to serve embedded data files. */
 static const struct stub_sym g_vfs_overrides[] = {
     { "close",           (void *)vfs_close          },
+    { "dup",             (void *)vfs_dup            },
+    { "dup2",            (void *)vfs_dup2           },
+    { "__dup2",          (void *)vfs_dup2           },
+    { "dup3",            (void *)vfs_dup3           },
+    { "fcntl",           (void *)vfs_fcntl          },
+    { "fcntl64",         (void *)vfs_fcntl          },
     { "open",            (void *)vfs_open           },
     { "open64",          (void *)vfs_open           },
     { "openat",          (void *)vfs_openat         },
@@ -18796,17 +21277,22 @@ relocation_special_provider(const char *name)
     return SPECIAL_PROVIDER_SCOPE;
 }
 
-static int frozen_dynstr_equal(const char *dynstr, size_t dynstr_size,
-                               uint32_t offset, const char *expected)
+static int frozen_dynstr_equal_n(const char *dynstr, size_t dynstr_size,
+                                 uint32_t offset, const char *expected,
+                                 size_t length)
 {
-    size_t length;
-
     if (!expected || (size_t)offset >= dynstr_size)
         return 0;
-    length = strlen(expected);
     return length < dynstr_size - (size_t)offset &&
            memcmp(dynstr + offset, expected, length) == 0 &&
            dynstr[offset + length] == '\0';
+}
+
+static int frozen_dynstr_equal(const char *dynstr, size_t dynstr_size,
+                               uint32_t offset, const char *expected)
+{
+    return expected && frozen_dynstr_equal_n(
+        dynstr, dynstr_size, offset, expected, strlen(expected));
 }
 
 /* COPY relocations consume bytes rather than merely an address.  When a
@@ -18865,9 +21351,10 @@ static int frozen_interp_symbol_copy_source_valid(
 /* Prove an interpreter-owned version against the actual frozen interpreter.
  * The interpreter is intentionally not mapped into the normal lookup scope,
  * so its bounded on-disk dynamic metadata is the provider catalog. */
-static int frozen_interp_exports_version(const char *name,
-                                         const char *version,
-                                         size_t copy_source_size)
+static int frozen_interp_exports_version_n(const char *name,
+                                           const char *version,
+                                           size_t version_length,
+                                           size_t copy_source_size)
 {
     const uint8_t *elf;
     struct dlfrz_elf64_dyn_view view;
@@ -18926,9 +21413,10 @@ static int frozen_interp_exports_version(const char *name,
                     sizeof(aux), &aux_offset))
                 return 0;
             memcpy(&aux, view.elf + aux_offset, sizeof(aux));
-            if (frozen_dynstr_equal(
+            if (frozen_dynstr_equal_n(
                     (const char *)view.elf + view.dynstr_offset,
-                    view.dynstr_size, aux.vda_name, version)) {
+                    view.dynstr_size, aux.vda_name, version,
+                    version_length)) {
                 uint16_t index =
                     definition.vd_ndx & UINT16_C(0x7fff);
 
@@ -18985,6 +21473,14 @@ static int frozen_interp_exports_version(const char *name,
         matched_symbol = 1;
     }
     return matched_symbol;
+}
+
+static int frozen_interp_exports_version(const char *name,
+                                         const char *version,
+                                         size_t copy_source_size)
+{
+    return name && version && frozen_interp_exports_version_n(
+        name, version, strlen(version), copy_source_size);
 }
 
 static int frozen_interp_exports_symbol(const char *name,
@@ -19057,23 +21553,126 @@ static uint64_t raw_relocation_special(const char *name, uint32_t gh)
     return address;
 }
 
-static int symbol_requires_native_glibc_gmon(const char *name)
+static uint64_t lookup_special_query(
+    const struct symbol_lookup_query *query, const char **canonical_out)
 {
-    return name &&
-        (strcmp(name, "__monstartup") == 0 ||
-         strcmp(name, "_mcleanup") == 0);
+    uint32_t index;
+
+    if (!query)
+        return 0;
+    index = query->gnu_hash & (SPECIAL_TAB_SIZE - 1);
+    for (uint32_t probe = 0; probe < SPECIAL_TAB_SIZE; probe++) {
+        if (!g_special_tab[index].used)
+            return 0;
+        if (g_special_tab[index].hash == query->gnu_hash &&
+            symbol_lookup_query_eq_cstr(
+                query, g_special_tab[index].name)) {
+            if (canonical_out)
+                *canonical_out = g_special_tab[index].name;
+            return g_special_tab[index].addr;
+        }
+        index = (index + 1) & (SPECIAL_TAB_SIZE - 1);
+    }
+    return 0;
+}
+
+static uint64_t lookup_stub_query(
+    const struct symbol_lookup_query *query, const char **canonical_out)
+{
+    for (const struct stub_sym *symbol = g_stubs; symbol->name; symbol++) {
+        if (!symbol_lookup_query_eq_cstr(query, symbol->name))
+            continue;
+        if (canonical_out)
+            *canonical_out = symbol->name;
+        return (uint64_t)(uintptr_t)symbol->addr;
+    }
+    return 0;
+}
+
+static uint64_t lookup_override_query(
+    const struct symbol_lookup_query *query, const char **canonical_out)
+{
+    for (const struct stub_sym *symbol = g_overrides;
+         symbol->name; symbol++) {
+        if (!symbol_lookup_query_eq_cstr(query, symbol->name))
+            continue;
+        if (canonical_out)
+            *canonical_out = symbol->name;
+        return (uint64_t)(uintptr_t)symbol->addr;
+    }
+    if (g_vfs_count > 0) {
+        for (const struct stub_sym *symbol = g_vfs_overrides;
+             symbol->name; symbol++) {
+            if (!symbol_lookup_query_eq_cstr(query, symbol->name))
+                continue;
+            if (canonical_out)
+                *canonical_out = symbol->name;
+            return (uint64_t)(uintptr_t)symbol->addr;
+        }
+    }
+    return 0;
+}
+
+static uint64_t lookup_fake_object_query(
+    const struct symbol_lookup_query *query, const char **canonical_out)
+{
+    static const char *const names[] = {
+        "_rtld_global", "_rtld_global_ro", "__libc_stack_end",
+        "__libc_enable_secure", "_dl_argv", "_r_debug",
+        "__stack_chk_guard", "__pointer_chk_guard", "__rseq_offset",
+        "__rseq_size", "__rseq_flags"
+    };
+
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        uint64_t address;
+
+        if (!symbol_lookup_query_eq_cstr(query, names[i]))
+            continue;
+        address = lookup_fake_object(names[i]);
+        if (address && canonical_out)
+            *canonical_out = names[i];
+        return address;
+    }
+    return 0;
+}
+
+static uint64_t raw_relocation_special_query(
+    const struct symbol_lookup_query *query, const char **canonical_out)
+{
+    uint64_t address;
+
+    if (canonical_out)
+        *canonical_out = NULL;
+    if (!query)
+        return 0;
+    if (g_special_tab_ready)
+        return lookup_special_query(query, canonical_out);
+    address = lookup_override_query(query, canonical_out);
+    if (!address)
+        address = lookup_stub_query(query, canonical_out);
+    if (!address)
+        address = lookup_fake_object_query(query, canonical_out);
+    return address;
+}
+
+static int symbol_query_requires_native_glibc_gmon(
+    const struct symbol_lookup_query *query)
+{
+    return symbol_lookup_query_eq_cstr(query, "__monstartup") ||
+           symbol_lookup_query_eq_cstr(query, "_mcleanup");
 }
 
 /* The unsupported contract belongs to glibc's implementation, not to these
  * two spellings.  An executable or plugin may provide an unrelated function
  * with the same name and must retain ordinary ELF interposition semantics. */
 static int selected_definition_requires_native_glibc_gmon(
-    const struct loaded_obj *owner, const char *name)
+    const struct loaded_obj *owner,
+    const struct symbol_lookup_query *query)
 {
     const struct loaded_obj *target_libc;
 
     if (g_is_musl_runtime || !owner ||
-        !symbol_requires_native_glibc_gmon(name))
+        !symbol_query_requires_native_glibc_gmon(query))
         return 0;
     target_libc = vfs_target_libc(g_all_objs, g_nobj);
     return target_libc && owner == target_libc;
@@ -19085,9 +21684,15 @@ static uint64_t lookup_relocation_special(struct loaded_obj *requester,
                                           int skip_requester)
 {
     const Elf64_Sym *reference;
-    const char *name;
+    const char *canonical_name = NULL;
     const char *version = NULL;
     const char *required_provider = NULL;
+    const struct loaded_symbol_name_key *version_key = NULL;
+    const struct loaded_symbol_name_key *provider_key = NULL;
+    struct symbol_lookup_query name_query;
+    struct symbol_lookup_query version_query;
+    struct symbol_lookup_query provider_query;
+    const struct symbol_lookup_query *required_provider_query = NULL;
     enum relocation_special_provider provider;
     struct loaded_obj *definition_owner = NULL;
     const Elf64_Sym *definition;
@@ -19100,21 +21705,37 @@ static uint64_t lookup_relocation_special(struct loaded_obj *requester,
         sym_index >= requester->dynsym_count)
         return 0;
     reference = loaded_dynsym(requester, sym_index);
-    if (!reference || !(name = loaded_symbol_name(requester, reference)))
+    if (!reference || !symbol_lookup_query_init_dynsym(
+            requester, sym_index, objs, nobj, &name_query))
         return 0;
     if (g_is_musl_runtime &&
         (requester->flags & LDR_FLAG_MAIN_EXE) != 0 &&
-        strcmp(name, "__libc_start_main") == 0)
+        symbol_lookup_query_eq_cstr(
+            &name_query, "__libc_start_main")) {
         address = (uint64_t)(uintptr_t)musl_libc_start_main_adapter;
-    else
-        address = raw_relocation_special(name, gnu_hash_calc(name));
-    if (!address)
+        canonical_name = "__libc_start_main";
+    } else {
+        address = raw_relocation_special_query(
+            &name_query, &canonical_name);
+    }
+    if (!address || !canonical_name)
         return 0;
     versioned = relocation_symbol_version(
-        requester, sym_index, &version, &required_hidden,
-        &required_provider);
+        requester, sym_index, &version, &version_key, &required_hidden,
+        &required_provider, &provider_key);
     if (versioned < 0)
         return 0;
+    if (versioned > 0 &&
+        !symbol_lookup_query_init_object_name(
+            requester, version, version_key, &version_query))
+        return 0;
+    if (required_provider) {
+        if (!symbol_lookup_query_init_object_name(
+                requester, required_provider, provider_key,
+                &provider_query))
+            return 0;
+        required_provider_query = &provider_query;
+    }
 
     /* A loader-owned shim substitutes for the definition selected by the
      * native scope; it must not preempt a requester-local definition.  The
@@ -19124,23 +21745,22 @@ static uint64_t lookup_relocation_special(struct loaded_obj *requester,
         return 0;
     if (!skip_requester && requester->symbolic_lookup) {
         const Elf64_Sym *self_definition = versioned
-            ? lookup_versioned_symbol_mode(
-                requester, name, version, 1, required_hidden,
-                required_provider)
-            : lookup_object_symbol(requester, name,
-                                   gnu_hash_calc(name));
+            ? lookup_versioned_symbol_mode_query(
+                requester, &name_query, &version_query, 1,
+                required_hidden, required_provider_query)
+            : lookup_object_symbol_query(requester, &name_query);
 
         if (self_definition)
             return 0;
     }
-    provider = relocation_special_provider(name);
+    provider = relocation_special_provider(canonical_name);
 
     if (skip_requester) {
         const void *fake_source;
 
         if (reference->st_size == 0 || reference->st_size > SIZE_MAX ||
             !lookup_fake_object_region(
-                name, &fake_source, &copy_source_size) ||
+                canonical_name, &fake_source, &copy_source_size) ||
             !fake_source || reference->st_size != copy_source_size)
             return 0;
     }
@@ -19178,7 +21798,8 @@ static uint64_t lookup_relocation_special(struct loaded_obj *requester,
             return address;
         return (provider == SPECIAL_PROVIDER_INTERP ||
                 provider == SPECIAL_PROVIDER_RUNTIME_LOADER) &&
-               frozen_interp_exports_symbol(name, copy_source_size)
+               frozen_interp_exports_symbol(
+                   canonical_name, copy_source_size)
             ? address : 0;
     }
     if (!version)
@@ -19186,10 +21807,12 @@ static uint64_t lookup_relocation_special(struct loaded_obj *requester,
     if (provider == SPECIAL_PROVIDER_SCOPE)
         return address;
     if (provider == SPECIAL_PROVIDER_GLIBC_PRIVATE &&
-        strcmp(version, "GLIBC_PRIVATE") != 0)
+        !symbol_lookup_query_eq_cstr(
+            &version_query, "GLIBC_PRIVATE"))
         return 0;
-    return frozen_interp_exports_version(
-        name, version, copy_source_size) ? address : 0;
+    return frozen_interp_exports_version_n(
+        canonical_name, version_query.name, version_query.key.length,
+        copy_source_size) ? address : 0;
 }
 
 /* Apply the same provider/version admission policy to dlsym and dlvsym.
@@ -19289,6 +21912,319 @@ static int dl_build_global_lookup_order(int nobj,
     return 1;
 }
 
+static int symbol_lookup_metadata_declared_immutable(
+    const struct loaded_obj *obj)
+{
+    if (!obj || !obj->dynsym)
+        return 1;
+    if (!obj->dynstr || !obj->dynstr_readonly ||
+        !obj->dynsym_readonly || (obj->versym && !obj->versym_readonly))
+        return 0;
+    /* Lookup prefers GNU over SysV when both are present, exactly as this
+     * proof does.  A cached view is published only for a completely
+     * file-backed table with no PF_W overlap. */
+    if (obj->gnu_hash)
+        return obj->gnu_hash_view_cached != 0;
+    if (obj->sysv_hash)
+        return obj->sysv_hash_view_cached != 0;
+    return 1;
+}
+
+static uint32_t relocation_definition_cache_hash(
+    uint16_t requester_index, uint32_t symbol_index,
+    uint16_t object_count, int skip_requester)
+{
+    uint64_t value = symbol_index;
+
+    value ^= (uint64_t)requester_index << 32;
+    value ^= (uint64_t)object_count << 48;
+    value ^= skip_requester ? UINT64_C(0x9e3779b97f4a7c15) : 0;
+    value ^= value >> 30;
+    value *= UINT64_C(0xbf58476d1ce4e5b9);
+    value ^= value >> 27;
+    value *= UINT64_C(0x94d049bb133111eb);
+    value ^= value >> 31;
+    return (uint32_t)value;
+}
+
+static struct relocation_definition_cache_ent *
+relocation_definition_cache_entry(
+    uint16_t requester_index, uint32_t symbol_index,
+    uint16_t object_count, int skip_requester, int create)
+{
+    uint32_t index = relocation_definition_cache_hash(
+        requester_index, symbol_index, object_count, skip_requester) &
+        (RELOCATION_DEFINITION_CACHE_SIZE - 1);
+
+    for (uint32_t probe = 0;
+         probe < RELOCATION_DEFINITION_CACHE_SIZE; probe++) {
+        struct relocation_definition_cache_ent *entry =
+            &g_relocation_definition_cache[index];
+
+        if (entry->epoch != g_cache_epoch) {
+            if (!create)
+                return NULL;
+            /* Keep at least half of every epoch's table empty.  Besides
+             * bounding first-touch cost, this guarantees that a miss never
+             * degenerates into a full-table walk; capacity exhaustion is an
+             * optimization miss, not a load failure. */
+            if (g_relocation_definition_cache_entries >=
+                RELOCATION_DEFINITION_CACHE_MAX_ENTRIES)
+                return NULL;
+            memset(entry, 0, sizeof(*entry));
+            entry->epoch = g_cache_epoch;
+            entry->requester_index = requester_index;
+            entry->reference_symbol_index = symbol_index;
+            entry->object_count = object_count;
+            entry->skip_requester = skip_requester ? 1 : 0;
+            g_relocation_definition_cache_entries++;
+            return entry;
+        }
+        if (entry->requester_index == requester_index &&
+            entry->reference_symbol_index == symbol_index &&
+            entry->object_count == object_count &&
+            entry->skip_requester == (skip_requester ? 1 : 0))
+            return entry;
+        index = (index + 1) & (RELOCATION_DEFINITION_CACHE_SIZE - 1);
+    }
+    return NULL;
+}
+
+/* Match lookup_relocation_definition's exact root order.  A single PF_W
+ * symbol, string, version, or selected hash table anywhere in that order
+ * disables caching for the requester; later relocations must then continue
+ * to observe the live ELF metadata exactly as before. */
+static int relocation_definition_cache_scope_immutable(
+    struct loaded_obj *requester, struct loaded_obj *objs, int nobj)
+{
+    struct relocation_scope_immutability_ent *entry;
+    uint16_t order[MAX_TOTAL_OBJS];
+    uint16_t order_count;
+    int requester_index;
+    int immutable;
+
+    if (!requester || objs != g_all_objs || !g_vfs_hash_key_ready ||
+        g_global_scope_count == 0 || nobj <= 0 ||
+        nobj > MAX_TOTAL_OBJS || nobj > UINT16_MAX ||
+        !dl_object_table_index(requester, nobj, &requester_index) ||
+        requester_index < 0 || requester_index >= MAX_TOTAL_OBJS ||
+        !requester->relocation_scope_root_valid ||
+        requester->relocation_scope_root >= (uint16_t)nobj)
+        return 0;
+
+    entry = &g_relocation_scope_immutability[requester_index];
+    if (entry->epoch == g_cache_epoch &&
+        entry->object_count == (uint16_t)nobj &&
+        entry->relocation_scope_root == requester->relocation_scope_root &&
+        entry->state != RELOCATION_SCOPE_IMMUTABILITY_UNKNOWN)
+        return entry->state == RELOCATION_SCOPE_IMMUTABLE;
+
+    /* Do not remember a malformed or half-built graph.  Once construction
+     * succeeds, both positive and negative metadata results are stable for
+     * this cache epoch; every graph publication path advances that epoch. */
+    if (dl_build_root_lookup_order(requester->relocation_scope_root, nobj,
+                                   order, &order_count) < 0)
+        return 0;
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+    g_relocation_definition_scope_scans++;
+#endif
+    immutable = symbol_lookup_metadata_declared_immutable(requester);
+    for (uint16_t i = 0; i < order_count; i++) {
+        if (order[i] >= (uint16_t)nobj)
+            return 0;
+        if (!symbol_lookup_metadata_declared_immutable(&objs[order[i]]))
+            immutable = 0;
+    }
+    entry->epoch = g_cache_epoch;
+    entry->object_count = (uint16_t)nobj;
+    entry->relocation_scope_root = requester->relocation_scope_root;
+    entry->state = immutable ? RELOCATION_SCOPE_IMMUTABLE
+                             : RELOCATION_SCOPE_MUTABLE;
+    return immutable;
+}
+
+static int relocation_definition_cache_lookup(
+    struct loaded_obj *requester, uint32_t symbol_index,
+    struct loaded_obj *objs, int nobj, int skip_requester,
+    struct loaded_obj **owner_out, const Elf64_Sym **symbol_out)
+{
+    struct relocation_definition_cache_ent *entry;
+    const Elf64_Sym *reference;
+    const Elf64_Sym *definition;
+    int requester_index;
+
+    if (!owner_out || !symbol_out || objs != g_all_objs || nobj <= 0 ||
+        nobj > MAX_TOTAL_OBJS || nobj > UINT16_MAX ||
+        !dl_object_table_index(requester, nobj, &requester_index) ||
+        requester_index < 0 || requester_index > UINT16_MAX)
+        return 0;
+    entry = relocation_definition_cache_entry(
+        (uint16_t)requester_index, symbol_index, (uint16_t)nobj,
+        skip_requester, 0);
+    if (!entry || !entry->found ||
+        entry->definition_owner_index >= (uint16_t)nobj)
+        return 0;
+    reference = loaded_dynsym(requester, symbol_index);
+    definition = loaded_dynsym(
+        &objs[entry->definition_owner_index],
+        entry->definition_symbol_index);
+    if (!reference || !definition ||
+        ELF64_ST_BIND(reference->st_info) == STB_GNU_UNIQUE ||
+        ELF64_ST_BIND(definition->st_info) == STB_GNU_UNIQUE)
+        return 0;
+    *owner_out = &objs[entry->definition_owner_index];
+    *symbol_out = definition;
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+    g_relocation_definition_cache_hits++;
+#endif
+    return 1;
+}
+
+static void relocation_definition_cache_store(
+    struct loaded_obj *requester, uint32_t symbol_index,
+    struct loaded_obj *objs, int nobj, int skip_requester,
+    struct loaded_obj *owner, const Elf64_Sym *definition)
+{
+    struct relocation_definition_cache_ent *entry;
+    const Elf64_Sym *reference;
+    uint32_t definition_symbol_index;
+    int requester_index;
+    int owner_index;
+
+    if (!owner || !definition || objs != g_all_objs || nobj <= 0 ||
+        nobj > MAX_TOTAL_OBJS || nobj > UINT16_MAX ||
+        !dl_object_table_index(requester, nobj, &requester_index) ||
+        !dl_object_table_index(owner, nobj, &owner_index) ||
+        requester_index < 0 || requester_index > UINT16_MAX ||
+        owner_index < 0 || owner_index > UINT16_MAX ||
+        !loaded_symbol_table_index(owner, definition,
+                                   &definition_symbol_index) ||
+        !(reference = loaded_dynsym(requester, symbol_index)) ||
+        ELF64_ST_BIND(reference->st_info) == STB_GNU_UNIQUE ||
+        ELF64_ST_BIND(definition->st_info) == STB_GNU_UNIQUE ||
+        !relocation_definition_cache_scope_immutable(
+            requester, objs, nobj))
+        return;
+    entry = relocation_definition_cache_entry(
+        (uint16_t)requester_index, symbol_index, (uint16_t)nobj,
+        skip_requester, 1);
+    if (!entry)
+        return;
+    entry->definition_owner_index = (uint16_t)owner_index;
+    entry->definition_symbol_index = definition_symbol_index;
+    entry->found = 1;
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+    g_relocation_definition_cache_stores++;
+#endif
+}
+
+static const Elf64_Sym *lookup_relocation_definition(
+    struct loaded_obj *requester, uint32_t sym_index,
+    struct loaded_obj *objs, int nobj, int skip_requester,
+    struct loaded_obj **owner_out)
+{
+    struct loaded_obj *owner = NULL;
+    const Elf64_Sym *definition = NULL;
+    int cacheable = 0;
+
+    if (owner_out)
+        *owner_out = NULL;
+    if (relocation_definition_cache_lookup(
+            requester, sym_index, objs, nobj, skip_requester,
+            &owner, &definition)) {
+        if (owner_out)
+            *owner_out = owner;
+        return definition;
+    }
+    definition = lookup_relocation_definition_uncached(
+        requester, sym_index, objs, nobj, skip_requester, &owner,
+        &cacheable);
+    if (!definition || !owner)
+        return NULL;
+    if (cacheable) {
+        relocation_definition_cache_store(
+            requester, sym_index, objs, nobj, skip_requester,
+            owner, definition);
+    }
+    if (owner_out)
+        *owner_out = owner;
+    return definition;
+}
+
+static int relocation_definition_cache_ifunc_lookup(
+    struct loaded_obj *requester, uint32_t symbol_index,
+    struct loaded_obj *objs, int nobj, int *is_ifunc_out)
+{
+    struct relocation_definition_cache_ent *entry;
+    struct loaded_obj *owner;
+    const Elf64_Sym *definition;
+    int requester_index;
+
+    if (!is_ifunc_out ||
+        !relocation_definition_cache_lookup(
+            requester, symbol_index, objs, nobj, 0,
+            &owner, &definition) ||
+        !dl_object_table_index(requester, nobj, &requester_index) ||
+        requester_index < 0 || requester_index > UINT16_MAX)
+        return 0;
+    (void)owner;
+    (void)definition;
+    entry = relocation_definition_cache_entry(
+        (uint16_t)requester_index, symbol_index, (uint16_t)nobj, 0, 0);
+    if (!entry || !entry->ifunc_classification_valid)
+        return 0;
+    *is_ifunc_out = entry->is_ifunc != 0;
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+    g_relocation_ifunc_cache_hits++;
+#endif
+    return 1;
+}
+
+static void relocation_definition_cache_ifunc_store(
+    struct loaded_obj *requester, uint32_t symbol_index,
+    struct loaded_obj *objs, int nobj, int is_ifunc)
+{
+    struct relocation_definition_cache_ent *entry;
+    struct loaded_obj *owner;
+    const Elf64_Sym *definition;
+    int requester_index;
+
+    /* A normal definition-cache entry proves both metadata immutability and
+     * the absence of GNU-unique selection. */
+    if (!relocation_definition_cache_lookup(
+            requester, symbol_index, objs, nobj, 0,
+            &owner, &definition) ||
+        !dl_object_table_index(requester, nobj, &requester_index) ||
+        requester_index < 0 || requester_index > UINT16_MAX)
+        return;
+    (void)owner;
+    (void)definition;
+    entry = relocation_definition_cache_entry(
+        (uint16_t)requester_index, symbol_index, (uint16_t)nobj, 0, 0);
+    if (!entry)
+        return;
+    entry->is_ifunc = is_ifunc ? 1 : 0;
+    entry->ifunc_classification_valid = 1;
+}
+
+static int global_symbol_cache_scope_immutable(
+    struct loaded_obj *objs, int nobj, int scoped_order,
+    const uint16_t *order, uint16_t order_count)
+{
+    if (objs != g_all_objs || nobj < 0 || nobj > MAX_TOTAL_OBJS)
+        return 0;
+    for (int position = 0;
+         position < (scoped_order ? (int)order_count : nobj);
+         position++) {
+        int index = scoped_order ? order[position] : position;
+
+        if (index < 0 || index >= nobj ||
+            !symbol_lookup_metadata_declared_immutable(&objs[index]))
+            return 0;
+    }
+    return 1;
+}
+
 static int resolve_sym_address(struct loaded_obj *objs, int nobj,
                                const char *name, uint64_t *address_out)
 {
@@ -19296,24 +22232,35 @@ static int resolve_sym_address(struct loaded_obj *objs, int nobj,
     uint16_t order[MAX_TOTAL_OBJS];
     uint16_t order_count = 0;
     int scoped_order;
+    int cache_scope_immutable;
+    int cache_name_safe;
 
     uint64_t cached = 0;
     int c;
 
     if (!symbol_lookup_query_init(name, &query))
         return 0;
-    c = sym_cache_lookup(&query, &cached);
-    if (c == 1) {
-        *address_out = cached;
-        return 1;
-    }
-    if (c == -1)
-        return 0;
-
     scoped_order = objs == g_all_objs
         ? dl_build_global_lookup_order(nobj, order, &order_count) : 0;
     if (scoped_order < 0)
         return 0;
+    cache_scope_immutable = global_symbol_cache_scope_immutable(
+        objs, nobj, scoped_order, order, order_count);
+    /* Special-provider and glibc-gmon classification consults provider
+     * identity in addition to ordinary symbol metadata.  Keep those names
+     * out of this address-only cache. */
+    cache_name_safe =
+        raw_relocation_special_query(&query, NULL) == 0 &&
+        !symbol_query_requires_native_glibc_gmon(&query);
+    if (cache_scope_immutable && cache_name_safe) {
+        c = sym_cache_lookup(&query, &cached);
+        if (c == 1) {
+            *address_out = cached;
+            return 1;
+        }
+        if (c == -1)
+            return 0;
+    }
     for (int position = 0;
          position < (scoped_order ? (int)order_count : nobj);
          position++) {
@@ -19326,13 +22273,15 @@ static int resolve_sym_address(struct loaded_obj *objs, int nobj,
             uint64_t special;
             uint64_t addr;
             int cacheable;
+            int selected_gnu_unique =
+                ELF64_ST_BIND(sym->st_info) == STB_GNU_UNIQUE;
 
             if (gnu_unique_canonicalize(
-                    objs, nobj, name, owner, sym, NULL, NULL,
+                    objs, nobj, &query, owner, sym, NULL, NULL,
                     &owner, &sym) < 0)
                 return -3;
             if (selected_definition_requires_native_glibc_gmon(
-                    owner, name))
+                    owner, &query))
                 return -2;
 
             special = lookup_api_special(name, NULL, owner);
@@ -19344,7 +22293,8 @@ static int resolve_sym_address(struct loaded_obj *objs, int nobj,
                                                 &cacheable))
                 continue;
             canonical_name = loaded_symbol_name(owner, sym);
-            if (cacheable && canonical_name)
+            if (cache_scope_immutable && cache_name_safe && cacheable &&
+                !selected_gnu_unique && canonical_name)
                 sym_cache_store_canonical(canonical_name, &query,
                                           CACHE_FOUND, addr);
             *address_out = addr;
@@ -19464,10 +22414,10 @@ static int resolve_relocation_symbol(struct loaded_obj *requester,
                                      struct loaded_obj *objs, int nobj,
                                      uint64_t *address_out)
 {
-    const char *name;
     const Elf64_Sym *reference;
     const Elf64_Sym *sym;
     struct loaded_obj *owner = NULL;
+    struct symbol_lookup_query query;
     uint64_t addr;
 
     if (!requester->dynsym || !requester->dynstr ||
@@ -19476,8 +22426,8 @@ static int resolve_relocation_symbol(struct loaded_obj *requester,
     reference = loaded_dynsym(requester, sym_index);
     if (!reference)
         return 0;
-    name = loaded_symbol_name(requester, reference);
-    if (!name)
+    if (!symbol_lookup_query_init_dynsym(
+            requester, sym_index, objs, nobj, &query))
         return 0;
     /* A requester-local hidden/internal/protected definition wins even when
      * its name is also implemented by a loader override. */
@@ -19497,7 +22447,7 @@ static int resolve_relocation_symbol(struct loaded_obj *requester,
     if (!sym || !owner ||
         !resolve_defined_symbol_address(owner, sym, &addr, NULL))
         return 0;
-    if (selected_definition_requires_native_glibc_gmon(owner, name))
+    if (selected_definition_requires_native_glibc_gmon(owner, &query))
         return -1;
     *address_out = addr;
     return 1;
@@ -19548,8 +22498,12 @@ static int relocation_symbol_is_ifunc(struct loaded_obj *requester,
     const Elf64_Sym *reference;
     const Elf64_Sym *definition;
     struct loaded_obj *owner = NULL;
-    const char *name;
     uint64_t special;
+    int is_ifunc;
+
+    if (relocation_definition_cache_ifunc_lookup(
+            requester, sym_index, objs, nobj, &is_ifunc))
+        return is_ifunc;
 
     if (!requester->dynsym || !requester->dynstr || sym_index == 0 ||
         sym_index >= requester->dynsym_count)
@@ -19557,21 +22511,56 @@ static int relocation_symbol_is_ifunc(struct loaded_obj *requester,
     reference = loaded_dynsym(requester, sym_index);
     if (!reference)
         return 0;
-    name = loaded_symbol_name(requester, reference);
-    if (!name)
-        return 0;
-    if (symbol_must_bind_locally(reference))
-        return ELF64_ST_TYPE(reference->st_info) == STT_GNU_IFUNC;
+    if (symbol_must_bind_locally(reference)) {
+        definition = lookup_relocation_definition(
+            requester, sym_index, objs, nobj, 0, &owner);
+        is_ifunc = definition && owner &&
+            ELF64_ST_TYPE(definition->st_info) == STT_GNU_IFUNC;
+        if (definition && owner)
+            relocation_definition_cache_ifunc_store(
+                requester, sym_index, objs, nobj, is_ifunc);
+        return is_ifunc;
+    }
 
     special = lookup_relocation_special(
         requester, sym_index, objs, nobj, 0);
-    if (special)
+    if (special) {
+        /* Provider admission inside lookup_relocation_special performs the
+         * same guarded ELF-definition lookup.  When that non-unique binding
+         * was cacheable, remember that the loader shim suppresses IFUNC
+         * classification as part of this exact epoch too. */
+        relocation_definition_cache_ifunc_store(
+            requester, sym_index, objs, nobj, 0);
         return 0;
+    }
 
     definition = lookup_relocation_definition(
         requester, sym_index, objs, nobj, 0, &owner);
-    return definition && owner &&
-           ELF64_ST_TYPE(definition->st_info) == STT_GNU_IFUNC;
+    is_ifunc = definition && owner &&
+        ELF64_ST_TYPE(definition->st_info) == STT_GNU_IFUNC;
+    if (definition && owner)
+        relocation_definition_cache_ifunc_store(
+            requester, sym_index, objs, nobj, is_ifunc);
+    return is_ifunc;
+}
+
+/* Phase filtering may bypass validate_relocation_record(), but only when
+ * the IFUNC decision is itself backed by the immutable, epoch-scoped
+ * definition cache.  A writable requester DYNSYM/DYNSTR/VERSYM can change
+ * between the ordinary and IFUNC graph-wide passes.  In that case the live
+ * record must retain the old validate-before-skip behavior so malformed
+ * metadata cannot make a previously deferred relocation disappear.  Do not
+ * pin an otherwise-valid live reclassification here: before this fast path,
+ * writable metadata was deliberately re-read in each phase. */
+static int relocation_ifunc_classification_stable(
+    struct loaded_obj *requester, uint32_t sym_index,
+    struct loaded_obj *objs, int nobj, int expected_ifunc)
+{
+    int cached_ifunc;
+
+    return relocation_definition_cache_ifunc_lookup(
+               requester, sym_index, objs, nobj, &cached_ifunc) &&
+           cached_ifunc == (expected_ifunc != 0);
 }
 
 #if defined(__aarch64__) || defined(__x86_64__)
@@ -19581,14 +22570,16 @@ static int resolve_tlsdesc_target(struct loaded_obj *obj,
                                   size_t *modid_out,
                                   uint64_t *offset_out,
                                   int64_t *tprel_out,
-                                  int *have_tprel_out)
+                                  int *have_tprel_out,
+                                  int *undefweak_out)
 {
     struct loaded_obj *owner = obj;
     const Elf64_Sym *sym = NULL;
     const Elf64_Sym *reference = NULL;
 
-    if (sidx != 0 && sidx < obj->dynsym_count)
-        reference = &obj->dynsym[sidx];
+    *undefweak_out = 0;
+    if (sidx != 0)
+        reference = loaded_dynsym(obj, sidx);
 
     /* sidx == 0 means STN_UNDEF / local-DSO reference: the TLSDESC addend is
      * a direct offset into the object's own TLS block.  Use a synthetic
@@ -19619,9 +22610,10 @@ static int resolve_tlsdesc_target(struct loaded_obj *obj,
     if (!sym || sym->st_shndx == SHN_UNDEF) {
         if (reference && ELF64_ST_BIND(reference->st_info) == STB_WEAK) {
             *modid_out = 0;
-            *offset_out = 0;
+            *offset_out = (uint64_t)addend;
             *tprel_out = 0;
-            *have_tprel_out = 1;
+            *have_tprel_out = 0;
+            *undefweak_out = 1;
             return 0;
         }
         return -1;
@@ -19656,15 +22648,24 @@ static int apply_aarch64_tlsdesc_reloc(struct loaded_obj *obj,
     uint64_t offset;
     int64_t tprel;
     int have_tprel;
+    int undefweak;
     void *slot = (void *)(uintptr_t)(obj->base + rel->r_offset);
 
     if (resolve_tlsdesc_target(obj, all, nobj,
                                ELF64_R_SYM(rel->r_info),
                                rel->r_addend,
                                &modid, &offset,
-                               &tprel, &have_tprel) < 0) {
+                               &tprel, &have_tprel, &undefweak) < 0) {
         ldr_err("unresolved TLSDESC symbol", obj->name);
         return -1;
+    }
+
+    if (undefweak) {
+        relocation_store_u64_pair(
+            slot,
+            (uint64_t)(uintptr_t)dlfreeze_aarch64_tlsdesc_undefweak,
+            offset);
+        return 0;
     }
 
     if (have_tprel) {
@@ -19701,15 +22702,24 @@ static int apply_x86_64_tlsdesc_reloc(struct loaded_obj *obj,
     uint64_t offset;
     int64_t tprel;
     int have_tprel;
+    int undefweak;
     void *slot = (void *)(uintptr_t)(obj->base + rel->r_offset);
 
     if (resolve_tlsdesc_target(obj, all, nobj,
                                ELF64_R_SYM(rel->r_info),
                                rel->r_addend,
                                &modid, &offset,
-                               &tprel, &have_tprel) < 0) {
+                               &tprel, &have_tprel, &undefweak) < 0) {
         ldr_err("unresolved TLSDESC symbol", obj->name);
         return -1;
+    }
+
+    if (undefweak) {
+        relocation_store_u64_pair(
+            slot,
+            (uint64_t)(uintptr_t)dlfreeze_x86_64_tlsdesc_undefweak,
+            offset);
+        return 0;
     }
 
     if (have_tprel) {
@@ -19772,15 +22782,21 @@ static enum relocation_admission classify_relocation_type(uint32_t type)
 static int validate_relocation_record(struct loaded_obj *obj,
                                       const Elf64_Rela *rel,
                                       const Elf64_Sym **reference_out,
-                                      const char **name_out,
+                                      struct symbol_lookup_query
+                                          *name_query_out,
                                       void **slot_out)
 {
     uint32_t type = ELF64_R_TYPE(rel->r_info);
     uint32_t sidx = ELF64_R_SYM(rel->r_info);
     const Elf64_Sym *reference = NULL;
     const char *name = NULL;
+    struct symbol_lookup_query name_query;
     size_t width = sizeof(uint64_t);
     void *slot = NULL;
+
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+    g_relocation_validation_calls++;
+#endif
 
     if (classify_relocation_type(type) == RELOCATION_UNSUPPORTED) {
         ldr_err("unsupported relocation in", obj->name);
@@ -19789,11 +22805,19 @@ static int validate_relocation_record(struct loaded_obj *obj,
     }
 
     if (sidx != 0) {
+        const struct loaded_symbol_name_key *key = NULL;
+
         reference = loaded_dynsym(obj, sidx);
         if (!reference)
             return -1;
         name = loaded_symbol_name(obj, reference);
         if (!name)
+            return -1;
+        if (obj->dynstr_readonly && obj->dynsym_readonly &&
+            obj->symbol_name_keys)
+            key = &obj->symbol_name_keys[sidx];
+        if (!symbol_lookup_query_init_object_name(
+                obj, name, key, &name_query))
             return -1;
     }
 
@@ -19825,10 +22849,32 @@ static int validate_relocation_record(struct loaded_obj *obj,
 
     if (reference_out)
         *reference_out = reference;
-    if (name_out)
-        *name_out = name;
+    if (name_query_out) {
+        memset(name_query_out, 0, sizeof(*name_query_out));
+        if (sidx != 0)
+            *name_query_out = name_query;
+    }
     if (slot_out)
         *slot_out = slot;
+    return 0;
+}
+
+/* A phase filter consumes classification metadata in addition to the
+ * relocation record's symbol name and destination geometry.  In the rare
+ * mutable-metadata fallback, revalidate the live VERSYM interpretation too:
+ * a missing normalized version entry must not turn a deferred relocation
+ * into an apparently ordinary one which the replay pass silently skips. */
+static int validate_relocation_phase_filter_skip(
+    struct loaded_obj *obj, const Elf64_Rela *rel)
+{
+    uint32_t sym_index = ELF64_R_SYM(rel->r_info);
+
+    if (validate_relocation_record(obj, rel, NULL, NULL, NULL) < 0)
+        return -1;
+    if (sym_index != 0 &&
+        relocation_symbol_version(
+            obj, sym_index, NULL, NULL, NULL, NULL, NULL) < 0)
+        return -1;
     return 0;
 }
 
@@ -19878,16 +22924,23 @@ static int preflight_resolver_relocation_destinations(
 
     for (int oi = 0; oi < ntargets; oi++) {
         struct loaded_obj *obj = &targets[oi];
-        const Elf64_Rela *tables[] = { obj->rela, obj->jmprel };
-        size_t counts[] = { obj->rela_count, obj->jmprel_count };
 
-        for (size_t t = 0; t < sizeof(tables) / sizeof(tables[0]); t++) {
-            for (size_t i = 0; i < counts[t]; i++) {
-                const Elf64_Rela *rel = &tables[t][i];
-                uint32_t type = ELF64_R_TYPE(rel->r_info);
-                uint32_t sidx = ELF64_R_SYM(rel->r_info);
-                int invokes_resolver = type == ARCH_RELOC_IRELATIVE;
+        for (enum loaded_rela_table table = LOADED_RELA_DYNAMIC;
+             table < LOADED_RELA_TABLE_COUNT; table++) {
+            size_t count = loaded_rela_table_count(obj, table);
 
+            for (size_t i = 0; i < count; i++) {
+                Elf64_Rela relocation;
+                const Elf64_Rela *rel = &relocation;
+                uint32_t type;
+                uint32_t sidx;
+                int invokes_resolver;
+
+                if (!loaded_rela_read(obj, table, i, &relocation))
+                    return -1;
+                type = ELF64_R_TYPE(rel->r_info);
+                sidx = ELF64_R_SYM(rel->r_info);
+                invokes_resolver = type == ARCH_RELOC_IRELATIVE;
                 if (!invokes_resolver &&
                     (type == ARCH_RELOC_ABS ||
                      type == ARCH_RELOC_GLOB_DAT ||
@@ -19929,7 +22982,7 @@ static int apply_copy_relocation(struct loaded_obj *obj,
                                  struct loaded_obj *objs, int nobj,
                                  const Elf64_Rela *rel,
                                  const Elf64_Sym *reference,
-                                 const char *name)
+                                 const struct symbol_lookup_query *name_query)
 {
     struct loaded_obj *owner = NULL;
     const Elf64_Sym *definition;
@@ -19953,11 +23006,14 @@ static int apply_copy_relocation(struct loaded_obj *obj,
     definition = lookup_relocation_definition(obj,
         ELF64_R_SYM(rel->r_info), objs, nobj, 1, &owner);
     if (!definition || !owner) {
+        const char *canonical_name = NULL;
         const void *fake_source;
 
-        if (name && lookup_relocation_special(
+        if (name_query && lookup_relocation_special(
                         obj, ELF64_R_SYM(rel->r_info), objs, nobj, 1) &&
-            lookup_fake_object_region(name, &fake_source, &source_size)) {
+            lookup_fake_object_query(name_query, &canonical_name) &&
+            lookup_fake_object_region(
+                canonical_name, &fake_source, &source_size)) {
             copy_size = destination_size < source_size
                 ? destination_size : source_size;
             if (copy_size != 0)
@@ -19965,7 +23021,7 @@ static int apply_copy_relocation(struct loaded_obj *obj,
             return 0;
         }
         if (ELF64_ST_BIND(reference->st_info) != STB_WEAK) {
-            ldr_err("unresolved COPY symbol", name ? name : obj->name);
+            ldr_err_symbol_query("unresolved COPY symbol", name_query);
             return -1;
         }
         return 0;
@@ -19994,11 +23050,47 @@ static int apply_prelinked_runtime_reloc(struct loaded_obj *obj,
     uint32_t type = ELF64_R_TYPE(rel->r_info);
     uint32_t sidx = ELF64_R_SYM(rel->r_info);
     const Elf64_Sym *reference;
-    const char *symbol_name;
+    struct symbol_lookup_query symbol_query;
     void *relocation_slot;
-    int symbolic_ifunc;
+    int ifunc_classification_stable = 1;
+    int symbolic_candidate = 0;
+    int symbolic_ifunc = 0;
 
-    if (validate_relocation_record(obj, rel, &reference, &symbol_name,
+    /* The complete object relocation tables were structurally validated
+     * before any relocation effect, and the prelinked fixup list was then
+     * re-derived from that admitted authority.  Select the one owning phase
+     * before rebuilding the name query and destination proof; skipped graph
+     * phases must not repeat that work for every slot. */
+    if (type == ARCH_RELOC_IRELATIVE) {
+        if (pass != RELOC_PASS_IRELATIVE)
+            return 0;
+    } else if (type == ARCH_RELOC_COPY) {
+        if (pass != RELOC_PASS_COPY)
+            return 0;
+    } else {
+        if (pass != RELOC_PASS_ORDINARY && pass != RELOC_PASS_IFUNC)
+            return 0;
+        symbolic_candidate =
+            type == ARCH_RELOC_ABS || type == ARCH_RELOC_GLOB_DAT ||
+            type == ARCH_RELOC_JUMP_SLOT;
+        symbolic_ifunc =
+            symbolic_candidate &&
+            relocation_symbol_is_ifunc(obj, sidx, objs, nobj);
+        if (symbolic_candidate)
+            ifunc_classification_stable =
+                relocation_ifunc_classification_stable(
+                    obj, sidx, objs, nobj, symbolic_ifunc);
+        if ((pass == RELOC_PASS_IFUNC) != symbolic_ifunc) {
+            if (!ifunc_classification_stable &&
+                validate_relocation_phase_filter_skip(obj, rel) < 0) {
+                ldr_err("malformed relocation in", obj->name);
+                return -1;
+            }
+            return 0;
+        }
+    }
+
+    if (validate_relocation_record(obj, rel, &reference, &symbol_query,
                                    &relocation_slot) < 0) {
         ldr_err("malformed relocation in", obj->name);
         return -1;
@@ -20008,8 +23100,6 @@ static int apply_prelinked_runtime_reloc(struct loaded_obj *obj,
         typedef uint64_t (*ifunc_t)(void);
         ifunc_t resolver;
 
-        if (pass != RELOC_PASS_IRELATIVE)
-            return 0;
         if (relocation_destination_overlaps_tls(
                 obj, rel->r_offset, sizeof(uint64_t))) {
             ldr_err("IFUNC relocation into PT_TLS is unsupported in",
@@ -20022,25 +23112,15 @@ static int apply_prelinked_runtime_reloc(struct loaded_obj *obj,
     }
 
     if (type == ARCH_RELOC_COPY) {
-        if (pass != RELOC_PASS_COPY)
-            return 0;
         if (g_debug) {
             ldr_msg("COPY reloc: ");
-            ldr_msg(symbol_name);
+            ldr_msg_symbol_query(&symbol_query);
             ldr_msg("\n");
         }
         return apply_copy_relocation(obj, objs, nobj, rel, reference,
-                                     symbol_name);
+                                     &symbol_query);
     }
 
-    if (pass != RELOC_PASS_ORDINARY && pass != RELOC_PASS_IFUNC)
-        return 0;
-    symbolic_ifunc =
-        (type == ARCH_RELOC_ABS || type == ARCH_RELOC_GLOB_DAT ||
-         type == ARCH_RELOC_JUMP_SLOT) &&
-        relocation_symbol_is_ifunc(obj, sidx, objs, nobj);
-    if ((pass == RELOC_PASS_IFUNC) != symbolic_ifunc)
-        return 0;
     if (symbolic_ifunc && relocation_destination_overlaps_tls(
             obj, rel->r_offset, sizeof(uint64_t))) {
         ldr_err("IFUNC relocation into PT_TLS is unsupported in",
@@ -20071,13 +23151,15 @@ static int apply_prelinked_runtime_reloc(struct loaded_obj *obj,
                 obj, sidx, objs, nobj, &addr);
 
             if (resolved < 0) {
-                ldr_err("glibc gmon profiling requires the native loader "
-                        "for symbol", symbol_name);
+                ldr_err_symbol_query(
+                    "glibc gmon profiling requires the native loader for "
+                    "symbol", &symbol_query);
                 return -1;
             }
             if (reference && !resolved &&
                 ELF64_ST_BIND(reference->st_info) != STB_WEAK) {
-                ldr_err("unresolved relocation symbol", symbol_name);
+                ldr_err_symbol_query(
+                    "unresolved relocation symbol", &symbol_query);
                 return -1;
             }
 
@@ -20096,7 +23178,6 @@ static int apply_prelinked_runtime_reloc(struct loaded_obj *obj,
         }
 
         if (sidx != 0) {
-            const char *name = symbol_name;
             struct loaded_obj *owner = NULL;
             const Elf64_Sym *definition = lookup_relocation_definition(
                 obj, sidx, objs, nobj, 0, &owner);
@@ -20108,7 +23189,8 @@ static int apply_prelinked_runtime_reloc(struct loaded_obj *obj,
                     return -1;
                 }
             } else if (ELF64_ST_BIND(reference->st_info) != STB_WEAK) {
-                ldr_err("unresolved TLS symbol", name);
+                ldr_err_symbol_query(
+                    "unresolved TLS symbol", &symbol_query);
                 return -1;
             } else
                 value = rel->r_addend;
@@ -20144,7 +23226,8 @@ static int apply_prelinked_runtime_reloc(struct loaded_obj *obj,
             if (definition && owner && owner->tls.modid) {
                 value = owner->tls.modid;
             } else if (ELF64_ST_BIND(reference->st_info) != STB_WEAK) {
-                ldr_err("unresolved TLS module symbol", symbol_name);
+                ldr_err_symbol_query(
+                    "unresolved TLS module symbol", &symbol_query);
                 return -1;
             } else {
                 value = 0;
@@ -20176,7 +23259,8 @@ static int apply_prelinked_runtime_reloc(struct loaded_obj *obj,
                 if (definition)
                     off = definition->st_value;
                 else if (ELF64_ST_BIND(reference->st_info) != STB_WEAK) {
-                    ldr_err("unresolved TLS offset symbol", symbol_name);
+                    ldr_err_symbol_query(
+                        "unresolved TLS offset symbol", &symbol_query);
                     return -1;
                 } else {
                     relocation_store_u64(relocation_slot, 0);
@@ -20207,9 +23291,8 @@ static int apply_prelinked_runtime_reloc(struct loaded_obj *obj,
         return -1;
     }
 
-    const char *required_version = NULL;
     int versioned = relocation_symbol_version(
-        obj, sidx, &required_version, NULL, NULL);
+        obj, sidx, NULL, NULL, NULL, NULL, NULL);
 
     if (versioned < 0) {
         if (g_debug) {
@@ -20218,11 +23301,9 @@ static int apply_prelinked_runtime_reloc(struct loaded_obj *obj,
 
             ldr_dbg_hex("[loader] malformed version symbol index=0x", sidx);
             if (reference) {
-                const char *name = loaded_symbol_name(obj, reference);
-
-                if (name) {
+                if (symbol_query.name) {
                     ldr_msg("[loader] malformed version symbol name=");
-                    ldr_msg(name);
+                    ldr_msg_symbol_query(&symbol_query);
                     ldr_msg("\n");
                 }
                 ldr_dbg_hex("[loader] malformed version shndx=0x",
@@ -20238,19 +23319,20 @@ static int apply_prelinked_runtime_reloc(struct loaded_obj *obj,
         return -1;
     }
     {
-        const char *name = symbol_name;
         uint64_t addr = 0;
         int resolved = resolve_relocation_symbol(
             obj, sidx, objs, nobj, &addr);
 
         if (resolved < 0) {
-            ldr_err("glibc gmon profiling requires the native loader for "
-                    "symbol", name);
+            ldr_err_symbol_query(
+                "glibc gmon profiling requires the native loader for "
+                "symbol", &symbol_query);
             return -1;
         }
         if (!resolved && reference &&
             ELF64_ST_BIND(reference->st_info) != STB_WEAK) {
-            ldr_err("unresolved relocation symbol", name);
+            ldr_err_symbol_query(
+                "unresolved relocation symbol", &symbol_query);
             return -1;
         }
         /* Runtime lookup is authoritative.  In particular, overwrite a
@@ -20259,7 +23341,10 @@ static int apply_prelinked_runtime_reloc(struct loaded_obj *obj,
         relocation_store_u64(relocation_slot, addr);
         if (g_debug) {
             ldr_msg("[loader] relocation ");
-            ldr_msg(name ? name : "<STN_UNDEF>");
+            if (symbol_query.name)
+                ldr_msg_symbol_query(&symbol_query);
+            else
+                ldr_msg("<STN_UNDEF>");
             ldr_dbg_hex(" -> 0x", addr);
         }
     }
@@ -20365,18 +23450,23 @@ static int validate_prelinked_runtime_fixups(
 
         {
             struct loaded_obj *obj = &objs[oi];
-            const Elf64_Rela *tables[] = { obj->rela, obj->jmprel };
-            size_t counts[] = { obj->rela_count, obj->jmprel_count };
             uint64_t expected_object_start = expected_total;
             uint64_t expected_object = 0;
 
-            for (size_t t = 0; t < sizeof(tables) / sizeof(tables[0]); t++) {
-                for (size_t i = 0; i < counts[t]; i++) {
-                    int required =
-                        prelinked_relocation_requires_runtime_fixup(
-                            obj, &tables[t][i]);
-                    uint32_t encoded;
+            for (enum loaded_rela_table table = LOADED_RELA_DYNAMIC;
+                 table < LOADED_RELA_TABLE_COUNT; table++) {
+                size_t count = loaded_rela_table_count(obj, table);
 
+                for (size_t i = 0; i < count; i++) {
+                    Elf64_Rela relocation;
+                    int required;
+                    uint32_t encoded;
+                    uint32_t admitted_encoded;
+
+                    if (!loaded_rela_read(obj, table, i, &relocation))
+                        return -1;
+                    required = prelinked_relocation_requires_runtime_fixup(
+                        obj, &relocation);
                     if (required < 0)
                         return -1;
                     if (!required)
@@ -20384,10 +23474,17 @@ static int validate_prelinked_runtime_fixups(
                     if (i > ~LDR_PRELINK_FIXUP_JMPREL ||
                         expected_total >= runtime_fixup_count)
                         return -1;
-                    encoded = (t ? LDR_PRELINK_FIXUP_JMPREL : 0) |
+                    encoded = (table == LOADED_RELA_PLT
+                                   ? LDR_PRELINK_FIXUP_JMPREL : 0) |
                               (uint32_t)i;
-                    if (!runtime_fixups ||
-                        runtime_fixups[expected_total] != encoded)
+                    if (!runtime_fixups)
+                        return -1;
+                    memcpy(&admitted_encoded,
+                           (const uint8_t *)runtime_fixups +
+                               (size_t)expected_total *
+                                   sizeof(admitted_encoded),
+                           sizeof(admitted_encoded));
+                    if (admitted_encoded != encoded)
                         return -1;
                     expected_total++;
                     expected_object++;
@@ -20410,38 +23507,91 @@ static int validate_prelinked_runtime_fixups(
 
 /* ==== Map one object's PT_LOAD segments ================================ */
 
+struct object_reservation_bounds {
+    uint64_t start;
+    uint64_t load_end;
+    uint64_t end;
+    size_t size;
+};
+
+/* Convert the manifest's assigned load interval into the one reservation
+ * shape used by every embedded object: all PT_LOAD pages followed by four
+ * inaccessible guard pages.  This is only arithmetic admission; after the
+ * program headers have been copied, map_object independently proves that
+ * their exact nonempty PT_LOAD extent agrees with these metadata bounds. */
+static int object_reservation_bounds_from_meta(
+    const struct dlfrz_lib_meta *meta,
+    struct object_reservation_bounds *bounds)
+{
+    uint64_t lo;
+    uint64_t hi;
+    uint64_t guard_size;
+
+    if (!meta || !bounds ||
+        g_page_size < 4096 || g_page_size > 65536 ||
+        (g_page_size & (g_page_size - 1)) != 0 ||
+        (meta->base_addr & (g_page_size - 1)) != 0 ||
+        meta->vaddr_lo >= meta->vaddr_hi ||
+        !u64_align_up_checked(meta->vaddr_hi, g_page_size, &hi))
+        return -1;
+    lo = page_floor(meta->vaddr_lo);
+    if (hi <= lo ||
+        !u64_add_checked(meta->base_addr, lo, &bounds->start) ||
+        !u64_add_checked(meta->base_addr, hi, &bounds->load_end) ||
+        !u64_mul_checked(4, g_page_size, &guard_size) ||
+        !u64_add_checked(bounds->load_end, guard_size, &bounds->end) ||
+        bounds->load_end <= bounds->start || bounds->end <= bounds->load_end ||
+        bounds->end - bounds->start > SIZE_MAX)
+        return -1;
+    bounds->size = (size_t)(bounds->end - bounds->start);
+    return 0;
+}
+
 /* Reserve each startup-mapped object independently.  Lazy manifest objects
  * can sit between promoted closure members in base-address order; reserving
  * the min/max span would consume those dormant objects' future ranges and
  * make their later MAP_FIXED_NOREPLACE admission fail. */
 static int reserve_address_range(const struct dlfrz_lib_meta *metas,
-                                  const int *idx_map, int nobj,
-                                  _Bool memcpy_mode)
+                                 const int *idx_map,
+                                 struct loaded_obj *objs, int nobj)
 {
-    (void)memcpy_mode;
+    int reserved = 0;
+
+    if (!metas || !idx_map || !objs || nobj <= 0)
+        return -1;
     for (int i = 0; i < nobj; i++) {
         int mi = idx_map[i];
-        uint64_t lo = metas[mi].base_addr + page_floor(metas[mi].vaddr_lo);
-        uint64_t hi = metas[mi].base_addr +
-                      ALIGN_UP(metas[mi].vaddr_hi, g_page_size);
-        uint64_t end;
+        struct object_reservation_bounds bounds;
         void *mapping;
 
-        if (hi <= lo || !u64_add_checked(hi, 4 * g_page_size, &end) ||
-            end - lo > SIZE_MAX)
-            return -1;
-        mapping = mmap((void *)(uintptr_t)lo, (size_t)(end - lo),
+        if (object_reservation_bounds_from_meta(&metas[mi], &bounds) < 0 ||
+            objs[i].runtime_reservation || objs[i].runtime_reservation_size)
+            goto fail;
+        mapping = mmap((void *)(uintptr_t)bounds.start, bounds.size,
                        PROT_NONE,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
                        -1, 0);
         if (mapping == MAP_FAILED)
-            return -1;
-        if (mapping != (void *)(uintptr_t)lo) {
-            munmap(mapping, (size_t)(end - lo));
-            return -1;
+            goto fail;
+        if (mapping != (void *)(uintptr_t)bounds.start) {
+            munmap(mapping, bounds.size);
+            goto fail;
         }
+        objs[i].runtime_reservation = mapping;
+        objs[i].runtime_reservation_size = bounds.size;
+        reserved++;
     }
-    return nobj > 0 ? 0 : -1;
+    return 0;
+
+fail:
+    while (reserved > 0) {
+        reserved--;
+        (void)munmap(objs[reserved].runtime_reservation,
+                     objs[reserved].runtime_reservation_size);
+        objs[reserved].runtime_reservation = NULL;
+        objs[reserved].runtime_reservation_size = 0;
+    }
+    return -1;
 }
 
 static int phdr_prot(const Elf64_Phdr *ph)
@@ -20452,6 +23602,38 @@ static int phdr_prot(const Elf64_Phdr *ph)
     if (ph->p_flags & PF_W) prot |= PROT_WRITE;
     if (ph->p_flags & PF_X) prot |= PROT_EXEC;
     return prot;
+}
+
+#ifdef DLFREEZE_FILEBACK_GATE
+static size_t g_fileback_map_attempts;
+static size_t g_fileback_map_accepts;
+#endif
+
+/* This helper may only receive the pinned descriptor covered by the exact
+ * clean-source handoff contract.  Comparing an unproven MAP_PRIVATE candidate
+ * is insufficient: the file could change or truncate after the comparison,
+ * leaving a retained mapping subject to changed bytes or SIGBUS.  Callers
+ * therefore keep every unproven source anonymous and never probe its fd. */
+static int map_fileback_segment(void *target, size_t length, int prot,
+                                int srcfd, off_t file_offset)
+{
+    void *mapping;
+
+#ifdef DLFREEZE_FILEBACK_GATE
+    g_fileback_map_attempts++;
+#endif
+    mapping = mmap(target, length, prot | PROT_READ,
+                   MAP_PRIVATE | MAP_FIXED, srcfd, file_offset);
+    if (mapping == MAP_FAILED)
+        return 0;
+    if (mapping != target) {
+        (void)munmap(mapping, length);
+        return -1;
+    }
+#ifdef DLFREEZE_FILEBACK_GATE
+    g_fileback_map_accepts++;
+#endif
+    return 1;
 }
 
 static int loaded_obj_pages_covered(const struct loaded_obj *obj,
@@ -20490,16 +23672,17 @@ static int loaded_obj_pages_covered(const struct loaded_obj *obj,
     return 1;
 }
 
-static int set_segment_protection(uint64_t base, const Elf64_Phdr *ph,
-                                  int prot)
+static int loaded_segment_page_range(uint64_t base, const Elf64_Phdr *ph,
+                                     uint64_t *start_out,
+                                     uint64_t *end_out)
 {
     uint64_t raw_start;
     uint64_t raw_end;
     uint64_t start;
     uint64_t end;
 
-    if (ph->p_memsz == 0)
-        return 0;
+    if (!ph || !start_out || !end_out || ph->p_memsz == 0)
+        return -1;
     if (!u64_add_checked(base, ph->p_vaddr, &raw_start) ||
         !u64_add_checked(raw_start, ph->p_memsz, &raw_end) ||
         !u64_align_up_checked(raw_end, g_page_size, &end))
@@ -20508,7 +23691,135 @@ static int set_segment_protection(uint64_t base, const Elf64_Phdr *ph,
 
     if (end <= start || end - start > SIZE_MAX)
         return -1;
+    *start_out = start;
+    *end_out = end;
+    return 0;
+}
+
+/* The manifest bounds choose where the reservation is made, but they are not
+ * authority for what the embedded ELF may modify.  Re-derive the exact byte
+ * extent from the copied PHDR authority and prove every nonempty PT_LOAD page
+ * is inside the load portion of that reservation (never its guards) before a
+ * segment mmap or mprotect is attempted. */
+static int object_load_pages_match_reservation(
+    const struct dlfrz_lib_meta *meta, const Elf64_Phdr *phdr,
+    uint16_t phnum, const struct object_reservation_bounds *bounds)
+{
+    uint64_t exact_lo = UINT64_MAX;
+    uint64_t exact_hi = 0;
+    int saw_nonempty_load = 0;
+
+    if (!meta || !phdr || phnum == 0 || !bounds ||
+        bounds->start >= bounds->load_end ||
+        bounds->load_end >= bounds->end ||
+        bounds->end - bounds->start != bounds->size)
+        return -1;
+
+    for (uint16_t i = 0; i < phnum; i++) {
+        const Elf64_Phdr *ph = &phdr[i];
+        uint64_t byte_end;
+        uint64_t page_start;
+        uint64_t page_end;
+
+        if (ph->p_type != PT_LOAD || ph->p_memsz == 0)
+            continue;
+        if (!u64_add_checked(ph->p_vaddr, ph->p_memsz, &byte_end) ||
+            loaded_segment_page_range(meta->base_addr, ph,
+                                      &page_start, &page_end) < 0 ||
+            page_start < bounds->start || page_end > bounds->load_end)
+            return -1;
+        if (!saw_nonempty_load || ph->p_vaddr < exact_lo)
+            exact_lo = ph->p_vaddr;
+        if (!saw_nonempty_load || byte_end > exact_hi)
+            exact_hi = byte_end;
+        saw_nonempty_load = 1;
+    }
+
+    if (!saw_nonempty_load || exact_lo != meta->vaddr_lo ||
+        exact_hi != meta->vaddr_hi)
+        return -1;
+    return 0;
+}
+
+static int set_segment_protection(uint64_t base, const Elf64_Phdr *ph,
+                                  int prot)
+{
+    uint64_t start;
+    uint64_t end;
+
+    if (ph->p_memsz == 0)
+        return 0;
+    if (loaded_segment_page_range(base, ph, &start, &end) < 0)
+        return -1;
     return mprotect((void *)(uintptr_t)start, (size_t)(end - start), prot);
+}
+
+/* A fresh anonymous reservation already supplies every BSS byte as zero.
+ * Before copying an object, make each complete PT_LOAD span which contains
+ * file bytes writable, and merge exactly adjacent spans.  Pure-BSS loads wait
+ * for the final protection pass.  No target code can run in this phase, and
+ * executable permission is deliberately absent until that pass.  Empty gaps
+ * and guard pages are never included in a run. */
+static int make_anonymous_load_runs_writable(
+    uint64_t base, const Elf64_Phdr *phdr, uint16_t phnum)
+{
+    uint64_t previous_end = 0;
+    uint64_t run_start = 0;
+    uint64_t run_end = 0;
+    int have_previous = 0;
+    int have_run = 0;
+
+    if (!phdr || phnum == 0)
+        return -1;
+
+    /* Validate every address before changing any mapping.  The shared ELF
+     * admission has already established ascending, non-overlapping PT_LOAD
+     * pages; retain that invariant here rather than partially transitioning
+     * an object whose relocated address would overflow. */
+    for (uint16_t i = 0; i < phnum; i++) {
+        const Elf64_Phdr *ph = &phdr[i];
+        uint64_t start;
+        uint64_t end;
+
+        if (ph->p_type != PT_LOAD || ph->p_memsz == 0 ||
+            ph->p_filesz == 0)
+            continue;
+        if (loaded_segment_page_range(base, ph, &start, &end) < 0 ||
+            (have_previous && start < previous_end))
+            return -1;
+        previous_end = end;
+        have_previous = 1;
+    }
+
+    for (uint16_t i = 0; i < phnum; i++) {
+        const Elf64_Phdr *ph = &phdr[i];
+        uint64_t start;
+        uint64_t end;
+
+        if (ph->p_type != PT_LOAD || ph->p_memsz == 0 ||
+            ph->p_filesz == 0)
+            continue;
+        if (loaded_segment_page_range(base, ph, &start, &end) < 0)
+            return -1;
+        if (have_run && start == run_end) {
+            run_end = end;
+            continue;
+        }
+        if (have_run &&
+            mprotect((void *)(uintptr_t)run_start,
+                     (size_t)(run_end - run_start),
+                     PROT_READ | PROT_WRITE) < 0)
+            return -1;
+        run_start = start;
+        run_end = end;
+        have_run = 1;
+    }
+    if (have_run &&
+        mprotect((void *)(uintptr_t)run_start,
+                 (size_t)(run_end - run_start),
+                 PROT_READ | PROT_WRITE) < 0)
+        return -1;
+    return 0;
 }
 
 static int make_file_range_writable(uint64_t base, const Elf64_Phdr *ph)
@@ -20639,14 +23950,13 @@ static int classify_program_header_table(const Elf64_Ehdr *ehdr,
 }
 
 static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
+                      uint32_t source_flags,
                       const struct dlfrz_lib_meta *meta,
                       const struct dlfrz_entry *ent,
                       struct loaded_obj *obj,
                       _Bool pre_reserved)
 {
     uint64_t base;
-    uint64_t lo;
-    uint64_t hi;
     uint64_t phdr_vaddr;
     uint64_t phdr_bytes64;
     size_t phdr_bytes;
@@ -20654,15 +23964,17 @@ static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     const Elf64_Ehdr *ehdr;
     Elf64_Phdr *phdr = MAP_FAILED;
     const Elf64_Phdr *dynamic = NULL;
+    struct object_reservation_bounds reservation_bounds;
     int phdr_is_mapped;
+    int anonymous_copy_mode;
     int reservation_created = 0;
 
     if (!mem || !meta || !ent || !obj || ent->data_offset < mem_foff ||
         ent->data_offset - mem_foff > SIZE_MAX)
         return -1;
     base = meta->base_addr;
-    lo = page_floor(meta->vaddr_lo);
-    if (!u64_align_up_checked(meta->vaddr_hi, g_page_size, &hi) || hi <= lo)
+    if (object_reservation_bounds_from_meta(
+            meta, &reservation_bounds) < 0)
         return -1;
     elf_base = mem + (size_t)(ent->data_offset - mem_foff);
     if (!address_has_alignment((uintptr_t)elf_base,
@@ -20682,10 +23994,42 @@ static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
                          &phdr_bytes64) || phdr_bytes64 > SIZE_MAX)
         return -1;
     phdr_bytes = (size_t)phdr_bytes64;
+
+    if (!pre_reserved) {
+        void *mapping;
+
+        /* Reserve the lazy object's assigned range before any internal mmap.
+         * Otherwise the PHDR snapshot itself can occupy the still-dormant
+         * address and make the subsequent NOREPLACE reservation fail. */
+        if (obj->runtime_reservation || obj->runtime_reservation_size)
+            goto fail;
+        mapping = mmap((void *)(uintptr_t)reservation_bounds.start,
+                       reservation_bounds.size,
+                       PROT_NONE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+                       -1, 0);
+        if (mapping == MAP_FAILED)
+            goto fail;
+        if (mapping != (void *)(uintptr_t)reservation_bounds.start) {
+            munmap(mapping, reservation_bounds.size);
+            goto fail;
+        }
+        obj->runtime_reservation = mapping;
+        obj->runtime_reservation_size = reservation_bounds.size;
+        reservation_created = 1;
+    } else if (obj->runtime_reservation !=
+                   (void *)(uintptr_t)reservation_bounds.start ||
+               obj->runtime_reservation_size != reservation_bounds.size) {
+        /* A pre-reserved caller must identify the exact interval it owns.
+         * Merely finding some mapping at a manifest-selected address is not
+         * sufficient authority for later fixed mappings or mprotect calls. */
+        goto fail;
+    }
+
     phdr = mmap(NULL, phdr_bytes, PROT_READ | PROT_WRITE,
                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (phdr == MAP_FAILED)
-        return -1;
+        goto fail;
     memcpy(phdr, elf_base + (size_t)ehdr->e_phoff, phdr_bytes);
 
     if (!dlfrz_load_pages_do_not_overlap(
@@ -20721,36 +24065,29 @@ static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     if (dynamic && !dlfrz_segment_is_contained_by_load(
                        phdr, meta->phdr_num, dynamic))
         goto fail;
+    if (object_load_pages_match_reservation(
+            meta, phdr, meta->phdr_num, &reservation_bounds) < 0)
+        goto fail;
 
-    if (!pre_reserved) {
-        /* Lazy dlopen path — reserve the object's address range now */
-        uint64_t span;
-        if (!u64_add_checked(hi - lo, 4 * g_page_size, &span) ||
-            span > SIZE_MAX)
-            goto fail;
-        void *m = mmap((void *)(base + lo), span,
-                       PROT_NONE,
-                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
-                       -1, 0);
-        if (m == MAP_FAILED)
-            goto fail;  /* address collision — do not use MAP_FIXED */
-        if (m != (void *)(uintptr_t)(base + lo)) {
-            munmap(m, span);
-            goto fail;
-        }
-        obj->runtime_reservation = m;
-        obj->runtime_reservation_size = (size_t)span;
-        reservation_created = 1;
-    }
+    /* An fd without the exact clean-source token is not an mmap candidate.
+     * Populate wholly from the authoritative retained bytes so later file
+     * mutation or truncation cannot affect the loaded object. */
+    anonymous_copy_mode =
+        srcfd < 0 ||
+        (source_flags & DLFRZ_SOURCE_EXACT_CLEAN_FILE) == 0;
+    if (anonymous_copy_mode &&
+        make_anonymous_load_runs_writable(
+            base, phdr, meta->phdr_num) < 0)
+        goto fail;
 
     /* Copy/map each PT_LOAD segment from the payload. */
     for (int i = 0; i < meta->phdr_num; i++) {
         const Elf64_Phdr *ph = &phdr[i];
-        int populated = 0;
+        uint64_t populated_file_bytes = 0;
 
         if (ph->p_type != PT_LOAD || ph->p_memsz == 0) continue;
 
-        if (ph->p_filesz > 0 && srcfd >= 0 && mem_foff == 0 &&
+        if (ph->p_filesz > 0 && !anonymous_copy_mode &&
             (ph->p_vaddr - page_floor(ph->p_vaddr)) ==
                 (ph->p_offset - page_floor(ph->p_offset)) &&
             !(g_perf_mode && (meta->flags & LDR_FLAG_MAIN_EXE))) {
@@ -20759,7 +24096,9 @@ static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
             uint64_t page_delta     = ph->p_vaddr - seg_page_vaddr;
             uint64_t map_input;
             uint64_t map_len;
+            uint64_t safe_map_len;
             uint64_t file_off;
+            uint64_t target_address;
 
             if (!u64_add_checked(page_delta, ph->p_filesz, &map_input) ||
                 !u64_align_up_checked(map_input, g_page_size, &map_len) ||
@@ -20769,32 +24108,52 @@ static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
             /* A packed object is a bounded file within a larger container.
              * Never round an mmap past that embedded EOF: doing so exposes
              * bytes from the next payload entry, unlike mapping the original
-             * ELF.  The anonymous-copy path below preserves the file bytes
-             * and leaves the out-of-file tail zero. */
+             * ELF.  Map every complete source page which is wholly owned by
+             * this entry, then copy only the terminal boundary into the
+             * still-anonymous reservation.  The latter is at most one page:
+             * ELF admission already proved p_offset + p_filesz is in range,
+             * while map_len is that same end rounded up to a page boundary. */
             if (seg_page_off <= ent->data_size &&
-                map_len <= ent->data_size - seg_page_off &&
-                u64_add_checked(ent->data_offset, seg_page_off, &file_off) &&
-                file_off <= (uint64_t)INT64_MAX) {
-                /* Map with the ELF permissions.  Writable relocation targets
-                 * remain writable; text/rodata receive final permissions. */
-                void *m = mmap((void *)(base + seg_page_vaddr),
-                               (size_t)map_len, phdr_prot(ph),
-                               MAP_PRIVATE | MAP_FIXED, srcfd,
-                               (off_t)file_off);
+                seg_page_off <= SIZE_MAX) {
+                uint64_t available = ent->data_size - seg_page_off;
 
-                if (m != MAP_FAILED)
-                    populated = 1;
+                safe_map_len = map_len;
+                if (safe_map_len > available)
+                    safe_map_len = page_floor(available);
+            } else {
+                safe_map_len = 0;
+            }
+            if (safe_map_len > page_delta && safe_map_len <= SIZE_MAX &&
+                u64_add_checked(ent->data_offset, seg_page_off, &file_off) &&
+                file_off <= (uint64_t)INT64_MAX &&
+                u64_add_checked(base, seg_page_vaddr, &target_address)) {
+                int mapped = map_fileback_segment(
+                    (void *)(uintptr_t)target_address,
+                    (size_t)safe_map_len,
+                    phdr_prot(ph), srcfd, (off_t)file_off);
+
+                if (mapped < 0)
+                    goto fail;
+                if (mapped) {
+                    populated_file_bytes = safe_map_len - page_delta;
+                    if (populated_file_bytes > ph->p_filesz)
+                        populated_file_bytes = ph->p_filesz;
+                }
             }
         }
-        if (ph->p_filesz > 0 && !populated) {
-            if (make_file_range_writable(base, ph) < 0)
+        if (populated_file_bytes < ph->p_filesz) {
+            if (!anonymous_copy_mode &&
+                make_file_range_writable(base, ph) < 0)
                 goto fail;
-            memcpy((void *)(base + ph->p_vaddr), elf_base + ph->p_offset,
-                   ph->p_filesz);
+            memcpy((void *)(base + ph->p_vaddr + populated_file_bytes),
+                   elf_base + ph->p_offset + populated_file_bytes,
+                   ph->p_filesz - populated_file_bytes);
         }
         /* Only clear the partial tail of the last file-backed page. Full
-         * .bss pages are already zero from the anonymous reservation. */
-        if (zero_segment_bss_tail(base, ph) < 0)
+         * .bss pages are already zero from the anonymous reservation.  A
+         * purely anonymous producer has not overlaid that tail with file
+         * bytes, so it must remain untouched. */
+        if (!anonymous_copy_mode && zero_segment_bss_tail(base, ph) < 0)
             goto fail;
     }
 
@@ -20805,6 +24164,8 @@ static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         const Elf64_Phdr *ph = &phdr[i];
 
         if (ph->p_type == PT_LOAD && ph->p_memsz != 0 &&
+            !(anonymous_copy_mode && ph->p_filesz != 0 &&
+              phdr_prot(ph) == (PROT_READ | PROT_WRITE)) &&
             set_segment_protection(base, ph, phdr_prot(ph)) < 0)
             goto fail;
     }
@@ -20815,18 +24176,19 @@ static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     obj->elf_type = ehdr->e_type;
     obj->phdr_num = meta->phdr_num;
     if (phdr_is_mapped) {
-        obj->phdr = (const Elf64_Phdr *)(uintptr_t)(base + phdr_vaddr);
-        if (!address_has_alignment((uintptr_t)obj->phdr,
+        obj->public_phdr =
+            (const Elf64_Phdr *)(uintptr_t)(base + phdr_vaddr);
+        if (!address_has_alignment((uintptr_t)obj->public_phdr,
                                    _Alignof(Elf64_Phdr)))
             goto fail;
-        (void)munmap(phdr, phdr_bytes);
     } else {
-        if (mprotect(phdr, phdr_bytes, PROT_READ) < 0)
-            goto fail;
-        obj->phdr = phdr;
-        obj->runtime_phdr_mapping = phdr;
-        obj->runtime_phdr_mapping_size = phdr_bytes;
+        obj->public_phdr = phdr;
     }
+    if (mprotect(phdr, phdr_bytes, PROT_READ) < 0)
+        goto fail;
+    obj->phdr = phdr;
+    obj->runtime_phdr_mapping = phdr;
+    obj->runtime_phdr_mapping_size = phdr_bytes;
     return 0;
 
 fail:
@@ -21281,11 +24643,105 @@ out:
     return result;
 }
 
+struct loaded_dynamic_semantic_name {
+    uint64_t offset;
+    const char *source;
+    const char **destination;
+    size_t length;
+    int present;
+};
+
+static int publish_loaded_dynamic_semantics(
+    struct loaded_obj *obj,
+    int have_soname, uint64_t soname_offset,
+    int have_rpath, uint64_t rpath_offset,
+    int have_runpath, uint64_t runpath_offset,
+    uint64_t dynamic_flags, uint64_t dynamic_flags_1)
+{
+    struct loaded_dynamic_semantic_name names[] = {
+        { soname_offset, NULL, &obj->admitted_soname, 0, have_soname },
+        { rpath_offset, NULL, &obj->admitted_rpath, 0, have_rpath },
+        { runpath_offset, NULL, &obj->admitted_runpath, 0, have_runpath }
+    };
+    size_t mapping_size = 0;
+    uint8_t *mapping = MAP_FAILED;
+    int dynstr_readonly;
+
+    if (!obj || obj->runtime_dynamic_semantic_mapping ||
+        obj->admitted_soname || obj->admitted_rpath ||
+        obj->admitted_runpath)
+        return -1;
+    dynstr_readonly = obj->dynstr && obj->dynstr_size &&
+        loaded_obj_range_declared_readonly(
+            obj, obj->dynstr, obj->dynstr_size);
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        struct symbol_lookup_query query;
+        size_t extent;
+
+        if (!names[i].present)
+            continue;
+        if (names[i].offset > UINT32_MAX ||
+            !(names[i].source = loaded_dynstr_value(
+                  obj, (uint32_t)names[i].offset)) ||
+            !loaded_object_name_query_current(
+                obj, names[i].source, &query) ||
+            query.key.length == SIZE_MAX)
+            return -1;
+        names[i].length = query.key.length;
+        if (dynstr_readonly)
+            continue;
+        extent = names[i].length + 1;
+        if (extent > SIZE_MAX - mapping_size)
+            return -1;
+        mapping_size += extent;
+    }
+
+    if (dynstr_readonly) {
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+            if (names[i].present)
+                *names[i].destination = names[i].source;
+    } else if (mapping_size != 0) {
+        size_t cursor = 0;
+
+        mapping = mmap(NULL, mapping_size, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mapping == MAP_FAILED)
+            return -1;
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+            if (!names[i].present)
+                continue;
+            memcpy(mapping + cursor, names[i].source, names[i].length);
+            mapping[cursor + names[i].length] = '\0';
+            *names[i].destination = (const char *)mapping + cursor;
+            cursor += names[i].length + 1;
+        }
+        if (cursor != mapping_size ||
+            mprotect(mapping, mapping_size, PROT_READ) < 0) {
+            (void)munmap(mapping, mapping_size);
+            obj->admitted_soname = NULL;
+            obj->admitted_rpath = NULL;
+            obj->admitted_runpath = NULL;
+            return -1;
+        }
+        obj->runtime_dynamic_semantic_mapping = mapping;
+        obj->runtime_dynamic_semantic_mapping_size = mapping_size;
+    }
+    obj->admitted_dynamic_flags = dynamic_flags;
+    obj->admitted_dynamic_flags_1 = dynamic_flags_1;
+    return 0;
+}
+
 static int parse_dynamic(struct loaded_obj *obj,
                          const struct dlfrz_lib_meta *meta)
 {
     const Elf64_Phdr *dyn_ph = NULL;
     const Elf64_Dyn *dyn;
+    const Elf64_Rela *raw_rela = NULL;
+    const Elf64_Rela *raw_jmprel = NULL;
+    const Elf64_Relr *raw_relr = NULL;
+    size_t raw_rela_count = 0;
+    size_t raw_jmprel_count = 0;
+    size_t raw_relr_count = 0;
     size_t dyn_slots;
     void *pointer;
     uint64_t symtab = 0, strtab = 0, strsz = 0, syment = 0;
@@ -21299,6 +24755,7 @@ static int parse_dynamic(struct loaded_obj *obj,
     uint64_t versym_addr = 0;
     uint64_t verdef_addr = 0, verdef_num = 0;
     uint64_t verneed_addr = 0, verneed_num = 0;
+    uint64_t soname_offset = 0, rpath_offset = 0, runpath_offset = 0;
     uint64_t dynamic_flags = 0;
     uint64_t dynamic_flags_1 = 0;
     int have_symtab = 0, have_strtab = 0, have_strsz = 0, have_syment = 0;
@@ -21314,7 +24771,8 @@ static int parse_dynamic(struct loaded_obj *obj,
     int have_verneed = 0, have_verneednum = 0;
     int have_relacount = 0;
     int have_dynamic_flags = 0, have_dynamic_flags_1 = 0;
-    int have_symbolic = 0;
+    int have_soname = 0, have_rpath = 0, have_runpath = 0;
+    int have_symbolic = 0, have_bind_now = 0;
     int saw_null = 0;
 
     if (!obj || !meta || !obj->phdr ||
@@ -21391,8 +24849,12 @@ static int parse_dynamic(struct loaded_obj *obj,
         case DT_VERDEFNUM: SET_DYNAMIC_VALUE(have_verdefnum, verdef_num, dyn[i].d_un.d_val); break;
         case DT_VERNEED: SET_DYNAMIC_VALUE(have_verneed, verneed_addr, dyn[i].d_un.d_ptr); break;
         case DT_VERNEEDNUM: SET_DYNAMIC_VALUE(have_verneednum, verneed_num, dyn[i].d_un.d_val); break;
+        case DT_SONAME: SET_DYNAMIC_VALUE(have_soname, soname_offset, dyn[i].d_un.d_val); break;
+        case DT_RPATH: SET_DYNAMIC_VALUE(have_rpath, rpath_offset, dyn[i].d_un.d_val); break;
+        case DT_RUNPATH: SET_DYNAMIC_VALUE(have_runpath, runpath_offset, dyn[i].d_un.d_val); break;
         case DT_RELACOUNT: SET_DYNAMIC_VALUE(have_relacount, relacount, dyn[i].d_un.d_val); break;
         case DT_SYMBOLIC: have_symbolic = 1; break;
+        case 24: /* DT_BIND_NOW */ have_bind_now = 1; break;
         case DT_FLAGS: SET_DYNAMIC_VALUE(have_dynamic_flags, dynamic_flags, dyn[i].d_un.d_val); break;
         case DT_FLAGS_1: SET_DYNAMIC_VALUE(have_dynamic_flags_1, dynamic_flags_1, dyn[i].d_un.d_val); break;
         case DT_TEXTREL:
@@ -21423,19 +24885,13 @@ static int parse_dynamic(struct loaded_obj *obj,
     if (!saw_null)
         return -1;
 
-    {
-        const uint64_t flags_allowed =
-            DF_ORIGIN | DF_SYMBOLIC | DF_BIND_NOW | DF_STATIC_TLS;
-        const uint64_t flags_1_allowed =
-            DF_1_NOW | DF_1_NODELETE | DF_1_ORIGIN | DF_1_NODEFLIB |
-            DF_1_NODUMP | DF_1_NODIRECT | DF_1_PIE;
+    if (have_bind_now)
+        dynamic_flags |= DLFRZ_DF_BIND_NOW;
 
-        if ((dynamic_flags & ~flags_allowed) != 0 ||
-            (dynamic_flags_1 & ~flags_1_allowed) != 0 ||
-            ((dynamic_flags_1 & DF_1_PIE) != 0 &&
-             (meta->flags & LDR_FLAG_MAIN_EXE) == 0))
-            return -1;
-    }
+    if (!dlfrz_dynamic_flags_are_supported(
+            dynamic_flags, dynamic_flags_1,
+            (meta->flags & LDR_FLAG_MAIN_EXE) != 0))
+        return -1;
 
     obj->symbolic_lookup =
         !g_is_musl_runtime && !(meta->flags & LDR_FLAG_MAIN_EXE) &&
@@ -21491,9 +24947,10 @@ static int parse_dynamic(struct loaded_obj *obj,
         obj->dynstr_size = (size_t)strsz;
     }
 
-    /* Relocation symbol indices are a second exact lower bound for dynsym.
-     * GNU hash deliberately omits undefined imports on some linkers (notably
-     * AArch64 GNU ld), so hash chains alone can under-count the table. */
+    /* Admit every relocation byte range before deriving any policy from its
+     * records.  Writable and overlapping tables are published through one
+     * immutable, overlap-coherent authority; ordinary read-only tables stay
+     * direct and require no allocation or copy. */
     if (have_rela) {
         if (rela_sz > SIZE_MAX ||
             !loaded_obj_file_vaddr_pointer(obj, rela, (size_t)rela_sz,
@@ -21501,18 +24958,9 @@ static int parse_dynamic(struct loaded_obj *obj,
             !address_has_alignment((uintptr_t)pointer,
                                    _Alignof(Elf64_Rela)))
             return -1;
-        obj->rela = (const Elf64_Rela *)pointer;
-        obj->rela_count = (size_t)rela_sz / sizeof(Elf64_Rela);
+        raw_rela = (const Elf64_Rela *)pointer;
+        raw_rela_count = (size_t)rela_sz / sizeof(Elf64_Rela);
     }
-    if (relacount > obj->rela_count)
-        return -1;
-    obj->rela_relative_count = (size_t)relacount;
-    for (size_t i = 0; i < obj->rela_relative_count; i++) {
-        if (ELF64_R_TYPE(obj->rela[i].r_info) != ARCH_RELOC_RELATIVE ||
-            ELF64_R_SYM(obj->rela[i].r_info) != 0)
-            return -1;
-    }
-
     if (have_jmprel) {
         if (pltrelsz > SIZE_MAX ||
             !loaded_obj_file_vaddr_pointer(obj, jmprel, (size_t)pltrelsz,
@@ -21520,17 +24968,52 @@ static int parse_dynamic(struct loaded_obj *obj,
             !address_has_alignment((uintptr_t)pointer,
                                    _Alignof(Elf64_Rela)))
             return -1;
-        obj->jmprel = (const Elf64_Rela *)pointer;
-        obj->jmprel_count = (size_t)pltrelsz / sizeof(Elf64_Rela);
+        raw_jmprel = (const Elf64_Rela *)pointer;
+        raw_jmprel_count = (size_t)pltrelsz / sizeof(Elf64_Rela);
     }
+    if (have_relr) {
+        if (relr_sz > SIZE_MAX ||
+            !loaded_obj_file_vaddr_pointer(obj, relr, (size_t)relr_sz,
+                                           &pointer) ||
+            !address_has_alignment((uintptr_t)pointer,
+                                   _Alignof(Elf64_Relr)))
+            return -1;
+        raw_relr = (const Elf64_Relr *)pointer;
+        raw_relr_count = (size_t)relr_sz / sizeof(Elf64_Relr);
+    }
+    if (publish_loaded_relocation_authority(
+            obj, raw_rela, raw_rela_count,
+            raw_jmprel, raw_jmprel_count,
+            raw_relr, raw_relr_count) < 0)
+        return -1;
+
+    if (relacount > obj->rela_count)
+        return -1;
+    obj->rela_relative_count = (size_t)relacount;
+    for (size_t i = 0; i < obj->rela_relative_count; i++) {
+        Elf64_Rela relocation;
+
+        if (!loaded_rela_read(obj, LOADED_RELA_DYNAMIC, i, &relocation) ||
+            ELF64_R_TYPE(relocation.r_info) != ARCH_RELOC_RELATIVE ||
+            ELF64_R_SYM(relocation.r_info) != 0)
+            return -1;
+    }
+
+    /* Relocation symbol indices are a second exact lower bound for dynsym.
+     * GNU hash deliberately omits undefined imports on some linkers (notably
+     * AArch64 GNU ld), so hash chains alone can under-count the table. */
     {
-        const Elf64_Rela *tables[] = { obj->rela, obj->jmprel };
-        size_t counts[] = { obj->rela_count, obj->jmprel_count };
+        for (enum loaded_rela_table table = LOADED_RELA_DYNAMIC;
+             table < LOADED_RELA_TABLE_COUNT; table++) {
+            size_t count = loaded_rela_table_count(obj, table);
 
-        for (size_t t = 0; t < sizeof(tables) / sizeof(tables[0]); t++) {
-            for (size_t i = 0; i < counts[t]; i++) {
-                uint32_t sidx = ELF64_R_SYM(tables[t][i].r_info);
+            for (size_t i = 0; i < count; i++) {
+                Elf64_Rela relocation;
+                uint32_t sidx;
 
+                if (!loaded_rela_read(obj, table, i, &relocation))
+                    return -1;
+                sidx = ELF64_R_SYM(relocation.r_info);
                 if (sidx == UINT32_MAX)
                     return -1;
                 if (sidx + 1 > obj->dynsym_count)
@@ -21567,6 +25050,7 @@ static int parse_dynamic(struct loaded_obj *obj,
         if (view.nchain < obj->dynsym_count)
             return -1;
         obj->dynsym_count = view.nchain;
+        cache_validated_sysv_hash_view(obj, &view);
     }
 
     if (gnu_hash_addr) {
@@ -21601,6 +25085,7 @@ static int parse_dynamic(struct loaded_obj *obj,
                 return -1;
         if (count > obj->dynsym_count)
             obj->dynsym_count = count;
+        cache_validated_gnu_hash_view(obj, &view, count);
     }
 
     if (have_symtab) {
@@ -21628,6 +25113,7 @@ static int parse_dynamic(struct loaded_obj *obj,
                                    _Alignof(Elf64_Sym)))
             return -1;
         obj->dynsym = (const Elf64_Sym *)pointer;
+        obj->dynsym_admitted_count = obj->dynsym_count;
         for (uint32_t i = 0; i < obj->dynsym_count; i++) {
             const Elf64_Sym *sym = loaded_dynsym(obj, i);
 
@@ -21651,6 +25137,7 @@ static int parse_dynamic(struct loaded_obj *obj,
                                    _Alignof(uint16_t)))
             return -1;
         obj->versym = (const uint16_t *)pointer;
+        obj->versym_admitted_count = obj->dynsym_count;
     }
     if (have_verdef) {
         if (!loaded_obj_file_vaddr_pointer(obj, verdef_addr,
@@ -21682,17 +25169,6 @@ static int parse_dynamic(struct loaded_obj *obj,
     }
     if (obj->dynsym && build_loaded_symbol_name_keys(obj) < 0)
         return -1;
-
-    if (have_relr) {
-        if (relr_sz > SIZE_MAX ||
-            !loaded_obj_file_vaddr_pointer(obj, relr, (size_t)relr_sz,
-                                           &pointer) ||
-            !address_has_alignment((uintptr_t)pointer,
-                                   _Alignof(Elf64_Relr)))
-            return -1;
-        obj->relr = (const Elf64_Relr *)pointer;
-        obj->relr_count = (size_t)relr_sz / sizeof(Elf64_Relr);
-    }
 
 #define SET_DYNAMIC_ARRAY(have_ptr, address, have_size, byte_size, field, count_field) do { \
         if ((have_ptr) != (have_size) || (byte_size) % sizeof(void *) != 0 || \
@@ -21729,14 +25205,12 @@ static int parse_dynamic(struct loaded_obj *obj,
         obj->fini_func = (void (*)(void))pointer;
     }
 
-    /* Every dynamic string reference that later drives dependency loading
-     * must be a complete string inside DT_STRTAB. */
+    /* DT_NEEDED remains an admission/discovery stream because native edge
+     * order is semantic.  Every other post-load policy string is published
+     * once below and never recovered from the live tag array again. */
     for (size_t i = 0; i < obj->dynamic_count; i++) {
         switch (obj->dynamic[i].d_tag) {
         case DT_NEEDED:
-        case DT_SONAME:
-        case DT_RPATH:
-        case DT_RUNPATH:
             if (obj->dynamic[i].d_un.d_val > UINT32_MAX ||
                 !loaded_dynstr_value(obj,
                     (uint32_t)obj->dynamic[i].d_un.d_val))
@@ -21744,7 +25218,10 @@ static int parse_dynamic(struct loaded_obj *obj,
             break;
         }
     }
-    return 0;
+    return publish_loaded_dynamic_semantics(
+        obj, have_soname, soname_offset,
+        have_rpath, rpath_offset, have_runpath, runpath_offset,
+        dynamic_flags, dynamic_flags_1);
 }
 
 static int install_public_debug_rendezvous(struct loaded_obj *objs, int nobj)
@@ -21797,29 +25274,104 @@ static int install_public_debug_rendezvous(struct loaded_obj *objs, int nobj)
  * separate graph-wide phases.  This keeps every resolver behind relocation
  * of all TLS templates and other ordinary data. */
 static int apply_relocs_rela(struct loaded_obj *obj,
-                              const Elf64_Rela *rtab, size_t count,
+                              enum loaded_rela_table table,
                               struct loaded_obj *all, int nobj,
                               enum relocation_pass pass)
 {
     uint64_t base = obj->base;
+    size_t count = loaded_rela_table_count(obj, table);
+
     for (size_t i = 0; i < count; i++) {
-        const Elf64_Rela *r = &rtab[i];
-        uint32_t type  = ELF64_R_TYPE(r->r_info);
-        uint32_t sidx  = ELF64_R_SYM(r->r_info);
+        Elf64_Rela relocation;
+        const Elf64_Rela *r = &relocation;
+        uint32_t type;
+        uint32_t sidx;
         const Elf64_Sym *reference;
-        const char *symbol_name;
+        struct symbol_lookup_query symbol_query;
         void *relocation_slot;
+        int ifunc_classification_stable = 1;
+        int symbolic_candidate = 0;
         int symbolic_ifunc;
         int gnu_unique_relocation = 0;
 
-        if (validate_relocation_record(obj, r, &reference, &symbol_name,
+        if (!loaded_rela_read(obj, table, i, &relocation))
+            return -1;
+        type = ELF64_R_TYPE(r->r_info);
+        sidx = ELF64_R_SYM(r->r_info);
+
+        /* validate_object_relocations() admitted every record before this
+         * graph can have effects.  Reconstruct the live symbol query and slot
+         * proof only in the phase which can actually consume the record. */
+        if (type == ARCH_RELOC_IRELATIVE) {
+            if (pass != RELOC_PASS_IRELATIVE)
+                continue;
+        } else if (type == ARCH_RELOC_COPY) {
+            if (pass != RELOC_PASS_COPY)
+                continue;
+        } else {
+            if (pass != RELOC_PASS_ORDINARY &&
+                pass != RELOC_PASS_IFUNC &&
+                pass != RELOC_PASS_GNU_UNIQUE)
+                continue;
+            symbolic_candidate =
+                type == ARCH_RELOC_ABS ||
+                type == ARCH_RELOC_GLOB_DAT ||
+                type == ARCH_RELOC_JUMP_SLOT;
+            symbolic_ifunc =
+                symbolic_candidate &&
+                relocation_symbol_is_ifunc(obj, sidx, all, nobj);
+            if (symbolic_candidate)
+                ifunc_classification_stable =
+                    relocation_ifunc_classification_stable(
+                        obj, sidx, all, nobj, symbolic_ifunc);
+            if (symbolic_ifunc) {
+                if (pass != RELOC_PASS_IFUNC) {
+                    if (!ifunc_classification_stable &&
+                        validate_relocation_phase_filter_skip(obj, r) < 0) {
+                        ldr_err("malformed relocation in", obj->name);
+                        return -1;
+                    }
+                    continue;
+                }
+            } else {
+                if (pass == RELOC_PASS_IFUNC) {
+                    if (!ifunc_classification_stable &&
+                        validate_relocation_phase_filter_skip(obj, r) < 0) {
+                        ldr_err("malformed relocation in", obj->name);
+                        return -1;
+                    }
+                    continue;
+                }
+                if (sidx != 0 &&
+                    (type == ARCH_RELOC_ABS ||
+                     type == ARCH_RELOC_GLOB_DAT ||
+                     type == ARCH_RELOC_JUMP_SLOT ||
+                     type == ARCH_RELOC_TPOFF ||
+                     type == ARCH_RELOC_DTPMOD ||
+                     type == ARCH_RELOC_DTPOFF ||
+                     type == ARCH_RELOC_TLSDESC))
+                    gnu_unique_relocation =
+                        relocation_resolves_gnu_unique(
+                            obj, sidx, all, nobj);
+                if (pass == RELOC_PASS_GNU_UNIQUE &&
+                    !gnu_unique_relocation) {
+                    /* Deferred GNU-unique replay is uncommon and has no
+                     * independent immutable classification cache.  Keep the
+                     * old validate-before-skip rule unconditionally here. */
+                    if (validate_relocation_phase_filter_skip(obj, r) < 0) {
+                        ldr_err("malformed relocation in", obj->name);
+                        return -1;
+                    }
+                    continue;
+                }
+            }
+        }
+        if (validate_relocation_record(obj, r, &reference, &symbol_query,
                                        &relocation_slot) < 0) {
             ldr_err("malformed relocation in", obj->name);
             return -1;
         }
         if (type == ARCH_RELOC_IRELATIVE) {
-            if (pass != RELOC_PASS_IRELATIVE)
-                continue;
             typedef uint64_t (*ifunc_t)(void);
             ifunc_t resolver = (ifunc_t)(base + r->r_addend);
             if (relocation_destination_overlaps_tls(
@@ -21832,34 +25384,11 @@ static int apply_relocs_rela(struct loaded_obj *obj,
             continue;
         }
         if (type == ARCH_RELOC_COPY) {
-            if (pass != RELOC_PASS_COPY)
-                continue;
-
             /* Copy relocations must wait until source DSOs have already
              * applied their own RELATIVE/RELR relocations. */
             if (apply_copy_relocation(obj, all, nobj, r, reference,
-                                      symbol_name) < 0)
+                                      &symbol_query) < 0)
                 return -1;
-            continue;
-        }
-        if (pass != RELOC_PASS_ORDINARY && pass != RELOC_PASS_IFUNC &&
-            pass != RELOC_PASS_GNU_UNIQUE)
-            continue;
-        symbolic_ifunc =
-            (type == ARCH_RELOC_ABS || type == ARCH_RELOC_GLOB_DAT ||
-             type == ARCH_RELOC_JUMP_SLOT) &&
-            relocation_symbol_is_ifunc(obj, sidx, all, nobj);
-        if (!symbolic_ifunc && sidx != 0 &&
-            (type == ARCH_RELOC_ABS || type == ARCH_RELOC_GLOB_DAT ||
-             type == ARCH_RELOC_JUMP_SLOT || type == ARCH_RELOC_TPOFF ||
-             type == ARCH_RELOC_DTPMOD || type == ARCH_RELOC_DTPOFF ||
-             type == ARCH_RELOC_TLSDESC))
-            gnu_unique_relocation = relocation_resolves_gnu_unique(
-                obj, sidx, all, nobj);
-        if (pass == RELOC_PASS_GNU_UNIQUE) {
-            if (!gnu_unique_relocation)
-                continue;
-        } else if ((pass == RELOC_PASS_IFUNC) != symbolic_ifunc) {
             continue;
         }
         if (symbolic_ifunc && relocation_destination_overlaps_tls(
@@ -21900,18 +25429,19 @@ static int apply_relocs_rela(struct loaded_obj *obj,
         case ARCH_RELOC_GLOB_DAT:
         case ARCH_RELOC_JUMP_SLOT:
         case ARCH_RELOC_ABS: {
-            const char *name = symbol_name ? symbol_name : "";
             uint64_t addr = 0;
             int resolved = resolve_relocation_symbol(
                 obj, sidx, all, nobj, &addr);
             if (resolved < 0) {
-                ldr_err("glibc gmon profiling requires the native loader "
-                        "for symbol", name);
+                ldr_err_symbol_query(
+                    "glibc gmon profiling requires the native loader for "
+                    "symbol", &symbol_query);
                 return -1;
             }
             if (reference && !resolved &&
                 ELF64_ST_BIND(reference->st_info) != STB_WEAK) {
-                ldr_err("unresolved relocation symbol", name);
+                ldr_err_symbol_query(
+                    "unresolved relocation symbol", &symbol_query);
                 return -1;
             }
             /* GLOB_DAT and JUMP_SLOT: result = S (no addend per ELF ABI).
@@ -21928,7 +25458,6 @@ static int apply_relocs_rela(struct loaded_obj *obj,
 
         case ARCH_RELOC_TPOFF: {
             if (sidx != 0) {
-                const char *name = symbol_name;
                 struct loaded_obj *owner = NULL;
                 const Elf64_Sym *definition = lookup_relocation_definition(
                     obj, sidx, all, nobj, 0, &owner);
@@ -21945,7 +25474,8 @@ static int apply_relocs_rela(struct loaded_obj *obj,
                     }
                     relocation_store_u64(relocation_slot, (uint64_t)value);
                 } else if (ELF64_ST_BIND(reference->st_info) != STB_WEAK) {
-                    ldr_err("unresolved TLS symbol", name);
+                    ldr_err_symbol_query(
+                        "unresolved TLS symbol", &symbol_query);
                     return -1;
                 } else {
                     relocation_store_u64(
@@ -21976,7 +25506,8 @@ static int apply_relocs_rela(struct loaded_obj *obj,
                 if (definition && owner && owner->tls.modid) {
                     value = owner->tls.modid;
                 } else if (ELF64_ST_BIND(reference->st_info) != STB_WEAK) {
-                    ldr_err("unresolved TLS module symbol", symbol_name);
+                    ldr_err_symbol_query(
+                        "unresolved TLS module symbol", &symbol_query);
                     return -1;
                 } else {
                     value = 0;
@@ -22002,7 +25533,8 @@ static int apply_relocs_rela(struct loaded_obj *obj,
                     if (definition)
                         off = definition->st_value;
                     else if (ELF64_ST_BIND(reference->st_info) != STB_WEAK) {
-                        ldr_err("unresolved TLS offset symbol", symbol_name);
+                        ldr_err_symbol_query(
+                            "unresolved TLS offset symbol", &symbol_query);
                         return -1;
                     } else {
                         relocation_store_u64(relocation_slot, 0);
@@ -22049,35 +25581,260 @@ static int apply_relocs_rela(struct loaded_obj *obj,
     return 0;
 }
 
+/* RELR bitmap runs are locally ascending, but the ELF encoding also permits
+ * a plain list of even direct addresses in arbitrary order.  Admission must
+ * therefore not advance a monotonic PT_LOAD cursor.  Build a temporary
+ * binary-search frontier over the immutable, p_vaddr-sorted PT_LOAD snapshot
+ * instead.  Each retained header is the writable interval which extends the
+ * maximum end seen so far.  For a query starting at V, the last frontier with
+ * p_vaddr <= V has the greatest end of every eligible interval starting at or
+ * before V; testing that one interval is consequently equivalent to the old
+ * "any one writable PT_LOAD contains the complete range" scan.  Adjacent
+ * intervals are never merged, so a relocation cannot straddle them.
+ *
+ * Normal ELF objects have one writable PT_LOAD.  Keep that path allocation
+ * free and use a bounded anonymous scratch mapping only for unusual objects
+ * with more frontier intervals.  The index exists only while admission is
+ * synchronous; replay retains no pointer to it and continues to rely on the
+ * one-shot admission state. */
+#define RELR_WRITABLE_FRONTIER_INLINE 8U
+
+struct relr_writable_load_index {
+    const struct loaded_obj *obj;
+    uint16_t *frontiers;
+    size_t count;
+    void *mapping;
+    size_t mapping_size;
+    int linear_fallback;
+    uint16_t inline_frontiers[RELR_WRITABLE_FRONTIER_INLINE];
+};
+
+#ifdef DLFREEZE_RELR_REPLAY_GATE
+static size_t g_relr_writable_index_phdr_visits;
+static size_t g_relr_writable_index_queries;
+static size_t g_relr_writable_index_mmaps;
+static int g_relr_writable_index_force_allocation_failure;
+#endif
+
+static int relr_writable_load_index_scan(
+    const struct loaded_obj *obj, uint16_t *frontiers,
+    size_t frontier_capacity, size_t *frontier_count_out)
+{
+    uint64_t previous_load_vaddr = 0;
+    uint64_t maximum_writable_end = 0;
+    size_t frontier_count = 0;
+    int saw_load = 0;
+
+    if (!obj || !obj->phdr || obj->phdr_num == 0 ||
+        !frontier_count_out || (frontier_capacity != 0 && !frontiers))
+        return -1;
+
+    for (uint16_t i = 0; i < obj->phdr_num; i++) {
+        const Elf64_Phdr *ph = &obj->phdr[i];
+        uint64_t end;
+
+#ifdef DLFREEZE_RELR_REPLAY_GATE
+        g_relr_writable_index_phdr_visits++;
+#endif
+        if (ph->p_type != PT_LOAD)
+            continue;
+        if ((saw_load && ph->p_vaddr < previous_load_vaddr) ||
+            ph->p_vaddr > UINT64_MAX - ph->p_memsz)
+            return -1;
+        previous_load_vaddr = ph->p_vaddr;
+        saw_load = 1;
+        if (ph->p_memsz == 0 || (ph->p_flags & PF_W) == 0)
+            continue;
+        end = ph->p_vaddr + ph->p_memsz;
+        if (end <= maximum_writable_end)
+            continue;
+        if (frontier_count < frontier_capacity)
+            frontiers[frontier_count] = i;
+        frontier_count++;
+        maximum_writable_end = end;
+    }
+    if (!saw_load)
+        return -1;
+    *frontier_count_out = frontier_count;
+    return 0;
+}
+
+static void relr_writable_load_index_release(
+    struct relr_writable_load_index *index)
+{
+    if (!index)
+        return;
+    if (index->mapping && index->mapping_size)
+        (void)munmap(index->mapping, index->mapping_size);
+    index->obj = NULL;
+    index->frontiers = NULL;
+    index->count = 0;
+    index->mapping = NULL;
+    index->mapping_size = 0;
+    index->linear_fallback = 0;
+}
+
+static int relr_writable_load_index_init(
+    const struct loaded_obj *obj, struct relr_writable_load_index *index)
+{
+    size_t count;
+
+    if (!index)
+        return -1;
+    memset(index, 0, sizeof(*index));
+    index->obj = obj;
+    index->frontiers = index->inline_frontiers;
+    if (relr_writable_load_index_scan(
+            obj, index->inline_frontiers,
+            RELR_WRITABLE_FRONTIER_INLINE, &count) < 0)
+        goto fail;
+    if (count <= RELR_WRITABLE_FRONTIER_INLINE) {
+        index->count = count;
+        return 0;
+    }
+    if (count > SIZE_MAX / sizeof(*index->frontiers))
+        goto fail;
+    index->mapping_size = count * sizeof(*index->frontiers);
+#ifdef DLFREEZE_RELR_REPLAY_GATE
+    if (g_relr_writable_index_force_allocation_failure)
+        goto fallback;
+#endif
+    index->mapping = mmap(NULL, index->mapping_size,
+                          PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (index->mapping == MAP_FAILED) {
+        index->mapping = NULL;
+        goto fallback;
+    }
+#ifdef DLFREEZE_RELR_REPLAY_GATE
+    g_relr_writable_index_mmaps++;
+#endif
+    index->frontiers = index->mapping;
+    {
+        size_t repeated_count;
+
+        if (relr_writable_load_index_scan(
+                obj, index->frontiers, count, &repeated_count) < 0 ||
+            repeated_count != count)
+            goto fail;
+    }
+    index->count = count;
+    return 0;
+
+fallback:
+    /* The frontier is an accelerator, not object-validity authority.  Under
+     * address-space pressure preserve the old exact PF_W PT_LOAD predicate;
+     * malformed or unstable program-header scans above still fail closed. */
+    index->mapping_size = 0;
+    index->frontiers = index->inline_frontiers;
+    index->count = 0;
+    index->linear_fallback = 1;
+    return 0;
+
+fail:
+    relr_writable_load_index_release(index);
+    return -1;
+}
+
+static int relr_writable_load_index_contains(
+    const struct relr_writable_load_index *index,
+    uint64_t vaddr, size_t size)
+{
+    const struct loaded_obj *obj;
+    const Elf64_Phdr *ph;
+    uintptr_t address;
+    uint64_t offset;
+    size_t low = 0;
+    size_t high;
+
+#ifdef DLFREEZE_RELR_REPLAY_GATE
+    g_relr_writable_index_queries++;
+#endif
+    if (!index || !(obj = index->obj) || !index->frontiers || size == 0 ||
+        vaddr > UINTPTR_MAX - obj->base)
+        return 0;
+    address = (uintptr_t)obj->base + (uintptr_t)vaddr;
+    /* Require a representable exclusive runtime end before replay turns the
+     * admitted vaddr into a pointer. */
+    if (size > UINTPTR_MAX - address)
+        return 0;
+    if (index->linear_fallback)
+        return loaded_obj_vaddr_pointer(
+            obj, vaddr, size, PF_W, NULL);
+    if (index->count == 0)
+        return 0;
+
+    high = index->count;
+    while (low < high) {
+        size_t middle = low + (high - low) / 2;
+        uint16_t phdr_index = index->frontiers[middle];
+
+        if (phdr_index >= obj->phdr_num)
+            return 0;
+        if (obj->phdr[phdr_index].p_vaddr <= vaddr)
+            low = middle + 1;
+        else
+            high = middle;
+    }
+    if (low == 0)
+        return 0;
+    ph = &obj->phdr[index->frontiers[low - 1]];
+    if (ph->p_type != PT_LOAD || (ph->p_flags & PF_W) == 0 ||
+        vaddr < ph->p_vaddr)
+        return 0;
+    offset = vaddr - ph->p_vaddr;
+    return offset <= ph->p_memsz && size <= ph->p_memsz - offset;
+}
+
 static int walk_relr(struct loaded_obj *obj, int apply)
 {
+    struct relr_writable_load_index writable_index = {0};
     uint64_t where_offset = 0;
     int have_where = 0;
+    int result = -1;
 
-    if (!obj->relr || obj->relr_count == 0)
+    if (!obj || ((obj->relr == NULL) != (obj->relr_count == 0)))
+        return -1;
+    if (obj->relr_count == 0)
         return 0;
+    if (apply) {
+        if (obj->relr_replay_state != LOADED_RELR_ADMITTED)
+            return -1;
+    } else if (obj->relr_replay_state != LOADED_RELR_UNADMITTED) {
+        return -1;
+    }
+    if (!apply && relr_writable_load_index_init(
+                      obj, &writable_index) < 0)
+        return -1;
     uint64_t base = obj->base;
 
     for (size_t i = 0; i < obj->relr_count; i++) {
-        Elf64_Relr entry = obj->relr[i];
+        Elf64_Relr entry;
+
+        if (!loaded_relr_read(obj, i, &entry))
+            goto out;
         if ((entry & 1) == 0) {
             void *where;
 
-            if (!loaded_obj_vaddr_pointer(obj, entry, sizeof(uint64_t), PF_W,
-                                          &where))
-                return -1;
-            if (apply)
+            if (apply) {
+                /* The immutable RELR authority and immutable PT_LOAD
+                 * snapshot are the exact inputs admitted above. */
+                where = (void *)(uintptr_t)(base + entry);
                 relocation_store_u64(
                     where, relocation_load_u64(where) + base);
+            } else if (!relr_writable_load_index_contains(
+                           &writable_index, entry, sizeof(uint64_t))) {
+                goto out;
+            }
             if (entry > UINT64_MAX - sizeof(uint64_t))
-                return -1;
+                goto out;
             where_offset = entry + sizeof(uint64_t);
             have_where = 1;
         } else {
             uint64_t bitmap = entry >> 1;
 
             if (!have_where)
-                return -1;
+                goto out;
             for (unsigned int j = 0; bitmap; j++, bitmap >>= 1) {
                 uint64_t offset;
                 void *where;
@@ -22086,21 +25843,29 @@ static int walk_relr(struct loaded_obj *obj, int apply)
                     continue;
                 if (where_offset > UINT64_MAX -
                                    (uint64_t)j * sizeof(uint64_t))
-                    return -1;
+                    goto out;
                 offset = where_offset + (uint64_t)j * sizeof(uint64_t);
-                if (!loaded_obj_vaddr_pointer(obj, offset, sizeof(uint64_t),
-                                              PF_W, &where))
-                    return -1;
-                if (apply)
+                if (apply) {
+                    where = (void *)(uintptr_t)(base + offset);
                     relocation_store_u64(
                         where, relocation_load_u64(where) + base);
+                } else if (!relr_writable_load_index_contains(
+                               &writable_index, offset, sizeof(uint64_t))) {
+                    goto out;
+                }
             }
             if (where_offset > UINT64_MAX - 63 * sizeof(uint64_t))
-                return -1;
+                goto out;
             where_offset += 63 * sizeof(uint64_t);
         }
     }
-    return 0;
+    if (apply)
+        obj->relr_replay_state = LOADED_RELR_REPLAYED;
+    result = 0;
+
+out:
+    relr_writable_load_index_release(&writable_index);
+    return result;
 }
 
 /* _mcleanup in glibc's gmon implementation calls the libc-private
@@ -22120,22 +25885,30 @@ static int loaded_object_requires_native_glibc_gmon(
     for (uint32_t i = 1; i < obj->dynsym_count; i++) {
         const Elf64_Sym *symbol = loaded_dynsym(obj, i);
         const char *name;
+        struct symbol_lookup_query name_query;
 
         if (!symbol || symbol->st_shndx != SHN_UNDEF)
             continue;
         name = loaded_symbol_name(obj, symbol);
-        if (!name)
+        if (!name || !loaded_object_name_query_current(
+                         obj, name, &name_query))
             return 1;
-        if (symbol_requires_native_glibc_gmon(name)) {
+        if (symbol_query_requires_native_glibc_gmon(&name_query)) {
             const char *version = NULL;
             const char *provider = NULL;
+            const struct loaded_symbol_name_key *provider_key = NULL;
+            struct symbol_lookup_query provider_query;
             int versioned = relocation_symbol_version(
-                obj, i, &version, NULL, &provider);
+                obj, i, &version, NULL, NULL, &provider, &provider_key);
 
             if (versioned < 0 ||
                 (versioned > 0 && (!version || !provider)))
                 return 1;
-            if (versioned > 0 && strcmp(provider, "libc.so.6") == 0)
+            if (versioned > 0 &&
+                (!symbol_lookup_query_init_object_name(
+                    obj, provider, provider_key, &provider_query) ||
+                 symbol_lookup_query_eq_cstr(
+                    &provider_query, "libc.so.6")))
                 return 1;
         }
     }
@@ -22144,16 +25917,93 @@ static int loaded_object_requires_native_glibc_gmon(
 
 static int validate_object_relocations(struct loaded_obj *obj)
 {
-    const Elf64_Rela *tables[] = { obj->rela, obj->jmprel };
-    size_t counts[] = { obj->rela_count, obj->jmprel_count };
-
+    if (!obj || obj->relr_replay_state != LOADED_RELR_UNADMITTED)
+        return -1;
     if (walk_relr(obj, 0) < 0)
         return -1;
-    for (size_t t = 0; t < sizeof(tables) / sizeof(tables[0]); t++) {
-        for (size_t i = 0; i < counts[t]; i++) {
-            if (validate_relocation_record(obj, &tables[t][i], NULL, NULL,
+    for (enum loaded_rela_table table = LOADED_RELA_DYNAMIC;
+         table < LOADED_RELA_TABLE_COUNT; table++) {
+        size_t count = loaded_rela_table_count(obj, table);
+
+        for (size_t i = 0; i < count; i++) {
+            Elf64_Rela relocation;
+
+            if (!loaded_rela_read(obj, table, i, &relocation) ||
+                validate_relocation_record(obj, &relocation, NULL, NULL,
                                            NULL) < 0)
                 return -1;
+        }
+    }
+    if (obj->relr_count != 0) {
+        /* RELR's implicit addend makes a pre-applied payload unsafe for the
+         * native loader: extraction would add the load bias a second time.
+         * The packer therefore validates but never serializes RELR effects.
+         * Both prelinked and ordinary objects consume the same admitted,
+         * one-shot runtime replay capability. */
+        obj->relr_replay_state = LOADED_RELR_ADMITTED;
+    }
+    return 0;
+}
+
+/* GNU startup loading is lazy for an object's PLT unless that object asks
+ * for immediate binding.  The direct loader intentionally has no PLT
+ * trampoline/resolver, so an unresolved JUMP_SLOT cannot be eagerly
+ * rewritten without changing a program which never calls that slot.  This
+ * includes weak imports: a later RTLD_GLOBAL load may define one before its
+ * first call.  Detect exactly that case after the startup lookup graph is
+ * complete, but without resolving an IFUNC or otherwise invoking target
+ * code.  A supervised child can then return quietly and let the native
+ * loader preserve lazy semantics.  musl is deliberately excluded by the
+ * caller because it binds eagerly for both public modes. */
+static int startup_find_unresolved_lazy_plt_import(
+    struct loaded_obj *objs, int nobj, struct loaded_obj **requester_out,
+    struct symbol_lookup_query *query_out)
+{
+    if (requester_out)
+        *requester_out = NULL;
+    if (query_out)
+        memset(query_out, 0, sizeof(*query_out));
+    if (!objs || nobj < 0)
+        return 1;
+    for (int oi = 0; oi < nobj; oi++) {
+        struct loaded_obj *obj = &objs[oi];
+
+        if ((obj->flags & LDR_FLAG_DLOPEN) != 0 ||
+            (obj->admitted_dynamic_flags & DLFRZ_DF_BIND_NOW) != 0 ||
+            (obj->admitted_dynamic_flags_1 & DLFRZ_DF_1_NOW) != 0)
+            continue;
+        for (size_t i = 0; i < obj->jmprel_count; i++) {
+            Elf64_Rela relocation;
+            uint32_t symbol_index;
+            const Elf64_Sym *reference;
+            struct loaded_obj *owner = NULL;
+
+            if (!loaded_rela_read(
+                    obj, LOADED_RELA_PLT, i, &relocation))
+                return 1;
+            if (ELF64_R_TYPE(relocation.r_info) != ARCH_RELOC_JUMP_SLOT)
+                continue;
+            symbol_index = ELF64_R_SYM(relocation.r_info);
+            if (symbol_index == 0) {
+                if (requester_out)
+                    *requester_out = obj;
+                return 1;
+            }
+            reference = loaded_dynsym(obj, symbol_index);
+            if (!reference)
+                return 1;
+            if (lookup_relocation_special(
+                    obj, symbol_index, objs, nobj, 0) != 0)
+                continue;
+            if (lookup_relocation_definition(
+                    obj, symbol_index, objs, nobj, 0, &owner) && owner)
+                continue;
+            if (requester_out)
+                *requester_out = obj;
+            if (query_out)
+                (void)symbol_lookup_query_init_dynsym(
+                    obj, symbol_index, objs, nobj, query_out);
+            return 1;
         }
     }
     return 0;
@@ -22172,31 +26022,38 @@ static int validate_object_relocations(struct loaded_obj *obj)
 static int preseed_rtld_got(struct loaded_obj *obj,
                             struct loaded_obj *objs, int nobj)
 {
-    const Elf64_Rela *tabs[] = { obj->rela, obj->jmprel };
-    size_t counts[] = { obj->rela_count, obj->jmprel_count };
-    for (int t = 0; t < 2; t++) {
-        for (size_t i = 0; i < counts[t]; i++) {
-            const Elf64_Rela *r = &tabs[t][i];
-            uint32_t type = ELF64_R_TYPE(r->r_info);
+    for (enum loaded_rela_table table = LOADED_RELA_DYNAMIC;
+         table < LOADED_RELA_TABLE_COUNT; table++) {
+        size_t count = loaded_rela_table_count(obj, table);
+
+        for (size_t i = 0; i < count; i++) {
+            Elf64_Rela relocation;
+            const Elf64_Rela *r = &relocation;
+            uint32_t type;
             uint32_t sidx;
-            const char *name;
+            const char *canonical_name = NULL;
+            struct symbol_lookup_query name_query;
             uint64_t addr = 0;
             const Elf64_Sym *reference;
             void *relocation_slot;
 
+            if (!loaded_rela_read(obj, table, i, &relocation))
+                return -1;
+            type = ELF64_R_TYPE(r->r_info);
             if (type != ARCH_RELOC_GLOB_DAT && type != ARCH_RELOC_JUMP_SLOT)
                 continue;
             sidx = ELF64_R_SYM(r->r_info);
             if (sidx == 0)
                 continue;
-            if (validate_relocation_record(obj, r, &reference, &name,
+            if (validate_relocation_record(obj, r, &reference, &name_query,
                                            &relocation_slot) < 0)
                 return -1;
             (void)reference;
-            if (name[0] != '_')
+            if (name_query.key.length == 0 || name_query.name[0] != '_')
                 continue;
 
-            if (lookup_fake_object(name))
+            if (lookup_fake_object_query(&name_query, &canonical_name) &&
+                canonical_name)
                 addr = lookup_relocation_special(
                     obj, sidx, objs, nobj, 0);
 
@@ -22206,7 +26063,7 @@ static int preseed_rtld_got(struct loaded_obj *obj,
                 relocation_store_u64(relocation_slot, addr);
                 if (g_debug) {
                     ldr_msg("GOT preseed: ");
-                    ldr_msg(name);
+                    ldr_msg_symbol_query(&name_query);
                     ldr_msg(" in ");
                     ldr_msg(obj->name);
                     ldr_msg("\n");
@@ -22231,13 +26088,15 @@ static int apply_all_relocs(struct loaded_obj *obj,
 
     /* RELA (.rela.dyn) */
     if (obj->rela_count > 0) {
-        if (apply_relocs_rela(obj, obj->rela, obj->rela_count, all, nobj, pass) < 0)
+        if (apply_relocs_rela(obj, LOADED_RELA_DYNAMIC,
+                              all, nobj, pass) < 0)
             return -1;
     }
 
     /* JMPREL (.rela.plt) */
     if (obj->jmprel_count > 0) {
-        if (apply_relocs_rela(obj, obj->jmprel, obj->jmprel_count, all, nobj, pass) < 0)
+        if (apply_relocs_rela(obj, LOADED_RELA_PLT,
+                              all, nobj, pass) < 0)
             return -1;
     }
 
@@ -22527,7 +26386,7 @@ static int init_libc_process_state(struct loaded_obj *objs, int nobj,
     return 0;
 }
 
-/* ==== Set final memory protections ===================================== */
+/* ==== Seal relocation-time writable pages ============================== */
 
 static int protect_object(struct loaded_obj *obj,
                           const struct dlfrz_lib_meta *meta)
@@ -22539,16 +26398,12 @@ static int protect_object(struct loaded_obj *obj,
         !address_has_alignment((uintptr_t)phdr, _Alignof(Elf64_Phdr)))
         return -1;
 
-    for (int i = 0; i < meta->phdr_num; i++) {
-        const Elf64_Phdr *ph = &phdr[i];
-        if (ph->p_type != PT_LOAD || ph->p_memsz == 0) continue;
-
-        if (set_segment_protection(obj->base, ph, phdr_prot(ph)) < 0)
-            return -1;
-    }
-
-    /* GNU_RELRO is writable while relocations are applied, then becomes
-     * read-only before any constructor or application code runs. */
+    /* Both packed-object and filesystem-object mapping paths restore every
+     * PT_LOAD to its final ELF permissions before publishing the object.
+     * Relocations are admitted only into PF_W segments and do not change VMA
+     * permissions, so repeating those mprotect calls here is unnecessary.
+     * GNU_RELRO alone remains writable while relocations are applied, then
+     * becomes read-only before any constructor or application code runs. */
     for (int i = 0; i < meta->phdr_num; i++) {
         const Elf64_Phdr *relro = &phdr[i];
         uint64_t relro_start, relro_end;
@@ -22581,6 +26436,13 @@ static int protect_object(struct loaded_obj *obj,
  * which read that image's compiled-default table.  No interpreter init code,
  * symbol lookup, constructors, or private link-map state is executed. */
 static struct loaded_obj g_target_tunable_service;
+#if defined(__x86_64__)
+enum { TARGET_X86_CPU_PREFIX_MAX = 424 };
+typedef void (*target_x86_cpu_wrapper_fn)(void);
+static uint8_t *g_target_x86_service_glro;
+static size_t g_target_x86_service_glro_size;
+static target_x86_cpu_wrapper_fn g_target_x86_cpu_wrapper;
+#endif
 
 static int target_service_range_is_available(
     uintptr_t start, size_t size, const struct dlfrz_lib_meta *metas,
@@ -23313,20 +27175,23 @@ static int target_service_local_relocation_value(
 
 static int relocate_target_tunable_service(struct loaded_obj *obj)
 {
-    const Elf64_Rela *tables[] = { obj->rela, obj->jmprel };
-    size_t counts[] = { obj->rela_count, obj->jmprel_count };
-
     if (walk_relr(obj, 1) < 0)
         return -1;
-    for (size_t table = 0; table < sizeof(tables) / sizeof(tables[0]);
-         table++) {
-        for (size_t i = 0; i < counts[table]; i++) {
-            const Elf64_Rela *rel = &tables[table][i];
+    for (enum loaded_rela_table table = LOADED_RELA_DYNAMIC;
+         table < LOADED_RELA_TABLE_COUNT; table++) {
+        size_t count = loaded_rela_table_count(obj, table);
+
+        for (size_t i = 0; i < count; i++) {
+            Elf64_Rela relocation;
+            const Elf64_Rela *rel = &relocation;
             const Elf64_Sym *reference = NULL;
             void *slot_pointer;
             uint64_t value;
-            uint32_t type = ELF64_R_TYPE(rel->r_info);
+            uint32_t type;
 
+            if (!loaded_rela_read(obj, table, i, &relocation))
+                return -1;
+            type = ELF64_R_TYPE(rel->r_info);
             if (validate_relocation_record(obj, rel, &reference, NULL,
                                            &slot_pointer) < 0)
                 return -1;
@@ -23368,8 +27233,69 @@ static int relocate_target_tunable_service(struct loaded_obj *obj)
     return 0;
 }
 
+#if defined(__x86_64__)
+static int initialize_target_x86_cpu_service_contract(
+    const struct loaded_obj *obj)
+{
+    const Elf64_Sym *glro_symbol;
+    void *glro = NULL;
+    void *wrapper = NULL;
+    void *wrapper_file = NULL;
+    uint64_t cpu_end;
+
+    if (!obj || !obj->phdr || !g_glibc_x86_cpu_contract_ready ||
+        !g_glibc_getauxval_contract_ready ||
+        g_glibc_x86_cpu_contract.published_prefix_size == 0 ||
+        g_glibc_x86_cpu_contract.published_prefix_size >
+            TARGET_X86_CPU_PREFIX_MAX)
+        return -1;
+    for (uint16_t i = 0; i < obj->phdr_num; i++) {
+        if (obj->phdr[i].p_type == PT_TLS)
+            return -1;
+        if (obj->phdr[i].p_type == PT_LOAD &&
+            (obj->phdr[i].p_flags & (PF_W | PF_X)) == (PF_W | PF_X))
+            return -1;
+    }
+    if (unique_default_exported_symbol(
+            obj, "_rtld_global_ro", &glro_symbol) !=
+            UNIQUE_DEFAULT_SYMBOL_FOUND ||
+        !glro_symbol || glro_symbol->st_shndx == SHN_UNDEF ||
+        glro_symbol->st_shndx >= SHN_LORESERVE ||
+        ELF64_ST_TYPE(glro_symbol->st_info) != STT_OBJECT ||
+        glro_symbol->st_size == 0 || glro_symbol->st_size > GLRO_SIZE ||
+        glro_symbol->st_size > SIZE_MAX ||
+        !loaded_obj_vaddr_pointer(
+            obj, glro_symbol->st_value, (size_t)glro_symbol->st_size,
+            PF_R, &glro) ||
+        !address_has_alignment((uintptr_t)glro, sizeof(uint64_t)) ||
+        !u64_add_checked(
+            g_glibc_x86_cpu_contract.cpu_features_offset,
+            g_glibc_x86_cpu_contract.layout.object_size, &cpu_end) ||
+        cpu_end > glro_symbol->st_size ||
+        g_glibc_getauxval_contract.hwcap_offset > glro_symbol->st_size ||
+        sizeof(uintptr_t) > glro_symbol->st_size -
+            g_glibc_getauxval_contract.hwcap_offset ||
+        g_glibc_getauxval_contract.hwcap2_offset > glro_symbol->st_size ||
+        sizeof(uintptr_t) > glro_symbol->st_size -
+            g_glibc_getauxval_contract.hwcap2_offset ||
+        !loaded_obj_vaddr_pointer(
+            obj, g_glibc_x86_cpu_contract.wrapper_vaddr, 32, PF_X,
+            &wrapper) ||
+        !loaded_obj_file_vaddr_pointer(
+            obj, g_glibc_x86_cpu_contract.wrapper_vaddr, 32,
+            &wrapper_file) || wrapper != wrapper_file)
+        return -1;
+
+    g_target_x86_service_glro = glro;
+    g_target_x86_service_glro_size = (size_t)glro_symbol->st_size;
+    g_target_x86_cpu_wrapper = (target_x86_cpu_wrapper_fn)wrapper;
+    return 0;
+}
+#endif
+
 static int initialize_target_tunable_service(
     const uint8_t *mem, uint64_t mem_foff, int srcfd,
+    uint32_t source_flags,
     const struct dlfrz_lib_meta *metas,
     const struct dlfrz_entry *entries, const char *strtab,
     uint32_t num_entries)
@@ -23381,6 +27307,12 @@ static int initialize_target_tunable_service(
     void *reservation = MAP_FAILED;
     void *rejected[MAX_TOTAL_OBJS];
     size_t rejected_count = 0;
+
+#if defined(__x86_64__)
+    g_target_x86_service_glro = NULL;
+    g_target_x86_service_glro_size = 0;
+    g_target_x86_cpu_wrapper = NULL;
+#endif
 
     for (uint32_t i = 0; i < num_entries; i++) {
         if (!(metas[i].flags & LDR_FLAG_INTERP))
@@ -23433,7 +27365,8 @@ static int initialize_target_tunable_service(
     obj->flags = LDR_FLAG_INTERP;
     obj->runtime_reservation = reservation;
     obj->runtime_reservation_size = (size_t)span64;
-    if (map_object(mem, mem_foff, srcfd, &service_meta, entry, obj, 1) < 0)
+    if (map_object(mem, mem_foff, srcfd, source_flags,
+                   &service_meta, entry, obj, 1) < 0)
         goto fail;
     obj->map_start = obj->base + page_floor(service_meta.vaddr_lo);
     obj->map_end = obj->base + service_meta.vaddr_hi;
@@ -23442,6 +27375,10 @@ static int initialize_target_tunable_service(
         validate_object_relocations(obj) < 0 ||
         relocate_target_tunable_service(obj) < 0)
         goto fail;
+#if defined(__x86_64__)
+    if (initialize_target_x86_cpu_service_contract(obj) < 0)
+        goto fail;
+#endif
 
     {
         void *get_value = NULL;
@@ -23477,6 +27414,11 @@ static int initialize_target_tunable_service(
 fail:
     g_target_tunable_get_val = NULL;
     g_target_tunable_is_initialized = NULL;
+#if defined(__x86_64__)
+    g_target_x86_service_glro = NULL;
+    g_target_x86_service_glro_size = 0;
+    g_target_x86_cpu_wrapper = NULL;
+#endif
     if (obj->runtime_reservation || obj->runtime_phdr_mapping) {
         dl_release_runtime_mapping(obj);
         reservation = MAP_FAILED;
@@ -23486,6 +27428,431 @@ fail:
         (void)munmap(reservation, (size_t)span64);
     return -1;
 }
+
+#if defined(__x86_64__)
+enum {
+    TARGET_X86_CPU_OBJECT_MAX = 528,
+    TARGET_X86_CPU_PROBE_CHILD_PREP = 120,
+    TARGET_X86_CPU_PROBE_CHILD_TARGET = 121,
+    TARGET_X86_CPU_PROBE_FAILED = -1,
+    TARGET_X86_CPU_PROBE_UNAVAILABLE = -2,
+    TARGET_X86_CPU_PROBE_CONTAINMENT_LOST = -3
+};
+
+#define TARGET_X86_CPU_PROBE_MAGIC UINT64_C(0x444c46525a435055)
+#define TARGET_X86_CPU_PROBE_VERSION UINT32_C(1)
+#define TARGET_X86_WAIT_CLONE UINT32_C(0x80000000)
+#define TARGET_X86_WAIT_NOHANG UINT32_C(1)
+
+struct target_x86_cpu_probe_result {
+    uint64_t magic;
+    uint32_t version;
+    uint32_t object_size;
+    uint32_t kind;
+    uint32_t reserved;
+    uintptr_t hwcap;
+    uintptr_t hwcap2;
+    uint8_t cpu[TARGET_X86_CPU_OBJECT_MAX];
+};
+
+_Static_assert(sizeof(struct target_x86_cpu_probe_result) <= PIPE_BUF,
+               "contained CPU probe result must be one atomic pipe write");
+
+static int target_x86_glro_ranges_overlap(uint64_t first,
+                                           uint64_t first_size,
+                                           uint64_t second,
+                                           uint64_t second_size)
+{
+    if (first > UINT64_MAX - first_size ||
+        second > UINT64_MAX - second_size)
+        return 1;
+    return first < second + second_size &&
+           second < first + first_size;
+}
+
+static void target_x86_cpu_probe_child_exit(int status)
+    __attribute__((noreturn));
+static void target_x86_cpu_probe_child_exit(int status)
+{
+    (void)arch_raw_syscall1(SYS_exit, status);
+    (void)arch_raw_syscall1(SYS_exit_group, status);
+    for (;;) {}
+}
+
+static int target_x86_cpu_probe_poll(int fd, short events,
+                                     unsigned int rounds,
+                                     short *revents_out)
+{
+    for (unsigned int round = 0; round < rounds; round++) {
+        struct pollfd descriptor;
+        long result;
+
+        descriptor.fd = fd;
+        descriptor.events = events;
+        descriptor.revents = 0;
+        result = arch_raw_syscall3(
+            SYS_poll, (long)&descriptor, 1, 100);
+        if (raw_syscall_failed(result)) {
+            if (result == -EINTR)
+                continue;
+            return -1;
+        }
+        if (result == 0)
+            continue;
+        if (descriptor.revents & (POLLERR | POLLNVAL))
+            return -1;
+        if (descriptor.revents & events) {
+            if (revents_out)
+                *revents_out = descriptor.revents;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int target_x86_cpu_probe_reap(long child, int terminate,
+                                     int *status_out)
+{
+    int status = 0;
+
+    if (terminate) {
+        /* Even if a sandbox denies SIGKILL, the child may already be a
+         * waitable zombie.  Always make the same bounded __WCLONE reap
+        * attempts before declaring containment lost. */
+        (void)arch_raw_syscall2(SYS_kill, child, SIGKILL);
+    }
+    for (unsigned int attempt = 0; attempt < 64; attempt++) {
+        long waited = arch_raw_syscall4(
+            SYS_wait4, child, (long)&status,
+            TARGET_X86_WAIT_CLONE | TARGET_X86_WAIT_NOHANG, 0);
+
+        if (waited == child) {
+            if (status_out)
+                *status_out = status;
+            return 1;
+        }
+        if (raw_syscall_failed(waited)) {
+            if (waited == -EINTR)
+                continue;
+            return 0;
+        }
+        if (waited != 0)
+            return 0;
+        /* Bounded raw sleep; inherited SIGCHLD dispositions and handlers do
+         * not participate in reaping an exit-signal-zero clone child. */
+        {
+            struct pollfd no_descriptors;
+            long paused;
+
+            no_descriptors.fd = -1;
+            no_descriptors.events = 0;
+            no_descriptors.revents = 0;
+            paused = arch_raw_syscall3(
+                SYS_poll, (long)&no_descriptors, 0, 10);
+            if (raw_syscall_failed(paused) && paused != -EINTR)
+                return 0;
+        }
+    }
+    return 0;
+}
+
+static void target_x86_cpu_probe_child(int result_fd, int result_read_fd,
+                                       int handoff_fd)
+    __attribute__((noreturn));
+static void target_x86_cpu_probe_child(int result_fd, int result_read_fd,
+                                       int handoff_fd)
+{
+    struct target_x86_cpu_probe_result result;
+    uint8_t *cpu;
+    uint64_t all_signals = UINT64_MAX;
+    uint32_t kind;
+    long written;
+
+    /* The clone is an internal COW probe, not another bootstrap worker.  It
+     * must not keep either the parent's result reader or the supervisor's
+     * handoff writer alive if target initialization stalls or is killed. */
+    if (result_read_fd >= 0)
+        (void)arch_raw_close(result_read_fd);
+    if (handoff_fd >= 0)
+        (void)arch_raw_close(handoff_fd);
+    if (g_frozen_srcfd >= 0)
+        (void)arch_raw_close(g_frozen_srcfd);
+
+    if (arch_raw_syscall4(
+            SYS_rt_sigprocmask, SIG_SETMASK, (long)&all_signals, 0,
+            sizeof(all_signals)) < 0)
+        target_x86_cpu_probe_child_exit(
+            TARGET_X86_CPU_PROBE_CHILD_PREP);
+    /* protect_object sealed the interpreter's RELRO.  Restore write access
+     * to each data PT_LOAD only in this COW child: CPU initialization also
+     * updates target-owned numeric state adjacent to _rtld_global_ro. */
+    for (uint16_t i = 0; i < g_target_tunable_service.phdr_num; i++) {
+        const Elf64_Phdr *phdr = &g_target_tunable_service.phdr[i];
+        uint64_t raw_start;
+        uint64_t raw_end;
+        uint64_t writable_end;
+        uintptr_t writable_start;
+
+        if (phdr->p_type != PT_LOAD || !(phdr->p_flags & PF_W) ||
+            phdr->p_memsz == 0)
+            continue;
+        if (!u64_add_checked(
+                g_target_tunable_service.base, phdr->p_vaddr,
+                &raw_start) ||
+            !u64_add_checked(raw_start, phdr->p_memsz, &raw_end) ||
+            !u64_align_up_checked(raw_end, g_page_size, &writable_end))
+            target_x86_cpu_probe_child_exit(
+                TARGET_X86_CPU_PROBE_CHILD_PREP);
+        writable_start = (uintptr_t)page_floor(raw_start);
+        if (writable_end <= writable_start ||
+            writable_end - writable_start > SIZE_MAX ||
+            arch_raw_syscall3(
+                SYS_mprotect, (long)writable_start,
+                (long)(size_t)(writable_end - writable_start),
+                PROT_READ | PROT_WRITE) < 0)
+            target_x86_cpu_probe_child_exit(
+                TARGET_X86_CPU_PROBE_CHILD_PREP);
+    }
+
+    cpu = g_target_x86_service_glro +
+          (size_t)g_glibc_x86_cpu_contract.cpu_features_offset;
+    ldr_memset(cpu, 0,
+               (size_t)g_glibc_x86_cpu_contract.layout.object_size);
+    ldr_memcpy(g_target_x86_service_glro +
+                   (size_t)g_glibc_getauxval_contract.hwcap_offset,
+               &g_kernel_hwcap, sizeof(g_kernel_hwcap));
+    ldr_memcpy(g_target_x86_service_glro +
+                   (size_t)g_glibc_getauxval_contract.hwcap2_offset,
+               &g_kernel_hwcap2, sizeof(g_kernel_hwcap2));
+
+    /* The accessor-adjacent no-argument wrapper is the exact path native
+     * DL_PLATFORM_INIT uses.  It sees kind zero and tail-jumps to the target
+     * interpreter's own initializer; every side effect remains COW-private
+     * to this clone child. */
+    g_target_x86_cpu_wrapper();
+
+    ldr_memset(&result, 0, sizeof(result));
+    ldr_memcpy(&kind, cpu + X86_CPUF_BASIC_KIND, sizeof(kind));
+    if (kind == 0 || kind > g_glibc_x86_cpu_contract.generic_kind)
+        target_x86_cpu_probe_child_exit(
+            TARGET_X86_CPU_PROBE_CHILD_TARGET);
+    result.magic = TARGET_X86_CPU_PROBE_MAGIC;
+    result.version = TARGET_X86_CPU_PROBE_VERSION;
+    result.object_size =
+        (uint32_t)g_glibc_x86_cpu_contract.layout.object_size;
+    result.kind = kind;
+    /* Native x86 ld.so seeds these slots from the raw kernel auxv and then
+     * lets its CPU initializer canonicalize the public GLRO values (for
+     * example, AT_HWCAP is not the raw CPUID-shaped kernel word).  Preserve
+     * the target wrapper's results; the exact target __getauxval contract
+     * below publishes those same slots. */
+    ldr_memcpy(&result.hwcap,
+               g_target_x86_service_glro +
+                   (size_t)g_glibc_getauxval_contract.hwcap_offset,
+               sizeof(result.hwcap));
+    ldr_memcpy(&result.hwcap2,
+               g_target_x86_service_glro +
+                   (size_t)g_glibc_getauxval_contract.hwcap2_offset,
+               sizeof(result.hwcap2));
+    ldr_memcpy(result.cpu, cpu, result.object_size);
+    do {
+        written = arch_raw_syscall3(
+            SYS_write, result_fd, (long)&result, sizeof(result));
+    } while (written == -EINTR);
+    if (written != (long)sizeof(result))
+        target_x86_cpu_probe_child_exit(
+            TARGET_X86_CPU_PROBE_CHILD_TARGET);
+    target_x86_cpu_probe_child_exit(0);
+}
+
+static int initialize_target_x86_cpu_features(int handoff_fd)
+{
+    struct target_x86_cpu_probe_result result;
+    uint8_t original_cpu[TARGET_X86_CPU_OBJECT_MAX];
+    uintptr_t original_hwcap;
+    uintptr_t original_hwcap2;
+    uint8_t *service_cpu;
+    size_t object_size;
+    int pipe_fds[2] = {-1, -1};
+    int child_status = 0;
+    uint32_t target_isa_1 = 0;
+    int have_result = 0;
+    int have_hup = 0;
+    int reaped = 0;
+    long child;
+    short events = 0;
+    int failure = TARGET_X86_CPU_PROBE_FAILED;
+
+    if (!g_target_x86_service_glro || !g_target_x86_service_glro_size ||
+        !g_target_x86_cpu_wrapper || !g_glibc_x86_cpu_contract_ready ||
+        !g_glibc_getauxval_contract_ready ||
+        g_glibc_x86_cpu_contract.layout.object_size == 0 ||
+        g_glibc_x86_cpu_contract.layout.object_size >
+            TARGET_X86_CPU_OBJECT_MAX ||
+        g_glibc_x86_cpu_contract.published_prefix_size == 0 ||
+        g_glibc_x86_cpu_contract.published_prefix_size >
+            TARGET_X86_CPU_PREFIX_MAX ||
+        g_glibc_x86_cpu_contract.cache_info_offset !=
+            g_glibc_x86_cpu_contract.published_prefix_size ||
+        g_glibc_x86_cpu_contract.cache_info_word_count !=
+            DLFRZ_GLIBC_X86_CPU_CACHE_INFO_WORDS ||
+        g_glibc_x86_cpu_contract.cache_info_offset >
+            g_glibc_x86_cpu_contract.layout.object_size ||
+        DLFRZ_GLIBC_X86_CPU_CACHE_INFO_WORDS * sizeof(uint64_t) >
+            (size_t)g_glibc_x86_cpu_contract.layout.object_size -
+                (size_t)g_glibc_x86_cpu_contract.cache_info_offset ||
+        target_x86_glro_ranges_overlap(
+            g_glibc_x86_cpu_contract.cpu_features_offset,
+            g_glibc_x86_cpu_contract.layout.object_size,
+            g_glibc_getauxval_contract.hwcap_offset,
+            sizeof(uintptr_t)) ||
+        target_x86_glro_ranges_overlap(
+            g_glibc_x86_cpu_contract.cpu_features_offset,
+            g_glibc_x86_cpu_contract.layout.object_size,
+            g_glibc_getauxval_contract.hwcap2_offset,
+            sizeof(uintptr_t)) ||
+        target_x86_glro_ranges_overlap(
+            g_glibc_getauxval_contract.hwcap_offset,
+            sizeof(uintptr_t),
+            g_glibc_getauxval_contract.hwcap2_offset,
+            sizeof(uintptr_t)) ||
+        !x86_cpuf_offset_ok(
+            0, (size_t)g_glibc_x86_cpu_contract.layout.object_size))
+        return TARGET_X86_CPU_PROBE_UNAVAILABLE;
+
+    object_size = (size_t)g_glibc_x86_cpu_contract.layout.object_size;
+    service_cpu = g_target_x86_service_glro +
+        (size_t)g_glibc_x86_cpu_contract.cpu_features_offset;
+    ldr_memcpy(original_cpu, service_cpu, object_size);
+    ldr_memcpy(&original_hwcap,
+               g_target_x86_service_glro +
+                   (size_t)g_glibc_getauxval_contract.hwcap_offset,
+               sizeof(original_hwcap));
+    ldr_memcpy(&original_hwcap2,
+               g_target_x86_service_glro +
+                   (size_t)g_glibc_getauxval_contract.hwcap2_offset,
+               sizeof(original_hwcap2));
+    for (size_t i = 0; i < object_size; i++) {
+        if (original_cpu[i] != 0)
+            return TARGET_X86_CPU_PROBE_UNAVAILABLE;
+    }
+    if (original_hwcap != 0 || original_hwcap2 != 0)
+        return TARGET_X86_CPU_PROBE_UNAVAILABLE;
+    ldr_memset(&result, 0, sizeof(result));
+
+    if (raw_syscall_failed(arch_raw_syscall2(
+            SYS_pipe2, (long)pipe_fds, O_CLOEXEC | O_NONBLOCK)))
+        return TARGET_X86_CPU_PROBE_UNAVAILABLE;
+    child = arch_raw_syscall5(SYS_clone, 0, 0, 0, 0, 0);
+    if (raw_syscall_failed(child)) {
+        failure = TARGET_X86_CPU_PROBE_UNAVAILABLE;
+        goto out;
+    }
+    if (child == 0)
+        target_x86_cpu_probe_child(pipe_fds[1], pipe_fds[0], handoff_fd);
+
+    (void)arch_raw_close(pipe_fds[1]);
+    pipe_fds[1] = -1;
+    if (target_x86_cpu_probe_poll(
+            pipe_fds[0], POLLIN | POLLHUP, 50, &events) != 1)
+        goto terminate;
+    if (events & POLLIN) {
+        long count;
+
+        do {
+            count = arch_raw_syscall3(
+                SYS_read, pipe_fds[0], (long)&result, sizeof(result));
+        } while (count == -EINTR);
+
+        if (count != (long)sizeof(result))
+            goto terminate;
+        have_result = 1;
+    }
+    have_hup = (events & POLLHUP) != 0;
+    if (!have_hup) {
+        events = 0;
+        if (target_x86_cpu_probe_poll(
+                pipe_fds[0], POLLHUP, 10, &events) != 1)
+            goto terminate;
+        have_hup = 1;
+    }
+    reaped = target_x86_cpu_probe_reap(child, 0, &child_status);
+    if (!reaped)
+        goto terminate;
+    if (!have_result || !have_hup ||
+        (child_status & 0x7f) != 0 ||
+        ((child_status >> 8) & 0xff) != 0)
+        goto validate_parent;
+    if (result.magic != TARGET_X86_CPU_PROBE_MAGIC ||
+        result.version != TARGET_X86_CPU_PROBE_VERSION ||
+        result.object_size !=
+            g_glibc_x86_cpu_contract.layout.object_size ||
+        result.object_size > sizeof(result.cpu) ||
+        result.kind == 0 ||
+        result.kind > g_glibc_x86_cpu_contract.generic_kind ||
+        result.reserved != 0)
+        goto validate_parent;
+    ldr_memcpy(&target_isa_1,
+               result.cpu +
+                   (size_t)g_glibc_x86_cpu_contract.layout.isa_1,
+               sizeof(target_isa_1));
+    /* GNU x86 ISA levels are cumulative BASELINE,V2,V3,V4 bits. */
+    if (target_isa_1 == 0 || target_isa_1 > UINT32_C(0x0f) ||
+        (target_isa_1 & (target_isa_1 + UINT32_C(1))) != 0)
+        goto validate_parent;
+    failure = 0;
+    goto validate_parent;
+
+terminate:
+    if (!reaped)
+        reaped = target_x86_cpu_probe_reap(child, 1, &child_status);
+validate_parent:
+    /* A successful clone probe is usable only if runtime COW isolation left
+     * every parent service byte exactly pristine. */
+    if (!reaped)
+        failure = TARGET_X86_CPU_PROBE_CONTAINMENT_LOST;
+    else if (ldr_memcmp(original_cpu, service_cpu, object_size) != 0 ||
+        ldr_memcmp(&original_hwcap,
+                   g_target_x86_service_glro +
+                       (size_t)g_glibc_getauxval_contract.hwcap_offset,
+                   sizeof(original_hwcap)) != 0 ||
+        ldr_memcmp(&original_hwcap2,
+                   g_target_x86_service_glro +
+                       (size_t)g_glibc_getauxval_contract.hwcap2_offset,
+                   sizeof(original_hwcap2)) != 0)
+        failure = TARGET_X86_CPU_PROBE_FAILED;
+    if (failure == 0) {
+        uint8_t *fake_cpu = g_fake_rtld_global_ro +
+            (size_t)g_glibc_x86_cpu_contract.cpu_features_offset;
+
+        /* The exact release profile and initializer end witness establish
+         * this complete object as pointer-free scalar/uint arrays.  Copy the
+         * target-computed extent verbatim; the child started it from zero,
+         * so admitted alignment holes are deterministic as at native
+         * startup. */
+        ldr_memcpy(fake_cpu, result.cpu, result.object_size);
+        g_x86_isa_1 = target_isa_1;
+        ldr_memcpy(g_fake_rtld_global_ro +
+                       (size_t)g_glibc_getauxval_contract.hwcap_offset,
+                   &result.hwcap, sizeof(result.hwcap));
+        ldr_memcpy(g_fake_rtld_global_ro +
+                       (size_t)g_glibc_getauxval_contract.hwcap2_offset,
+                   &result.hwcap2, sizeof(result.hwcap2));
+    } else if (reaped && !have_result &&
+               (child_status & 0x7f) == 0 &&
+               ((child_status >> 8) & 0xff) ==
+                   TARGET_X86_CPU_PROBE_CHILD_PREP) {
+        failure = TARGET_X86_CPU_PROBE_UNAVAILABLE;
+    }
+
+out:
+    if (pipe_fds[0] >= 0)
+        (void)arch_raw_close(pipe_fds[0]);
+    if (pipe_fds[1] >= 0)
+        (void)arch_raw_close(pipe_fds[1]);
+    return failure;
+}
+#endif
 
 /* ==== dlopen implementation ============================================ */
 
@@ -23501,16 +27868,19 @@ static const char *dl_basename(const char *path)
  * ordinary ELF object and must retain normal path-based dlopen semantics. */
 static int dl_is_kernel_virtual_dependency(const char *name)
 {
-    return name &&
-        (strcmp(name, "linux-vdso.so.1") == 0 ||
-         strcmp(name, "linux-gate.so.1") == 0);
+    struct symbol_lookup_query query;
+
+    return symbol_lookup_query_init(name, &query) &&
+           (symbol_lookup_query_eq_cstr(&query, "linux-vdso.so.1") ||
+            symbol_lookup_query_eq_cstr(&query, "linux-gate.so.1"));
 }
 
-static int dl_is_frozen_interpreter_identity(const char *name)
+static int dl_is_frozen_interpreter_identity_query(
+    const struct symbol_lookup_query *query)
 {
     int interp_index = -1;
 
-    if (!name || !name[0])
+    if (!query || !query->name || query->key.length == 0)
         return 0;
 
     /* Only the artifact's exact PT_INTERP path or parsed DT_SONAME is
@@ -23530,11 +27900,11 @@ static int dl_is_frozen_interpreter_identity(const char *name)
     }
     if (interp_index < 0)
         return 0;
-    if (strchr(name, '/')) {
+    if (symbol_lookup_query_has_slash(query)) {
         const char *interp = g_frozen_strtab +
             g_frozen_entries[interp_index].name_offset;
 
-        return strcmp(name, interp) == 0;
+        return symbol_lookup_query_eq_cstr(query, interp);
     }
     if (g_frozen_entries[interp_index].data_offset < g_frozen_mem_foff ||
         g_frozen_entries[interp_index].data_size > SIZE_MAX)
@@ -23553,14 +27923,24 @@ static int dl_is_frozen_interpreter_identity(const char *name)
             return 0;
         soname = (const char *)elf + view.dynstr_offset +
             (size_t)view.soname_offset;
-        return strcmp(name, soname) == 0;
+        return symbol_lookup_query_eq_cstr(query, soname);
     }
 }
 
-static int dl_is_virtual_runtime_dependency(const char *name)
+static int dl_is_frozen_interpreter_identity(const char *name)
 {
-    return dl_is_kernel_virtual_dependency(name) ||
-           dl_is_frozen_interpreter_identity(name);
+    struct symbol_lookup_query query;
+
+    return symbol_lookup_query_init(name, &query) &&
+           dl_is_frozen_interpreter_identity_query(&query);
+}
+
+static int dl_is_virtual_runtime_dependency_query(
+    const struct symbol_lookup_query *query)
+{
+    return symbol_lookup_query_eq_cstr(query, "linux-vdso.so.1") ||
+           symbol_lookup_query_eq_cstr(query, "linux-gate.so.1") ||
+           dl_is_frozen_interpreter_identity_query(query);
 }
 
 static int dl_store_name(struct loaded_obj *obj, const char *s)
@@ -24053,28 +28433,27 @@ static int dl_lazy_static_tls_admitted(const struct loaded_obj *obj,
      * an object with no PT_TLS may still import an initial-exec TLS symbol
      * from a dependency and therefore require the dependency closure to
      * have received startup static-TLS offsets. */
-    if (obj->tls.memsz != 0) {
-        for (size_t i = 0; i < obj->dynamic_count; i++) {
-            if (obj->dynamic[i].d_tag == DT_FLAGS &&
-                (obj->dynamic[i].d_un.d_val & 0x10 /* DF_STATIC_TLS */)) {
-                requires_static_tls = 1;
-                break;
-            }
-        }
-    }
+    if (obj->tls.memsz != 0 &&
+        (obj->admitted_dynamic_flags & DF_STATIC_TLS) != 0)
+        requires_static_tls = 1;
     if (!requires_static_tls) {
-        const Elf64_Rela *tables[] = { obj->rela, obj->jmprel };
-        size_t counts[] = { obj->rela_count, obj->jmprel_count };
+        for (enum loaded_rela_table table = LOADED_RELA_DYNAMIC;
+             table < LOADED_RELA_TABLE_COUNT && !requires_static_tls;
+             table++) {
+            size_t count = loaded_rela_table_count(obj, table);
 
-        for (size_t t = 0; t < sizeof(tables) / sizeof(tables[0]) &&
-                           !requires_static_tls; t++) {
-            for (size_t i = 0; i < counts[t]; i++) {
-                const Elf64_Rela *rel = &tables[t][i];
+            for (size_t i = 0; i < count; i++) {
+                Elf64_Rela relocation;
+                const Elf64_Rela *rel = &relocation;
                 const Elf64_Sym *reference;
                 const Elf64_Sym *definition;
                 struct loaded_obj *owner = NULL;
                 uint32_t sym_index;
 
+                if (!loaded_rela_read(obj, table, i, &relocation)) {
+                    requires_static_tls = 1;
+                    break;
+                }
                 if (ELF64_R_TYPE(rel->r_info) != ARCH_RELOC_TPOFF)
                     continue;
                 sym_index = ELF64_R_SYM(rel->r_info);
@@ -24263,58 +28642,339 @@ static int dl_loaded_request_matches(const struct loaded_obj *obj,
     return dl_manifest_request_matches(owner, request);
 }
 
-static int dl_loaded_manifest_dependency_matches(
-    const struct loaded_obj *obj, const char *needed)
-{
-    uint32_t owner;
+struct dl_startup_dependency_source {
+    uint64_t data_offset;
+    uint64_t data_size;
+    uint32_t manifest_index;
+    uint16_t object_index;
+};
 
-    if (!obj || obj->frozen_manifest_index_plus_one == 0)
-        return 0;
-    owner = obj->frozen_manifest_index_plus_one - 1;
-    if (owner >= g_frozen_num_entries)
-        return 0;
-    for (uint32_t i = 0; i < g_frozen_num_entries; i++)
-        if (dl_manifest_shlib_source_alias(
-                g_frozen_entries, owner, i) &&
-            dl_manifest_dependency_matches(i, needed))
+struct dl_startup_dependency_slot {
+    const char *name;
+    size_t name_length;
+    uint64_t name_hash;
+    uint16_t object_index;
+    uint8_t pathful;
+};
+
+struct dl_startup_dependency_index {
+    void *mapping;
+    size_t mapping_size;
+    struct dl_startup_dependency_slot *slots;
+    size_t capacity;
+};
+
+static int dl_startup_dependency_source_compare(const void *left_void,
+                                                const void *right_void)
+{
+    const struct dl_startup_dependency_source *left = left_void;
+    const struct dl_startup_dependency_source *right = right_void;
+
+    if (left->data_offset != right->data_offset)
+        return left->data_offset < right->data_offset ? -1 : 1;
+    if (left->data_size != right->data_size)
+        return left->data_size < right->data_size ? -1 : 1;
+    if (left->object_index != right->object_index)
+        return left->object_index < right->object_index ? -1 : 1;
+    if (left->manifest_index != right->manifest_index)
+        return left->manifest_index < right->manifest_index ? -1 : 1;
+    return 0;
+}
+
+/* Find the mapped startup object owning one immutable manifest source.  The
+ * object list is capped at 512 entries, while DATA and request aliases are
+ * deliberately not.  Sorting this bounded source list once keeps a manifest
+ * scan O(M log O) without trusting attacker-controlled source geometry as a
+ * hash key.  A zero-sized SHLIB cannot alias another record, but retaining
+ * its own manifest identity here preserves the old direct-owner fallback. */
+static int dl_startup_dependency_source_find(
+    const struct dl_startup_dependency_source *sources,
+    size_t source_count, const struct dlfrz_entry *entry,
+    uint32_t manifest_index, uint16_t *object_index_out)
+{
+    size_t low = 0;
+    size_t high = source_count;
+
+    if (entry->data_size == 0) {
+        for (size_t i = 0; i < source_count; i++) {
+            if (sources[i].manifest_index != manifest_index)
+                continue;
+            *object_index_out = sources[i].object_index;
             return 1;
-    return dl_manifest_dependency_matches(owner, needed);
+        }
+        return 0;
+    }
+    while (low < high) {
+        size_t middle = low + (high - low) / 2;
+        const struct dl_startup_dependency_source *candidate =
+            &sources[middle];
+
+        if (candidate->data_offset < entry->data_offset ||
+            (candidate->data_offset == entry->data_offset &&
+             candidate->data_size < entry->data_size)) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    if (low >= source_count ||
+        sources[low].data_offset != entry->data_offset ||
+        sources[low].data_size != entry->data_size)
+        return 0;
+    *object_index_out = sources[low].object_index;
+    return 1;
+}
+
+static const char *dl_startup_manifest_dependency_identity(
+    const struct dlfrz_entry *entry, int *pathful_out)
+{
+    const char *recorded;
+
+    if (!(entry->flags & LDR_FLAG_SHLIB) ||
+        ((entry->flags & LDR_FLAG_DLOPEN) &&
+         entry->dlopen_request_offset != 0))
+        return NULL;
+    recorded = g_frozen_strtab + entry->name_offset;
+    *pathful_out = (entry->flags & DLFRZ_FLAG_NEEDED_PATHFUL) != 0;
+    return *pathful_out ? recorded : dl_basename(recorded);
+}
+
+static uint64_t dl_startup_dependency_name_hash(const char *name,
+                                                size_t name_length,
+                                                int pathful)
+{
+    return vfs_hash_n(name, name_length) ^
+           (pathful ? UINT64_C(0x9e3779b97f4a7c15)
+                    : UINT64_C(0xd6e8feb86659fd93));
+}
+
+static void dl_startup_dependency_index_release(
+    struct dl_startup_dependency_index *index)
+{
+    if (index->mapping && index->mapping_size)
+        (void)munmap(index->mapping, index->mapping_size);
+    memset(index, 0, sizeof(*index));
+}
+
+static int dl_startup_dependency_index_insert(
+    struct dl_startup_dependency_index *index, const char *name,
+    size_t name_length, int pathful, uint16_t object_index)
+{
+    uint64_t name_hash = dl_startup_dependency_name_hash(
+        name, name_length, pathful);
+    size_t slot_index = (size_t)name_hash & (index->capacity - 1);
+
+    for (size_t probes = 0; probes < index->capacity; probes++) {
+        struct dl_startup_dependency_slot *slot =
+            &index->slots[slot_index];
+
+        if (!slot->name) {
+            slot->name = name;
+            slot->name_length = name_length;
+            slot->name_hash = name_hash;
+            slot->object_index = object_index;
+            slot->pathful = (uint8_t)pathful;
+            return 0;
+        }
+        if (slot->name_hash == name_hash &&
+            slot->name_length == name_length &&
+            slot->pathful == (uint8_t)pathful &&
+            memcmp(slot->name, name, name_length) == 0) {
+            /* Manifest order is not load order: a later alias record may
+             * belong to an earlier mapped object.  Native startup lookup
+             * selects the first loaded matching object, so retain the
+             * lowest object index for this identity. */
+            if (object_index < slot->object_index)
+                slot->object_index = object_index;
+            return 0;
+        }
+        slot_index = (slot_index + 1) & (index->capacity - 1);
+    }
+    return -1;
+}
+
+/* Build the manifest half of startup DT_NEEDED resolution once.  Previously
+ * every edge scanned every loaded object and, for each object, the complete
+ * manifest to rediscover exact source aliases.  Large captured-file tables
+ * therefore made graph construction O(E * O * M).  This temporary keyed
+ * identity table makes alias discovery O(M log O), then each edge performs
+ * one exact lookup while retaining native object-order matching below. */
+static int dl_startup_dependency_index_build(
+    const struct loaded_obj *objs, int nobj,
+    struct dl_startup_dependency_index *index)
+{
+    struct dl_startup_dependency_source sources[MAX_TOTAL_OBJS];
+    size_t source_count = 0;
+    size_t identity_count = 0;
+    size_t capacity;
+
+    memset(index, 0, sizeof(*index));
+    if (!objs || nobj <= 0 || nobj > MAX_TOTAL_OBJS ||
+        !g_frozen_entries || !g_frozen_strtab)
+        return -1;
+    for (int i = 0; i < nobj; i++) {
+        uint32_t manifest_index;
+        const struct dlfrz_entry *entry;
+
+        if (objs[i].frozen_manifest_index_plus_one == 0)
+            continue;
+        manifest_index = objs[i].frozen_manifest_index_plus_one - 1;
+        if (manifest_index >= g_frozen_num_entries)
+            return -1;
+        entry = &g_frozen_entries[manifest_index];
+        if (!(entry->flags & LDR_FLAG_SHLIB))
+            continue;
+        sources[source_count].data_offset = entry->data_offset;
+        sources[source_count].data_size = entry->data_size;
+        sources[source_count].manifest_index = manifest_index;
+        sources[source_count].object_index = (uint16_t)i;
+        source_count++;
+    }
+    qsort(sources, source_count, sizeof(sources[0]),
+          dl_startup_dependency_source_compare);
+    for (size_t i = 1; i < source_count; i++) {
+        if (sources[i].data_size != 0 &&
+            sources[i - 1].data_offset == sources[i].data_offset &&
+            sources[i - 1].data_size == sources[i].data_size &&
+            sources[i - 1].object_index != sources[i].object_index)
+            return -1;
+    }
+
+    for (uint32_t i = 0; i < g_frozen_num_entries; i++) {
+        const struct dlfrz_entry *entry = &g_frozen_entries[i];
+        uint16_t object_index;
+        const char *name;
+        int pathful;
+
+        name = dl_startup_manifest_dependency_identity(entry, &pathful);
+        if (!name || !name[0] ||
+            !dl_startup_dependency_source_find(
+                sources, source_count, entry, i, &object_index))
+            continue;
+        identity_count++;
+    }
+    if (identity_count == 0)
+        return 0;
+    if (!g_vfs_hash_key_ready ||
+        vfs_table_capacity(identity_count, sizeof(*index->slots),
+                           &capacity) < 0)
+        return -1;
+    index->mapping_size = capacity * sizeof(*index->slots);
+    index->mapping = mmap(NULL, index->mapping_size,
+                          PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (index->mapping == MAP_FAILED) {
+        index->mapping = NULL;
+        index->mapping_size = 0;
+        return -1;
+    }
+    index->slots = index->mapping;
+    index->capacity = capacity;
+
+    for (uint32_t i = 0; i < g_frozen_num_entries; i++) {
+        const struct dlfrz_entry *entry = &g_frozen_entries[i];
+        uint16_t object_index;
+        const char *name;
+        size_t name_length;
+        int pathful;
+
+        name = dl_startup_manifest_dependency_identity(entry, &pathful);
+        if (!name || !name[0] ||
+            !dl_startup_dependency_source_find(
+                sources, source_count, entry, i, &object_index))
+            continue;
+        name_length = strlen(name);
+        if (dl_startup_dependency_index_insert(
+                index, name, name_length, pathful, object_index) < 0) {
+            dl_startup_dependency_index_release(index);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Returns one for the first loaded manifest owner and zero for no manifest
+ * identity.  Exact byte comparison is authoritative; the keyed hash only
+ * bounds hostile collision work. */
+static int dl_startup_dependency_index_lookup(
+    const struct dl_startup_dependency_index *index,
+    const char *needed, uint16_t *object_index_out)
+{
+    size_t name_length;
+    uint64_t name_hash;
+    size_t slot_index;
+    int pathful;
+
+    if (!index || !needed || !needed[0] || !object_index_out)
+        return -1;
+    if (index->capacity == 0)
+        return 0;
+    pathful = dl_path_has_slash(needed);
+    name_length = strlen(needed);
+    name_hash = dl_startup_dependency_name_hash(
+        needed, name_length, pathful);
+    slot_index = (size_t)name_hash & (index->capacity - 1);
+    for (size_t probes = 0; probes < index->capacity; probes++) {
+        const struct dl_startup_dependency_slot *slot =
+            &index->slots[slot_index];
+
+        if (!slot->name)
+            return 0;
+        if (slot->name_hash == name_hash &&
+            slot->name_length == name_length &&
+            slot->pathful == (uint8_t)pathful &&
+            memcmp(slot->name, needed, name_length) == 0) {
+            *object_index_out = slot->object_index;
+            return 1;
+        }
+        slot_index = (slot_index + 1) & (index->capacity - 1);
+    }
+    return -1;
 }
 
 static const char *dl_object_soname(const struct loaded_obj *obj)
 {
-    if (!obj || !obj->dynamic)
-        return NULL;
-    for (size_t i = 0; i < obj->dynamic_count; i++) {
-        if (obj->dynamic[i].d_tag != DT_SONAME)
-            continue;
-        if (obj->dynamic[i].d_un.d_val > UINT32_MAX)
-            return NULL;
-        return loaded_dynstr_value(
-            obj, (uint32_t)obj->dynamic[i].d_un.d_val);
-    }
-    return NULL;
+    return obj ? obj->admitted_soname : NULL;
+}
+
+static int dl_object_soname_query(
+    const struct loaded_obj *obj, struct symbol_lookup_query *query)
+{
+    const char *soname = dl_object_soname(obj);
+
+    return soname && symbol_lookup_query_init(soname, query);
 }
 
 static int dl_loaded_dependency_matches(const struct loaded_obj *obj,
                                         const char *needed)
 {
-    if (!obj || !obj->name || !needed)
+    struct symbol_lookup_query query;
+
+    return symbol_lookup_query_init(needed, &query) &&
+           dl_loaded_dependency_matches_query(obj, &query);
+}
+
+static int dl_loaded_dependency_matches_query(
+    const struct loaded_obj *obj,
+    const struct symbol_lookup_query *needed)
+{
+    if (!obj || !obj->name || !needed || !needed->name)
         return 0;
-    if (dl_path_has_slash(needed))
-        return strcmp(obj->name, needed) == 0;
+    if (symbol_lookup_query_has_slash(needed))
+        return symbol_lookup_query_eq_cstr(needed, obj->name);
     if (g_is_musl_runtime) {
-        if (dlfrz_musl_reserved_soname(needed) &&
+        if (symbol_lookup_query_is_musl_reserved_soname(needed) &&
             obj == g_target_musl_libc_obj)
             return 1;
         return obj->musl_shortname &&
-               strcmp(obj->musl_shortname, needed) == 0;
+               symbol_lookup_query_eq_cstr(needed, obj->musl_shortname);
     }
     {
-        const char *soname = dl_object_soname(obj);
+        struct symbol_lookup_query soname;
 
-        return (soname && strcmp(soname, needed) == 0) ||
-               gnu_loaded_name_registry_matches(obj, needed);
+        return (dl_object_soname_query(obj, &soname) &&
+                loaded_name_key_eq(soname.name, &soname.key, needed)) ||
+               gnu_loaded_name_registry_matches_query(obj, needed);
     }
 }
 
@@ -24343,6 +29003,75 @@ static int dl_record_loaded_bare_name(struct loaded_obj *obj,
     return 0;
 }
 
+static int dl_initialize_startup_dependency_edges(struct loaded_obj *objs,
+                                                  int nobj)
+{
+    struct dl_startup_dependency_index manifest_index;
+    int result = -1;
+
+    if (dl_startup_dependency_index_build(
+            objs, nobj, &manifest_index) < 0)
+        return -1;
+    for (int i = 0; i < nobj; i++) {
+        struct loaded_obj *obj = &objs[i];
+
+        if (!obj->dynamic || !obj->dynstr)
+            continue;
+        for (size_t d = 0; d < obj->dynamic_count; d++) {
+            const char *needed;
+            struct symbol_lookup_query needed_query;
+            struct loaded_obj *dependency = NULL;
+            uint16_t manifest_owner = 0;
+            int manifest_match;
+
+            if (obj->dynamic[d].d_tag != DT_NEEDED)
+                continue;
+            if (obj->dynamic[d].d_un.d_val > UINT32_MAX)
+                goto out;
+            needed = loaded_dynstr_value(
+                obj, (uint32_t)obj->dynamic[d].d_un.d_val);
+            if (!needed || !loaded_object_name_query_current(
+                               obj, needed, &needed_query) ||
+                needed_query.key.length == 0)
+                goto out;
+            if (dl_is_virtual_runtime_dependency_query(&needed_query))
+                continue;
+            manifest_match = dl_startup_dependency_index_lookup(
+                &manifest_index, needed, &manifest_owner);
+            if (manifest_match < 0 ||
+                (manifest_match > 0 && manifest_owner >= nobj))
+                goto out;
+            /* Native SONAME/loaded-name state changes as earlier edges are
+             * recorded, and native loaders select the first object in load
+             * order.  Keep that bounded object-order walk; only the old
+             * full-manifest alias scan is replaced by the immutable index. */
+            for (int j = 0; j < nobj; j++) {
+                if (dl_loaded_dependency_matches_query(
+                        &objs[j], &needed_query) ||
+                    (manifest_match > 0 &&
+                     manifest_owner == (uint16_t)j)) {
+                    dependency = &objs[j];
+                    break;
+                }
+            }
+            if (!dependency)
+                goto out;
+            if (!dl_path_has_slash(needed) &&
+                dl_record_loaded_bare_name(
+                    dependency, needed, nobj) < 0)
+                goto out;
+            if (dl_add_dependency_edge(
+                    obj, dependency, nobj, 1) < 0)
+                goto out;
+        }
+    }
+    result = 0;
+
+out:
+    dl_startup_dependency_index_release(&manifest_index);
+    return result;
+}
+
 static int dl_initialize_startup_lookup_scopes(struct loaded_obj *objs,
                                                int nobj)
 {
@@ -24368,45 +29097,8 @@ static int dl_initialize_startup_lookup_scopes(struct loaded_obj *objs,
     }
     if (main_index < 0)
         return -1;
-
-    for (int i = 0; i < nobj; i++) {
-        struct loaded_obj *obj = &objs[i];
-
-        if (!obj->dynamic || !obj->dynstr)
-            continue;
-        for (size_t d = 0; d < obj->dynamic_count; d++) {
-            const char *needed;
-            struct loaded_obj *dependency = NULL;
-
-            if (obj->dynamic[d].d_tag != DT_NEEDED)
-                continue;
-            if (obj->dynamic[d].d_un.d_val > UINT32_MAX)
-                return -1;
-            needed = loaded_dynstr_value(
-                obj, (uint32_t)obj->dynamic[d].d_un.d_val);
-            if (!needed || !needed[0])
-                return -1;
-            if (dl_is_virtual_runtime_dependency(needed))
-                continue;
-            for (int j = 0; j < nobj; j++) {
-                if (dl_loaded_dependency_matches(&objs[j], needed) ||
-                    dl_loaded_manifest_dependency_matches(
-                        &objs[j], needed)) {
-                    dependency = &objs[j];
-                    break;
-                }
-            }
-            if (!dependency)
-                return -1;
-            if (!dl_path_has_slash(needed) &&
-                dl_record_loaded_bare_name(
-                    dependency, needed, nobj) < 0)
-                return -1;
-            if (dl_add_dependency_edge(
-                    obj, dependency, nobj, 1) < 0)
-                return -1;
-        }
-    }
+    if (dl_initialize_startup_dependency_edges(objs, nobj) < 0)
+        return -1;
 
     if (!dl_object_is_visible(&objs[main_index]))
         return -1;
@@ -25106,7 +29798,8 @@ static int dl_kernel_osversion(uint32_t *version_out)
 static int dl_gnu_cache_hwcaps_section(
     const uint8_t *file, size_t file_size,
     const struct dl_gnu_cache_header *header, size_t strings_end,
-    const uint32_t **indices_out, size_t *count_out)
+    const uint32_t **indices_out, size_t *count_out,
+    int *target_tunables_out)
 {
     const struct dl_gnu_cache_extension *extension;
     const struct dl_gnu_cache_extension_section *sections;
@@ -25114,9 +29807,12 @@ static int dl_gnu_cache_hwcaps_section(
     size_t sections_offset;
     size_t directory_end;
     size_t minimum_offset;
+    int saw_target_tunables = 0;
 
     *indices_out = NULL;
     *count_out = 0;
+    if (target_tunables_out)
+        *target_tunables_out = 0;
     if (offset == 0)
         return 0;
     if (strings_end > SIZE_MAX - 3)
@@ -25147,10 +29843,22 @@ static int dl_gnu_cache_hwcaps_section(
             data_size > file_size - data_offset ||
             (data_size != 0 && data_offset < directory_end))
             return -1;
+        if (sections[i].tag ==
+                2 /* cache_extension_tag_tunables */) {
+            if (saw_target_tunables || data_size == 0 ||
+                (data_offset & 7u) != 0 || (data_size & 7u) != 0)
+                return -1;
+            saw_target_tunables = 1;
+            if (target_tunables_out)
+                *target_tunables_out = 1;
+            continue;
+        }
         if (sections[i].tag != 1 /* cache_extension_tag_glibc_hwcaps */)
             continue;
         if ((data_offset & 3u) != 0 || data_size == 0 ||
             (data_size & 3u) != 0)
+            return -1;
+        if (*indices_out)
             return -1;
         *indices_out = (const void *)(file + data_offset);
         *count_out = data_size / sizeof(uint32_t);
@@ -25290,6 +29998,101 @@ static int dl_gnu_cache_snapshot_initialize(const char *cache_path)
     return g_glibc_cache_snapshot_state;
 }
 
+/* glibc can publish system-wide tunable overrides through extension tag 2 in
+ * the target's cache.  Although the tag first appeared upstream in 2.44, a
+ * vendor may backport that cache feature independently of the release string.
+ * The isolated interpreter service exposes only its compiled defaults, so the
+ * CPU initializer would diverge from native startup when that tag is present.
+ * Inspect the same immutable cache snapshot used by later lookups and fail
+ * closed on an unreadable or malformed extension directory.  Return 1 for
+ * tag 2, 0 for its proven absence, and -1 when absence cannot be proved. */
+static int dl_gnu_cache_target_tunables_state(const char *cache_path)
+{
+    static const char magic[] = "glibc-ld.so.cache";
+    static const char version[] = "1.1";
+    const struct dl_gnu_cache_header *header;
+    const uint8_t *file;
+    const uint8_t *cache_base;
+    const uint32_t *unused_indices;
+    size_t unused_count;
+    size_t file_size;
+    size_t cache_base_offset = 0;
+    size_t cache_size;
+    size_t entry_bytes;
+    size_t strings_start;
+    size_t strings_end;
+    int target_tunables = 0;
+    int state;
+
+    state = dl_gnu_cache_snapshot_initialize(cache_path);
+    if (state != DL_GNU_CACHE_SNAPSHOT_READY ||
+        !g_glibc_cache_image)
+        return -1;
+    file = g_glibc_cache_image;
+    file_size = g_glibc_cache_image_size;
+    if (file_size < sizeof(magic) - 1 ||
+        memcmp(file, magic, sizeof(magic) - 1) != 0) {
+        const struct dl_gnu_cache_old_header *old_header;
+        size_t old_entries_size;
+        size_t old_end;
+        size_t signature_size = sizeof(magic) - 1 + sizeof(version) - 1;
+
+        if (file_size < sizeof(*old_header) ||
+            memcmp(file, DL_GNU_CACHE_OLD_MAGIC,
+                   sizeof(DL_GNU_CACHE_OLD_MAGIC) - 1) != 0)
+            goto malformed;
+        old_header = (const void *)file;
+        if ((size_t)old_header->nlibs >
+            (file_size - sizeof(*old_header)) /
+                sizeof(struct dl_gnu_cache_old_entry))
+            goto malformed;
+        old_entries_size = (size_t)old_header->nlibs *
+            sizeof(struct dl_gnu_cache_old_entry);
+        old_end = sizeof(*old_header) + old_entries_size;
+        if (old_end > SIZE_MAX - (DL_GNU_CACHE_NEW_ALIGNMENT - 1u))
+            goto malformed;
+        cache_base_offset =
+            (old_end + (DL_GNU_CACHE_NEW_ALIGNMENT - 1u)) &
+            ~(size_t)(DL_GNU_CACHE_NEW_ALIGNMENT - 1u);
+        if (cache_base_offset > file_size ||
+            signature_size > file_size - cache_base_offset ||
+            memcmp(file + cache_base_offset, magic,
+                   sizeof(magic) - 1) != 0 ||
+            memcmp(file + cache_base_offset + sizeof(magic) - 1,
+                   version, sizeof(version) - 1) != 0)
+            return 0; /* A bounded old-format cache has no extensions. */
+    }
+    cache_base = file + cache_base_offset;
+    cache_size = file_size - cache_base_offset;
+    if (cache_size < sizeof(*header))
+        goto malformed;
+    header = (const void *)cache_base;
+    if (memcmp(header->magic, magic, sizeof(header->magic)) != 0 ||
+        memcmp(header->version, version, sizeof(header->version)) != 0 ||
+        (header->flags != 0 && (header->flags & 3u) != 2u) ||
+        (size_t)header->nlibs >
+            (cache_size - sizeof(*header)) /
+                sizeof(struct dl_gnu_cache_entry))
+        goto malformed;
+    entry_bytes = (size_t)header->nlibs *
+                  sizeof(struct dl_gnu_cache_entry);
+    strings_start = sizeof(*header) + entry_bytes;
+    if ((size_t)header->len_strings > cache_size - strings_start)
+        goto malformed;
+    strings_end = strings_start + (size_t)header->len_strings;
+    if (cache_base_offset > SIZE_MAX - strings_end ||
+        dl_gnu_cache_hwcaps_section(
+            file, file_size, header, cache_base_offset + strings_end,
+            &unused_indices, &unused_count, &target_tunables) < 0)
+        goto malformed;
+    return target_tunables;
+
+malformed:
+    dl_gnu_cache_snapshot_reset();
+    g_glibc_cache_snapshot_state = DL_GNU_CACHE_SNAPSHOT_MALFORMED;
+    return -1;
+}
+
 /* Look up a bare name using the target GNU runtime's on-disk cache.  The
  * cache is an ABI-owned ordering source; unlike a compiled list of guessed
  * directories, it covers configured multiarch and glibc-hwcaps locations.
@@ -25409,7 +30212,7 @@ static int dl_gnu_cache_lookup_path(const char *cache_path,
     entries = (const void *)(cache_base + sizeof(*header));
     if (dl_gnu_cache_hwcaps_section(
             file, file_size, header, cache_base_offset + strings_end,
-            &hwcap_indices, &hwcap_count) < 0)
+            &hwcap_indices, &hwcap_count, NULL) < 0)
         goto malformed;
     kernel_osversion_known = g_glibc_minor <= 35 &&
         dl_kernel_osversion(&kernel_osversion) == 0;
@@ -25661,13 +30464,22 @@ static int dl_search_path_list(
     const struct dl_rpath_scope *child_inherited,
     struct loaded_obj **result)
 {
+    struct symbol_lookup_query query;
+    size_t length;
+
     if (!list)
         return 0;
-    /* Environment strings are bounded by the entry stack, and ELF search
-     * strings have already been admitted through the object's bounded
-     * DT_STRTAB.  Iterate the complete native input instead of imposing an
-     * unrelated component/byte ceiling. */
-    return dl_search_path_bytes(list, strlen(list), grammar, owner, needed,
+    /* Revalidate ELF-owned bytes on each post-load use: a PF_W DT_STRTAB may
+     * lose its terminator after admission.  Environment strings remain
+     * kernel/caller C strings and have no owning ELF bound. */
+    if (owner && loaded_object_name_capacity(owner, list, &length)) {
+        if (!loaded_object_name_query_current(owner, list, &query))
+            return -1;
+        length = query.key.length;
+    } else {
+        length = strlen(list);
+    }
+    return dl_search_path_bytes(list, length, grammar, owner, needed,
                                 child_inherited, result);
 }
 
@@ -25675,51 +30487,19 @@ static int dl_object_search_paths(const struct loaded_obj *obj,
                                   const char **rpath_out,
                                   const char **runpath_out)
 {
-    const char *rpath = NULL;
-    const char *runpath = NULL;
-
-    if (obj && obj->dynamic) {
-        for (size_t i = 0; i < obj->dynamic_count; i++) {
-            const char **slot;
-            const char *value;
-
-            if (obj->dynamic[i].d_tag == DT_RPATH)
-                slot = &rpath;
-            else if (obj->dynamic[i].d_tag == DT_RUNPATH)
-                slot = &runpath;
-            else
-                continue;
-            if (obj->dynamic[i].d_un.d_val > UINT32_MAX)
-                return -1;
-            value = loaded_dynstr_value(
-                obj, (uint32_t)obj->dynamic[i].d_un.d_val);
-            if (!value || (*slot && strcmp(*slot, value) != 0))
-                return -1;
-            *slot = value;
-        }
-    }
-    *rpath_out = rpath;
-    *runpath_out = runpath;
+    if (!rpath_out || !runpath_out)
+        return -1;
+    *rpath_out = obj ? obj->admitted_rpath : NULL;
+    *runpath_out = obj ? obj->admitted_runpath : NULL;
     return 0;
 }
 
 static int dl_object_flags_1(const struct loaded_obj *obj,
                              uint64_t *flags_out)
 {
-    uint64_t flags = 0;
-    int seen = 0;
-
-    if (obj && obj->dynamic) {
-        for (size_t i = 0; i < obj->dynamic_count; i++) {
-            if (obj->dynamic[i].d_tag != DT_FLAGS_1)
-                continue;
-            if (seen && flags != obj->dynamic[i].d_un.d_val)
-                return -1;
-            flags = obj->dynamic[i].d_un.d_val;
-            seen = 1;
-        }
-    }
-    *flags_out = flags;
+    if (!flags_out)
+        return -1;
+    *flags_out = obj ? obj->admitted_dynamic_flags_1 : 0;
     return 0;
 }
 
@@ -26112,12 +30892,12 @@ static int dl_lazy_dynamic_flags_admitted(const struct loaded_obj *obj,
         dl_set_error(name, ": malformed DT_FLAGS_1 metadata");
         return -1;
     }
-    if (flags & DF_1_PIE) {
-        dl_set_error(name, ": PIE executable cannot be loaded with dlopen");
-        return -1;
-    }
-    if (flags & DF_1_NOOPEN) {
-        dl_set_error(name, ": DF_1_NOOPEN object cannot be loaded");
+    if (!dlfrz_dynamic_flags_allow_dlopen(flags)) {
+        if (flags & DF_1_PIE)
+            dl_set_error(name,
+                         ": PIE executable cannot be loaded with dlopen");
+        else
+            dl_set_error(name, ": DF_1_NOOPEN object cannot be loaded");
         return -1;
     }
     return 0;
@@ -26376,6 +31156,7 @@ static int dl_transaction_discover_dependencies(void)
             &g_dl_transaction.dependency_work[work_index];
         struct loaded_obj *obj;
         const char *needed = NULL;
+        struct symbol_lookup_query needed_query;
         struct loaded_obj *dependency = NULL;
         int before_nobj;
         size_t before_depth;
@@ -26431,11 +31212,13 @@ static int dl_transaction_discover_dependencies(void)
             }
             needed = loaded_dynstr_value(
                 obj, (uint32_t)item->d_un.d_val);
-            if (!needed || !needed[0]) {
+            if (!needed || !loaded_object_name_query_current(
+                               obj, needed, &needed_query) ||
+                needed_query.key.length == 0) {
                 dl_set_error(obj->name, ": malformed DT_NEEDED name");
                 return -1;
             }
-            if (!dl_is_virtual_runtime_dependency(needed))
+            if (!dl_is_virtual_runtime_dependency_query(&needed_query))
                 break;
             needed = NULL;
         }
@@ -26448,7 +31231,8 @@ static int dl_transaction_discover_dependencies(void)
         }
 
         for (int j = 0; j < g_nobj; j++) {
-            if (dl_loaded_dependency_matches(&g_all_objs[j], needed)) {
+            if (dl_loaded_dependency_matches_query(
+                    &g_all_objs[j], &needed_query)) {
                 dependency = &g_all_objs[j];
                 found = 1;
                 break;
@@ -26513,13 +31297,13 @@ static int dl_transaction_discover_dependencies(void)
                 (uint16_t)dependency_index;
             work->waiting_for_child = 1;
             work->pending_record_bare_name =
-                !dl_path_has_slash(needed);
+                !symbol_lookup_query_has_slash(&needed_query);
             work->pending_first_loaded_as_dependency = 1;
             continue;
         }
         if (g_dl_transaction.dependency_work_depth != before_depth)
             return -1;
-        if (!dl_path_has_slash(needed) &&
+        if (!symbol_lookup_query_has_slash(&needed_query) &&
             dl_record_loaded_bare_name(
                 dependency, needed, g_nobj) < 0) {
             dl_set_error(needed,
@@ -26723,6 +31507,26 @@ static void dl_transaction_release_tls_blocks(void **maps,
 
 static void dl_release_runtime_mapping(struct loaded_obj *obj)
 {
+    /* Revoke direct-dereference proofs before their backing reservation can
+     * disappear.  Runtime unload is serialized, but this ordering also keeps
+     * failure cleanup from leaving a transient stale proof. */
+    if (obj) {
+        obj->dynsym_admitted_count = 0;
+        obj->versym_admitted_count = 0;
+        obj->rela = NULL;
+        obj->rela_count = 0;
+        obj->rela_relative_count = 0;
+        obj->jmprel = NULL;
+        obj->jmprel_count = 0;
+        obj->relr = NULL;
+        obj->relr_count = 0;
+        obj->relr_replay_state = LOADED_RELR_UNADMITTED;
+        obj->symbol_name_index = NULL;
+    }
+    if (obj && obj->runtime_relocation_mapping &&
+        obj->runtime_relocation_mapping_size)
+        munmap(obj->runtime_relocation_mapping,
+               obj->runtime_relocation_mapping_size);
     if (obj && obj->runtime_reservation && obj->runtime_reservation_size)
         munmap(obj->runtime_reservation, obj->runtime_reservation_size);
     if (obj && obj->runtime_phdr_mapping &&
@@ -26740,12 +31544,17 @@ static void dl_release_runtime_mapping(struct loaded_obj *obj)
         obj->runtime_symbol_name_mapping_size)
         munmap(obj->runtime_symbol_name_mapping,
                obj->runtime_symbol_name_mapping_size);
+    if (obj && obj->runtime_dynamic_semantic_mapping &&
+        obj->runtime_dynamic_semantic_mapping_size)
+        munmap(obj->runtime_dynamic_semantic_mapping,
+               obj->runtime_dynamic_semantic_mapping_size);
     if (obj) {
         obj->runtime_reservation = NULL;
         obj->runtime_reservation_size = 0;
         obj->runtime_phdr_mapping = NULL;
         obj->runtime_phdr_mapping_size = 0;
         obj->phdr = NULL;
+        obj->public_phdr = NULL;
         obj->phdr_num = 0;
         obj->runtime_name_mapping = NULL;
         obj->runtime_name_mapping_size = 0;
@@ -26755,7 +31564,34 @@ static void dl_release_runtime_mapping(struct loaded_obj *obj)
         obj->runtime_symbol_name_mapping = NULL;
         obj->runtime_symbol_name_mapping_size = 0;
         obj->symbol_name_keys = NULL;
+        obj->symbol_name_index = NULL;
         obj->version_name_index = NULL;
+        obj->runtime_dynamic_semantic_mapping = NULL;
+        obj->runtime_dynamic_semantic_mapping_size = 0;
+        obj->runtime_relocation_mapping = NULL;
+        obj->runtime_relocation_mapping_size = 0;
+        obj->admitted_soname = NULL;
+        obj->admitted_rpath = NULL;
+        obj->admitted_runpath = NULL;
+        obj->admitted_dynamic_flags = 0;
+        obj->admitted_dynamic_flags_1 = 0;
+        obj->dynstr_readonly = 0;
+        obj->dynsym_readonly = 0;
+        obj->versym_readonly = 0;
+        obj->gnu_hash_view_cached = 0;
+        obj->sysv_hash_view_cached = 0;
+        obj->gnu_hash_cached_bloom = NULL;
+        obj->gnu_hash_cached_buckets = NULL;
+        obj->gnu_hash_cached_chain_addr = 0;
+        obj->gnu_hash_cached_nbuckets = 0;
+        obj->gnu_hash_cached_symoffset = 0;
+        obj->gnu_hash_cached_bloom_size = 0;
+        obj->gnu_hash_cached_bloom_shift = 0;
+        obj->gnu_hash_cached_chain_count = 0;
+        obj->sysv_hash_cached_buckets = NULL;
+        obj->sysv_hash_cached_chains = NULL;
+        obj->sysv_hash_cached_nbuckets = 0;
+        obj->sysv_hash_cached_nchain = 0;
         obj->name = NULL;
     }
 }
@@ -27505,6 +32341,37 @@ static int dl_transaction_commit(void)
     for (int i = 0; i < start_nobj; i++)
         if (dormant_pending[i])
             g_all_objs[i].deferred_gnu_unique_relocations = 0;
+    /* The transaction's DTV and object scope are now irrevocably committed.
+     * Publish immutable module extents before constructors can issue their
+     * first TLS access.  Other threads with no slot still miss this fast path
+     * and serialize the one-time DTV growth through the loader lock. */
+    for (int i = start_nobj; i < g_nobj; i++) {
+        struct loaded_obj *obj = &g_all_objs[i];
+        struct runtime_tls_fast_entry *entry;
+        uint64_t encoded_extent;
+        uint64_t published_extent;
+
+        if (obj->tls.memsz == 0)
+            continue;
+        if (!runtime_tls_template_valid(obj) || obj->tls.modid == 0 ||
+            obj->tls.modid > MAX_TOTAL_OBJS ||
+            obj->tls.memsz == UINT64_MAX)
+            _exit(127);
+        entry = &g_runtime_tls_fast[obj->tls.modid];
+        encoded_extent = obj->tls.memsz + 1;
+        published_extent = runtime_atomic_load64(
+            &entry->extent_plus_one);
+        if (published_extent != 0) {
+            if (published_extent != encoded_extent ||
+                runtime_atomic_load64(&entry->static_tpoff_bits) !=
+                    (uint64_t)obj->tls.tpoff)
+                _exit(127);
+        } else {
+            runtime_atomic_store64(&entry->static_tpoff_bits,
+                                   (uint64_t)obj->tls.tpoff);
+            runtime_atomic_store64(&entry->extent_plus_one, encoded_extent);
+        }
+    }
     dl_debug_publication_end();
 
     /* Mark the transaction committed before invoking user constructors so a
@@ -27708,6 +32575,15 @@ static struct loaded_obj *load_elf_from_file_fd(
         return NULL;
     }
 
+    if (make_anonymous_load_runs_writable(
+            base, phdr_buf, ehdr.e_phnum) < 0) {
+        munmap(reservation, (size_t)reservation_len);
+        release_runtime_dso_headers(phdr_buf, phdr_size);
+        close(fd);
+        dl_set_error(path, ": cannot prepare segment population");
+        return NULL;
+    }
+
     /* Populate every PT_LOAD into the anonymous reservation.  Retaining a
      * MAP_PRIVATE source-file VMA would leave clean pages vulnerable to
      * SIGBUS if another process truncated the DSO after dlopen returned. */
@@ -27716,7 +32592,6 @@ static struct loaded_obj *load_elf_from_file_fd(
             continue;
         if (phdr_buf[i].p_filesz > 0) {
             if (runtime_probe_file_mapping_policy(fd, &phdr_buf[i]) < 0 ||
-                make_file_range_writable(base, &phdr_buf[i]) < 0 ||
                 runtime_pread_exact(
                     fd, (void *)(base + phdr_buf[i].p_vaddr),
                     (size_t)phdr_buf[i].p_filesz,
@@ -27727,13 +32602,6 @@ static struct loaded_obj *load_elf_from_file_fd(
                 dl_set_error(path, ": cannot populate segment");
                 return NULL;
             }
-        }
-        if (zero_segment_bss_tail(base, &phdr_buf[i]) < 0) {
-            munmap(reservation, (size_t)reservation_len);
-            release_runtime_dso_headers(phdr_buf, phdr_size);
-            close(fd);
-            dl_set_error(path, ": cannot zero segment tail");
-            return NULL;
         }
     }
 
@@ -27749,6 +32617,9 @@ static struct loaded_obj *load_elf_from_file_fd(
     for (int i = 0; i < ehdr.e_phnum; i++) {
         if (phdr_buf[i].p_type == PT_LOAD &&
             phdr_buf[i].p_memsz != 0 &&
+            !(phdr_buf[i].p_filesz != 0 &&
+              phdr_prot(&phdr_buf[i]) ==
+                  (PROT_READ | PROT_WRITE)) &&
             set_segment_protection(base, &phdr_buf[i],
                                    phdr_prot(&phdr_buf[i])) < 0) {
             munmap(reservation, (size_t)reservation_len);
@@ -27759,8 +32630,7 @@ static struct loaded_obj *load_elf_from_file_fd(
         }
     }
 
-    if (!phdr_is_mapped &&
-        mprotect(phdr_buf, phdr_size, PROT_READ) < 0) {
+    if (mprotect(phdr_buf, phdr_size, PROT_READ) < 0) {
         munmap(reservation, (size_t)reservation_len);
         release_runtime_dso_headers(phdr_buf, phdr_size);
         close(fd);
@@ -27787,15 +32657,15 @@ static struct loaded_obj *load_elf_from_file_fd(
             dl_set_error(path, ": program-header address overflows");
             return NULL;
         }
-        obj->phdr = (const Elf64_Phdr *)(uintptr_t)(base + phdr_vaddr);
-        release_runtime_dso_headers(phdr_buf, phdr_size);
-        phdr_buf = NULL;
+        obj->public_phdr =
+            (const Elf64_Phdr *)(uintptr_t)(base + phdr_vaddr);
     } else {
-        obj->phdr = phdr_buf;
-        obj->runtime_phdr_mapping = phdr_buf;
-        obj->runtime_phdr_mapping_size = phdr_size;
-        phdr_buf = NULL;
+        obj->public_phdr = phdr_buf;
     }
+    obj->phdr = phdr_buf;
+    obj->runtime_phdr_mapping = phdr_buf;
+    obj->runtime_phdr_mapping_size = phdr_size;
+    phdr_buf = NULL;
     if (dl_store_name(obj, path) < 0) {
         dl_set_error(path, ": cannot allocate dlopen name storage");
         dl_release_runtime_mapping(obj);
@@ -27962,6 +32832,7 @@ static struct loaded_obj *load_embedded_object(
 
     /* Map segments from the frozen image at the pre-assigned base */
     if (map_object(g_frozen_mem, g_frozen_mem_foff, g_frozen_srcfd,
+                   g_frozen_source_flags,
                    emeta, eent, obj, 0) < 0) {
         dl_set_error(ename, ": mmap failed");
         if (obj->runtime_reservation && obj->runtime_reservation_size)
@@ -28080,8 +32951,10 @@ static int dlopen_flags_admitted(int flags, int *no_load,
         return -1;
     }
 
-    /* Relocations are deliberately eager for both public binding modes;
-     * when both are present this also gives RTLD_NOW its native precedence.
+    /* RTLD_NOW takes native precedence when both binding bits are present.
+     * Pure RTLD_LAZY is syntactically valid here; the caller admits it for
+     * musl's eager policy and for identities which are already visible, but
+     * refuses a new GNU object because this loader has no lazy PLT resolver.
      * RTLD_NODELETE is naturally satisfied because dlclose never unmaps an
      * object or releases loader-owned TLS before process exit. */
     *no_load = (value & DLFRZ_RTLD_NOLOAD) != 0;
@@ -28131,6 +33004,7 @@ static int dl_record_musl_dlopen_root_loader(
 static void *my_dlopen_for_caller(const char *path, int flags,
                                   void *return_address)
 {
+    enum runtime_loader_phase phase;
     struct loaded_obj *caller;
     const struct loaded_obj *top_loader;
     struct loaded_obj *ret = NULL;
@@ -28139,14 +33013,23 @@ static void *my_dlopen_for_caller(const char *path, int flags,
     size_t loader_scope_count = 0;
     int embedded_match = 0;
     int loaded_from_disk = 0;
+    int requires_lazy_binding;
     int no_load;
     int pathful;
     int publish_global;
 
     dl_clear_error();
 
+    phase = runtime_loader_phase();
+    if (phase == RUNTIME_LOADER_PHASE_RESET) {
+        dl_set_error("dlopen: startup object graph is not published", NULL);
+        return NULL;
+    }
+
     if (dlopen_flags_admitted(flags, &no_load, &publish_global) < 0)
         return NULL;
+    requires_lazy_binding =
+        dlfrz_dlopen_mode_requires_lazy_binding(flags);
     if (!path)
         return DL_GLOBAL_HANDLE;
     if (g_dl_transaction.active) {
@@ -28186,6 +33069,17 @@ static void *my_dlopen_for_caller(const char *path, int flags,
         if (!dl_object_is_visible(&g_all_objs[i])) {
             if (no_load)
                 continue;
+            if (phase != RUNTIME_LOADER_PHASE_RUNNING) {
+                dl_set_error("dlopen: object activation is unavailable "
+                             "during startup relocation", NULL);
+                return NULL;
+            }
+            if (!g_is_musl_runtime && requires_lazy_binding) {
+                dl_set_error(
+                    "dlopen: a new RTLD_LAZY object requires native lazy binding",
+                    NULL);
+                return NULL;
+            }
             if (dl_lazy_dynamic_flags_admitted(&g_all_objs[i], path) < 0 ||
                 dl_activate_dormant_scope(&g_all_objs[i],
                                           publish_global) < 0) {
@@ -28194,16 +33088,39 @@ static void *my_dlopen_for_caller(const char *path, int flags,
                                  ": cannot activate traced dormant closure");
                 return NULL;
             }
-        } else if (publish_global &&
-                   dl_promote_scope_global(&g_all_objs[i]) < 0) {
-            dl_set_error(path, ": cannot promote loaded scope to RTLD_GLOBAL");
-            return NULL;
+        } else if (publish_global) {
+            if (phase != RUNTIME_LOADER_PHASE_RUNNING) {
+                /* Every visible startup object is already in the startup
+                 * global scope.  Return that existing handle without
+                 * rebuilding or publishing any scope metadata. */
+                if (!dl_global_scope_contains((uint16_t)i)) {
+                    dl_set_error("dlopen: object-scope promotion is "
+                                 "unavailable during startup relocation",
+                                 NULL);
+                    return NULL;
+                }
+            } else if (dl_promote_scope_global(&g_all_objs[i]) < 0) {
+                dl_set_error(path,
+                             ": cannot promote loaded scope to RTLD_GLOBAL");
+                return NULL;
+            }
         }
         if (dl_object_is_visible(&g_all_objs[i]))
             return &g_all_objs[i];
     }
     if (no_load) {
         dl_set_error(path, ": object is not loaded");
+        return NULL;
+    }
+    if (!g_is_musl_runtime && requires_lazy_binding) {
+        dl_set_error(
+            "dlopen: a new RTLD_LAZY object requires native lazy binding",
+            NULL);
+        return NULL;
+    }
+    if (phase != RUNTIME_LOADER_PHASE_RUNNING) {
+        dl_set_error("dlopen: object loading is unavailable during startup "
+                     "relocation", NULL);
         return NULL;
     }
 
@@ -28300,15 +33217,18 @@ static void *my_dlopen_serialized(const char *path, int flags,
                                   void *return_address)
 {
     void *result;
+    runtime_loader_lock_token lock_token =
+        runtime_loader_lock_acquire();
 
-    runtime_loader_lock_acquire();
     result = my_dlopen_for_caller(path, flags, return_address);
-    if (result && runtime_thread_services_ensure() < 0) {
+    if (result &&
+        runtime_loader_phase() == RUNTIME_LOADER_PHASE_RUNNING &&
+        runtime_thread_services_ensure() < 0) {
         ldr_msg("dlfreeze-loader: cannot initialize target pthread "
                 "loader services\n");
         _exit(127);
     }
-    runtime_loader_lock_release();
+    runtime_loader_lock_release(lock_token);
     return result;
 }
 
@@ -28418,8 +33338,9 @@ static int my_dlinfo(void *handle, int request, void *arg)
 {
     struct loaded_obj *obj;
     int result = -1;
+    runtime_loader_lock_token lock_token =
+        runtime_loader_lock_acquire();
 
-    runtime_loader_lock_acquire();
     dl_clear_error();
     if (!arg) {
         dl_set_error("dlinfo: NULL result pointer", NULL);
@@ -28458,7 +33379,7 @@ static int my_dlinfo(void *handle, int request, void *arg)
         result = 0;
         break;
     case DLFRZ_RTLD_DI_PHDR:
-        *(const ElfW(Phdr) **)arg = obj->phdr;
+        *(const ElfW(Phdr) **)arg = loaded_obj_public_phdr(obj);
         result = obj->phdr_num;
         break;
     default:
@@ -28467,7 +33388,7 @@ static int my_dlinfo(void *handle, int request, void *arg)
     }
 
 out:
-    runtime_loader_lock_release();
+    runtime_loader_lock_release(lock_token);
     return result;
 }
 
@@ -28571,22 +33492,25 @@ static void *my_dlmopen_serialized(long /*Lmid_t*/ lmid, const char *path,
                                    int flags, void *return_address)
 {
     void *result;
+    runtime_loader_lock_token lock_token =
+        runtime_loader_lock_acquire();
 
-    runtime_loader_lock_acquire();
     if (lmid == 0) { /* LM_ID_BASE */
         result = my_dlopen_for_caller(path, flags, return_address);
-        if (result && runtime_thread_services_ensure() < 0) {
+        if (result &&
+            runtime_loader_phase() == RUNTIME_LOADER_PHASE_RUNNING &&
+            runtime_thread_services_ensure() < 0) {
             ldr_msg("dlfreeze-loader: cannot initialize target pthread "
                     "loader services\n");
             _exit(127);
         }
-        runtime_loader_lock_release();
+        runtime_loader_lock_release(lock_token);
         return result;
     }
 
     dl_clear_error();
     dl_set_error("dlmopen: link-map namespaces are not supported", NULL);
-    runtime_loader_lock_release();
+    runtime_loader_lock_release(lock_token);
     return NULL;
 }
 
@@ -28627,14 +33551,14 @@ static int dl_lookup_handle_symbol(struct loaded_obj *root,
         if (sym) {
             owner = &g_all_objs[index];
             if (gnu_unique_canonicalize(
-                    g_all_objs, g_nobj, symbol, owner, sym, NULL, NULL,
+                    g_all_objs, g_nobj, &query, owner, sym, NULL, NULL,
                     &owner, &sym) < 0)
                 return -3;
             uint64_t special = lookup_api_special(
                 symbol, version, owner);
 
             if (selected_definition_requires_native_glibc_gmon(
-                    owner, symbol))
+                    owner, &query))
                 return -2;
             if (special) {
                 *address_out = special;
@@ -28685,11 +33609,11 @@ static int dl_lookup_order_symbol(const uint16_t *order, uint16_t count,
             continue;
         owner = &g_all_objs[index];
         if (gnu_unique_canonicalize(
-                g_all_objs, g_nobj, symbol, owner, sym, NULL, NULL,
+                g_all_objs, g_nobj, &query, owner, sym, NULL, NULL,
                 &owner, &sym) < 0)
             return -3;
         if (selected_definition_requires_native_glibc_gmon(
-                owner, symbol))
+                owner, &query))
             return -2;
         special = lookup_api_special(
             symbol, version, owner);
@@ -28739,7 +33663,7 @@ static void *my_dlsym_locked(void *handle, const char *symbol,
 
             if (sym) {
                 if (gnu_unique_canonicalize(
-                        g_all_objs, g_nobj, symbol, owner, sym,
+                        g_all_objs, g_nobj, &query, owner, sym,
                         NULL, NULL, &owner, &sym) < 0) {
                     dl_set_error("dlsym: GNU unique registry exhausted or "
                                  "malformed", NULL);
@@ -28749,7 +33673,7 @@ static void *my_dlsym_locked(void *handle, const char *symbol,
                     symbol, NULL, owner);
 
                 if (selected_definition_requires_native_glibc_gmon(
-                        owner, symbol)) {
+                        owner, &query)) {
                     dl_set_error("dlsym: glibc gmon profiling requires the "
                                  "native loader for symbol: ", symbol);
                     return NULL;
@@ -28861,10 +33785,11 @@ static void *my_dlsym(void *handle, const char *symbol)
     void *return_address =
         __builtin_extract_return_addr(__builtin_return_address(0));
     void *result;
+    runtime_loader_lock_token lock_token =
+        runtime_loader_lock_acquire();
 
-    runtime_loader_lock_acquire();
     result = my_dlsym_locked(handle, symbol, return_address);
-    runtime_loader_lock_release();
+    runtime_loader_lock_release(lock_token);
     return result;
 }
 
@@ -28904,7 +33829,7 @@ static void *my_dlvsym_locked(void *handle, const char *symbol,
 
             if (sym) {
                 if (gnu_unique_canonicalize(
-                        g_all_objs, g_nobj, symbol, owner, sym,
+                        g_all_objs, g_nobj, &query, owner, sym,
                         NULL, NULL, &owner, &sym) < 0) {
                     dl_set_error("dlvsym: GNU unique registry exhausted or "
                                  "malformed", NULL);
@@ -28914,7 +33839,7 @@ static void *my_dlvsym_locked(void *handle, const char *symbol,
                     symbol, version, owner);
 
                 if (selected_definition_requires_native_glibc_gmon(
-                        owner, symbol)) {
+                        owner, &query)) {
                     dl_set_error("dlvsym: glibc gmon profiling requires the "
                                  "native loader for symbol: ", symbol);
                     return NULL;
@@ -29016,7 +33941,7 @@ static void *my_dlvsym_locked(void *handle, const char *symbol,
 
                 if (sym) {
                     if (gnu_unique_canonicalize(
-                            g_all_objs, g_nobj, symbol, owner, sym,
+                            g_all_objs, g_nobj, &query, owner, sym,
                             NULL, NULL, &owner, &sym) < 0) {
                         dl_set_error("dlvsym: GNU unique registry exhausted "
                                      "or malformed", NULL);
@@ -29025,7 +33950,7 @@ static void *my_dlvsym_locked(void *handle, const char *symbol,
                     special = lookup_api_special(
                         symbol, version, owner);
                     if (selected_definition_requires_native_glibc_gmon(
-                            owner, symbol)) {
+                            owner, &query)) {
                         dl_set_error("dlvsym: glibc gmon profiling requires "
                                      "the native loader for symbol: ",
                                      symbol);
@@ -29061,7 +33986,7 @@ static void *my_dlvsym_locked(void *handle, const char *symbol,
         if (sym) {
             owner = &g_all_objs[i];
             if (gnu_unique_canonicalize(
-                    g_all_objs, g_nobj, symbol, owner, sym, NULL, NULL,
+                    g_all_objs, g_nobj, &query, owner, sym, NULL, NULL,
                     &owner, &sym) < 0) {
                 dl_set_error("dlvsym: GNU unique registry exhausted or "
                              "malformed", NULL);
@@ -29071,7 +33996,7 @@ static void *my_dlvsym_locked(void *handle, const char *symbol,
                 symbol, version, owner);
 
             if (selected_definition_requires_native_glibc_gmon(
-                    owner, symbol)) {
+                    owner, &query)) {
                 dl_set_error("dlvsym: glibc gmon profiling requires the "
                              "native loader for symbol: ", symbol);
                 return NULL;
@@ -29100,10 +34025,11 @@ static void *my_dlvsym(void *handle, const char *symbol, const char *version)
     void *return_address =
         __builtin_extract_return_addr(__builtin_return_address(0));
     void *result;
+    runtime_loader_lock_token lock_token =
+        runtime_loader_lock_acquire();
 
-    runtime_loader_lock_acquire();
     result = my_dlvsym_locked(handle, symbol, version, return_address);
-    runtime_loader_lock_release();
+    runtime_loader_lock_release(lock_token);
     return result;
 }
 
@@ -29113,13 +34039,14 @@ enum dladdr_symbol_scan {
     DLADDR_SCAN_GLIBC_SYSV
 };
 
-static int dladdr_symbol_is_candidate(const Elf64_Sym *symbol,
+static int dladdr_symbol_is_candidate(const struct loaded_obj *obj,
+                                      const Elf64_Sym *symbol,
                                       enum dladdr_symbol_scan scan)
 {
     unsigned int binding;
     unsigned int type;
 
-    if (!symbol)
+    if (!obj || !symbol)
         return 0;
     binding = ELF64_ST_BIND(symbol->st_info);
     type = ELF64_ST_TYPE(symbol->st_info);
@@ -29138,7 +34065,9 @@ static int dladdr_symbol_is_candidate(const Elf64_Sym *symbol,
         (symbol->st_shndx == SHN_UNDEF && symbol->st_value == 0))
         return 0;
     if (scan == DLADDR_SCAN_GLIBC_GNU)
-        return 1;
+        return (binding == STB_GLOBAL || binding == STB_WEAK ||
+                binding == STB_GNU_UNIQUE) &&
+               symbol_visible_outside_object(symbol);
 
     /* glibc's SysV-hash fallback scans the complete dynsym range, so it
      * applies the binding and visibility filters which the GNU-hash path can
@@ -29156,10 +34085,11 @@ static void dladdr_consider_symbol(const struct loaded_obj *obj,
                                    uintptr_t *best_address)
 {
     const char *name;
+    struct symbol_lookup_query name_query;
     uintptr_t candidate;
 
     if (!obj || !best_name || !best_symbol || !best_address ||
-        !dladdr_symbol_is_candidate(symbol, scan) ||
+        !dladdr_symbol_is_candidate(obj, symbol, scan) ||
         symbol->st_value > UINTPTR_MAX - obj->base)
         return;
     candidate = (uintptr_t)obj->base + (uintptr_t)symbol->st_value;
@@ -29175,7 +34105,9 @@ static void dladdr_consider_symbol(const struct loaded_obj *obj,
              : address - candidate >= symbol->st_size))
         return;
     name = loaded_symbol_name(obj, symbol);
-    if (!name || !name[0])
+    if (!name || !loaded_object_name_query_current(
+                     obj, name, &name_query) ||
+        name_query.key.length == 0)
         return;
     *best_address = candidate;
     *best_name = name;
@@ -29198,6 +34130,7 @@ static void dladdr_scan_symbols(const struct loaded_obj *obj,
 
     if (obj->gnu_hash) {
         struct gnu_hash_view view;
+        uint32_t total_visits = 0;
 
         if (!get_gnu_hash_view(obj, &view))
             return;
@@ -29211,9 +34144,18 @@ static void dladdr_scan_symbols(const struct loaded_obj *obj,
             for (;;) {
                 uint32_t chain;
 
-                if (index >= obj->dynsym_count ||
+                /* A valid GNU hash partitions exported symbols across its
+                 * buckets, so the complete scan visits at most dynsym_count
+                 * records.  PF_W buckets may duplicate the same chain; retain
+                 * current-byte semantics while bounding aggregate work. */
+                if (total_visits >= obj->dynsym_count ||
+                    index >= obj->dynsym_count ||
                     !gnu_hash_chain_value(obj, &view, index, &chain))
                     return;
+                total_visits++;
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+                g_dladdr_gnu_chain_visits++;
+#endif
                 dladdr_consider_symbol(
                     obj, loaded_dynsym(obj, index), DLADDR_SCAN_GLIBC_GNU,
                     address, best_name, best_symbol, best_address);
@@ -29300,10 +34242,11 @@ static int my_dladdr_locked(const void *address_ptr, Dl_info *info)
 static int my_dladdr(const void *address_ptr, Dl_info *info)
 {
     int result;
+    runtime_loader_lock_token lock_token =
+        runtime_loader_lock_acquire();
 
-    runtime_loader_lock_acquire();
     result = my_dladdr_locked(address_ptr, info);
-    runtime_loader_lock_release();
+    runtime_loader_lock_release(lock_token);
     return result;
 }
 
@@ -29318,8 +34261,9 @@ static int my_dladdr1(const void *address_ptr, Dl_info *info,
     struct loaded_obj *obj = NULL;
     const Elf64_Sym *symbol = NULL;
     int result = 0;
+    runtime_loader_lock_token lock_token =
+        runtime_loader_lock_acquire();
 
-    runtime_loader_lock_acquire();
     if (!info || !extra_info ||
         (flags != DLFRZ_RTLD_DL_SYMENT &&
          flags != DLFRZ_RTLD_DL_LINKMAP)) {
@@ -29341,21 +34285,22 @@ static int my_dladdr1(const void *address_ptr, Dl_info *info,
     }
 
 out:
-    runtime_loader_lock_release();
+    runtime_loader_lock_release(lock_token);
     return result;
 }
 
 static int my_dlclose(void *handle)
 {
     int result = 0;
+    runtime_loader_lock_token lock_token =
+        runtime_loader_lock_acquire();
 
-    runtime_loader_lock_acquire();
     dl_clear_error();
     if (handle != DL_GLOBAL_HANDLE && !dl_object_from_handle(handle)) {
         dl_set_error("dlclose: invalid handle", NULL);
         result = -1;
     }
-    runtime_loader_lock_release();
+    runtime_loader_lock_release(lock_token);
     return result;  /* no-op — never unload */
 }
 
@@ -29363,14 +34308,15 @@ static char *my_dlerror(void)
 {
     char *result = NULL;
     struct dl_error_state *state;
+    runtime_loader_lock_token lock_token =
+        runtime_loader_lock_acquire();
 
-    runtime_loader_lock_acquire();
     state = dl_current_error_state(0);
     if (state && state->valid) {
         state->valid = 0;
         result = state->message;
     }
-    runtime_loader_lock_release();
+    runtime_loader_lock_release(lock_token);
     return result;
 }
 
@@ -29438,10 +34384,11 @@ static int glibc_hook_dlclose(void *handle)
 static void *glibc_hook_dlsym(void *handle, const char *name, void *caller)
 {
     void *result;
+    runtime_loader_lock_token lock_token =
+        runtime_loader_lock_acquire();
 
-    runtime_loader_lock_acquire();
     result = my_dlsym_locked(handle, name, caller);
-    runtime_loader_lock_release();
+    runtime_loader_lock_release(lock_token);
     return result;
 }
 
@@ -29449,10 +34396,11 @@ static void *glibc_hook_dlvsym(void *handle, const char *name,
                                const char *version, void *caller)
 {
     void *result;
+    runtime_loader_lock_token lock_token =
+        runtime_loader_lock_acquire();
 
-    runtime_loader_lock_acquire();
     result = my_dlvsym_locked(handle, name, version, caller);
-    runtime_loader_lock_release();
+    runtime_loader_lock_release(lock_token);
     return result;
 }
 
@@ -29490,19 +34438,22 @@ static void *glibc_hook_libc_dlopen(const char *path, int mode)
     struct glibc_hook_error_snapshot error_snapshot;
     void *result = NULL;
     int public_mode;
+    runtime_loader_lock_token lock_token =
+        runtime_loader_lock_acquire();
 
-    runtime_loader_lock_acquire();
     glibc_hook_save_error(&error_snapshot);
     if (glibc_hook_internal_mode(mode, &public_mode) == 0) {
         result = my_dlopen_for_caller(path, public_mode, caller);
-        if (result && runtime_thread_services_ensure() < 0) {
+        if (result &&
+            runtime_loader_phase() == RUNTIME_LOADER_PHASE_RUNNING &&
+            runtime_thread_services_ensure() < 0) {
             ldr_msg("dlfreeze-loader: cannot initialize target pthread "
                     "loader services\n");
             _exit(127);
         }
     }
     glibc_hook_restore_error(&error_snapshot);
-    runtime_loader_lock_release();
+    runtime_loader_lock_release(lock_token);
     return result;
 }
 
@@ -29512,12 +34463,13 @@ static void *glibc_hook_libc_dlsym(void *handle, const char *name)
         __builtin_extract_return_addr(__builtin_return_address(0));
     struct glibc_hook_error_snapshot error_snapshot;
     void *result;
+    runtime_loader_lock_token lock_token =
+        runtime_loader_lock_acquire();
 
-    runtime_loader_lock_acquire();
     glibc_hook_save_error(&error_snapshot);
     result = my_dlsym_locked(handle, name, caller);
     glibc_hook_restore_error(&error_snapshot);
-    runtime_loader_lock_release();
+    runtime_loader_lock_release(lock_token);
     return result;
 }
 
@@ -29528,12 +34480,13 @@ static void *glibc_hook_libc_dlvsym(void *handle, const char *name,
         __builtin_extract_return_addr(__builtin_return_address(0));
     struct glibc_hook_error_snapshot error_snapshot;
     void *result;
+    runtime_loader_lock_token lock_token =
+        runtime_loader_lock_acquire();
 
-    runtime_loader_lock_acquire();
     glibc_hook_save_error(&error_snapshot);
     result = my_dlvsym_locked(handle, name, version, caller);
     glibc_hook_restore_error(&error_snapshot);
-    runtime_loader_lock_release();
+    runtime_loader_lock_release(lock_token);
     return result;
 }
 
@@ -29541,14 +34494,15 @@ static int glibc_hook_libc_dlclose(void *handle)
 {
     struct glibc_hook_error_snapshot error_snapshot;
     int result = 0;
+    runtime_loader_lock_token lock_token =
+        runtime_loader_lock_acquire();
 
-    runtime_loader_lock_acquire();
     glibc_hook_save_error(&error_snapshot);
     dl_clear_error();
     if (handle != DL_GLOBAL_HANDLE && !dl_object_from_handle(handle))
         result = -1;
     glibc_hook_restore_error(&error_snapshot);
-    runtime_loader_lock_release();
+    runtime_loader_lock_release(lock_token);
     return result;
 }
 
@@ -29611,12 +34565,16 @@ static void write_perf_map(void)
         if (!obj->dynsym || !obj->dynstr) continue;
 
         for (uint32_t s = 0; s < obj->dynsym_count; s++) {
-            const Elf64_Sym *sym = &obj->dynsym[s];
+            const Elf64_Sym *sym = loaded_dynsym(obj, s);
+            const char *name;
+
+            if (!sym) continue;
             unsigned char stype = ELF64_ST_TYPE(sym->st_info);
             if (stype != STT_FUNC && stype != STT_GNU_IFUNC) continue;
             if (sym->st_value == 0 || sym->st_shndx == SHN_UNDEF) continue;
 
-            const char *name = obj->dynstr + sym->st_name;
+            name = loaded_symbol_name(obj, sym);
+            if (!name) continue;
             if (!name[0]) continue;
 
             uint64_t addr = obj->base + sym->st_value;
@@ -29672,12 +34630,12 @@ static int my_dl_iterate_phdr_locked(
     unsigned long long active_count = dl_visible_object_count();
     for (int i = 0; i < g_nobj; i++) {
         if (!dl_object_is_visible(&g_all_objs[i]) ||
-            !g_all_objs[i].phdr) continue;
+            !loaded_obj_public_phdr(&g_all_objs[i])) continue;
         struct dl_phdr_info info;
         memset(&info, 0, sizeof(info));
         info.dlpi_addr    = (ElfW(Addr))g_all_objs[i].base;
         info.dlpi_name    = dl_public_object_name(&g_all_objs[i]);
-        info.dlpi_phdr    = g_all_objs[i].phdr;
+        info.dlpi_phdr    = loaded_obj_public_phdr(&g_all_objs[i]);
         info.dlpi_phnum   = g_all_objs[i].phdr_num;
         info.dlpi_adds    = active_count;
         info.dlpi_subs    = 0;
@@ -29702,10 +34660,11 @@ static int my_dl_iterate_phdr(
         void *data)
 {
     int result;
+    runtime_loader_lock_token lock_token =
+        runtime_loader_lock_acquire();
 
-    runtime_loader_lock_acquire();
     result = my_dl_iterate_phdr_locked(callback, data);
-    runtime_loader_lock_release();
+    runtime_loader_lock_release(lock_token);
     return result;
 }
 
@@ -30010,6 +34969,15 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
             objs[oi].tls.vaddr  = phdrs[j].p_vaddr;
             objs[oi].tls.align  = align;
             objs[oi].tls.modid  = (size_t)(oi + 1);
+            /* The checked static layout above is bounded to INT64_MAX, so
+             * extent + 1 is nonzero and exactly represents this module.  The
+             * release-store publishes the immutable signed offset with it. */
+            runtime_atomic_store64(
+                &g_runtime_tls_fast[objs[oi].tls.modid].static_tpoff_bits,
+                (uint64_t)objs[oi].tls.tpoff);
+            runtime_atomic_store64(
+                &g_runtime_tls_fast[objs[oi].tls.modid].extent_plus_one,
+                objs[oi].tls.memsz + 1);
             break;
         }
     }
@@ -30499,17 +35467,26 @@ static int topo_visit_init(int idx, struct loaded_obj *objs, int nobj,
 
 /* ==== Main entry point ================================================= */
 
+static int g_terminal_refusal_requested;
+
+#if defined(__x86_64__)
 static void notify_terminal_refusal(int handoff_fd)
 {
     const char marker = DLFRZ_HANDOFF_TERMINAL_REFUSAL;
     ssize_t written;
 
+    /* Record the terminal classification before attempting the primary
+     * handoff marker.  loader_run() carries it back to the bootstrap child
+     * even when seccomp or descriptor damage makes the write impossible. */
+    g_terminal_refusal_requested = 1;
+    g_loader_diagnostics_suppressed = 0;
     if (handoff_fd < 0)
         return;
     do {
         written = write(handoff_fd, &marker, sizeof(marker));
     } while (written < 0 && loader_errno_value() == EINTR);
 }
+#endif
 
 /* Ordinary and COPY relocations only mutate this supervised child's private
  * mappings.  Keep extraction fallback available through those deterministic
@@ -30520,6 +35497,7 @@ static void notify_application_started_or_exit(int *handoff_fd)
     const char marker = DLFRZ_HANDOFF_APPLICATION_STARTED;
     long written;
 
+    g_loader_diagnostics_suppressed = 0;
     if (!handoff_fd || *handoff_fd < 0)
         return;
     do {
@@ -30658,28 +35636,60 @@ static int embedded_glibc_config_paths(
             (entries[interp_index].data_offset - mem_foff);
         size_t elf_size = (size_t)entries[interp_index].data_size;
 
-        return dlfrz_glibc_config_path(
-                   elf, elf_size, DLFRZ_GLIBC_CACHE_SUFFIX,
-                   sizeof(DLFRZ_GLIBC_CACHE_SUFFIX) - 1,
-                   cache_path, PATH_MAX) &&
-               dlfrz_glibc_config_path(
-                   elf, elf_size, DLFRZ_GLIBC_PRELOAD_SUFFIX,
-                   sizeof(DLFRZ_GLIBC_PRELOAD_SUFFIX) - 1,
-                   preload_path, PATH_MAX);
+        return dlfrz_glibc_elf_config_paths(
+            elf, elf_size, cache_path, PATH_MAX,
+            preload_path, PATH_MAX);
     }
 }
 
-int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
-               const struct dlfrz_lib_meta *metas,
-               const struct dlfrz_entry *entries,
-               const char *strtab,
-               uint32_t num_entries,
-               const uint32_t *runtime_fixups,
-               uint32_t runtime_fixup_count,
-               int handoff_fd,
-               int argc, char **argv, char **envp)
+static int loader_source_contract_is_valid(int srcfd, uint32_t source_flags)
 {
+    if ((source_flags & ~DLFRZ_SOURCE_EXACT_CLEAN_FILE) != 0)
+        return 0;
+    /* At initial handoff an exact token must name the still-open descriptor
+     * whose clean private view is byte-equivalent to mem.  The descriptor is
+     * closed after TLS while that proven live mapping remains retained;
+     * fdless lazy loads therefore consume mem through the ordinary copy path. */
+    if ((source_flags & DLFRZ_SOURCE_EXACT_CLEAN_FILE) != 0 &&
+        srcfd < 0)
+        return 0;
+    return 1;
+}
+
+static int loader_run_impl(const uint8_t *mem, uint64_t mem_foff, int srcfd,
+                           uint32_t source_flags,
+                           const struct dlfrz_lib_meta *metas,
+                           const struct dlfrz_entry *entries,
+                           const char *strtab,
+                           uint32_t num_entries,
+                           const uint32_t *runtime_fixups,
+                           uint32_t runtime_fixup_count,
+                           int handoff_fd,
+                           int argc, char **argv, char **envp)
+{
+    struct loader_readonly_snapshot runtime_fixup_snapshot = {0};
+    const uint32_t *admitted_runtime_fixups = NULL;
     uintptr_t *initial_sp;
+
+    /* A supervised failure before handoff is an internal choice to retry the
+     * exact embedded ELF files through their native loader.  Keep that
+     * speculative attempt silent unless the caller explicitly enables debug;
+     * strict/in-process runs have no handoff fd, and terminal or application
+     * handoff explicitly re-enables diagnostics before anything externally
+     * visible can fail. */
+    g_loader_diagnostics_suppressed = handoff_fd >= 0;
+
+    /* A direct attempt starts with no target-visible namespace.  The graph
+     * is published exactly once below, after ordinary/COPY relocation and
+     * before the first target resolver can enter a dlfcn shim. */
+    runtime_atomic_store32(&g_runtime_loader_phase,
+                           RUNTIME_LOADER_PHASE_RESET);
+    runtime_atomic_store64(&g_runtime_loader_lock.state, 0);
+    runtime_atomic_store32(&g_runtime_loader_lock.process_id, 0);
+    g_nobj = 0;
+
+    if (!loader_source_contract_is_valid(srcfd, source_flags))
+        return -1;
 
     g_target_tls_active = 0;
     g_target_errno_ready = 0;
@@ -30698,12 +35708,21 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     g_target_musl_init_libc = NULL;
     g_target_musl_init_libc_done = 0;
     g_target_musl_libc_obj = NULL;
+    g_target_glibc_libc_obj = NULL;
     memset(&g_musl_contract, 0, sizeof(g_musl_contract));
     dl_gnu_cache_snapshot_reset();
     g_glibc_cache_path[0] = '\0';
     g_glibc_preload_path[0] = '\0';
     g_loader_errno = 0;
     g_fake_libc_stack_end = NULL;
+    g_special_tab_ready = 0;
+#if defined(__x86_64__)
+    if (!initialize_x86_tlsdesc_xstate()) {
+        ldr_msg("dlfreeze: refusing direct load: kernel XSAVE state cannot "
+                "be represented safely\n");
+        return -1;
+    }
+#endif
 
     initial_sp = validated_initial_stack(argc, argv, envp);
     if (!initial_sp) {
@@ -30728,6 +35747,8 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     {
         const char *dbg = getenv("DLFREEZE_DEBUG");
         g_debug = (dbg && dbg[0] != '0' && dbg[0] != '\0');
+        if (g_debug)
+            g_loader_diagnostics_suppressed = 0;
         const char *perf = getenv("DLFREEZE_PERF");
         g_perf_mode = (perf && perf[0] != '0' && perf[0] != '\0');
     }
@@ -30751,9 +35772,9 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
 
         if (unsupported_env) {
             /* Preserve native loader semantics by declining direct loading.
-             * This is deliberately a recoverable failure: the bootstrap may
-             * extract a clean runtime-relocated artifact, while its existing
-             * direct-only gates reject prelinked or captured-DATA payloads. */
+             * This is deliberately a recoverable failure whenever the
+             * manifest's paths and captured-file state are representable by
+             * extraction. */
             ldr_msg("dlfreeze: refusing direct load: nonempty ");
             ldr_msg(unsupported_env);
             ldr_msg(" is unsupported\n");
@@ -30790,12 +35811,16 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     gnu_loaded_name_registry_reset();
     g_global_scope_root = -1;
     g_global_scope_count = 0;
+    memset(g_runtime_tls_fast, 0, sizeof(g_runtime_tls_fast));
     g_init_order_count = 0;
     g_fini_running = 0;
     g_startup_exit_addr = 0;
     g_glibc_off = NULL;
     g_glibc_rtld_fixed = 0;
     g_glibc_minor = -1;
+    memset(&g_glibc_getauxval_contract, 0,
+           sizeof(g_glibc_getauxval_contract));
+    g_glibc_getauxval_contract_ready = 0;
 #if defined(__x86_64__)
     memset(&g_glibc_x86_cpu_contract, 0,
            sizeof(g_glibc_x86_cpu_contract));
@@ -30837,7 +35862,6 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         if (prelinked < 0)
             prelinked = object_prelinked;
         else if (prelinked != object_prelinked) {
-            notify_terminal_refusal(handoff_fd);
             ldr_err("mixed pre-linked object metadata", NULL);
             return -1;
         }
@@ -30864,8 +35888,6 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     else if (musl_layout && !glibc_off)
         runtime = FROZEN_RUNTIME_MUSL;
     if (runtime == FROZEN_RUNTIME_UNKNOWN) {
-        if (prelinked)
-            notify_terminal_refusal(handoff_fd);
         ldr_msg("dlfreeze: direct-load artifact is incompatible with this "
                 "runtime layout\n");
         return -1;
@@ -30882,8 +35904,6 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         if (!embedded_glibc_config_paths(
                 mem, mem_foff, entries, metas, num_entries,
                 g_glibc_cache_path, g_glibc_preload_path)) {
-            if (prelinked)
-                notify_terminal_refusal(handoff_fd);
             ldr_msg("dlfreeze: target glibc configuration paths are "
                     "missing or ambiguous\n");
             return -1;
@@ -30892,8 +35912,6 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         if (g_kernel_minsigstksz == 0)
             g_kernel_minsigstksz = glibc_legacy_minsigstksz();
         if (g_kernel_minsigstksz == 0) {
-            if (prelinked)
-                notify_terminal_refusal(handoff_fd);
             ldr_msg("dlfreeze: target glibc signal-stack parameter is "
                     "unavailable\n");
             return -1;
@@ -30915,11 +35933,22 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         if (!embedded_glibc_libc_release_matches(
                 mem, mem_foff, entries, metas, num_entries,
                 g_glibc_minor)) {
-            if (prelinked)
-                notify_terminal_refusal(handoff_fd);
             ldr_msg("dlfreeze: direct-load artifact has a glibc "
                     "libc/interpreter release mismatch\n");
             return -1;
+        }
+        {
+            int target_tunables = dl_gnu_cache_target_tunables_state(
+                g_glibc_cache_path);
+
+            if (target_tunables != 0) {
+                ldr_msg(target_tunables > 0
+                    ? "dlfreeze: refusing direct load: target glibc cache "
+                      "contains system-wide tunable overrides\n"
+                    : "dlfreeze: refusing direct load: target glibc cache "
+                      "extensions cannot be validated\n");
+                return -1;
+            }
         }
         if (unsupported_env) {
             ldr_msg("dlfreeze: refusing direct load: nonempty ");
@@ -30930,8 +35959,9 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     }
 
     /* Private libc layouts must be positively identified before mapping any
-     * target object.  A stale prelinked artifact is terminally refused here;
-     * clean runtime-relocation payloads may still use extraction fallback. */
+     * target object.  Failure remains recoverable while the supervisor can
+     * launch the extraction-safe embedded ELF files with their native
+     * runtime. */
     if (runtime == FROZEN_RUNTIME_MUSL) {
         g_musl_layout = musl_layout;
         uintptr_t random = get_auxval(envp, AT_RANDOM);
@@ -30945,15 +35975,6 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
 
     struct sigaction startup_crash_handlers[CRASH_SIGNAL_COUNT];
     capture_crash_handlers(startup_crash_handlers);
-
-    /* Kick off asynchronous readahead of the frozen binary so that
-     * page faults during segment mapping hit warm page cache. */
-    if (srcfd >= 0) {
-        off_t end = lseek(srcfd, 0, SEEK_END);
-        if (end > 0)
-            (void)arch_raw_syscall3(SYS_readahead, srcfd, 0,
-                                    (long)(size_t)end);
-    }
 
     /* Install crash handlers for debugging */
     install_crash_handlers();
@@ -30970,6 +35991,7 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     g_frozen_mem         = mem;
     g_frozen_mem_foff    = mem_foff;
     g_frozen_srcfd       = srcfd;
+    g_frozen_source_flags = source_flags;
     g_frozen_metas       = metas;
     g_frozen_entries     = entries;
     g_frozen_strtab      = strtab;
@@ -30978,6 +36000,13 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     /* Initialize embedded data-file VFS (before any opens) */
     if (vfs_init(mem, mem_foff, entries, strtab, num_entries) < 0) {
         ldr_err("invalid or unrepresentable VFS manifest", NULL);
+        return -1;
+    }
+    /* Fake rtld storage and captured-VFS membership are now final.  Publish
+     * the unified table before relocation preflight so classification never
+     * repeats the linear override/stub/fake-object scans. */
+    if (build_special_table() < 0) {
+        ldr_err("special-symbol table capacity exhausted", NULL);
         return -1;
     }
 
@@ -31055,21 +36084,19 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     }
     dl_manifest_startup_owners_release(&startup_owners);
 
-    if (argc > 0 && argv && objs[0].name && objs[0].name[0])
-        argv[0] = (char *)objs[0].name;
-
     /* 2. Map all ordinary and promoted-dormant objects into memory at their
      *    pre-assigned addresses.  Each range is reserved independently so
      *    unpromoted manifest objects retain their later lazy-load ranges. */
     ldr_dbg("[loader] mapping objects...\n");
-    if (reserve_address_range(metas, idx_map, nobj, srcfd < 0) < 0) {
+    if (reserve_address_range(metas, idx_map, objs, nobj) < 0) {
         ldr_err("failed to reserve address range", NULL);
         return -1;
     }
     for (int i = 0; i < nobj; i++) {
         int mi = idx_map[i];
         g_dl_metas[i] = metas[mi];
-        if (map_object(mem, mem_foff, srcfd, &metas[mi], &entries[mi], &objs[i], 1) < 0)
+        if (map_object(mem, mem_foff, srcfd, source_flags,
+                       &metas[mi], &entries[mi], &objs[i], 1) < 0)
             return -1;
         objs[i].map_start = objs[i].base + page_floor(metas[mi].vaddr_lo);
         objs[i].map_end   = objs[i].base + metas[mi].vaddr_hi;
@@ -31093,8 +36120,6 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     }
     if (!startup_gnu_properties_admitted(
             objs, nobj, g_kernel_hwcap, g_kernel_hwcap2)) {
-        if (prelinked)
-            notify_terminal_refusal(handoff_fd);
         ldr_msg("dlfreeze: direct-load artifact requires unsupported "
                 "GNU control-flow protection\n");
         return -1;
@@ -31113,8 +36138,6 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         }
         if (!is_musl_runtime &&
             loaded_object_requires_native_glibc_gmon(&objs[i])) {
-            if (prelinked)
-                notify_terminal_refusal(handoff_fd);
             ldr_err("glibc gmon profiling requires the native loader for",
                     objs[i].name);
             return -1;
@@ -31130,8 +36153,6 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
      * object, regardless of its deployment basename. */
     if (is_musl_runtime &&
         !initialize_musl_target_contract(objs, nobj)) {
-        if (prelinked)
-            notify_terminal_refusal(handoff_fd);
         ldr_msg("dlfreeze: direct-load artifact failed target musl "
                 "private-layout validation\n");
         return -1;
@@ -31143,11 +36164,32 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
 
     if (!is_musl_runtime &&
         initialize_glibc_thread_contract(objs, nobj) < 0) {
-        if (prelinked)
-            notify_terminal_refusal(handoff_fd);
         ldr_msg("dlfreeze: direct-load artifact failed target glibc "
                 "thread-layout validation\n");
         return -1;
+    }
+    if (!is_musl_runtime) {
+        struct loaded_obj *lazy_requester = NULL;
+        struct symbol_lookup_query lazy_query;
+
+        if (startup_find_unresolved_lazy_plt_import(
+                objs, nobj, &lazy_requester, &lazy_query)) {
+            if (handoff_fd < 0) {
+                if (lazy_query.name) {
+                    ldr_err_symbol_query(
+                        "native lazy PLT binding is required for unresolved "
+                        "symbol", &lazy_query);
+                } else {
+                    ldr_err("native lazy PLT binding is required for an "
+                            "unresolved symbol in",
+                            lazy_requester ? lazy_requester->name : NULL);
+                }
+            } else if (g_debug) {
+                ldr_dbg("[loader] native lazy PLT binding is required; "
+                        "using extraction fallback\n");
+            }
+            return -1;
+        }
     }
     if (!is_musl_runtime) {
         /* Mutate synthetic private rtld state only after the exact target
@@ -31156,33 +36198,72 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         g_glibc_rtld_fixed = 1;
     }
 
-    if (prelinked &&
-        validate_prelinked_runtime_fixups(
-            objs, nobj, metas, idx_map, entries, num_entries,
-            runtime_fixups, runtime_fixup_count) < 0) {
-        ldr_err("non-canonical pre-linked runtime fixup metadata", NULL);
-        return -1;
+    if (prelinked) {
+        size_t runtime_fixup_bytes;
+
+        if (__builtin_mul_overflow((size_t)runtime_fixup_count,
+                                   sizeof(*runtime_fixups),
+                                   &runtime_fixup_bytes) ||
+            loader_readonly_snapshot_create(
+                runtime_fixups, runtime_fixup_bytes,
+                &runtime_fixup_snapshot) < 0) {
+            ldr_err("cannot snapshot pre-linked runtime fixups", NULL);
+            return -1;
+        }
+        admitted_runtime_fixups =
+            (const uint32_t *)runtime_fixup_snapshot.bytes;
+        if (validate_prelinked_runtime_fixups(
+                objs, nobj, metas, idx_map, entries, num_entries,
+                admitted_runtime_fixups, runtime_fixup_count) < 0) {
+            loader_readonly_snapshot_release(&runtime_fixup_snapshot);
+            ldr_err("non-canonical pre-linked runtime fixup metadata", NULL);
+            return -1;
+        }
     }
     if (preflight_resolver_relocation_destinations(
             objs, nobj, objs, nobj, NULL) < 0) {
+        loader_readonly_snapshot_release(&runtime_fixup_snapshot);
         ldr_err("resolver relocation preflight failed", NULL);
         return -1;
     }
     if (!is_musl_runtime &&
         initialize_target_tunable_service(
-            mem, mem_foff, srcfd, metas, entries, strtab,
+            mem, mem_foff, srcfd, source_flags, metas, entries, strtab,
             num_entries) < 0) {
-        if (prelinked)
-            notify_terminal_refusal(handoff_fd);
+        loader_readonly_snapshot_release(&runtime_fixup_snapshot);
         ldr_err("target interpreter lacks safe tunable defaults", NULL);
         return -1;
     }
     if (initialize_target_libc_helpers(objs, nobj) < 0) {
-        if (prelinked)
-            notify_terminal_refusal(handoff_fd);
+        loader_readonly_snapshot_release(&runtime_fixup_snapshot);
         ldr_err("target libc lacks required direct-loader operations", NULL);
         return -1;
     }
+#if defined(__x86_64__)
+    if (!is_musl_runtime) {
+        int cpu_probe = initialize_target_x86_cpu_features(handoff_fd);
+
+        if (cpu_probe < 0) {
+            /* Only a pre-clone refusal or a positively identified PREP/120
+             * child exit proves that the target wrapper did not run.  Every
+             * other post-clone anomaly is terminal even for a clean payload:
+             * COW contains memory, but is not a syscall sandbox. */
+            if (cpu_probe != TARGET_X86_CPU_PROBE_UNAVAILABLE)
+                notify_terminal_refusal(handoff_fd);
+            loader_readonly_snapshot_release(&runtime_fixup_snapshot);
+            if (cpu_probe == TARGET_X86_CPU_PROBE_UNAVAILABLE)
+                ldr_msg("dlfreeze: target x86 CPU probe is unavailable "
+                        "before target invocation\n");
+            else if (cpu_probe == TARGET_X86_CPU_PROBE_CONTAINMENT_LOST)
+                ldr_msg("dlfreeze: target x86 CPU probe containment could "
+                        "not be re-established\n");
+            else
+                ldr_msg("dlfreeze: target x86 CPU probe failed safely in "
+                        "its contained child\n");
+            return -1;
+        }
+    }
+#endif
 
     /* Rewrite the kernel's existing auxiliary vector before any target
      * resolver or libc initializer parses it.  This same vector is later
@@ -31201,12 +36282,13 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         if (!(objs[i].flags & LDR_FLAG_MAIN_EXE))
             continue;
         if (entry) {
+            loader_readonly_snapshot_release(&runtime_fixup_snapshot);
             ldr_err("multiple startup entry points", NULL);
             return -1;
         }
         mi = idx_map[i];
         entry = objs[i].base + metas[mi].entry;
-        exe_phdr = (uintptr_t)objs[i].phdr;
+        exe_phdr = (uintptr_t)loaded_obj_public_phdr(&objs[i]);
         exe_phnum = metas[mi].phdr_num;
     }
     if (is_musl_runtime) {
@@ -31214,6 +36296,7 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
             if (&objs[i] != g_target_musl_libc_obj)
                 continue;
             if (at_base) {
+                loader_readonly_snapshot_release(&runtime_fixup_snapshot);
                 ldr_err("multiple target musl libc objects", NULL);
                 return -1;
             }
@@ -31223,8 +36306,7 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     if (!entry || (is_musl_runtime && !at_base) ||
         !rewrite_target_auxv(envp, exe_phdr, exe_phnum, at_base,
                              entry, at_random)) {
-        if (prelinked)
-            notify_terminal_refusal(handoff_fd);
+        loader_readonly_snapshot_release(&runtime_fixup_snapshot);
         ldr_msg("dlfreeze: refusing direct load: kernel auxiliary vector "
                 "cannot represent the target image\n");
         return -1;
@@ -31242,9 +36324,11 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     uintptr_t tp = setup_tls(objs, nobj, mem, mem_foff, metas, entries,
                               idx_map, num_entries, at_random);
     if (!tp) {
+        loader_readonly_snapshot_release(&runtime_fixup_snapshot);
         ldr_err("TLS setup failed", NULL);
         return -1;
     }
+    release_frozen_source_fd_after_tls();
     /* After setup_tls, the target thread pointer is live.  From here onward
      * loader-owned OS work must use the raw syscall layer and no bootstrap
      * allocator, stdio, signal, locale, or resource API may run.  Until
@@ -31266,11 +36350,17 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     if (prelinked) {
         ldr_dbg("[loader] pre-linked: applying runtime fixups...\n");
 
-        /* Build the unified special-symbol hash table (overrides, stubs,
-         * fake rtld objects) for fast O(1) lookup per relocation. */
-        if (build_special_table() < 0) {
-            ldr_err("special-symbol table capacity exhausted", NULL);
-            _exit(127);
+        /* RELR is validation-only at pack time because its implicit addend
+         * must remain extraction-safe.  Replay every admitted table before
+         * pre-seeding startup-critical GOT slots, matching the native
+         * relative-before-symbolic order and preventing a RELR alias from
+         * clobbering a preseed needed by a later IFUNC resolver. */
+        for (int i = 0; i < nobj; i++) {
+            if ((objs[i].flags & LDR_FLAG_DLOPEN_EARLY) == 0 &&
+                walk_relr(&objs[i], 1) < 0) {
+                ldr_err("malformed RELR relocation in", objs[i].name);
+                _exit(127);
+            }
         }
 
         /* Pre-seed _rtld_global/_rtld_global_ro in every object's GOT
@@ -31316,13 +36406,13 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
                     continue;
                 }
 
-                if (runtime_fixups != NULL &&
+                if (admitted_runtime_fixups != NULL &&
                     metas[idx_map[i]].runtime_fixup_count != 0) {
                     uint32_t off = metas[idx_map[i]].runtime_fixup_off;
                     uint32_t count = metas[idx_map[i]].runtime_fixup_count;
                     if (off <= runtime_fixup_count &&
                         count <= runtime_fixup_count - off) {
-                        obj_fixups = runtime_fixups + off;
+                        obj_fixups = admitted_runtime_fixups + off;
                         obj_fixup_count = count;
                     }
                 }
@@ -31336,27 +36426,31 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
 
                 if (obj_fixups != NULL) {
                     for (uint32_t f = 0; f < obj_fixup_count; f++) {
-                        uint32_t encoded = obj_fixups[f];
-                        const Elf64_Rela *tab;
-                        size_t count;
-                        uint32_t idx =
-                            encoded & ~LDR_PRELINK_FIXUP_JMPREL;
+                        Elf64_Rela relocation;
+                        uint32_t encoded;
+                        uint32_t idx;
+                        enum loaded_rela_table table;
+
+                        memcpy(&encoded,
+                               (const uint8_t *)obj_fixups +
+                                   (size_t)f * sizeof(encoded),
+                               sizeof(encoded));
+                        idx = encoded & ~LDR_PRELINK_FIXUP_JMPREL;
 
                         if (encoded & LDR_PRELINK_FIXUP_JMPREL) {
-                            tab = objs[i].jmprel;
-                            count = objs[i].jmprel_count;
+                            table = LOADED_RELA_PLT;
                         } else {
-                            tab = objs[i].rela;
-                            count = objs[i].rela_count;
+                            table = LOADED_RELA_DYNAMIC;
                         }
-                        if (!tab || idx >= count) {
+                        if (!loaded_rela_read(
+                                &objs[i], table, idx, &relocation)) {
                             ldr_err("invalid pre-linked runtime fixup in",
                                     objs[i].name);
                             _exit(127);
                         }
 
                         if (apply_prelinked_runtime_reloc(
-                                &objs[i], objs, nobj, &tab[idx], pass) < 0)
+                                &objs[i], objs, nobj, &relocation, pass) < 0)
                             _exit(127);
                     }
 
@@ -31366,6 +36460,8 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
             if (pass == RELOC_PASS_COPY) {
                 if (tp)
                     copy_tdata(objs, nobj, tp);
+                runtime_loader_publish_startup_graph(
+                    nobj, argc, argv, runtime_envp);
                 if (is_musl_runtime) {
                     notify_application_started_or_exit(&handoff_fd);
                     init_musl_process_state(
@@ -31376,11 +36472,6 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         }
     } else {
         ldr_dbg("[loader] applying relocations...\n");
-
-        if (build_special_table() < 0) {
-            ldr_err("special-symbol table capacity exhausted", NULL);
-            _exit(127);
-        }
 
         /* Pre-seed _rtld_global/_rtld_global_ro GOT entries so IFUNC
          * resolvers called during GLOB_DAT processing work correctly. */
@@ -31412,6 +36503,8 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
          * relocation is complete, and before any target resolver runs. */
         if (tp)
             copy_tdata(objs, nobj, tp);
+        runtime_loader_publish_startup_graph(
+            nobj, argc, argv, runtime_envp);
         if (is_musl_runtime) {
             notify_application_started_or_exit(&handoff_fd);
             init_musl_process_state(
@@ -31443,23 +36536,15 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         }
     }
 
+    loader_readonly_snapshot_release(&runtime_fixup_snapshot);
+
     /* Target libc is now fully relocated, so VFS callbacks and subsequent
      * loader failures may safely publish errno through its TLS accessor. */
     g_target_errno_ready = 1;
 
-    /* 6. Set final memory protections.
-     *    For pre-linked objects, segments were already mapped with their
-     *    correct ELF permissions from map_object, so no mprotect needed
-     *    — UNLESS memcpy was used (perf mode or UPX path with srcfd<0),
-     *    where the anonymous reservation leaves pages as RWX and we need
-     *    to set proper per-segment permissions. */
+    /* 6. Seal GNU_RELRO after every relocation pass.  map_object has already
+     *    restored final PT_LOAD permissions for both mmap and memcpy paths. */
     ldr_dbg("[loader] setting protections...\n");
-    /* Always call protect_object for every loaded object so that text
-     * pages are correctly marked PROT_EXEC.  For prelinked non-UPX
-     * binaries the file-backed mmap already sets the right permissions,
-     * but if mmap falls back to memcpy the pages would be PROT_RW only
-     * and executing them would raise SIGILL.  The extra mprotect calls
-     * are a no-op when the permissions already match. */
     for (int i = 0; i < nobj; i++) {
         if (objs[i].final_protections_pending)
             continue;
@@ -31469,14 +36554,13 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         }
     }
 
-    /* Set dlopen support globals before init functions or main() can
-     * call dlopen.  g_nobj is the count of objects in g_all_objs. */
-    g_nobj = nobj;
-    g_argc = argc;
-    g_argv = argv;
-    g_envp = runtime_envp;
-    runtime_loader_lock_initialize();
-    dl_refresh_public_link_maps();
+    /* Resolver-time dlfcn queries have used this complete startup graph in
+     * read-only mode.  Keep mutations gated while libc process/thread state
+     * and loader finalization ownership are established below. */
+    if (runtime_loader_phase() !=
+            RUNTIME_LOADER_PHASE_STARTUP_READONLY ||
+        g_nobj != nobj)
+        loader_exit(127);
 
     /* 7. Initialise libc process state (environ, arena, tcache) BEFORE
      *    calling any init functions — library init_array entries may call
@@ -31509,6 +36593,11 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
             _exit(127);
         }
     }
+
+    /* From here, every service needed by a transactional object-graph
+     * mutation is live, and constructors may use ordinary recursive
+     * dlopen semantics. */
+    runtime_loader_enable_mutation();
 
     /* 7b. Call shared library init functions (libc first, then others).
      *    Skip the exe — its constructors are called later.
@@ -31584,4 +36673,27 @@ int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     ldr_dbg("[loader] transferring to _start...\n");
     transfer_to_entry(entry, initial_sp, is_musl_runtime);
     /* NOTREACHED */
+}
+
+int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
+               uint32_t source_flags,
+               const struct dlfrz_lib_meta *metas,
+               const struct dlfrz_entry *entries,
+               const char *strtab,
+               uint32_t num_entries,
+               const uint32_t *runtime_fixups,
+               uint32_t runtime_fixup_count,
+               int handoff_fd,
+               int argc, char **argv, char **envp)
+{
+    int result;
+
+    g_terminal_refusal_requested = 0;
+    result = loader_run_impl(
+        mem, mem_foff, srcfd, source_flags, metas, entries, strtab,
+        num_entries,
+        runtime_fixups, runtime_fixup_count, handoff_fd, argc, argv, envp);
+    return g_terminal_refusal_requested
+        ? DLFRZ_LOADER_RUN_TERMINAL_REFUSAL
+        : result;
 }

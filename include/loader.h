@@ -15,13 +15,29 @@ struct dlfrz_entry;
 #define DLFRZ_HANDOFF_APPLICATION_STARTED '1'
 #define DLFRZ_HANDOFF_TERMINAL_REFUSAL     'R'
 
+/* loader_run() uses a distinct return only when it also requested a terminal
+ * handoff refusal.  The supervised bootstrap child converts that internal
+ * result to a reserved process status, providing a fail-closed backup when a
+ * sandbox denies the primary marker write. */
+#define DLFRZ_LOADER_RUN_TERMINAL_REFUSAL   (-2)
+#define DLFRZ_LOADER_CHILD_TERMINAL_REFUSAL 126
+
+/* The bootstrap sets this only when the retained read-only memory authority
+ * and srcfd are exact, clean MAP_PRIVATE views of the same regular file.
+ * It does not claim that the backing file is globally immutable.  This is a
+ * proof token, not a request: without it the loader must continue treating
+ * mem as the sole byte authority. */
+#define DLFRZ_SOURCE_EXACT_CLEAN_FILE (1U << 0)
+
 /*
  * Load all libraries from the frozen binary's in-memory payload,
  * resolve relocations, set up TLS, and jump to the executable's _start.
  *
  *   mem:          pointer to start of frozen file / payload in memory
  *   mem_foff:     file offset corresponding to mem[0]
- *                 (normal path: 0, UPX path: g_loader_info.payload_foff)
+ *                 (mapped/canonical/UPX payload: payload file offset;
+ *                  compatibility whole-file mapping: 0)
+ *   source_flags: bootstrap-proven properties of mem/srcfd
  *   metas:        per-library metadata array (num_entries elements)
  *   entries:      manifest entry array (num_entries elements)
  *   strtab:       string table
@@ -35,6 +51,7 @@ struct dlfrz_entry;
  * loaded executable.  On failure it returns -1.
  */
 int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
+               uint32_t source_flags,
                const struct dlfrz_lib_meta *metas,
                const struct dlfrz_entry *entries,
                const char *strtab,

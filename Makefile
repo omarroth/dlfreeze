@@ -96,7 +96,7 @@ $(DLFREEZE): $(TOOL_OBJS)
 BOOTSTRAP_CC := $(STATIC_CC)
 INC      = include
 
-$(BOOTSTRAP): $(SRC)/bootstrap.c $(SRC)/loader.c $(INC)/common.h $(INC)/dynamic_semantics.h $(INC)/glibc_layout.h $(INC)/libc_semantics.h $(INC)/load_segments.h $(INC)/musl_layout.h $(INC)/loader.h $(BUILD_STAMP_FILE)
+$(BOOTSTRAP): $(SRC)/bootstrap.c $(SRC)/loader.c $(INC)/common.h $(INC)/dynamic_semantics.h $(INC)/gnu_properties.h $(INC)/glibc_layout.h $(INC)/libc_semantics.h $(INC)/load_segments.h $(INC)/musl_layout.h $(INC)/loader.h $(BUILD_STAMP_FILE)
 	$(BOOTSTRAP_CC) -Wall -Wextra $(ERROR_CFLAGS) -O2 -D_GNU_SOURCE -Iinclude -fno-stack-protector \
 	    -ffunction-sections -fdata-sections \
 	    -static -Wl,--gc-sections -Wl,-Ttext-segment=0x40000000 \
@@ -115,10 +115,10 @@ PRELOAD_ARCH_CFLAGS := $(if $(filter aarch64,$(BUILD_ARCH)),$(call supported_cc_
 PRELOAD_STATIC_ARCH_CFLAGS := $(if $(filter aarch64,$(STATIC_CC_ARCH)),$(call supported_cc_option,$(STATIC_CC),-mno-outline-atomics),)
 
 $(PRELOAD): $(SRC)/dlopen_preload.c $(INC)/dynamic_semantics.h $(BUILD_STAMP_FILE)
-	$(CC) $(CFLAGS) $(ERROR_CFLAGS) $(PRELOAD_ARCH_CFLAGS) -U_FORTIFY_SOURCE -shared -fPIC -Wl,-z,defs -o $@ $< -ldl -lpthread
+	$(CC) $(CFLAGS) $(ERROR_CFLAGS) $(PRELOAD_ARCH_CFLAGS) -U_FORTIFY_SOURCE -shared -fPIC -Wl,-z,defs -o $@ $< -ldl
 
 $(PRELOAD_STATIC): $(SRC)/dlopen_preload.c $(INC)/dynamic_semantics.h $(BUILD_STAMP_FILE)
-	$(STATIC_CC) $(CFLAGS) $(ERROR_CFLAGS) $(PRELOAD_STATIC_ARCH_CFLAGS) -U_FORTIFY_SOURCE -shared -fPIC -Wl,-z,defs -o $@ $< -ldl -lpthread
+	$(STATIC_CC) $(CFLAGS) $(ERROR_CFLAGS) $(PRELOAD_STATIC_ARCH_CFLAGS) -U_FORTIFY_SOURCE -shared -fPIC -Wl,-z,defs -o $@ $< -ldl
 
 # ── test suite ─────────────────────────────────────────────────────
 test: all
@@ -140,4 +140,4 @@ clean:
 $(BUILD)/main.o:         $(SRC)/main.c $(INC)/elf_parser.h $(INC)/dep_resolver.h $(INC)/packer.h
 $(BUILD)/elf_parser.o:   $(SRC)/elf_parser.c $(INC)/elf_parser.h $(INC)/load_segments.h
 $(BUILD)/dep_resolver.o: $(SRC)/dep_resolver.c $(INC)/dep_resolver.h $(INC)/elf_parser.h $(INC)/glibc_layout.h $(INC)/libc_semantics.h
-$(BUILD)/packer.o:       $(SRC)/packer.c $(INC)/packer.h $(INC)/common.h $(INC)/dynamic_semantics.h $(INC)/elf_sections.h $(INC)/glibc_layout.h $(INC)/load_segments.h $(INC)/musl_layout.h $(INC)/dep_resolver.h
+$(BUILD)/packer.o:       $(SRC)/packer.c $(INC)/packer.h $(INC)/common.h $(INC)/dynamic_semantics.h $(INC)/elf_sections.h $(INC)/gnu_properties.h $(INC)/glibc_layout.h $(INC)/load_segments.h $(INC)/musl_layout.h $(INC)/dep_resolver.h

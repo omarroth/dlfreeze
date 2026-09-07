@@ -454,7 +454,9 @@ int main(int argc, char **argv)
     phnum = dlinfo(handle, TEST_RTLD_DI_PHDR, &phdr);
     /* RTLD_DI_PHDR was added in glibc 2.34.  It is mandatory for the
      * dlfreeze strict run, while an older native control may lack it. */
-    if (strict_mode && (phnum <= 0 || !phdr))
+    if (strict_mode &&
+        (phnum <= 0 || !phdr || phdr != iterate_tls.phdr ||
+         (ElfW(Half))phnum != iterate_tls.phnum))
         return fail(43);
     if (phnum > 0 && phdr) {
         for (int i = 0; i < phnum; i++) {

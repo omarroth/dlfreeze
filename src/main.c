@@ -27,12 +27,88 @@
 #include <time.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
+#include <sys/file.h>
 
 #include "elf_parser.h"
 #include "dep_resolver.h"
+#include "libc_semantics.h"
 #include "packer.h"
 
 extern char **environ;
+
+static int set_trace_owner_environment(void)
+{
+    char owner[32];
+    pid_t pid = getpid();
+    int length;
+
+    if (pid <= 0) {
+        errno = EIO;
+        return -1;
+    }
+    length = snprintf(owner, sizeof(owner), "%ld", (long)pid);
+    if (length <= 0 || (size_t)length >= sizeof(owner)) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    return setenv("DLFREEZE_TRACE_OWNER_PID", owner, 1);
+}
+
+static int prepare_trace_descriptor(int fd)
+{
+    struct stat status;
+    int descriptor_flags;
+    int status_flags;
+
+    if (fd < 0 || fstat(fd, &status) < 0 ||
+        !S_ISREG(status.st_mode) || status.st_size != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    descriptor_flags = fcntl(fd, F_GETFD);
+    status_flags = fcntl(fd, F_GETFL);
+    if (descriptor_flags < 0 || status_flags < 0 ||
+        fcntl(fd, F_SETFD, descriptor_flags & ~FD_CLOEXEC) < 0 ||
+        fcntl(fd, F_SETFL, status_flags | O_APPEND | O_NONBLOCK) < 0)
+        return -1;
+    return 0;
+}
+
+static int set_trace_descriptor_environment(int fd, const char *fd_name,
+                                            const char *identity_name)
+{
+    struct stat status;
+    char fd_value[32];
+    char identity_value[68];
+    int fd_length;
+    int identity_length;
+
+    if (fd < 0 || !fd_name || !identity_name ||
+        fstat(fd, &status) < 0 ||
+        !S_ISREG(status.st_mode) ||
+        status.st_size != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    fd_length = snprintf(fd_value, sizeof(fd_value), "%d", fd);
+    if (fd_length <= 0 || (size_t)fd_length >= sizeof(fd_value)) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    identity_length = snprintf(
+        identity_value, sizeof(identity_value),
+        "%016" PRIx64 ":%016" PRIx64 ":%016" PRIx64 ":%016" PRIx64,
+        (uint64_t)status.st_dev, (uint64_t)status.st_ino,
+        (uint64_t)(status.st_mode & S_IFMT), (uint64_t)status.st_rdev);
+    if (identity_length != (int)sizeof(identity_value) - 1) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    if (setenv(identity_name, identity_value, 1) < 0)
+        return -1;
+    return setenv(fd_name, fd_value, 1);
+}
 
 /* A traced target shares dlfreeze's foreground process group so terminal
  * input and job control behave as they do when the target is run directly.
@@ -270,6 +346,20 @@ static int resolved_snapshot_matches_stat(
            snapshot->ctime_nsec == st->st_ctim.tv_nsec;
 }
 
+static void resolved_snapshot_from_stat(struct dep_file_snapshot *snapshot,
+                                        const struct stat *st)
+{
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->device = st->st_dev;
+    snapshot->inode = st->st_ino;
+    snapshot->size = st->st_size;
+    snapshot->mtime_sec = st->st_mtim.tv_sec;
+    snapshot->mtime_nsec = st->st_mtim.tv_nsec;
+    snapshot->ctime_sec = st->st_ctim.tv_sec;
+    snapshot->ctime_nsec = st->st_ctim.tv_nsec;
+    snapshot->valid = 1;
+}
+
 /* A resolved_lib.name is the exact DT_NEEDED lookup identity and may contain
  * a slash.  Helper ABI selection also needs the provider's ELF identity, so
  * admit an exact DT_SONAME without inferring anything from a pathname.  Parse
@@ -302,29 +392,6 @@ out:
     elf_info_free(&info);
     close(fd);
     return matches;
-}
-
-static int target_runtime_has_soname(const struct dep_list *deps,
-                                     const char *interp_soname,
-                                     const char *soname)
-{
-    if (!deps || !soname || !soname[0])
-        return 0;
-    if (interp_soname && interp_soname[0] &&
-        strcmp(interp_soname, soname) == 0)
-        return 1;
-    for (int i = 0; i < deps->count; i++) {
-        int structural_match;
-
-        if (deps->libs[i].name &&
-            strcmp(deps->libs[i].name, soname) == 0)
-            return 1;
-        structural_match = resolved_lib_soname_matches(
-            &deps->libs[i], soname);
-        if (structural_match != 0)
-            return structural_match;
-    }
-    return 0;
 }
 
 static int paths_name_same_file(const char *left, const char *right)
@@ -364,6 +431,15 @@ static int target_runtime_provider(const struct dep_list *deps,
 
     if (!deps || !name || !name[0] || !path_out)
         return -1;
+    /* musl's reserved libc/libpthread/libdl-style names all bind to the
+     * already-loaded combined PT_INTERP object, even when a minimal target
+     * has no DT_NEEDED self-edge and the interpreter exports no SONAME. */
+    if (deps->runtime_family == DEP_RUNTIME_MUSL &&
+        ((interp_soname && strcmp(interp_soname, name) == 0) ||
+         dlfrz_musl_reserved_soname(name))) {
+        if (target_provider_add(&provider, deps->interp_path) < 0)
+            return -1;
+    }
     if (deps->interp_path && interp_soname &&
         strcmp(interp_soname, name) == 0) {
         if (target_provider_add(&provider, deps->interp_path) < 0)
@@ -440,11 +516,9 @@ already_checked:
 }
 
 /* Rank preload DSOs by ELF ABI and runtime identity, rather than compiler
- * names, libc path spelling, or application name.  A helper may legitimately
- * add unversioned dependencies which are not in the target's startup closure,
- * but every versioned dependency must match the selected target provider.
- * At least one DT_NEEDED runtime identity is required for a non-neutral
- * helper; a dependency-free helper remains a valid fallback. */
+ * names, libc path spelling, or application name.  Every helper dependency
+ * must resolve to the exact provider already present in the target startup
+ * graph; a dependency-free helper remains a valid fallback. */
 static int preload_target_score(const char *path, struct dep_list *deps,
                                 const char *interp_soname)
 {
@@ -462,20 +536,33 @@ static int preload_target_score(const char *path, struct dep_list *deps,
 
     score = 0;
     for (int i = 0; i < info.needed_count; i++) {
-        int runtime_match = target_runtime_has_soname(
-            deps, interp_soname, info.needed[i]);
+        const char *startup_provider = NULL;
+        char *helper_provider = NULL;
+        int runtime_match = target_runtime_provider(
+            deps, interp_soname, info.needed[i], &startup_provider);
+        int helper_match;
 
-        if (runtime_match < 0) {
+        if (runtime_match != 1 ||
+            dep_resolve_aux_dependency(
+                deps, path, info.needed[i], &helper_provider) != 1) {
+            free(helper_provider);
             score = -1;
             goto out;
         }
-        if (runtime_match > 0)
-            score++;
+        helper_match = paths_name_same_file(
+            startup_provider, helper_provider);
+        free(helper_provider);
+        if (!helper_match) {
+            score = -1;
+            goto out;
+        }
+        score++;
     }
 
-    /* A non-neutral helper with no shared runtime identity is incompatible. */
-    if (info.needed_count > 0 && score == 0)
-        score = -1;
+    /* Every helper DT_NEEDED must resolve to an identity which is already in
+     * the target startup graph.  Instrumentation-only DSOs would perturb
+     * RTLD_NOLOAD, weak/global lookup, and reuse semantics even if omitted
+     * from the eventual manifest. */
 
 out:
     elf_info_free(&info);
@@ -607,6 +694,167 @@ static int match_glob(const char *pattern, const char *path)
     return fnmatch(pattern, path, 0) == 0;
 }
 
+enum glob_token_kind {
+    GLOB_TOKEN_LITERAL,
+    GLOB_TOKEN_ANY,
+    GLOB_TOKEN_STAR
+};
+
+/* Parse only enough of fnmatch's grammar to answer an existential question.
+ * Bracket expressions are deliberately over-approximated as "any byte": this
+ * can retain an irrelevant directory but can never omit a relevant one. */
+static enum glob_token_kind glob_token_at(const char *pattern, size_t length,
+                                          size_t position,
+                                          size_t *next_position,
+                                          unsigned char *literal)
+{
+    unsigned char value = (unsigned char)pattern[position];
+
+    if (value == '*') {
+        *next_position = position + 1;
+        return GLOB_TOKEN_STAR;
+    }
+    if (value == '?') {
+        *next_position = position + 1;
+        return GLOB_TOKEN_ANY;
+    }
+    if (value == '\\' && position + 1 < length) {
+        *literal = (unsigned char)pattern[position + 1];
+        *next_position = position + 2;
+        return GLOB_TOKEN_LITERAL;
+    }
+    if (value == '[') {
+        size_t end = position + 1;
+
+        if (end < length && (pattern[end] == '!' || pattern[end] == '^'))
+            end++;
+        if (end < length && pattern[end] == ']')
+            end++;
+        while (end < length && pattern[end] != ']') {
+            if (pattern[end] == '\\' && end + 1 < length)
+                end += 2;
+            else
+                end++;
+        }
+        *next_position = end < length ? end + 1 : position + 1;
+        return GLOB_TOKEN_ANY;
+    }
+    *literal = value;
+    *next_position = position + 1;
+    return GLOB_TOKEN_LITERAL;
+}
+
+static void glob_epsilon_closure(const char *pattern, size_t length,
+                                 unsigned char states[PATH_MAX + 1])
+{
+    for (size_t position = 0; position < length; position++) {
+        if (states[position] && pattern[position] == '*')
+            states[position + 1] = 1;
+    }
+}
+
+static void glob_consume_fixed(const char *pattern, size_t length,
+                               const unsigned char current[PATH_MAX + 1],
+                               unsigned char next[PATH_MAX + 1],
+                               unsigned char input)
+{
+    memset(next, 0, PATH_MAX + 1);
+    for (size_t position = 0; position < length; position++) {
+        size_t after;
+        unsigned char literal = 0;
+        enum glob_token_kind kind;
+
+        if (!current[position])
+            continue;
+        kind = glob_token_at(pattern, length, position, &after, &literal);
+        if (kind == GLOB_TOKEN_STAR)
+            next[position] = 1;
+        else if (kind == GLOB_TOKEN_ANY || literal == input)
+            next[after] = 1;
+    }
+    glob_epsilon_closure(pattern, length, next);
+}
+
+static void glob_consume_some_nonslash(
+    const char *pattern, size_t length,
+    const unsigned char current[PATH_MAX + 1],
+    unsigned char next[PATH_MAX + 1])
+{
+    memset(next, 0, PATH_MAX + 1);
+    for (size_t position = 0; position < length; position++) {
+        size_t after;
+        unsigned char literal = 0;
+        enum glob_token_kind kind;
+
+        if (!current[position])
+            continue;
+        kind = glob_token_at(pattern, length, position, &after, &literal);
+        if (kind == GLOB_TOKEN_STAR)
+            next[position] = 1;
+        else if (kind == GLOB_TOKEN_ANY || literal != '/')
+            next[after] = 1;
+    }
+    glob_epsilon_closure(pattern, length, next);
+}
+
+/* Return whether the glob can match rpath plus exactly one non-empty path
+ * component.  This is the directory-probe scope intended by -f: a glob for
+ * /foo/a-prefix selects an observed /foo, while a nested /foo/bar glob does
+ * not select / or /foo.
+ * The NFA uses fnmatch-compatible '*' slash behavior for the fixed prefix. */
+static int glob_may_match_immediate_child(const char *pattern,
+                                          const char *rpath)
+{
+    unsigned char states[PATH_MAX + 1] = {0};
+    unsigned char next[PATH_MAX + 1];
+    unsigned char reachable[PATH_MAX + 1];
+    size_t pattern_len = strlen(pattern);
+    size_t rpath_len = strlen(rpath);
+
+    if (pattern_len >= PATH_MAX || rpath_len >= PATH_MAX)
+        return 1;
+    for (size_t i = 0; i < pattern_len; i++) {
+        if ((unsigned char)pattern[i] >= 0x80)
+            return 1;
+    }
+    for (size_t i = 0; i < rpath_len; i++) {
+        if ((unsigned char)rpath[i] >= 0x80)
+            return 1;
+    }
+
+    states[0] = 1;
+    glob_epsilon_closure(pattern, pattern_len, states);
+    for (size_t i = 0; i < rpath_len; i++) {
+        glob_consume_fixed(pattern, pattern_len, states, next,
+                           (unsigned char)rpath[i]);
+        memcpy(states, next, sizeof(states));
+    }
+    if (rpath_len == 0 || rpath[rpath_len - 1] != '/') {
+        glob_consume_fixed(pattern, pattern_len, states, next, '/');
+        memcpy(states, next, sizeof(states));
+    }
+
+    /* A child component is non-empty.  Then find the transitive closure of
+     * states reachable by additional non-slash bytes. */
+    glob_consume_some_nonslash(pattern, pattern_len, states, reachable);
+    for (;;) {
+        int changed = 0;
+
+        if (reachable[pattern_len])
+            return 1;
+        glob_consume_some_nonslash(pattern, pattern_len, reachable, next);
+        for (size_t i = 0; i <= pattern_len; i++) {
+            if (next[i] && !reachable[i]) {
+                reachable[i] = 1;
+                changed = 1;
+            }
+        }
+        glob_epsilon_closure(pattern, pattern_len, reachable);
+        if (!changed)
+            return reachable[pattern_len] != 0;
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* Capture data files opened during a traced run with the same preload */
 /* helper that records exact dlopen requests.                           */
@@ -615,17 +863,25 @@ static int dir_matches_patterns(const char *rpath, const char **patterns,
                                 int npatterns)
 {
     for (int i = 0; i < npatterns; i++) {
-        if (match_glob(patterns[i], rpath))
-            return 1;
-
-        /* Pattern may only match children of this directory. */
-        char probe[PATH_MAX];
-        int plen = snprintf(probe, sizeof(probe), "%s/x", rpath);
-        if (plen > 0 && plen < (int)sizeof(probe) &&
-            match_glob(patterns[i], probe))
+        if (match_glob(patterns[i], rpath) ||
+            glob_may_match_immediate_child(patterns[i], rpath))
             return 1;
     }
 
+    return 0;
+}
+
+static int file_request_matches_patterns(const char *path, int is_dir,
+                                         const char **patterns,
+                                         int npatterns)
+{
+    if (is_dir)
+        return dir_matches_patterns(path, patterns, npatterns);
+
+    for (int i = 0; i < npatterns; i++) {
+        if (match_glob(patterns[i], path))
+            return 1;
+    }
     return 0;
 }
 
@@ -638,79 +894,83 @@ static int path_is_known_dep(const char *rpath, const char *exe_path,
         return 1;
 
     for (int i = 0; i < deps->count; i++) {
-        char dpath[PATH_MAX];
-
-        if (realpath(deps->libs[i].path, dpath) && strcmp(rpath, dpath) == 0)
+        if (deps->libs[i].path && strcmp(rpath, deps->libs[i].path) == 0)
             return 1;
     }
 
     return 0;
 }
 
-static void process_captured_path(const char *exe_path, const char **patterns,
-                                  int npatterns, struct data_file_list *out,
-                                  struct dep_list *deps,
-                                  const char *request_path,
-                                  const char *source_path, int is_dir)
+static int process_captured_path(const char *exe_path, const char **patterns,
+                                 int npatterns, struct data_file_list *out,
+                                 struct dep_list *deps,
+                                 const char *request_path,
+                                 const char *source_path, int is_dir,
+                                 const struct stat *source_st,
+                                 const struct dep_file_snapshot *snapshot)
 {
-    struct stat sb;
-
     if (is_dir) {
-        if (stat(source_path, &sb) != 0 || !S_ISDIR(sb.st_mode))
-            return;
+        if (!source_st || !S_ISDIR(source_st->st_mode))
+            return -1;
         if (!dir_matches_patterns(request_path, patterns, npatterns))
-            return;
+            return 0;
 
         /* Preserve successful directory probes without bulk-pulling contents;
          * traced file probes carry per-child existence semantics. */
         data_file_list_add_directory(out, request_path);
-        return;
+        return out->failed ? -1 : 0;
     }
 
-    if (stat(source_path, &sb) != 0 || !S_ISREG(sb.st_mode))
-        return;
-
-    int is_elf = elf_check(source_path);
-    if (is_elf && strcmp(request_path, source_path) == 0 &&
-        path_is_known_dep(source_path, exe_path, deps)) {
-        /* Already captured as a DLOPEN / shlib dep; the frozen_dlopen_serve_memfd
-         * path handles probe-opens at runtime.  No separate data entry needed. */
-        return;
-    }
+    if (!source_st || !S_ISREG(source_st->st_mode) || !snapshot ||
+        !snapshot->valid)
+        return -1;
 
     if (strcmp(request_path, source_path) == 0 &&
         path_is_known_dep(source_path, exe_path, deps))
-        return;
+        return 0;
 
     for (int i = 0; i < npatterns; i++) {
         if (match_glob(patterns[i], request_path)) {
-            data_file_list_add(out, request_path, source_path);
-            return;
+            data_file_list_add(out, request_path, source_path, snapshot);
+            return out->failed ? -1 : 0;
         }
     }
+    return 0;
 }
 
 /* Record a path that was probed during execution but did not exist at
  * freeze time.  At runtime the VFS will honour these entries and return
  * ENOENT even if the file has since appeared on the target system. */
-static void process_captured_negative_path(const char **patterns, int npatterns,
-                                           struct data_file_list *out,
-                                           const char *path)
+static int process_captured_negative_path(const char **patterns, int npatterns,
+                                          struct data_file_list *out,
+                                          const char *path)
 {
     struct stat sb;
+    int selected = 0;
 
     if (!path || path[0] != '/')
-        return;
-    /* Must genuinely not exist at freeze time */
-    if (stat(path, &sb) == 0)
-        return;
+        return -1;
 
     for (int i = 0; i < npatterns; i++) {
         if (match_glob(patterns[i], path)) {
-            data_file_list_add_negative(out, path);
-            return;
+            selected = 1;
+            break;
         }
     }
+    if (!selected)
+        return 0;
+
+    /* A selected negative observation is part of runtime lookup semantics.
+     * If it appeared after the trace, silently omitting the record would let
+     * the frozen program fall through to unrelated host state. */
+    if (stat(path, &sb) == 0) {
+        errno = ESTALE;
+        return -1;
+    }
+    if (errno != ENOENT && errno != ENOTDIR)
+        return -1;
+    data_file_list_add_negative(out, path);
+    return out->failed ? -1 : 0;
 }
 
 static void finish_captured_paths(struct data_file_list *out, int verbose)
@@ -753,49 +1013,225 @@ static int file_trace_hex_decode(const char *hex, size_t hex_len,
     return 0;
 }
 
-static int trace_file_has_header(const char *tracef, const char *expected)
+struct file_trace_snapshot {
+    uint64_t device;
+    uint64_t inode;
+    uint64_t type;
+    uint64_t size;
+    uint64_t mtime_sec;
+    uint64_t mtime_nsec;
+    uint64_t ctime_sec;
+    uint64_t ctime_nsec;
+};
+
+struct file_trace_pending_operation {
+    uint64_t pid;
+    uint64_t attempt;
+    char begin_kind;
+};
+
+static size_t file_trace_pending_operation_index(
+    const struct file_trace_pending_operation *pending, size_t count,
+    uint64_t pid, uint64_t attempt)
 {
-    FILE *tf = fopen(tracef, "r");
-    char line[128];
-    int ready = 0;
-    int read_failed;
+    size_t index;
 
-    if (!tf)
-        return 0;
-
-    if (fgets(line, sizeof(line), tf)) {
-        size_t len = strlen(line);
-
-        if (len > 0 && line[len - 1] == '\n') {
-            line[--len] = '\0';
-            ready = (len == 0 || line[len - 1] != '\r') &&
-                    strcmp(line, expected) == 0;
-        }
+    for (index = 0; index < count; index++) {
+        if (pending[index].pid == pid &&
+            pending[index].attempt == attempt)
+            break;
     }
-    read_failed = ferror(tf);
-    if (fclose(tf) != 0 || read_failed)
-        ready = 0;
-    return ready;
+    return index;
 }
 
-static int parse_preload_file_trace(const char *tracef, const char *exe_path,
+static int file_trace_pid_has_pending_call(
+    const struct file_trace_pending_operation *pending, size_t count,
+    uint64_t pid)
+{
+    for (size_t index = 0; index < count; index++) {
+        if (pending[index].pid == pid &&
+            pending[index].begin_kind == 'B')
+            return 1;
+    }
+    return 0;
+}
+
+_Static_assert(sizeof(((struct stat *)0)->st_dev) <= sizeof(uint64_t),
+               "file-trace device identity exceeds wire width");
+_Static_assert(sizeof(((struct stat *)0)->st_ino) <= sizeof(uint64_t),
+               "file-trace inode identity exceeds wire width");
+_Static_assert(sizeof(((struct stat *)0)->st_size) <= sizeof(uint64_t),
+               "file-trace size exceeds wire width");
+_Static_assert(sizeof(((struct stat *)0)->st_mtim.tv_sec) <= sizeof(uint64_t),
+               "file-trace timestamp exceeds wire width");
+
+static int file_trace_u64_decode(const char *hex, uint64_t *value_out)
+{
+    uint64_t value = 0;
+
+    if (!hex || !value_out || strlen(hex) != 16)
+        return -1;
+    for (size_t i = 0; i < 16; i++) {
+        int digit = file_trace_hex_value(hex[i]);
+
+        if (digit < 0)
+            return -1;
+        value = (value << 4) | (uint64_t)digit;
+    }
+    *value_out = value;
+    return 0;
+}
+
+static int file_trace_fixed_u64_decode(const char *hex, uint64_t *value_out)
+{
+    uint64_t value = 0;
+
+    if (!hex || !value_out)
+        return -1;
+    for (size_t i = 0; i < 16; i++) {
+        int digit = file_trace_hex_value(hex[i]);
+
+        if (digit < 0)
+            return -1;
+        value = (value << 4) | (uint64_t)digit;
+    }
+    *value_out = value;
+    return 0;
+}
+
+static int file_trace_snapshot_decode(char *const fields[8],
+                                      struct file_trace_snapshot *snapshot)
+{
+    uint64_t values[8];
+
+    if (!fields || !snapshot)
+        return -1;
+    for (size_t i = 0; i < 8; i++) {
+        if (file_trace_u64_decode(fields[i], &values[i]) < 0)
+            return -1;
+    }
+    snapshot->device = values[0];
+    snapshot->inode = values[1];
+    snapshot->type = values[2];
+    snapshot->size = values[3];
+    snapshot->mtime_sec = values[4];
+    snapshot->mtime_nsec = values[5];
+    snapshot->ctime_sec = values[6];
+    snapshot->ctime_nsec = values[7];
+    if (snapshot->mtime_nsec > 999999999 ||
+        snapshot->ctime_nsec > 999999999)
+        return -1;
+    return 0;
+}
+
+static void file_trace_snapshot_from_stat(struct file_trace_snapshot *snapshot,
+                                          const struct stat *st)
+{
+    snapshot->device = (uint64_t)st->st_dev;
+    snapshot->inode = (uint64_t)st->st_ino;
+    snapshot->type = (uint64_t)(st->st_mode & S_IFMT);
+    snapshot->size = (uint64_t)st->st_size;
+    snapshot->mtime_sec = (uint64_t)st->st_mtim.tv_sec;
+    snapshot->mtime_nsec = (uint64_t)st->st_mtim.tv_nsec;
+    snapshot->ctime_sec = (uint64_t)st->st_ctim.tv_sec;
+    snapshot->ctime_nsec = (uint64_t)st->st_ctim.tv_nsec;
+}
+
+static int file_trace_snapshot_matches_stat(
+    const struct file_trace_snapshot *snapshot, const struct stat *st,
+    int is_dir)
+{
+    struct file_trace_snapshot current;
+
+    if (!snapshot || !st)
+        return 0;
+    file_trace_snapshot_from_stat(&current, st);
+    if (snapshot->device != current.device ||
+        snapshot->inode != current.inode || snapshot->type != current.type)
+        return 0;
+    if (is_dir)
+        return snapshot->type == (uint64_t)S_IFDIR;
+    return snapshot->type == (uint64_t)S_IFREG &&
+           snapshot->size == current.size &&
+           snapshot->mtime_sec == current.mtime_sec &&
+           snapshot->mtime_nsec == current.mtime_nsec &&
+           snapshot->ctime_sec == current.ctime_sec &&
+           snapshot->ctime_nsec == current.ctime_nsec;
+}
+
+static int trace_fd_has_header(int trace_fd, const char *expected)
+{
+    char line[128];
+    size_t expected_length;
+    ssize_t length;
+
+    if (trace_fd < 0 || !expected)
+        return 0;
+    expected_length = strlen(expected);
+    if (expected_length + 1 > sizeof(line))
+        return 0;
+    do {
+        length = pread(trace_fd, line, expected_length + 1, 0);
+    } while (length < 0 && errno == EINTR);
+    return length == (ssize_t)(expected_length + 1) &&
+           memcmp(line, expected, expected_length) == 0 &&
+           line[expected_length] == '\n';
+}
+
+static void dump_trace_fd(int trace_fd, const char *heading)
+{
+    char buffer[4096];
+    off_t offset = 0;
+
+    if (trace_fd < 0)
+        return;
+    printf("%s\n", heading);
+    for (;;) {
+        ssize_t length;
+
+        do {
+            length = pread(trace_fd, buffer, sizeof(buffer), offset);
+        } while (length < 0 && errno == EINTR);
+        if (length <= 0)
+            break;
+        printf("  %.*s", (int)length, buffer);
+        offset += length;
+    }
+}
+
+static int parse_preload_file_trace(int trace_fd, const char *exe_path,
                                     const char **patterns, int npatterns,
                                     struct data_file_list *out,
                                     struct dep_list *deps, int verbose)
 {
-    FILE *tf = fopen(tracef, "r");
-    char line[4 * PATH_MAX + 16];
+    FILE *tf = trace_fd >= 0 ? fdopen(trace_fd, "r") : NULL;
+    char line[4 * PATH_MAX + 256];
     int saw_header = 0;
+    int saw_owner = 0;
+    int saw_record = 0;
+    uint64_t owner_pid = 0;
+    uint64_t pending_exec_attempts[1024];
+    size_t pending_exec_count = 0;
+    struct file_trace_pending_operation pending_operations[1024];
+    size_t pending_operation_count = 0;
 
-    if (!tf)
+    if (!tf) {
+        if (trace_fd >= 0)
+            close(trace_fd);
         return -1;
+    }
+    if (flock(fileno(tf), LOCK_EX | LOCK_NB) < 0) {
+        fprintf(stderr,
+                "dlfreeze: file trace is still owned by a live traced "
+                "process\n");
+        fclose(tf);
+        return -1;
+    }
 
     while (fgets(line, sizeof(line), tf)) {
         size_t len = strlen(line);
         char request[PATH_MAX];
         char source[PATH_MAX];
-        char *separator;
-        size_t request_hex_len;
 
         if (len == 0 || line[len - 1] != '\n') {
             fprintf(stderr, "dlfreeze: malformed or truncated file trace\n");
@@ -809,21 +1245,238 @@ static int parse_preload_file_trace(const char *tracef, const char *exe_path,
             return -1;
         }
 
-        if (strcmp(line, "#DLFREEZE_PRELOAD_TRACE_V4") == 0) {
+        if (strcmp(line, "#DLFREEZE_PRELOAD_TRACE_V9") == 0) {
+            if (saw_header) {
+                fprintf(stderr,
+                        "dlfreeze: duplicate file trace version header\n");
+                fclose(tf);
+                return -1;
+            }
             saw_header = 1;
             continue;
+        }
+        if (strcmp(line, "#DLFREEZE_PRELOAD_TRACE_V8") == 0) {
+            fprintf(stderr,
+                    "dlfreeze: file trace V8 has no file-operation "
+                    "transactions and is unsupported\n");
+            fclose(tf);
+            return -1;
+        }
+        if (strcmp(line, "#DLFREEZE_PRELOAD_TRACE_V7") == 0) {
+            fprintf(stderr,
+                    "dlfreeze: file trace V7 has no owner-exec provenance "
+                    "and is unsupported\n");
+            fclose(tf);
+            return -1;
         }
         if (!saw_header) {
             fprintf(stderr, "dlfreeze: unsupported file trace format\n");
             fclose(tf);
             return -1;
         }
-        if (len > 2 && line[0] == '!' && line[1] == ' ') {
+        if (len == 18 && line[0] == 'O' && line[1] == ' ') {
+            if (saw_owner || saw_record ||
+                file_trace_fixed_u64_decode(line + 2, &owner_pid) < 0 ||
+                owner_pid == 0) {
+                fprintf(stderr,
+                        "dlfreeze: malformed or duplicate file trace owner "
+                        "record\n");
+                fclose(tf);
+                return -1;
+            }
+            saw_owner = 1;
+            continue;
+        }
+        if (len > 0 && line[0] == 'O') {
             fprintf(stderr,
-                    "dlfreeze: preload helper reported an incomplete file "
-                    "trace: %s\n", line + 2);
+                    "dlfreeze: malformed or duplicate file trace owner "
+                    "record\n");
             fclose(tf);
             return -1;
+        }
+        if (saw_owner && len == 35 &&
+            (line[0] == 'E' || line[0] == 'C') && line[1] == ' ' &&
+            line[18] == ' ') {
+            uint64_t record_pid;
+            uint64_t attempt;
+            size_t index;
+
+            if (file_trace_fixed_u64_decode(line + 2, &record_pid) < 0 ||
+                record_pid != owner_pid ||
+                file_trace_fixed_u64_decode(line + 19, &attempt) < 0 ||
+                attempt == 0) {
+                fprintf(stderr, "dlfreeze: malformed file trace exec record\n");
+                fclose(tf);
+                return -1;
+            }
+            for (index = 0; index < pending_exec_count; index++) {
+                if (pending_exec_attempts[index] == attempt)
+                    break;
+            }
+            if (line[0] == 'E') {
+                if (index != pending_exec_count ||
+                    pending_exec_count >=
+                        sizeof(pending_exec_attempts) /
+                            sizeof(pending_exec_attempts[0])) {
+                    fprintf(stderr,
+                            "dlfreeze: malformed file trace exec record\n");
+                    fclose(tf);
+                    return -1;
+                }
+                pending_exec_attempts[pending_exec_count++] = attempt;
+            } else {
+                if (index == pending_exec_count) {
+                    fprintf(stderr,
+                            "dlfreeze: malformed file trace exec record\n");
+                    fclose(tf);
+                    return -1;
+                }
+                pending_exec_count--;
+                pending_exec_attempts[index] =
+                    pending_exec_attempts[pending_exec_count];
+            }
+            saw_record = 1;
+            continue;
+        }
+        if (len > 0 && (line[0] == 'E' || line[0] == 'C')) {
+            fprintf(stderr, "dlfreeze: malformed file trace exec record\n");
+            fclose(tf);
+            return -1;
+        }
+        /* V9 file calls use B/K and descriptor-table mutations use V/W.
+         * Both share one pid+attempt namespace so malformed, duplicated, or
+         * cross-process closes cannot make a partial trace look complete. */
+        if (saw_owner && len == 35 &&
+            (line[0] == 'B' || line[0] == 'K' ||
+             line[0] == 'V' || line[0] == 'W') &&
+            line[1] == ' ' && line[18] == ' ') {
+            uint64_t record_pid;
+            uint64_t attempt;
+            size_t index;
+
+            if (file_trace_fixed_u64_decode(line + 2, &record_pid) < 0 ||
+                record_pid == 0 ||
+                file_trace_fixed_u64_decode(line + 19, &attempt) < 0 ||
+                attempt == 0) {
+                fprintf(stderr,
+                        "dlfreeze: malformed file trace operation record\n");
+                fclose(tf);
+                return -1;
+            }
+            index = file_trace_pending_operation_index(
+                pending_operations, pending_operation_count,
+                record_pid, attempt);
+            if (line[0] == 'B' || line[0] == 'V') {
+                if (index != pending_operation_count ||
+                    pending_operation_count >=
+                        sizeof(pending_operations) /
+                            sizeof(pending_operations[0])) {
+                    fprintf(stderr,
+                            "dlfreeze: duplicate or excessive file trace "
+                            "operation begin\n");
+                    fclose(tf);
+                    return -1;
+                }
+                pending_operations[pending_operation_count].pid = record_pid;
+                pending_operations[pending_operation_count].attempt = attempt;
+                pending_operations[pending_operation_count].begin_kind =
+                    line[0];
+                pending_operation_count++;
+            } else {
+                char expected = line[0] == 'K' ? 'B' : 'V';
+
+                if (index == pending_operation_count ||
+                    pending_operations[index].begin_kind != expected) {
+                    fprintf(stderr,
+                            "dlfreeze: unmatched file trace operation "
+                            "commit\n");
+                    fclose(tf);
+                    return -1;
+                }
+                pending_operation_count--;
+                pending_operations[index] =
+                    pending_operations[pending_operation_count];
+            }
+            saw_record = 1;
+            continue;
+        }
+        if (len > 0 &&
+            (line[0] == 'B' || line[0] == 'K' ||
+             line[0] == 'V' || line[0] == 'W')) {
+            fprintf(stderr,
+                    "dlfreeze: malformed file trace operation record\n");
+            fclose(tf);
+            return -1;
+        }
+        if (saw_owner && len >= 20 && line[0] == '!' && line[1] == ' ' &&
+            line[18] == ' ' && line[19] != '\0') {
+            uint64_t record_pid;
+            int reason_valid = 1;
+
+            for (size_t i = 19; i < len; i++) {
+                if (!((line[i] >= 'a' && line[i] <= 'z') ||
+                      (line[i] >= '0' && line[i] <= '9') ||
+                      line[i] == '-')) {
+                    reason_valid = 0;
+                    break;
+                }
+            }
+            if (!reason_valid ||
+                file_trace_fixed_u64_decode(line + 2, &record_pid) < 0 ||
+                record_pid == 0) {
+                fprintf(stderr,
+                        "dlfreeze: malformed file trace terminal record\n");
+                fclose(tf);
+                return -1;
+            }
+            fprintf(stderr,
+                    "dlfreeze: preload helper reported an incomplete file "
+                    "trace: %s\n", line + 19);
+            fclose(tf);
+            return -1;
+        }
+        if (len > 0 && line[0] == '!') {
+            fprintf(stderr, "dlfreeze: malformed file trace terminal record\n");
+            fclose(tf);
+            return -1;
+        }
+        if (!saw_owner) {
+            fprintf(stderr, "dlfreeze: missing file trace owner record\n");
+            fclose(tf);
+            return -1;
+        }
+
+        /* A successful open can refer to an object with no stable source
+         * pathname (for example, a deleted file or a procfs file represented
+         * by qemu-user as a deleted memfd).  Such an observation is harmless
+         * only when its original request lies outside the capture scope. */
+        if (len > 22 && line[0] == 'U' && line[1] == ' ' &&
+            line[18] == ' ' && (line[19] == 'F' || line[19] == 'D') &&
+            line[20] == ' ') {
+            uint64_t record_pid;
+
+            if (file_trace_fixed_u64_decode(line + 2, &record_pid) < 0 ||
+                record_pid == 0 || strchr(line + 21, ' ') ||
+                file_trace_hex_decode(line + 21, strlen(line + 21),
+                                      request, sizeof(request)) < 0 ||
+                request[0] != '/' ||
+                !file_trace_pid_has_pending_call(
+                    pending_operations, pending_operation_count,
+                    record_pid)) {
+                fprintf(stderr, "dlfreeze: malformed file trace record\n");
+                fclose(tf);
+                return -1;
+            }
+            saw_record = 1;
+            if (file_request_matches_patterns(request, line[19] == 'D',
+                                              patterns, npatterns)) {
+                fprintf(stderr,
+                        "dlfreeze: selected successful open has no stable "
+                        "source path: %s\n", request);
+                fclose(tf);
+                return -1;
+            }
+            continue;
         }
         if (len < 4 || line[1] != ' ' ||
             (line[0] != 'F' && line[0] != 'D' && line[0] != 'N')) {
@@ -833,72 +1486,135 @@ static int parse_preload_file_trace(const char *tracef, const char *exe_path,
         }
 
         if (line[0] == 'N') {
-            if (strchr(line + 2, ' ') ||
-                file_trace_hex_decode(line + 2, strlen(line + 2),
+            uint64_t record_pid;
+
+            if (len <= 20 || line[18] != ' ' ||
+                file_trace_fixed_u64_decode(line + 2, &record_pid) < 0 ||
+                record_pid == 0 || strchr(line + 19, ' ') ||
+                file_trace_hex_decode(line + 19, strlen(line + 19),
                                       request, sizeof(request)) < 0 ||
-                request[0] != '/') {
+                request[0] != '/' ||
+                !file_trace_pid_has_pending_call(
+                    pending_operations, pending_operation_count,
+                    record_pid)) {
                 fprintf(stderr, "dlfreeze: malformed file trace record\n");
                 fclose(tf);
                 return -1;
             }
-            process_captured_negative_path(patterns, npatterns, out, request);
+            saw_record = 1;
+            if (process_captured_negative_path(patterns, npatterns, out,
+                                               request) < 0) {
+                fprintf(stderr,
+                        "dlfreeze: selected missing path changed after "
+                        "tracing: %s\n", request);
+                fclose(tf);
+                return -1;
+            }
             continue;
         }
-        separator = strchr(line + 2, ' ');
-        if (!separator || strchr(separator + 1, ' ')) {
+        {
+            char *fields[11];
+            char *cursor = line + 2;
+            struct file_trace_snapshot trace_snapshot;
+            struct dep_file_snapshot pack_snapshot = {0};
+            struct stat source_st;
+            int is_dir = line[0] == 'D';
+            uint64_t record_pid;
+
+            for (size_t i = 0; i < 11; i++) {
+                char *next;
+
+                fields[i] = cursor;
+                next = strchr(cursor, ' ');
+                if (i == 10) {
+                    if (next)
+                        goto malformed_success_record;
+                } else {
+                    if (!next)
+                        goto malformed_success_record;
+                    *next = '\0';
+                    cursor = next + 1;
+                }
+                if (!fields[i][0])
+                    goto malformed_success_record;
+            }
+            if (file_trace_u64_decode(fields[0], &record_pid) < 0 ||
+                record_pid == 0 ||
+                !file_trace_pid_has_pending_call(
+                    pending_operations, pending_operation_count,
+                    record_pid))
+                goto malformed_success_record;
+            if (file_trace_hex_decode(fields[1], strlen(fields[1]),
+                                      request, sizeof(request)) < 0 ||
+                file_trace_hex_decode(fields[2], strlen(fields[2]),
+                                      source, sizeof(source)) < 0 ||
+                file_trace_snapshot_decode(&fields[3], &trace_snapshot) < 0 ||
+                request[0] != '/' || source[0] != '/' ||
+                trace_snapshot.type !=
+                    (uint64_t)(is_dir ? S_IFDIR : S_IFREG))
+                goto malformed_success_record;
+            saw_record = 1;
+
+            /* Short-lived observations outside the requested capture scope
+             * remain irrelevant.  Selected records below are strict. */
+            if (!file_request_matches_patterns(request, is_dir,
+                                               patterns, npatterns))
+                continue;
+
+            {
+                char *canonical = realpath(source, NULL);
+
+                if (!canonical || strcmp(canonical, source) != 0) {
+                    fprintf(stderr,
+                            "dlfreeze: captured source is no longer "
+                            "canonical or readable: %s\n", source);
+                    free(canonical);
+                    fclose(tf);
+                    return -1;
+                }
+                free(canonical);
+            }
+            if (stat(source, &source_st) != 0 ||
+                (!is_dir && source_st.st_size < 0) ||
+                !file_trace_snapshot_matches_stat(&trace_snapshot,
+                                                  &source_st, is_dir)) {
+                fprintf(stderr,
+                        "dlfreeze: captured source changed after tracing: "
+                        "%s\n", source);
+                fclose(tf);
+                return -1;
+            }
+            if (!is_dir)
+                resolved_snapshot_from_stat(&pack_snapshot, &source_st);
+            if (process_captured_path(
+                    exe_path, patterns, npatterns, out, deps, request, source,
+                    is_dir, &source_st, is_dir ? NULL : &pack_snapshot) < 0) {
+                fprintf(stderr,
+                        "dlfreeze: cannot retain captured source snapshot: "
+                        "%s\n", source);
+                fclose(tf);
+                return -1;
+            }
+            continue;
+
+malformed_success_record:
             fprintf(stderr, "dlfreeze: malformed file trace record\n");
             fclose(tf);
             return -1;
         }
-        request_hex_len = (size_t)(separator - (line + 2));
-        if (file_trace_hex_decode(line + 2, request_hex_len,
-                                  request, sizeof(request)) < 0 ||
-            file_trace_hex_decode(separator + 1, strlen(separator + 1),
-                                  source, sizeof(source)) < 0 ||
-            request[0] != '/' || source[0] != '/') {
-            fprintf(stderr, "dlfreeze: malformed file trace encoding\n");
-            fclose(tf);
-            return -1;
-        }
-        /* A successful open may refer to a short-lived scratch file which is
-         * deliberately removed before the traced process exits.  Such a file
-         * is irrelevant when its request is outside every capture pattern;
-         * do not let its later disappearance invalidate an otherwise complete
-         * trace.  Records selected for capture remain strict: their source
-         * must still be canonical and readable below. */
-        if (line[0] == 'D') {
-            if (!dir_matches_patterns(request, patterns, npatterns))
-                continue;
-        } else {
-            int matched = 0;
-
-            for (int i = 0; i < npatterns; i++) {
-                if (match_glob(patterns[i], request)) {
-                    matched = 1;
-                    break;
-                }
-            }
-            if (!matched)
-                continue;
-        }
-        {
-            char *canonical = realpath(source, NULL);
-
-            if (!canonical || strcmp(canonical, source) != 0) {
-                fprintf(stderr,
-                        "dlfreeze: captured source is no longer canonical "
-                        "or readable: %s\n", source);
-                free(canonical);
-                fclose(tf);
-                return -1;
-            }
-            free(canonical);
-        }
-        process_captured_path(exe_path, patterns, npatterns, out, deps,
-                              request, source, line[0] == 'D');
     }
 
-    if (ferror(tf) || !saw_header) {
+    if (ferror(tf) || !saw_header || !saw_owner ||
+        pending_exec_count != 0 || pending_operation_count != 0) {
+        if (!ferror(tf) && saw_header && saw_owner &&
+            pending_exec_count != 0)
+            fprintf(stderr,
+                    "dlfreeze: traced owner replaced its process image "
+                    "during file tracing\n");
+        else if (!ferror(tf) && saw_header && saw_owner &&
+                 pending_operation_count != 0)
+            fprintf(stderr,
+                    "dlfreeze: incomplete file operation evidence\n");
         fclose(tf);
         return -1;
     }
@@ -908,6 +1624,310 @@ static int parse_preload_file_trace(const char *tracef, const char *exe_path,
     return 0;
 }
 
+static int trace_temp_path_component_is_trusted(const struct stat *status)
+{
+    uid_t effective_uid = geteuid();
+
+    if (!status || !S_ISDIR(status->st_mode)) {
+        errno = ENOTDIR;
+        return 0;
+    }
+    /* Every directory owner controls the name immediately below it.  A
+     * sticky directory prevents unrelated writers from replacing that child,
+     * but its owner retains that authority, so admit only root and this
+     * effective user as path controllers. */
+    if (status->st_uid != 0 && status->st_uid != effective_uid) {
+        errno = EACCES;
+        return 0;
+    }
+    if ((status->st_mode & (S_IWGRP | S_IWOTH)) != 0 &&
+        (status->st_mode & S_ISVTX) == 0) {
+        errno = EACCES;
+        return 0;
+    }
+    return 1;
+}
+
+static int trace_temp_directory_matches_path(int directory_fd,
+                                             const char *canonical)
+{
+    struct stat descriptor_status;
+    struct stat path_status;
+    int path_fd;
+
+    path_fd = open(canonical,
+                   O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (path_fd < 0)
+        return 0;
+    if (fstat(directory_fd, &descriptor_status) < 0 ||
+        fstat(path_fd, &path_status) < 0 ||
+        !trace_temp_path_component_is_trusted(&descriptor_status) ||
+        !trace_temp_path_component_is_trusted(&path_status)) {
+        int saved_errno = errno;
+
+        close(path_fd);
+        errno = saved_errno;
+        return 0;
+    }
+    if (descriptor_status.st_dev != path_status.st_dev ||
+        descriptor_status.st_ino != path_status.st_ino) {
+        close(path_fd);
+        errno = ESTALE;
+        return 0;
+    }
+    close(path_fd);
+    return 1;
+}
+
+/* Resolve a user preference once, then bind every component relative to the
+ * preceding descriptor.  The canonical pathname may originate through a
+ * symlink, but no symlink participates in the descriptor walk admitted for
+ * the later mkstemp pathname. */
+static int open_trace_temp_directory(const char *candidate, char *canonical,
+                                     size_t canonical_size)
+{
+    char resolved[PATH_MAX];
+    char component[NAME_MAX + 1];
+    const char *cursor;
+    size_t resolved_length;
+    int current_fd;
+
+    if (!candidate || candidate[0] != '/' || !canonical ||
+        canonical_size == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!realpath(candidate, resolved))
+        return -1;
+    resolved_length = strlen(resolved);
+    if (resolved_length == 0 || resolved[0] != '/' ||
+        resolved_length >= canonical_size) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    current_fd = open("/", O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (current_fd < 0)
+        return -1;
+    {
+        struct stat status;
+
+        if (fstat(current_fd, &status) < 0 ||
+            !trace_temp_path_component_is_trusted(&status)) {
+            int saved_errno = errno;
+
+            close(current_fd);
+            errno = saved_errno;
+            return -1;
+        }
+    }
+
+    cursor = resolved + 1;
+    while (*cursor) {
+        const char *end = strchr(cursor, '/');
+        size_t length = end ? (size_t)(end - cursor) : strlen(cursor);
+        struct stat status;
+        int next_fd;
+
+        if (length == 0 || length > NAME_MAX) {
+            close(current_fd);
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        memcpy(component, cursor, length);
+        component[length] = '\0';
+        next_fd = openat(current_fd, component,
+                         O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        if (next_fd < 0) {
+            int saved_errno = errno;
+
+            close(current_fd);
+            errno = saved_errno;
+            return -1;
+        }
+        if (fstat(next_fd, &status) < 0 ||
+            !trace_temp_path_component_is_trusted(&status)) {
+            int saved_errno = errno;
+
+            close(next_fd);
+            close(current_fd);
+            errno = saved_errno;
+            return -1;
+        }
+        close(current_fd);
+        current_fd = next_fd;
+        cursor = end ? end + 1 : cursor + length;
+    }
+
+    memcpy(canonical, resolved, resolved_length + 1);
+    if (!trace_temp_directory_matches_path(current_fd, canonical)) {
+        int saved_errno = errno;
+
+        close(current_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    return current_fd;
+}
+
+static int trace_tempfile_identity_matches(int directory_fd, const char *name,
+                                           int file_fd)
+{
+    struct stat descriptor_status;
+    struct stat path_status;
+
+    if (fstat(file_fd, &descriptor_status) < 0 ||
+        fstatat(directory_fd, name, &path_status, AT_SYMLINK_NOFOLLOW) < 0)
+        return 0;
+    if (!S_ISREG(descriptor_status.st_mode) ||
+        !S_ISREG(path_status.st_mode) ||
+        descriptor_status.st_dev != path_status.st_dev ||
+        descriptor_status.st_ino != path_status.st_ino) {
+        errno = ESTALE;
+        return 0;
+    }
+    return 1;
+}
+
+static int finalize_trace_tempfile(int directory_fd, const char *name,
+                                   int file_fd)
+{
+    struct stat descriptor_status;
+    struct stat path_status;
+    int chmod_result;
+
+    do {
+        chmod_result = fchmod(file_fd, 0600);
+    } while (chmod_result < 0 && errno == EINTR);
+    if (chmod_result < 0 ||
+        fstat(file_fd, &descriptor_status) < 0 ||
+        fstatat(directory_fd, name, &path_status, AT_SYMLINK_NOFOLLOW) < 0)
+        return -1;
+    if (!S_ISREG(descriptor_status.st_mode) ||
+        !S_ISREG(path_status.st_mode) ||
+        descriptor_status.st_dev != path_status.st_dev ||
+        descriptor_status.st_ino != path_status.st_ino) {
+        errno = ESTALE;
+        return -1;
+    }
+    if ((descriptor_status.st_mode & 07777) != 0600 ||
+        (path_status.st_mode & 07777) != 0600) {
+        errno = EACCES;
+        return -1;
+    }
+    return 0;
+}
+
+static int make_trace_tempfile(char *path, size_t path_size,
+                               const char *stem, int *collector_fd_out)
+{
+    const char *candidate = NULL;
+    const char *environment = NULL;
+
+    if (collector_fd_out)
+        *collector_fd_out = -1;
+    if (!path || path_size == 0 || !stem || !stem[0] ||
+        !collector_fd_out ||
+        strchr(stem, '/')) {
+        errno = EINVAL;
+        return -1;
+    }
+    /* The packer is not a privileged launcher, but do not let a mismatched
+     * real/effective identity choose a trace destination through an inherited
+     * environment.  Runtime AT_SECURE handling is enforced separately by the
+     * bootstrap. */
+    if (getuid() == geteuid() && getgid() == getegid())
+        environment = getenv("TMPDIR");
+    if (environment && environment[0] && environment[0] == '/')
+        candidate = environment;
+
+    for (int attempt = 0; attempt < 2; attempt++) {
+        const char *directory = attempt == 0 && candidate ? candidate : "/tmp";
+        char canonical[PATH_MAX];
+        size_t directory_length;
+        int directory_fd;
+        int length;
+        int fd;
+        int collector_fd = -1;
+        const char *name;
+
+        if (attempt == 1 && !candidate)
+            break;
+        directory_fd = open_trace_temp_directory(
+            directory, canonical, sizeof(canonical));
+        if (directory_fd < 0)
+            continue;
+        directory_length = strlen(canonical);
+        if (directory_length > INT_MAX) {
+            close(directory_fd);
+            errno = ENAMETOOLONG;
+            continue;
+        }
+        length = snprintf(path, path_size, "%.*s%s%s.XXXXXX",
+                          (int)directory_length, canonical,
+                          directory_length == 1 ? "" : "/", stem);
+        if (length < 0 || (size_t)length >= path_size) {
+            close(directory_fd);
+            errno = ENAMETOOLONG;
+            continue;
+        }
+        /* mkstemp consumes a pathname rather than a directory descriptor.
+         * Reopen that pathname and compare it with the component-walk result
+         * immediately before creation; permissions above prevent an unrelated
+         * user from changing an admitted controller after this check. */
+        if (!trace_temp_directory_matches_path(directory_fd, canonical)) {
+            int saved_errno = errno;
+
+            close(directory_fd);
+            errno = saved_errno;
+            continue;
+        }
+        fd = mkstemp(path);
+        if (fd >= 0) {
+            name = strrchr(path, '/');
+            name = name ? name + 1 : path;
+            if (name[0] &&
+                finalize_trace_tempfile(directory_fd, name, fd) == 0) {
+                /* Some flock implementations require a writable descriptor
+                 * for LOCK_EX.  This is a distinct open file description from
+                 * the helper writer, not merely dup(2) of it. */
+                collector_fd = openat(directory_fd, name,
+                                      O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+            }
+            if (collector_fd >= 0 &&
+                trace_tempfile_identity_matches(
+                    directory_fd, name, collector_fd) &&
+                unlinkat(directory_fd, name, 0) == 0) {
+                *collector_fd_out = collector_fd;
+                close(directory_fd);
+                return fd;
+            }
+            {
+                int saved_errno = errno ? errno : EIO;
+
+                /* Remove only the name still bound to the descriptor returned
+                 * by mkstemp; never unlink an intervening replacement. */
+                if (name[0] && trace_tempfile_identity_matches(
+                                      directory_fd, name, fd))
+                    (void)unlinkat(directory_fd, name, 0);
+                if (collector_fd >= 0)
+                    close(collector_fd);
+                close(fd);
+                close(directory_fd);
+                errno = saved_errno;
+                continue;
+            }
+        }
+        {
+            int saved_errno = errno;
+
+            close(directory_fd);
+            errno = saved_errno;
+        }
+    }
+    return -1;
+}
+
 static int capture_data_files(const char *exe_path, const char *exe_identity,
                               int argc, char **argv,
                               int optind_val, const char **patterns,
@@ -915,11 +1935,13 @@ static int capture_data_files(const char *exe_path, const char *exe_identity,
                               struct dep_list *deps, int verbose,
                               const char *preload_path)
 {
-    char tracef[] = "/tmp/dlfreeze-file-trace.XXXXXX";
-    char dlopen_tracef[] = "/tmp/dlfreeze-trace.XXXXXX";
+    char tracef[PATH_MAX];
+    char dlopen_tracef[PATH_MAX];
     sigset_t forward_set, old_mask;
     int tfd;
     int dtfd;
+    int tcollector = -1;
+    int dtcollector = -1;
     int st;
     pid_t pid;
 
@@ -935,26 +1957,32 @@ static int capture_data_files(const char *exe_path, const char *exe_identity,
         return -1;
     }
 
-    tfd = mkstemp(tracef);
+    tfd = make_trace_tempfile(tracef, sizeof(tracef),
+                              "dlfreeze-file-trace", &tcollector);
     if (tfd < 0) {
         perror("mkstemp");
         return -1;
     }
-    if (close(tfd) < 0) {
-        perror("close");
-        unlink(tracef);
+    if (prepare_trace_descriptor(tfd) < 0) {
+        perror("prepare trace descriptor");
+        close(tfd);
+        close(tcollector);
         return -1;
     }
-    dtfd = mkstemp(dlopen_tracef);
+    dtfd = make_trace_tempfile(dlopen_tracef, sizeof(dlopen_tracef),
+                               "dlfreeze-trace", &dtcollector);
     if (dtfd < 0) {
         perror("mkstemp");
-        unlink(tracef);
+        close(tfd);
+        close(tcollector);
         return -1;
     }
-    if (close(dtfd) < 0) {
-        perror("close");
-        unlink(tracef);
-        unlink(dlopen_tracef);
+    if (prepare_trace_descriptor(dtfd) < 0) {
+        perror("prepare trace descriptor");
+        close(tfd);
+        close(tcollector);
+        close(dtfd);
+        close(dtcollector);
         return -1;
     }
 
@@ -963,8 +1991,10 @@ static int capture_data_files(const char *exe_path, const char *exe_identity,
     build_trace_signal_set(&forward_set);
     if (sigprocmask(SIG_BLOCK, &forward_set, &old_mask) < 0) {
         perror("sigprocmask");
-        unlink(tracef);
-        unlink(dlopen_tracef);
+        close(tfd);
+        close(tcollector);
+        close(dtfd);
+        close(dtcollector);
         return -1;
     }
 
@@ -972,8 +2002,10 @@ static int capture_data_files(const char *exe_path, const char *exe_identity,
     if (pid < 0) {
         sigprocmask(SIG_SETMASK, &old_mask, NULL);
         perror("fork");
-        unlink(tracef);
-        unlink(dlopen_tracef);
+        close(tfd);
+        close(tcollector);
+        close(dtfd);
+        close(dtcollector);
         return -1;
     }
 
@@ -990,8 +2022,15 @@ static int capture_data_files(const char *exe_path, const char *exe_identity,
          * reader: its first read is stopped by SIGTTIN while the parent waits
          * forever.  No trace timeout relies on a private process group. */
         if (prepend_ld_preload(preload_path) < 0 ||
-            setenv("DLFREEZE_TRACE_FILE", dlopen_tracef, 1) < 0 ||
-            setenv("DLFREEZE_FILE_TRACE_FILE", tracef, 1) < 0)
+            set_trace_owner_environment() < 0 ||
+            set_trace_descriptor_environment(
+                dtfd, "DLFREEZE_TRACE_FD",
+                "DLFREEZE_TRACE_IDENTITY") < 0 ||
+            set_trace_descriptor_environment(
+                tfd, "DLFREEZE_FILE_TRACE_FD",
+                "DLFREEZE_FILE_TRACE_IDENTITY") < 0 ||
+            unsetenv("DLFREEZE_TRACE_FILE") < 0 ||
+            unsetenv("DLFREEZE_FILE_TRACE_FILE") < 0)
             _exit(127);
         tav = calloc((size_t)nargs + 1, sizeof(*tav));
         if (!tav)
@@ -1004,10 +2043,18 @@ static int capture_data_files(const char *exe_path, const char *exe_identity,
         _exit(127);
     }
 
+    /* These are the helper's open file descriptions.  Keeping either copy in
+     * the collector would make its later nonblocking flock unable to detect a
+     * still-running fork descendant. */
+    close(tfd);
+    tfd = -1;
+    close(dtfd);
+    dtfd = -1;
+
     if (supervise_trace_child(pid, &forward_set, &old_mask, &st) < 0) {
         perror("waitpid");
-        unlink(tracef);
-        unlink(dlopen_tracef);
+        close(tcollector);
+        close(dtcollector);
         return -1;
     }
     if (verbose)
@@ -1015,37 +2062,30 @@ static int capture_data_files(const char *exe_path, const char *exe_identity,
                WIFEXITED(st) ? WEXITSTATUS(st) : -1);
     if (!WIFEXITED(st)) {
         fprintf(stderr, "dlfreeze: traced execution did not exit normally\n");
-        unlink(tracef);
-        unlink(dlopen_tracef);
+        close(tcollector);
+        close(dtcollector);
         return -1;
     }
 
-    if (!trace_file_has_header(tracef, "#DLFREEZE_PRELOAD_TRACE_V4") ||
-        !trace_file_has_header(dlopen_tracef,
-                               "#DLFREEZE_DLOPEN_TRACE_V4")) {
+    if (!trace_fd_has_header(tcollector, "#DLFREEZE_PRELOAD_TRACE_V9") ||
+        !trace_fd_has_header(dtcollector,
+                             "#DLFREEZE_DLOPEN_TRACE_V8")) {
         fprintf(stderr,
                 "dlfreeze: preload trace helper is incompatible with the "
                 "target runtime or produced incomplete readiness records\n");
-        unlink(tracef);
-        unlink(dlopen_tracef);
+        close(tcollector);
+        close(dtcollector);
         return -1;
     }
 
-    if (verbose) {
-        FILE *dtf = fopen(dlopen_tracef, "r");
-        if (dtf) {
-            char ln[1024];
-            printf("dlopen traced:\n");
-            while (fgets(ln, sizeof(ln), dtf))
-                printf("  %s", ln);
-            fclose(dtf);
-        }
-    }
-    if (dep_add_dlopen_libs(deps, dlopen_tracef) < 0) {
-        unlink(dlopen_tracef);
-        unlink(tracef);
+    if (verbose)
+        dump_trace_fd(dtcollector, "dlopen traced:");
+    if (dep_add_dlopen_libs_fd(deps, dtcollector) < 0) {
+        dtcollector = -1;
+        close(tcollector);
         return -1;
     }
+    dtcollector = -1;
     if (verbose) {
         printf("libraries after trace: %d\n", deps->count);
         for (int i = 0; i < deps->count; i++)
@@ -1054,10 +2094,9 @@ static int capture_data_files(const char *exe_path, const char *exe_identity,
                        deps->libs[i].name, deps->libs[i].path);
     }
 
-    unlink(dlopen_tracef);
-    st = parse_preload_file_trace(tracef, exe_path, patterns, npatterns,
+    st = parse_preload_file_trace(tcollector, exe_path, patterns, npatterns,
                                   out, deps, verbose);
-    unlink(tracef);
+    tcollector = -1;
     return st;
 }
 
@@ -1178,11 +2217,29 @@ int main(int argc, char **argv)
     data_file_list_init(&data_files);
     if (do_trace) {
         int trace_failed = 0;
-        char *preload = find_compatible_preload(self, &deps, verbose);
-        if (!preload) {
+        const char *inherited_preload = getenv("LD_PRELOAD");
+        const char *inherited_audit = getenv("LD_AUDIT");
+        char *preload = NULL;
+
+        /* A caller-supplied loader injection changes the target's initial
+         * namespace before the trace helper can observe every source (audit
+         * DSOs may live in a separate namespace).  Do not conflate those
+         * effects with the target's resolved startup graph. */
+        if ((inherited_preload && inherited_preload[0]) ||
+            (inherited_audit && inherited_audit[0])) {
             fprintf(stderr,
-                    "dlfreeze: -t has no ABI-compatible preload helper; "
-                    "syscall tracing cannot recover exact dlopen requests\n");
+                    "dlfreeze: -t does not admit inherited LD_PRELOAD or "
+                    "LD_AUDIT injection\n");
+            trace_failed = 1;
+        }
+        if (!trace_failed)
+            preload = find_compatible_preload(self, &deps, verbose);
+        if (!preload) {
+            if (!trace_failed)
+                fprintf(stderr,
+                        "dlfreeze: -t has no ABI-compatible preload helper; "
+                        "syscall tracing cannot recover exact dlopen "
+                        "requests\n");
             trace_failed = 1;
         }
 
@@ -1205,103 +2262,117 @@ int main(int argc, char **argv)
             preload = NULL;
         } else if (!trace_failed) {
             /* dlopen-only tracing (no -f patterns, no strace needed) */
-            char tracef[] = "/tmp/dlfreeze-trace.XXXXXX";
-            int tfd = mkstemp(tracef);
+            char tracef[PATH_MAX];
+            int collector_fd = -1;
+            int tfd = make_trace_tempfile(tracef, sizeof(tracef),
+                                          "dlfreeze-trace", &collector_fd);
             if (tfd < 0) {
                 perror("mkstemp");
                 trace_failed = 1;
+            } else if (prepare_trace_descriptor(tfd) < 0) {
+                perror("prepare trace descriptor");
+                close(tfd);
+                close(collector_fd);
+                trace_failed = 1;
             } else {
-                if (close(tfd) < 0) {
-                    perror("close");
+                printf("Tracing dlopen calls …\n");
+
+                sigset_t forward_set, old_mask;
+                build_trace_signal_set(&forward_set);
+                if (sigprocmask(SIG_BLOCK, &forward_set, &old_mask) < 0) {
+                    perror("sigprocmask");
+                    close(tfd);
+                    close(collector_fd);
                     trace_failed = 1;
                 } else {
-                    printf("Tracing dlopen calls …\n");
+                    pid_t pid = fork();
 
-                    sigset_t forward_set, old_mask;
-                    build_trace_signal_set(&forward_set);
-                    if (sigprocmask(SIG_BLOCK, &forward_set, &old_mask) < 0) {
-                        perror("sigprocmask");
+                    if (pid == 0) {
+                        if (sigprocmask(SIG_SETMASK, &old_mask, NULL) < 0)
+                            _exit(127);
+                        /* Preserve foreground terminal ownership for traced
+                         * interactive programs; see capture_data_files(). */
+                        if (prepend_ld_preload(preload) < 0 ||
+                            set_trace_owner_environment() < 0 ||
+                            set_trace_descriptor_environment(
+                                tfd, "DLFREEZE_TRACE_FD",
+                                "DLFREEZE_TRACE_IDENTITY") < 0 ||
+                            unsetenv("DLFREEZE_TRACE_FILE") < 0 ||
+                            unsetenv("DLFREEZE_FILE_TRACE_FILE") < 0 ||
+                            unsetenv("DLFREEZE_FILE_TRACE_FD") < 0 ||
+                            unsetenv("DLFREEZE_FILE_TRACE_IDENTITY") < 0)
+                            _exit(127);
+
+                        int tstart = optind + 1; /* args after executable */
+                        int nargs = 1 + (argc - tstart);
+                        char **tav = calloc((size_t)nargs + 1,
+                                           sizeof(char *));
+                        if (!tav)
+                            _exit(127);
+                        tav[0] = (char *)requested_exe;
+                        for (int i = tstart; i < argc; i++)
+                            tav[1 + i - tstart] = argv[i];
+                        tav[nargs] = NULL;
+                        execve(exe_path, tav, environ);
+                        _exit(127);
+                    }
+                    if (pid < 0) {
+                        sigprocmask(SIG_SETMASK, &old_mask, NULL);
+                        perror("fork");
+                        close(tfd);
+                        close(collector_fd);
                         trace_failed = 1;
                     } else {
-                        pid_t pid = fork();
+                        int st;
 
-                        if (pid == 0) {
-                            if (sigprocmask(SIG_SETMASK, &old_mask, NULL) < 0)
-                                _exit(127);
-                            /* Preserve foreground terminal ownership for traced
-                             * interactive programs; see capture_data_files().
-                             */
-                            if (prepend_ld_preload(preload) < 0)
-                                _exit(127);
-                            if (setenv("DLFREEZE_TRACE_FILE", tracef, 1) < 0)
-                                _exit(127);
-
-                            int tstart = optind + 1; /* args after executable */
-                            int nargs = 1 + (argc - tstart);
-                            char **tav = calloc(nargs + 1, sizeof(char *));
-                            if (!tav)
-                                _exit(127);
-                            tav[0] = (char *)requested_exe;
-                            for (int i = tstart; i < argc; i++)
-                                tav[1 + i - tstart] = argv[i];
-                            tav[nargs] = NULL;
-                            execve(exe_path, tav, environ);
-                            _exit(127);
-                        }
-                        if (pid < 0) {
-                            sigprocmask(SIG_SETMASK, &old_mask, NULL);
-                            perror("fork");
+                        /* Drop the collector's copy of the helper OFD before
+                         * waiting, or a descendant-liveness lock could never
+                         * distinguish parent ownership from target ownership. */
+                        close(tfd);
+                        tfd = -1;
+                        if (supervise_trace_child(pid, &forward_set,
+                                                  &old_mask, &st) < 0) {
+                            perror("waitpid");
+                            close(collector_fd);
+                            collector_fd = -1;
                             trace_failed = 1;
                         } else {
-                            int st;
-
-                            if (supervise_trace_child(pid, &forward_set,
-                                                      &old_mask, &st) < 0) {
-                                perror("waitpid");
+                            if (verbose)
+                                printf("trace exit status: %d\n",
+                                       WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+                            if (verbose)
+                                dump_trace_fd(collector_fd, "traced:");
+                            if (!WIFEXITED(st) ||
+                                !trace_fd_has_header(
+                                    collector_fd,
+                                    "#DLFREEZE_DLOPEN_TRACE_V8")) {
+                                fprintf(
+                                    stderr,
+                                    "dlfreeze: preload trace helper is "
+                                    "incompatible with the target runtime "
+                                    "or produced no valid V8 readiness "
+                                    "record\n");
                                 trace_failed = 1;
+                                close(collector_fd);
+                                collector_fd = -1;
                             } else {
-                                if (verbose)
-                                    printf("trace exit status: %d\n",
-                                           WIFEXITED(st) ? WEXITSTATUS(st)
-                                                         : -1);
-                                if (verbose) {
-                                    FILE *tf = fopen(tracef, "r");
-                                    if (tf) {
-                                        char ln[1024];
-                                        printf("traced:\n");
-                                        while (fgets(ln, sizeof(ln), tf))
-                                            printf("  %s", ln);
-                                        fclose(tf);
-                                    }
-                                }
-                                if (!WIFEXITED(st) ||
-                                    !trace_file_has_header(
-                                        tracef, "#DLFREEZE_DLOPEN_TRACE_V4")) {
-                                    fprintf(
-                                        stderr,
-                                        "dlfreeze: preload trace helper is "
-                                        "incompatible with the target runtime "
-                                        "or produced no valid V4 readiness "
-                                        "record\n");
+                                if (dep_add_dlopen_libs_fd(
+                                        &deps, collector_fd) < 0)
                                     trace_failed = 1;
-                                } else if (dep_add_dlopen_libs(&deps, tracef) <
-                                           0) {
-                                    trace_failed = 1;
-                                }
-                                if (verbose) {
-                                    printf("libraries after trace: %d\n",
-                                           deps.count);
-                                    for (int i = 0; i < deps.count; i++)
-                                        if (deps.libs[i].from_dlopen)
-                                            printf("  (dlopen) %-30s → %s\n",
-                                                   deps.libs[i].name,
-                                                   deps.libs[i].path);
-                                }
+                                collector_fd = -1;
+                            }
+                            if (verbose) {
+                                printf("libraries after trace: %d\n",
+                                       deps.count);
+                                for (int i = 0; i < deps.count; i++)
+                                    if (deps.libs[i].from_dlopen)
+                                        printf("  (dlopen) %-30s → %s\n",
+                                               deps.libs[i].name,
+                                               deps.libs[i].path);
                             }
                         }
                     }
                 }
-                unlink(tracef);
             }
         }
         free(preload);

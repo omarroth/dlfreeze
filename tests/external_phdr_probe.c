@@ -2,6 +2,7 @@
 
 #include <dlfcn.h>
 #include <elf.h>
+#include <fcntl.h>
 #include <link.h>
 #include <signal.h>
 #include <stdint.h>
@@ -56,9 +57,16 @@ static int header_view_is_read_only(const Elf64_Phdr *phdr)
     if (child < 0)
         return 0;
     if (child == 0) {
+        int nullfd = open("/dev/null", O_WRONLY | O_CLOEXEC);
         volatile unsigned char *byte =
             (volatile unsigned char *)(uintptr_t)phdr;
 
+        if (nullfd >= 0) {
+            if (nullfd != STDERR_FILENO) {
+                (void)dup2(nullfd, STDERR_FILENO);
+                (void)close(nullfd);
+            }
+        }
         *byte = *byte;
         _exit(0);
     }

@@ -177,6 +177,10 @@ for src_dir in $FROZEN_GLOB; do
         echo "ERROR: $src_dir lacks the mandatory hello artifact pair"
         contract_error=1
     fi
+    if [ ! -f "$src_dir/exitcode.frozen" ]; then
+        echo "ERROR: $src_dir lacks the mandatory exitcode artifact"
+        contract_error=1
+    fi
     contract_status="$src_dir/direct-contracts.v1"
     if [ ! -f "$contract_status" ]; then
         if [ "$require_direct_contracts" = 1 ]; then
@@ -188,8 +192,14 @@ for src_dir in $FROZEN_GLOB; do
 
     contract_runtime_count=0
     contract_seen_runtime=
+    contract_version=
+    contract_runtime=
+    contract_state=
+    contract_variant=
+    contract_extra=
     while IFS='|' read -r contract_version contract_runtime \
-            contract_state contract_variant contract_extra; do
+            contract_state contract_variant contract_extra ||
+          [ -n "$contract_version$contract_runtime$contract_state$contract_variant$contract_extra" ]; do
         contract_runtime_count=$((contract_runtime_count + 1))
         if [ "$contract_version" != 1 ] || [ -n "$contract_extra" ]; then
             echo "ERROR: malformed generic direct-contract entry in $contract_status"
@@ -291,8 +301,14 @@ for src_dir in $FROZEN_GLOB; do
     # ── generic strict-direct contracts ─────────────────────────────
     contract_status="$src_dir/direct-contracts.v1"
     if [ -f "$contract_status" ]; then
+        contract_version=
+        contract_runtime=
+        contract_state=
+        contract_variant=
+        contract_extra=
         while IFS='|' read -r contract_version contract_runtime \
-                contract_state contract_variant contract_extra; do
+                contract_state contract_variant contract_extra ||
+              [ -n "$contract_version$contract_runtime$contract_state$contract_variant$contract_extra" ]; do
             # The validation pass above already checked version, spelling,
             # uniqueness, and file presence.
             if [ "$contract_state" = unsupported ]; then
@@ -378,7 +394,7 @@ for src_dir in $FROZEN_GLOB; do
             fi
         fi
     else
-        skip "$src_env/exitcode.frozen" "artifact not found"
+        fail "$src_env/exitcode.frozen" "mandatory artifact not found"
     fi
 
     # ── exitcode.upx.frozen ────────────────────────────────────────

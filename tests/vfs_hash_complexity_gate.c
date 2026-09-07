@@ -1,10 +1,14 @@
 /* Focused embedded-VFS hashing and derived-directory complexity gate. */
+#define DLFREEZE_VFS_COMPLEXITY_GATE 1
 #include "../src/loader.c"
 
 #define COLLIDER_COUNT (1U << 14)
 #define COLLIDER_PAIRS 14U
 #define COLLIDER_STRIDE (2U * COLLIDER_PAIRS + 2U)
 #define DEEP_COMPONENTS 12000U
+#define FROZEN_ELF_COUNT (1U << 14)
+#define FROZEN_ELF_NAME_SIZE 48U
+#define FROZEN_ELF_STRIDE (2U * FROZEN_ELF_NAME_SIZE)
 
 static uint64_t legacy_djb_hash(const char *string)
 {
@@ -21,6 +25,7 @@ static void reset_gate_vfs(void)
     g_vfs_table = NULL;
     g_vfs_table_size = 0;
     g_vfs_count = 0;
+    frozen_elf_index_reset();
     vfs_reset_dirs();
     g_frozen_metas = NULL;
     g_frozen_entries = NULL;
@@ -104,6 +109,98 @@ out:
     return result;
 }
 
+static int frozen_elf_index_gate(void)
+{
+    struct dlfrz_entry *entries = NULL;
+    struct dlfrz_lib_meta *metas = NULL;
+    char *strings = NULL;
+    uint8_t data = 0;
+    size_t lookup_count = 0;
+    int result = -1;
+
+    entries = calloc(FROZEN_ELF_COUNT, sizeof(*entries));
+    metas = calloc(FROZEN_ELF_COUNT, sizeof(*metas));
+    strings = calloc(FROZEN_ELF_COUNT, FROZEN_ELF_STRIDE);
+    if (!entries || !metas || !strings)
+        goto out;
+    for (uint32_t i = 0; i < FROZEN_ELF_COUNT; i++) {
+        size_t offset = (size_t)i * FROZEN_ELF_STRIDE;
+        char *canonical = strings + offset;
+        char *logical = canonical + FROZEN_ELF_NAME_SIZE;
+        int canonical_length;
+        int logical_length;
+
+        if (offset > UINT32_MAX - FROZEN_ELF_NAME_SIZE)
+            goto out;
+        canonical_length = snprintf(
+            canonical, FROZEN_ELF_NAME_SIZE,
+            "/frozen/canonical/%08u.so", i);
+        logical_length = snprintf(
+            logical, FROZEN_ELF_NAME_SIZE,
+            "/frozen/logical/%08u.so", i);
+        if (canonical_length <= 0 ||
+            (size_t)canonical_length >= FROZEN_ELF_NAME_SIZE ||
+            logical_length <= 0 ||
+            (size_t)logical_length >= FROZEN_ELF_NAME_SIZE)
+            goto out;
+        entries[i].flags = DLFRZ_FLAG_SHLIB;
+        entries[i].name_offset = (uint32_t)offset;
+        entries[i].logical_name_offset =
+            (uint32_t)(offset + FROZEN_ELF_NAME_SIZE);
+        metas[i].flags = LDR_FLAG_SHLIB;
+    }
+
+    /* The last entry's canonical spelling aliases entry zero's logical
+     * spelling.  The index must retain the old lowest-manifest-index result. */
+    entries[FROZEN_ELF_COUNT - 1].name_offset =
+        entries[0].logical_name_offset;
+    g_frozen_mem = &data;
+    g_frozen_mem_foff = 0;
+    g_frozen_metas = metas;
+    g_frozen_entries = entries;
+    g_frozen_strtab = strings;
+    g_frozen_num_entries = FROZEN_ELF_COUNT;
+    if (vfs_init(&data, 0, entries, strings, FROZEN_ELF_COUNT) < 0 ||
+        g_frozen_elf_path_count != 2U * FROZEN_ELF_COUNT - 1U ||
+        frozen_elf_find(strings + entries[0].logical_name_offset) != 0)
+        goto out;
+
+    g_frozen_elf_lookup_probes = 0;
+    for (uint32_t i = 0; i < FROZEN_ELF_COUNT; i++) {
+        const char *canonical = strings + (size_t)i * FROZEN_ELF_STRIDE;
+        const char *logical = canonical + FROZEN_ELF_NAME_SIZE;
+        char missing[FROZEN_ELF_NAME_SIZE];
+        int missing_length;
+        int canonical_expected =
+            i == FROZEN_ELF_COUNT - 1 ? -1 : (int)i;
+
+        if (canonical_expected >= 0 &&
+            frozen_elf_find(canonical) != canonical_expected)
+            goto out;
+        if (frozen_elf_find(logical) != (int)i)
+            goto out;
+        missing_length = snprintf(
+            missing, sizeof(missing), "/not-frozen/%08u.so", i);
+        if (missing_length <= 0 ||
+            (size_t)missing_length >= sizeof(missing) ||
+            frozen_elf_find(missing) != -1)
+            goto out;
+        lookup_count += canonical_expected >= 0 ? 3U : 2U;
+    }
+    if (g_frozen_elf_lookup_probes > lookup_count * 16U)
+        goto out;
+    result = 0;
+
+out:
+    reset_gate_vfs();
+    g_frozen_mem = NULL;
+    g_frozen_mem_foff = 0;
+    free(entries);
+    free(metas);
+    free(strings);
+    return result;
+}
+
 static int deep_directory_gate(void)
 {
     struct dlfrz_entry entry;
@@ -150,7 +247,9 @@ int main(void)
         return 1;
     if (collider_manifest_gate() < 0)
         return 2;
-    if (deep_directory_gate() < 0)
+    if (frozen_elf_index_gate() < 0)
         return 3;
+    if (deep_directory_gate() < 0)
+        return 4;
     return 0;
 }

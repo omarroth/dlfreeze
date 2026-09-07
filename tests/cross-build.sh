@@ -468,11 +468,14 @@ EOF
             continue
         fi
         contract_interp_real=$(readlink -f "$contract_interp" 2>/dev/null || true)
-        contract_runtime_hash=$(
-            [ -n "$contract_interp_real" ] &&
-            [ -f "$contract_interp_real" ] &&
-            sha256sum "$contract_interp_real" 2>/dev/null | awk '{print $1}'
-        )
+        contract_runtime_hash=
+        if [ -n "$contract_interp_real" ] &&
+           [ -f "$contract_interp_real" ]; then
+            if ! contract_runtime_hash=$(sha256sum "$contract_interp_real" 2>/dev/null); then
+                contract_runtime_hash=
+            fi
+            contract_runtime_hash=${contract_runtime_hash%% *}
+        fi
         case "$contract_runtime_hash" in
             ''|*[!0-9a-f]*)
                 echo "ERROR: generic direct contract ($contract_cc) cannot identify interpreter content: $contract_interp" >&2
@@ -819,9 +822,10 @@ echo ""
 echo "--- Test suite ---"
 # The test suite skips tests whose prerequisites are missing (Docker,
 # specific relocation types, etc.), but real failures must fail the build.
-# Require direct-loader coverage exactly when this image has an admitted host
-# runtime.  A clean extraction fallback is a capability result; compiler,
-# packer, and ambiguous-output failures from the probe remain fatal.
+# Require aggregate direct-loader coverage when this image has an admitted
+# host runtime.  run_tests.sh resolves selectors against its authoritative
+# registry and applies this aggregate requirement only when that resolved
+# range is the full suite; partial shards still own their individual result.
 if probe_direct_runtime_admission; then
     DLFREEZE_REQUIRE_DIRECT=1
 else
@@ -832,7 +836,9 @@ else
     DLFREEZE_REQUIRE_DIRECT=0
 fi
 export DLFREEZE_REQUIRE_DIRECT
-echo "direct coverage required: $DLFREEZE_REQUIRE_DIRECT"
+DLFREEZE_REQUIRE_DIRECT_FULL_SUITE_ONLY=1
+export DLFREEZE_REQUIRE_DIRECT_FULL_SUITE_ONLY
+echo "full-suite direct coverage required: $DLFREEZE_REQUIRE_DIRECT"
 if run_suite bash tests/run_tests.sh build; then
     echo "Test suite: all passed"
 else

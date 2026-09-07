@@ -17,7 +17,7 @@ the strict direct-loader contract is exercised by generic C fixtures.
 
 | Area | Supported contract |
 |---|---|
-| Architecture | ELF64 x86_64 and AArch64; source and target must match |
+| Architecture | Little-endian ELF64 x86_64 and AArch64; source and target must match |
 | Default extraction | Bundles the interpreter and libraries when no runtime DATA is captured; may use a byte-identical installed interpreter, otherwise invokes the bundled copy |
 | Direct load (`-d`) | Target-validated musl 1.2.2–1.2.6 and admitted glibc 2.34–2.44 shapes with an SSP-disabled static bootstrap capability; static musl and static glibc are the tested bootstrap implementations. Other targets and unvalidated startup entry points use extraction only when the artifact has no captured DATA |
 | `dlopen()` dependencies | Capture with `-t` by exercising relevant paths; uncaptured libraries may use an explicit host-disk fallback |
@@ -43,7 +43,10 @@ currently remains resident until process exit. A loader-owned recursive lock
 serializes runtime graph/TLS publication with concurrent `dlopen()`, `dlsym()`,
 `dlclose()`, `dladdr()`, `dladdr1()`, `dlinfo()`, `dl_iterate_phdr()`, and
 unwind metadata readers; standard `fork()` handlers preserve a coherent
-child-side snapshot.
+child-side snapshot. A child created by a raw fork syscall while an outer
+loader operation owns that lock must unwind the inherited operation before
+re-entering the loader; an earlier nested re-entry fails closed because raw
+syscalls bypass the registered atfork repair contract.
 Loader-owned errno, finalization, pthread-key, atfork, allocation, and VFS
 fallthrough services bind directly to complete, executable function definitions
 in the structurally selected target libc. Executable or preload interposers
@@ -73,10 +76,17 @@ with `dlerror()` rather than consuming a private loader handle as a native
 `RTLD_DI_SERINFO` hook is terminated with status 127 because its opaque output
 ABI cannot be completed safely.
 The direct loader honors `RTLD_LOCAL`, `RTLD_GLOBAL` promotion, and
-`RTLD_NOLOAD` visibility checks. It accepts `RTLD_LAZY` for compatibility
-(including together with `RTLD_NOW`, which takes precedence) but resolves
-relocations eagerly; `RTLD_NODELETE` is therefore implicit. Unknown mode bits
-and `RTLD_DEEPBIND` fail closed.
+`RTLD_NOLOAD` visibility checks. Musl's `RTLD_LAZY` contract is eager, so it is
+replayed directly. On GNU runtimes, successful `RTLD_LAZY` requests for an
+already-visible object and requests where `RTLD_NOW` takes precedence can be
+replayed directly. A traced pure-lazy request that first loads an object, a
+failed traced loader call, or a startup lazy PLT import which needs native lazy
+binding selects extraction when the manifest permits it; strict/direct-only
+execution refuses it before target code runs. Remaining admitted relocations
+are resolved eagerly. In particular, a resolved GNU IFUNC behind a lazy PLT
+slot may run during direct startup even if the application never calls that
+slot; exact native lazy-binding timing is outside the direct-mode contract.
+`RTLD_NODELETE` is implicit. Unknown mode bits and `RTLD_DEEPBIND` fail closed.
 Glibc also has a separate private module-loader interface used by facilities
 such as external gconv converters and NSS backends. Direct mode does not create
 per-module private `link_map` or symbol-lookup structures, nor use synthetic
@@ -118,11 +128,13 @@ embedded libc's stable release identity to match the admitted interpreter.
 A supported x86-64 glibc target also has to prove its private CPU-feature
 object from the exact interpreter: the exported accessor, its initialization
 wrapper, the initializer's field writes, and the control-flow roots of its
-generic CPU-kind value must all agree. The loader publishes a conservative
-generic feature state and derives cache thresholds and separately exposed ISA
-levels from the executing machine's CPUID/XCR0 state. An unfamiliar compiler
-shape or layout is refused rather than guessed. This private libc ABI remains
-one reason that direct loading is experimental.
+generic CPU-kind value must all agree. In a bounded copy-on-write clone, the
+loader runs that exact target wrapper and initializer, validates their result,
+then publishes the complete target-computed scalar CPU object, cache values,
+HWCAP state, and ISA level only if the parent mapping remained unchanged. An
+unfamiliar compiler shape, layout, or initializer result is refused rather
+than guessed. This private libc ABI remains one reason that direct loading is
+experimental.
 A nonempty `GLIBC_TUNABLES` selects native extraction because reproducing the
 interpreter's parsing, security, and CPU policy would require its private
 initialization machinery. Glibc gmon profiling (including GCC `-pg`) also
@@ -153,18 +165,19 @@ strings in the structurally admitted interpreter, so custom glibc
 `SYSCONFDIR` builds do not silently inherit the bootstrap host's `/etc`. The
 loader does not
 guess Debian, Fedora, or generic `/lib*` directories. It accepts bounded
-legacy, old/new compatibility, and version-1.1 caches, checks any GNU ABI-tag
-kernel minimum against a raw `uname(2)` result, and supports the built-in
-x86-64 v2/v3/v4 hwcaps names. A missing or malformed cache, a cache miss which would
-require glibc's private compiled default-directory table, and a
+legacy, old/new compatibility, and version-1.1 caches, reproduces the target
+glibc release's GNU ABI-tag behavior (kernel-minimum checks through glibc 2.35,
+and the later releases' intentional omission), and supports the built-in
+x86-64 v2/v3/v4 hwcaps names. A missing or malformed cache, a cache miss which
+would require glibc's private compiled default-directory table, and a
 `DF_1_NODEFLIB` cache result whose system-directory status cannot be proven
 fail closed. Trace such loads with `-t` when portability or self-containment
 matters.
 Pack-time GNU `DT_NEEDED` resolution uses the same RPATH/environment/RUNPATH
 ordering and reads the binary cache directly; it never invokes `ldconfig` or
 parses its localized output. It accepts bounded legacy, compatibility, and
-version-1.1 cache images, selects an exact-architecture generic entry, checks
-any GNU ABI-tag kernel minimum against `uname(2)`, and validates the resulting
+version-1.1 cache images, selects an exact-architecture generic entry, applies
+the target glibc release's GNU ABI-tag semantics, and validates the resulting
 ELF. A malformed or missing cache, a validated cache miss, and an
 unclassifiable `DF_1_NODEFLIB` request fail closed. This deliberately avoids
 copying glibc's evolving CPU/tunable policy or inferring its private compiled
@@ -176,17 +189,21 @@ auxiliary-vector slots in place before target libc initialization, and restores
 that same initial stack pointer at the executable entry. Constructors,
 `getauxval()`, `pthread_getattr_np()`, and `main` therefore observe one stack
 and one target-image auxiliary vector with the kernel's original guard and
-`RLIMIT_STACK` semantics.
+`RLIMIT_STACK` semantics. GNU direct mode reports `AT_BASE` as zero because it
+does not map the native ELF interpreter; that observable value is part of the
+experimental direct-mode contract.
 Target ELF objects are prelinked into deterministic virtual-address slots and
 reserved at runtime with `MAP_FIXED_NOREPLACE`. Address collisions therefore
 fail closed, but the target executable and DSOs do not receive normal
 per-execution ASLR. Do not treat direct-mode artifacts as hardened executables.
-Prelinked artifacts, captured-DATA manifests, and exact pathful dynamic-load
-manifests cannot use extraction fallback, so their direct loader enters in the
-original process and preserves the caller-assigned PID. A clean
-runtime-relocation artifact remains supervised until application handoff so an
-early loader refusal can still select extraction; after handoff it is never
-retried.
+Prelinked objects retain extraction-safe relocation bytes: RELR is replayed at
+runtime, while only explicit-addend, file-backed RELA relative results may be
+persisted. Consequently, prelinked and ordinary clean artifacts can remain
+supervised until application handoff and select extraction after an early
+loader refusal. The supervisor never retries after target resolvers or other
+target code can run. Captured-DATA manifests and exact pathful or otherwise
+unreproducible dynamic-load identities remain direct-only; their loader enters
+in the original process and preserves the caller-assigned PID.
 
 Captured files are served by the direct loader's in-process VFS. Consequently,
 `-f` requires both `-t` and `-d`, and packing fails if the target runtime cannot
@@ -202,25 +219,55 @@ not rewritten to the freeze-time source path; `readlink()` observes the identity
 reported by the kernel for the currently executing artifact.
 
 Tracing is implemented by a target-ABI-compatible `LD_PRELOAD` helper and
-observes the libc interfaces that it interposes. It cannot observe a program
-that bypasses libc with raw `openat`, `openat2`, or `statx` system calls, and it
-captures only paths exercised by the traced run. Treat either case as an input
-coverage limitation rather than an implicit promise of self-containment.
-An exec'd program can also deliberately remove the preload/trace environment,
-and a daemonized descendant can outlive the supervised trace and race trace
-collection; neither case can be made complete without a ptrace-, seccomp-, or
-audit-level tracer.
+observes the libc interfaces that it interposes. Each trace stream is claimed
+by one process image. Fork descendants inherit that claim and write
+PID-tagged records; a fork-and-exec descendant is deliberately excluded
+because neither the direct namespace nor the captured-file VFS survives
+`exec`. A same-PID `exec` invalidates the trace, and collection refuses a
+stream still owned by a live descendant instead of racing an append.
+If a loader callback reaches an interposer before libc has published
+`environ`, the helper reads the inherited trace contract from
+`/proc/self/environ` with raw syscalls. Failure to read that initial contract
+makes the trace incomplete rather than silently dropping the early operation.
+Successful dynamic-load and captured-file records bind the observed path to
+its device, inode, type, size, mtime, and ctime, which are revalidated before
+packing. There is no portable way for the helper to obtain the loader's
+private file descriptor, so a narrow race remains between the loader's open
+and the helper's post-return pathname snapshot. Later changes fail closed.
+Trace-descriptor mutations through `close`, `dup`, `dup2`, `dup3`,
+`close_range`, and `closefrom` are bracketed by begin/commit records. The
+helper rehomes its private descriptors before calling a downstream interposer
+and never holds its descriptor lock across that call. A destructive range is
+forwarded exactly once when a private descriptor can be moved outside it. For
+the common range that covers every non-stdio descriptor, no such number
+exists; `close_range` is then issued as raw segments around the private
+descriptors, and `closefrom` is implemented equivalently. This preserves
+traceability but is observable to seccomp policies or lower interposers that
+distinguish the original range from its segments. `CLOSE_RANGE_UNSHARE`
+cannot share one process-global trace publication across the resulting fd
+tables and therefore makes the trace unusable while retaining the native
+call. A failed segment likewise invalidates the trace because earlier
+segments may already have changed the descriptor table.
+The helper cannot observe raw syscalls which bypass an interposed libc entry
+point, including `openat`, `openat2`, `statx`, and descriptor mutations.
+Likewise, `fcntl(F_DUPFD*)` is not interposed, so code which deliberately
+discovers and duplicates a private trace descriptor can escape the descriptor
+transaction protocol. A program can also remove the preload/trace environment
+or access a path outside the exercised run. Treat these cases as coverage
+limitations rather than an implicit promise of self-containment; closing them
+requires a ptrace-, seccomp-, or audit-level tracer.
 The captured-file VFS serves a followed symlink's contents under the traced
 request path; it does not reproduce the symlink object for `lstat()` or
 `readlink()`. Synthetic captured-directory descriptors are intended for
-enumeration and relative lookups. Descriptor duplication, `fchdir()`, and
-descriptor metadata are not yet virtualized and can expose host descriptor or
-working-directory behavior; avoid those operations in captured-directory
-workloads.
-Extraction uses a private directory under `/tmp`; that path must permit both
-file creation and execution. The directory remains available while the
-supervised target is running and is removed afterward, so extraction mode is
-not intended for targets that daemonize descendants which outlive the target.
+enumeration and relative lookups. Their identity is propagated through
+`dup()`, `dup2()`, `dup3()`, and `fcntl(F_DUPFD*)`; `fchdir()` and descriptor
+metadata are not yet virtualized and can expose host working-directory or
+descriptor behavior. Avoid those operations in captured-directory workloads.
+Extraction uses a securely admitted private directory below `TMPDIR`, with an
+equally checked `/tmp` fallback; the selected path must permit both file
+creation and execution. The directory remains available while the supervised
+target is running and is removed afterward, so extraction mode is not intended
+for targets that daemonize descendants which outlive the target.
 When no byte-identical system interpreter is available, invoking the bundled
 interpreter is necessarily observable through `argv[0]` and `/proc/self/exe`.
 Artifacts fail closed when the kernel reports `AT_SECURE` (for example after a
@@ -264,10 +311,14 @@ stdlib=$(python3 -I -c 'import sysconfig; print(sysconfig.get_path("stdlib"))')
 ## How it works
 
 1. **Dependency resolution** — BFS walk over `DT_NEEDED` entries, with ABI validation, content-based target-libc identification, bounded GNU legacy/compatibility/version-1.1 cache lookup, exact musl prefix/path-file replacement semantics, and target-specific `$ORIGIN`/`DT_RPATH`/`DT_RUNPATH` ordering. No distribution library directories are guessed; missing or incompatible required libraries, cache misses that require private GNU defaults, and unknown loader search ABIs are fatal.
-2. **dlopen tracing** (`-t`) — Runs the program under an `LD_PRELOAD` shim that intercepts `dlopen()` and records the resolved paths.
+2. **Dynamic-load tracing** (`-t`) — Runs the program under an `LD_PRELOAD` shim that records successful and failed `dlopen()`/`dlmopen()` calls, including their modes and resolved object identities.
 3. **Packing** — Concatenates the statically-linked bootstrap stub, every collected object (page-aligned), a string table, a manifest, and a 64-byte footer (`DLFREEZ` magic) into a single ELF.
 4. **Runtime — extraction mode (default)** — For artifacts without captured DATA, the bootstrap extracts files to a tmpdir. It uses normal kernel `PT_INTERP` startup when the installed interpreter is byte-identical, otherwise it invokes the bundled interpreter.
 5. **Runtime — direct-load mode** (`-d`) — For admitted glibc 2.34–2.44 and target-validated musl 1.2.2–1.2.6 shapes, the bootstrap invokes an in-process ELF loader that maps segments, resolves relocations, builds runtime state, and serves captured DATA. Unsupported runtimes use extraction only when no DATA was captured.
+
+The bootstrap and direct loader are copied into each frozen executable when it
+is packed. Rebuilding `dlfreeze` does not update existing artifacts; regenerate
+an artifact to pick up loader fixes and startup-performance improvements.
 
 Frozen binaries are compatible with UPX and should mostly work with other packing tools: the payload lives in a `PT_LOAD` segment so compressors preserve it, and a `DLFRZLDR` sentinel in `.data` lets the bootstrap find the payload in virtual memory if the footer is no longer at EOF.
 
@@ -303,7 +354,7 @@ primitives, and publishes exposed errno results through the target libc rather
 than re-entering bootstrap TLS.
 
 ```bash
-make            # also builds native and alternate-libc preload helpers
+make            # also builds native- and static-bootstrap-ABI preload helpers
 make test       # runs the suite; -d cases are strict (no hidden extraction fallback)
 make bench      # startup benchmarks (requires perf)
 make clean
@@ -317,6 +368,24 @@ target one environment while iterating on a failure:
 tests/local-cross-matrix.sh --arch amd64 --env ubuntu-20.04
 tests/local-cross-matrix.sh --arch arm64 --env alpine-3.20
 ```
+
+The manual GitHub Actions workflow accepts the same architecture/environment
+filter and can additionally run one exact test-function range. Setting both
+selectors to the same function is useful for reproducing a CI-only failure
+without launching the complete suite:
+
+```bash
+gh workflow run cross-platform.yml \
+  -f architecture=arm64 \
+  -f environment=ubuntu-24.04 \
+  -f test_start_at=test_direct_dlopen_embedded_static_tls \
+  -f test_stop_after=test_direct_dlopen_embedded_static_tls
+```
+
+Partial shards report their own pass/skip/fail result without requiring an
+unrelated aggregate direct-artifact count; direct-load tests still verify
+their individual artifacts strictly. An explicitly selected first-to-last
+range remains a full suite and retains the aggregate direct-coverage check.
 
 The benchmark harness can opt into larger traced runtime workloads when they
 are installed:

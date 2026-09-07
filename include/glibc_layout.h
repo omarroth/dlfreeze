@@ -21,65 +21,6 @@
 #define DLFRZ_GLIBC_CACHE_SUFFIX "/ld.so.cache"
 #define DLFRZ_GLIBC_PRELOAD_SUFFIX "/ld.so.preload"
 
-/* glibc compiles SYSCONFDIR into its interpreter.  It may therefore consult
- * paths other than /etc/ld.so.cache and /etc/ld.so.preload.  Recover only a
- * unique, complete absolute C string whose final path component is the
- * requested glibc filename.  Requiring a NUL-string boundary prevents a
- * diagnostic such as "Do not use /etc/ld.so.cache", or the /etc suffix of a
- * custom-prefix path, from being mistaken for the configured pathname.
- * Duplicate copies of the same string are harmless; distinct candidates are
- * ambiguous and fail closed. */
-static inline int
-dlfrz_glibc_config_path(const void *data, size_t data_size,
-                        const char *suffix, size_t suffix_size,
-                        char *path_out, size_t path_size)
-{
-    const unsigned char *bytes = (const unsigned char *)data;
-    size_t found_size = 0;
-
-    if (path_out && path_size)
-        path_out[0] = '\0';
-    if (!bytes || !suffix || suffix_size < 2 || suffix[0] != '/' ||
-        !path_out || path_size == 0)
-        return 0;
-
-    for (size_t offset = 0; offset < data_size;) {
-        const unsigned char *terminator;
-        size_t candidate_size;
-
-        if (bytes[offset] != '/' ||
-            (offset != 0 && bytes[offset - 1] != '\0')) {
-            offset++;
-            continue;
-        }
-        terminator = (const unsigned char *)memchr(
-            bytes + offset, '\0', data_size - offset);
-        if (!terminator)
-            break;
-        candidate_size = (size_t)(terminator - (bytes + offset));
-        if (candidate_size >= suffix_size &&
-            memcmp(bytes + offset + candidate_size - suffix_size,
-                   suffix, suffix_size) == 0) {
-            if (candidate_size >= path_size) {
-                path_out[0] = '\0';
-                return 0;
-            }
-            if (found_size == 0) {
-                memcpy(path_out, bytes + offset, candidate_size);
-                path_out[candidate_size] = '\0';
-                found_size = candidate_size;
-            } else if (found_size != candidate_size ||
-                       memcmp(path_out, bytes + offset,
-                              candidate_size) != 0) {
-                path_out[0] = '\0';
-                return 0;
-            }
-        }
-        offset += candidate_size + 1;
-    }
-    return found_size != 0;
-}
-
 /*
  * glibc's _rtld_global and _rtld_global_ro are private implementation
  * details.  Their total sizes are only admission keys for layouts whose
@@ -108,6 +49,19 @@ dlfrz_glibc_config_path(const void *data, size_t data_size,
     X(DLFRZ_GLIBC_X86_2_40,          EM_X86_64,   928, 2120)                 \
     X(DLFRZ_GLIBC_X86_2_44,          EM_X86_64,   928, 2136)                 \
     X(DLFRZ_GLIBC_X86_RTLD_952_2888, EM_X86_64,   952, 2888)
+
+/* Some x86-64 glibc builds publish a dynamic-symbol extent for
+ * _rtld_global which is 16 bytes larger than the corresponding validated
+ * private layout.  These are observed, exact aliases, not a general size
+ * adjustment: an unlisted size must remain unknown.  Keep aliases separate
+ * from DLFRZ_GLIBC_LAYOUT_KEYS so enum ids and private offset profiles
+ * continue to have one definition. */
+#define DLFRZ_GLIBC_LAYOUT_PUBLIC_SIZE_ALIASES(X)                             \
+    X(DLFRZ_GLIBC_X86_RTLD_896_4336, EM_X86_64, 896, 4352)                   \
+    X(DLFRZ_GLIBC_X86_2_34,          EM_X86_64, 928, 4320)                   \
+    X(DLFRZ_GLIBC_X86_2_37_OR_2_40_LEGACY,                                  \
+                                            EM_X86_64, 952, 4368)            \
+    X(DLFRZ_GLIBC_X86_RTLD_952_2888, EM_X86_64, 952, 2904)
 
 enum dlfrz_glibc_layout_id {
     DLFRZ_GLIBC_LAYOUT_UNKNOWN = 0,
@@ -245,12 +199,28 @@ dlfrz_glibc_layout_lookup(uint16_t machine, uint64_t glro_size,
         DLFRZ_GLIBC_LAYOUT_KEYS(DLFRZ_GLIBC_LAYOUT_ROW)
 #undef DLFRZ_GLIBC_LAYOUT_ROW
     };
+    static const struct dlfrz_glibc_layout_key public_size_aliases[] = {
+#define DLFRZ_GLIBC_LAYOUT_ALIAS_ROW(id, arch, ro, global) \
+        { id, arch, ro, global },
+        DLFRZ_GLIBC_LAYOUT_PUBLIC_SIZE_ALIASES(
+            DLFRZ_GLIBC_LAYOUT_ALIAS_ROW)
+#undef DLFRZ_GLIBC_LAYOUT_ALIAS_ROW
+    };
 
     for (unsigned int i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
         if (keys[i].machine == machine &&
             keys[i].glro_size == glro_size &&
             keys[i].gl_size == gl_size)
             return keys[i].id;
+    }
+    for (unsigned int i = 0;
+         i < sizeof(public_size_aliases) /
+                 sizeof(public_size_aliases[0]);
+         i++) {
+        if (public_size_aliases[i].machine == machine &&
+            public_size_aliases[i].glro_size == glro_size &&
+            public_size_aliases[i].gl_size == gl_size)
+            return public_size_aliases[i].id;
     }
     return DLFRZ_GLIBC_LAYOUT_UNKNOWN;
 }
@@ -825,14 +795,15 @@ dlfrz_elf64_dyn_view_init(const void *data, size_t elf_size,
         !dlfrz_glibc_vaddr_file_range(
             elf, elf_size, &ehdr, strtab_address, strtab_size,
             &strtab_offset) || elf[strtab_offset] != '\0' ||
+        elf[strtab_offset + (size_t)strtab_size - 1] != '\0' ||
         !dlfrz_glibc_vaddr_file_available(
             elf, elf_size, &ehdr, symtab_address, &symtab_offset,
             &symtab_available))
         return 0;
-    if (have_soname &&
-        (soname_offset >= strtab_size ||
-         !memchr(elf + strtab_offset + (size_t)soname_offset, '\0',
-                 (size_t)(strtab_size - soname_offset))))
+    /* A complete ELF string table reserves its first and final bytes for
+     * NUL.  Once both sentinels and the complete DT_STRSZ range are proved,
+     * every in-range offset denotes a bounded, terminated suffix. */
+    if (have_soname && soname_offset >= strtab_size)
         return 0;
     if (symtab_available / sizeof(Elf64_Sym) > UINT32_MAX)
         max_symbols = UINT32_MAX;
@@ -881,9 +852,7 @@ dlfrz_elf64_dyn_view_init(const void *data, size_t elf_size,
         memcpy(&symbol,
                elf + symtab_offset + (size_t)i * sizeof(symbol),
                sizeof(symbol));
-        if (symbol.st_name >= strtab_size ||
-            !memchr(elf + strtab_offset + symbol.st_name, '\0',
-                    (size_t)strtab_size - symbol.st_name))
+        if (symbol.st_name >= strtab_size)
             return 0;
     }
 
@@ -1225,6 +1194,57 @@ dlfrz_glibc_x86_mov_load(const unsigned char *bytes, size_t available,
     load->displacement = displacement;
     load->length = cursor;
     return 1;
+}
+
+/* Enumerate exactly the byte positions at which the decoder above can
+ * succeed.  A valid load always starts with REX.W followed by opcode 0x8b
+ * and has at least one ModR/M byte.  Searching for the uncommon opcode first
+ * avoids invoking the full decoder at every byte of a multi-MiB executable
+ * segment without weakening its checks or its duplicate-witness scan.
+ *
+ * POSITION_LIMIT bounds candidate starts, not instruction ends.  This
+ * distinction preserves callers whose bounded chain window permits an
+ * instruction beginning at its last byte positions to consume bytes from
+ * the enclosing CODE_SIZE range. */
+static inline int
+dlfrz_glibc_x86_next_mov_load_candidate(
+    const unsigned char *code, size_t code_size, size_t position_limit,
+    size_t start, size_t *position_out)
+{
+    size_t position_end;
+    size_t opcode_position;
+
+    if (!code || !position_out || position_limit > code_size ||
+        code_size < 3)
+        return 0;
+    /* Positions [0, code_size - 2) have the decoder's three required
+     * bytes.  POSITION_END is exclusive for starts and inclusive for their
+     * second-byte opcode positions. */
+    position_end = code_size - 2;
+    if (position_end > position_limit)
+        position_end = position_limit;
+    if (start >= position_end)
+        return 0;
+    opcode_position = start + 1;
+
+    while (opcode_position <= position_end) {
+        const unsigned char *opcode =
+            (const unsigned char *)memchr(
+                code + opcode_position, UINT8_C(0x8b),
+                position_end - opcode_position + 1);
+        size_t candidate;
+
+        if (!opcode)
+            return 0;
+        candidate = (size_t)(opcode - code) - 1;
+        if (code[candidate] >= UINT8_C(0x48) &&
+            code[candidate] <= UINT8_C(0x4f)) {
+            *position_out = candidate;
+            return 1;
+        }
+        opcode_position = (size_t)(opcode - code) + 1;
+    }
+    return 0;
 }
 
 static inline int
@@ -1837,6 +1857,79 @@ dlfrz_glibc_x86_dlfcn_slot_dispatches(
     return completed;
 }
 
+/* Collect the four stripped internal-member dispatches in one pass through
+ * the bounded hook-consumer window.  Keep this separate from the public
+ * single-slot helper above so its behavior remains unchanged. */
+static inline void
+dlfrz_glibc_x86_dlfcn_internal_slot_dispatches(
+    const unsigned char *code, size_t code_size, size_t start,
+    unsigned int hook_register,
+    size_t completed[DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U],
+    size_t slot_positions[DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U])
+{
+    const size_t internal_count = DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U;
+    const int64_t first_displacement =
+        INT64_C(9) * (int64_t)sizeof(void *);
+    const int64_t end_displacement =
+        (int64_t)DLFRZ_GLIBC_DLFCN_HOOK_SLOTS *
+        (int64_t)sizeof(void *);
+    size_t end = code_size;
+
+    for (size_t internal = 0; internal < internal_count; internal++) {
+        completed[internal] = 0;
+        slot_positions[internal] = 0;
+    }
+    if (start > end)
+        return;
+    if (end - start > 96U)
+        end = start + 96U;
+    for (size_t position = start; position < end; position++) {
+        unsigned int base;
+        int64_t displacement;
+        size_t length;
+        struct dlfrz_glibc_x86_mov_load load;
+
+        if (dlfrz_glibc_x86_indirect_memory(
+                code + position, end - position, &base, &displacement,
+                &length) && base == hook_register &&
+            displacement >= first_displacement &&
+            displacement < end_displacement &&
+            displacement % (int64_t)sizeof(void *) == 0) {
+            size_t internal =
+                (size_t)(displacement / (int64_t)sizeof(void *)) - 9U;
+
+            completed[internal]++;
+            slot_positions[internal] = position;
+        }
+        if (!dlfrz_glibc_x86_mov_load(
+                code + position, end - position, &load) ||
+            load.rip_relative || load.base != hook_register ||
+            load.displacement < first_displacement ||
+            load.displacement >= end_displacement ||
+            load.displacement % (int64_t)sizeof(void *) != 0)
+            continue;
+        {
+            size_t internal =
+                (size_t)(load.displacement /
+                         (int64_t)sizeof(void *)) - 9U;
+            size_t dispatch_end = end;
+
+            if (dispatch_end - position > 96U)
+                dispatch_end = position + 96U;
+            for (size_t dispatch = position + load.length;
+                 dispatch < dispatch_end; dispatch++) {
+                if (!dlfrz_glibc_x86_indirect_register(
+                        code + dispatch, dispatch_end - dispatch,
+                        load.destination, &length))
+                    continue;
+                completed[internal]++;
+                slot_positions[internal] = position;
+                break;
+            }
+        }
+    }
+}
+
 static inline int
 dlfrz_glibc_x86_dlfcn_branch_targets(
     const unsigned char *code, size_t code_size, uint64_t code_vaddr,
@@ -1937,6 +2030,103 @@ dlfrz_glibc_x86_dlfcn_member_matches(
     return completed;
 }
 
+/* Scan one x86-64 code region once for all four hidden dlfcn-hook
+ * consumers.  The expensive part of this validation is finding the
+ * relocation-rooted GOT/hook chain in a stripped executable PT_LOAD.  Once
+ * such a chain is found, collect all four members while scanning its bounded
+ * (96-byte) dispatch window once.  Keep a separate match count per slot so
+ * this has exactly the same fail-closed uniqueness contract as four calls to
+ * dlfrz_glibc_x86_dlfcn_member_matches(). */
+static inline int
+dlfrz_glibc_x86_dlfcn_internal_matches(
+    const unsigned char *code, size_t code_size, uint64_t code_vaddr,
+    uint64_t glro_got_vaddr, int hook_offset,
+    size_t matches[DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U],
+    size_t hook_positions[DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U],
+    size_t slot_positions[DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U])
+{
+    const size_t internal_count = DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U;
+    size_t got_position;
+    size_t got_search = 0;
+
+    if (!matches || !hook_positions || !slot_positions)
+        return 0;
+    for (size_t i = 0; i < internal_count; i++) {
+        matches[i] = 0;
+        hook_positions[i] = 0;
+        slot_positions[i] = 0;
+    }
+
+    while (dlfrz_glibc_x86_next_mov_load_candidate(
+               code, code_size, code_size, got_search, &got_position)) {
+        struct dlfrz_glibc_x86_mov_load got_load;
+        uint64_t next_vaddr;
+        uint64_t target_vaddr;
+        size_t hook_end;
+        size_t hook_position;
+        size_t hook_search;
+
+        got_search = got_position + 1;
+
+        if (!dlfrz_glibc_x86_mov_load(
+                code + got_position, code_size - got_position, &got_load) ||
+            !got_load.rip_relative ||
+            code_vaddr > UINT64_MAX - got_position ||
+            code_vaddr + got_position > UINT64_MAX - got_load.length)
+            continue;
+        next_vaddr = code_vaddr + got_position + got_load.length;
+        if (!dlfrz_glibc_add_signed_u64(
+                next_vaddr, got_load.displacement, &target_vaddr) ||
+            target_vaddr != glro_got_vaddr)
+            continue;
+        hook_end = code_size;
+        if (hook_end - got_position > 1024U)
+            hook_end = got_position + 1024U;
+        hook_search = got_position + got_load.length;
+        while (dlfrz_glibc_x86_next_mov_load_candidate(
+                   code, code_size, hook_end, hook_search,
+                   &hook_position)) {
+            struct dlfrz_glibc_x86_mov_load hook_load;
+
+            hook_search = hook_position + 1;
+
+            if (!dlfrz_glibc_x86_mov_load(
+                    code + hook_position, code_size - hook_position,
+                    &hook_load) || hook_load.rip_relative ||
+                hook_load.base != got_load.destination ||
+                hook_load.displacement != hook_offset)
+                continue;
+            if (hook_position > got_position + 48U &&
+                !dlfrz_glibc_x86_dlfcn_branch_targets(
+                    code, code_size, code_vaddr,
+                    got_position + got_load.length, hook_position))
+                continue;
+            {
+                size_t dispatches[DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U];
+                size_t dispatch_positions[
+                    DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U];
+
+                dlfrz_glibc_x86_dlfcn_internal_slot_dispatches(
+                    code, code_size, hook_position + hook_load.length,
+                    hook_load.destination, dispatches,
+                    dispatch_positions);
+                for (size_t internal = 0; internal < internal_count;
+                     internal++) {
+                    if (dispatches[internal] != 1)
+                        continue;
+                    if (matches[internal] == SIZE_MAX)
+                        return 0;
+                    matches[internal]++;
+                    hook_positions[internal] = hook_position;
+                    slot_positions[internal] =
+                        dispatch_positions[internal];
+                }
+            }
+        }
+    }
+    return 1;
+}
+
 static inline int
 dlfrz_glibc_aarch64_indirect_branch(uint32_t instruction,
                                     unsigned int expected_register)
@@ -2014,6 +2204,73 @@ dlfrz_glibc_aarch64_dlfcn_slot_dispatches(
         }
     }
     return completed;
+}
+
+/* Collect all hidden internal-member loads while decoding the bounded
+ * AArch64 hook-consumer window once. */
+static inline void
+dlfrz_glibc_aarch64_dlfcn_internal_slot_dispatches(
+    const unsigned char *code, size_t code_size, size_t start,
+    unsigned int hook_register,
+    size_t completed[DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U],
+    size_t slot_positions[DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U])
+{
+    const size_t internal_count = DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U;
+    const uint64_t first_displacement = UINT64_C(9) * UINT64_C(8);
+    const uint64_t end_displacement =
+        (uint64_t)DLFRZ_GLIBC_DLFCN_HOOK_SLOTS * UINT64_C(8);
+    size_t end = code_size;
+
+    for (size_t internal = 0; internal < internal_count; internal++) {
+        completed[internal] = 0;
+        slot_positions[internal] = 0;
+    }
+    if (start > end || (start & 3U) != 0)
+        return;
+    if (end - start > 96U)
+        end = start + 96U;
+    for (size_t position = start;
+         position + sizeof(uint32_t) <= end;
+         position += sizeof(uint32_t)) {
+        uint32_t load = dlfrz_glibc_read_u32(code + position);
+        uint64_t displacement;
+        unsigned int target_register;
+        unsigned int dispatch_register;
+        size_t dispatch_end;
+        size_t internal;
+
+        if ((load & UINT32_C(0xffc00000)) != UINT32_C(0xf9400000) ||
+            ((load >> 5) & 31U) != hook_register)
+            continue;
+        displacement =
+            (uint64_t)((load >> 10) & UINT32_C(0xfff)) * UINT64_C(8);
+        if (displacement < first_displacement ||
+            displacement >= end_displacement)
+            continue;
+        internal = (size_t)(displacement / UINT64_C(8)) - 9U;
+        target_register = load & 31U;
+        dispatch_register = target_register;
+        dispatch_end = end;
+        if (dispatch_end - position > 96U)
+            dispatch_end = position + 96U;
+        for (size_t dispatch = position + sizeof(uint32_t);
+             dispatch + sizeof(uint32_t) <= dispatch_end;
+             dispatch += sizeof(uint32_t)) {
+            uint32_t instruction =
+                dlfrz_glibc_read_u32(code + dispatch);
+            unsigned int destination;
+
+            if (dlfrz_glibc_aarch64_indirect_branch(
+                    instruction, dispatch_register)) {
+                completed[internal]++;
+                slot_positions[internal] = position;
+                break;
+            }
+            if (dlfrz_glibc_aarch64_register_move(
+                    instruction, dispatch_register, &destination))
+                dispatch_register = destination;
+        }
+    }
 }
 
 /* AArch64 compilers need not keep the GOT load adjacent to its ADRP.  Find
@@ -2193,6 +2450,89 @@ dlfrz_glibc_aarch64_dlfcn_member_matches(
     return completed;
 }
 
+/* AArch64 counterpart of the one-pass hidden-member scan above. */
+static inline int
+dlfrz_glibc_aarch64_dlfcn_internal_matches(
+    const unsigned char *code, size_t code_size, uint64_t code_vaddr,
+    uint64_t glro_got_vaddr, int hook_offset,
+    size_t matches[DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U],
+    size_t hook_positions[DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U],
+    size_t slot_positions[DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U])
+{
+    const size_t internal_count = DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U;
+
+    if (!matches || !hook_positions || !slot_positions)
+        return 0;
+    for (size_t i = 0; i < internal_count; i++) {
+        matches[i] = 0;
+        hook_positions[i] = 0;
+        slot_positions[i] = 0;
+    }
+    /* Match the single-slot scanner: an unaligned executable region cannot
+     * contain an AArch64 witness, but another well-formed PT_LOAD may. */
+    if ((code_vaddr & 3U) != 0)
+        return 1;
+
+    for (size_t got_position = 0;
+         got_position + sizeof(uint32_t) <= code_size;
+         got_position += sizeof(uint32_t)) {
+        size_t got_load_position = 0;
+        unsigned int glro_register = 0;
+        size_t hook_end;
+
+        if (!dlfrz_glibc_aarch64_dlfcn_glro_load(
+                code, code_size, code_vaddr, got_position,
+                glro_got_vaddr, &got_load_position, &glro_register))
+            continue;
+        hook_end = code_size;
+        if (hook_end - got_load_position > 1024U)
+            hook_end = got_load_position + 1024U;
+        for (size_t hook_position =
+                 got_load_position + sizeof(uint32_t);
+             hook_position + sizeof(uint32_t) <= hook_end;
+             hook_position += sizeof(uint32_t)) {
+            uint32_t hook_load =
+                dlfrz_glibc_read_u32(code + hook_position);
+            unsigned int hook_register;
+
+            if ((hook_load & UINT32_C(0xffc00000)) !=
+                    UINT32_C(0xf9400000) ||
+                ((hook_load >> 5) & 31U) != glro_register ||
+                ((uint64_t)((hook_load >> 10) & UINT32_C(0xfff)) *
+                 UINT64_C(8)) != (uint64_t)hook_offset)
+                continue;
+            if (hook_position > got_load_position + 48U &&
+                !dlfrz_glibc_aarch64_dlfcn_branch_targets(
+                    code, code_size, code_vaddr,
+                    got_load_position + sizeof(uint32_t), hook_position))
+                continue;
+            hook_register = hook_load & 31U;
+            {
+                size_t dispatches[DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U];
+                size_t dispatch_positions[
+                    DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U];
+
+                dlfrz_glibc_aarch64_dlfcn_internal_slot_dispatches(
+                    code, code_size,
+                    hook_position + sizeof(uint32_t), hook_register,
+                    dispatches, dispatch_positions);
+                for (size_t internal = 0; internal < internal_count;
+                     internal++) {
+                    if (dispatches[internal] != 1)
+                        continue;
+                    if (matches[internal] == SIZE_MAX)
+                        return 0;
+                    matches[internal]++;
+                    hook_positions[internal] = hook_position;
+                    slot_positions[internal] =
+                        dispatch_positions[internal];
+                }
+            }
+        }
+    }
+    return 1;
+}
+
 /* Return one unique exported libc implementation even though glibc exports
  * multiple symbol-version aliases for the same function body. */
 static inline int
@@ -2234,6 +2574,109 @@ dlfrz_glibc_function_definition(const struct dlfrz_elf64_dyn_view *view,
             matched.st_value, matched.st_size))
         return 0;
     *definition = matched;
+    return 1;
+}
+
+static inline const char *
+dlfrz_glibc_dlfcn_public_name(unsigned int slot)
+{
+    static const char *const names[9] = {
+        "dlopen", "dlclose", "dlsym", "dlvsym", "dlerror",
+        "dladdr", "dladdr1", "dlinfo", "dlmopen"
+    };
+
+    return slot < sizeof(names) / sizeof(names[0]) ? names[slot] : NULL;
+}
+
+/* All public dlfcn witnesses have a distinct third byte except dladdr and
+ * dladdr1.  Classify that bounded prefix before doing one exact string-table
+ * comparison, so collecting the complete hook contract does not turn into
+ * nine full dynsym scans. */
+static inline int
+dlfrz_glibc_dlfcn_public_name_slot(
+    const struct dlfrz_elf64_dyn_view *view, uint32_t name_offset)
+{
+    const unsigned char *name;
+    size_t remaining;
+    int slot;
+
+    if (!view || name_offset >= view->dynstr_size)
+        return -1;
+    name = view->elf + view->dynstr_offset + (size_t)name_offset;
+    remaining = view->dynstr_size - (size_t)name_offset;
+    if (remaining < 3 || name[0] != 'd' || name[1] != 'l')
+        return -1;
+    switch (name[2]) {
+    case 'o': slot = 0; break;
+    case 'c': slot = 1; break;
+    case 's': slot = 2; break;
+    case 'v': slot = 3; break;
+    case 'e': slot = 4; break;
+    case 'a':
+        if (dlfrz_glibc_dynstr_name(
+                view->elf + view->dynstr_offset, view->dynstr_size,
+                name_offset, dlfrz_glibc_dlfcn_public_name(5)))
+            return 5;
+        slot = 6;
+        break;
+    case 'i': slot = 7; break;
+    case 'm': slot = 8; break;
+    default: return -1;
+    }
+    return dlfrz_glibc_dynstr_name(
+               view->elf + view->dynstr_offset, view->dynstr_size,
+               name_offset, dlfrz_glibc_dlfcn_public_name((unsigned)slot))
+        ? slot : -1;
+}
+
+/* Collect the nine exported implementations in one bounded dynsym pass.
+ * Per-name validity and version-alias uniqueness are identical to
+ * dlfrz_glibc_function_definition(); only the repeated table traversal is
+ * removed. */
+static inline int
+dlfrz_glibc_dlfcn_public_definitions(
+    const struct dlfrz_elf64_dyn_view *view, Elf64_Sym definitions[9])
+{
+    unsigned int found = 0;
+
+    if (!view || !definitions)
+        return 0;
+    memset(definitions, 0, 9U * sizeof(definitions[0]));
+    for (uint32_t i = 0; i < view->dynsym_count; i++) {
+        Elf64_Sym symbol;
+        const char *name;
+        int slot;
+
+        dlfrz_elf64_dyn_view_symbol(view, i, &symbol);
+        slot = dlfrz_glibc_dlfcn_public_name_slot(view, symbol.st_name);
+        if (slot < 0)
+            continue;
+        name = dlfrz_glibc_dlfcn_public_name((unsigned int)slot);
+        if (ELF64_ST_BIND(symbol.st_info) != STB_GLOBAL ||
+            ELF64_ST_TYPE(symbol.st_info) != STT_FUNC ||
+            ELF64_ST_VISIBILITY(symbol.st_other) != STV_DEFAULT ||
+            symbol.st_shndx == SHN_UNDEF ||
+            symbol.st_shndx >= SHN_LORESERVE || symbol.st_value == 0 ||
+            symbol.st_size == 0 || symbol.st_size > 2048 ||
+            (view->have_sysv_hash &&
+             !dlfrz_elf64_sysv_hash_exports(view, name, i)) ||
+            (view->have_gnu_hash &&
+             !dlfrz_elf64_gnu_hash_exports(view, name, i)))
+            return 0;
+        if ((found & (1U << slot)) != 0 &&
+            (definitions[slot].st_value != symbol.st_value ||
+             definitions[slot].st_size != symbol.st_size))
+            return 0;
+        definitions[slot] = symbol;
+        found |= 1U << slot;
+    }
+    if (found != (1U << 9) - 1U)
+        return 0;
+    for (unsigned int slot = 0; slot < 9U; slot++)
+        if (!dlfrz_glibc_vaddr_executable_file_range(
+                view->elf, view->elf_size, &view->ehdr,
+                definitions[slot].st_value, definitions[slot].st_size))
+            return 0;
     return 1;
 }
 
@@ -2358,44 +2801,56 @@ dlfrz_glibc_glro_got_relocation(const struct dlfrz_elf64_dyn_view *view,
 }
 
 static inline int
+dlfrz_glibc_dlfcn_public_definition_valid(
+    const struct dlfrz_elf64_dyn_view *view, const Elf64_Sym *symbol,
+    unsigned int slot, uint64_t glro_got_vaddr, int hook_offset,
+    size_t *hook_file_offset_out, size_t *slot_file_offset_out)
+{
+    size_t function_offset;
+    size_t hook_position = 0;
+    size_t slot_position = 0;
+    size_t matches;
+
+    if (!symbol || slot >= DLFRZ_GLIBC_DLFCN_HOOK_SLOTS ||
+        !dlfrz_glibc_vaddr_file_range(
+            view->elf, view->elf_size, &view->ehdr,
+            symbol->st_value, symbol->st_size, &function_offset))
+        return 0;
+    if (view->ehdr.e_machine == EM_X86_64) {
+        matches = dlfrz_glibc_x86_dlfcn_member_matches(
+            view->elf + function_offset, (size_t)symbol->st_size,
+            symbol->st_value, glro_got_vaddr, hook_offset, slot,
+            (size_t)symbol->st_size,
+            &hook_position, &slot_position);
+    } else if (view->ehdr.e_machine == EM_AARCH64) {
+        matches = dlfrz_glibc_aarch64_dlfcn_member_matches(
+            view->elf + function_offset, (size_t)symbol->st_size,
+            symbol->st_value, glro_got_vaddr, hook_offset, slot,
+            (size_t)symbol->st_size,
+            &hook_position, &slot_position);
+    } else {
+        return 0;
+    }
+    if (matches != 1 || hook_position >= (size_t)symbol->st_size ||
+        slot_position >= (size_t)symbol->st_size)
+        return 0;
+    *hook_file_offset_out = function_offset + hook_position;
+    *slot_file_offset_out = function_offset + slot_position;
+    return 1;
+}
+
+static inline int
 dlfrz_glibc_dlfcn_public_member_valid(
     const struct dlfrz_elf64_dyn_view *view, const char *name,
     unsigned int slot, uint64_t glro_got_vaddr, int hook_offset,
     size_t *hook_file_offset_out, size_t *slot_file_offset_out)
 {
     Elf64_Sym symbol;
-    size_t function_offset;
-    size_t hook_position = 0;
-    size_t slot_position = 0;
-    size_t matches;
 
-    if (slot >= DLFRZ_GLIBC_DLFCN_HOOK_SLOTS ||
-        !dlfrz_glibc_function_definition(view, name, &symbol) ||
-        !dlfrz_glibc_vaddr_file_range(
-            view->elf, view->elf_size, &view->ehdr,
-            symbol.st_value, symbol.st_size, &function_offset))
-        return 0;
-    if (view->ehdr.e_machine == EM_X86_64) {
-        matches = dlfrz_glibc_x86_dlfcn_member_matches(
-            view->elf + function_offset, (size_t)symbol.st_size,
-            symbol.st_value, glro_got_vaddr, hook_offset, slot,
-            (size_t)symbol.st_size,
-            &hook_position, &slot_position);
-    } else if (view->ehdr.e_machine == EM_AARCH64) {
-        matches = dlfrz_glibc_aarch64_dlfcn_member_matches(
-            view->elf + function_offset, (size_t)symbol.st_size,
-            symbol.st_value, glro_got_vaddr, hook_offset, slot,
-            (size_t)symbol.st_size,
-            &hook_position, &slot_position);
-    } else {
-        return 0;
-    }
-    if (matches != 1 || hook_position >= (size_t)symbol.st_size ||
-        slot_position >= (size_t)symbol.st_size)
-        return 0;
-    *hook_file_offset_out = function_offset + hook_position;
-    *slot_file_offset_out = function_offset + slot_position;
-    return 1;
+    return dlfrz_glibc_function_definition(view, name, &symbol) &&
+           dlfrz_glibc_dlfcn_public_definition_valid(
+               view, &symbol, slot, glro_got_vaddr, hook_offset,
+               hook_file_offset_out, slot_file_offset_out);
 }
 
 /* Installed libc strips the hidden __libc_dlopen_mode/__libc_dlsym/
@@ -2460,6 +2915,82 @@ dlfrz_glibc_dlfcn_internal_member_valid(
     return 1;
 }
 
+/* Validate all four stripped __libc_dl* consumers while traversing each
+ * executable PT_LOAD only once.  Match counts remain independent: a missing
+ * or duplicate witness for any one slot rejects the complete hook exactly as
+ * the former four-pass validation did. */
+static inline int
+dlfrz_glibc_dlfcn_internal_members_valid(
+    const struct dlfrz_elf64_dyn_view *view,
+    uint64_t glro_got_vaddr, int hook_offset,
+    size_t hook_file_offsets[DLFRZ_GLIBC_DLFCN_HOOK_SLOTS],
+    size_t slot_file_offsets[DLFRZ_GLIBC_DLFCN_HOOK_SLOTS])
+{
+    const size_t internal_count = DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U;
+    size_t completed[DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U] = {0};
+    size_t selected_hooks[DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U] = {0};
+    size_t selected_slots[DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U] = {0};
+
+    if (!view || !hook_file_offsets || !slot_file_offsets)
+        return 0;
+    for (uint16_t i = 0; i < view->ehdr.e_phnum; i++) {
+        Elf64_Phdr phdr;
+        size_t matches[DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U];
+        size_t hook_positions[DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U];
+        size_t slot_positions[DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U];
+        int scanned;
+
+        if (!dlfrz_glibc_read_phdr(
+                view->elf, view->elf_size, &view->ehdr, i, &phdr))
+            return 0;
+        if (phdr.p_type != PT_LOAD || !(phdr.p_flags & PF_X) ||
+            phdr.p_filesz == 0)
+            continue;
+        if (phdr.p_filesz > SIZE_MAX || phdr.p_offset > view->elf_size ||
+            (size_t)phdr.p_filesz >
+                view->elf_size - (size_t)phdr.p_offset)
+            return 0;
+        if (view->ehdr.e_machine == EM_X86_64) {
+            scanned = dlfrz_glibc_x86_dlfcn_internal_matches(
+                view->elf + (size_t)phdr.p_offset,
+                (size_t)phdr.p_filesz, phdr.p_vaddr,
+                glro_got_vaddr, hook_offset, matches,
+                hook_positions, slot_positions);
+        } else if (view->ehdr.e_machine == EM_AARCH64) {
+            scanned = dlfrz_glibc_aarch64_dlfcn_internal_matches(
+                view->elf + (size_t)phdr.p_offset,
+                (size_t)phdr.p_filesz, phdr.p_vaddr,
+                glro_got_vaddr, hook_offset, matches,
+                hook_positions, slot_positions);
+        } else {
+            return 0;
+        }
+        if (!scanned)
+            return 0;
+        for (size_t internal = 0; internal < internal_count; internal++) {
+            if (matches[internal] > 1 ||
+                completed[internal] > SIZE_MAX - matches[internal])
+                return 0;
+            if (matches[internal] == 1) {
+                selected_hooks[internal] =
+                    (size_t)phdr.p_offset + hook_positions[internal];
+                selected_slots[internal] =
+                    (size_t)phdr.p_offset + slot_positions[internal];
+            }
+            completed[internal] += matches[internal];
+        }
+    }
+    for (size_t internal = 0; internal < internal_count; internal++) {
+        size_t slot = 9U + internal;
+
+        if (completed[internal] != 1)
+            return 0;
+        hook_file_offsets[slot] = selected_hooks[internal];
+        slot_file_offsets[slot] = selected_slots[internal];
+    }
+    return 1;
+}
+
 /* Validate the complete 13-member private hook against the target libc.
  * A release/profile supplies only the candidate field displacement.  The
  * field is first independently proved by the tightly constrained dlclose
@@ -2471,13 +3002,9 @@ dlfrz_glibc_dlfcn_hook_consumer_valid(
     const void *data, size_t elf_size, int hook_offset,
     struct dlfrz_glibc_dlfcn_consumer_evidence *evidence)
 {
-    static const char *const public_names[9] = {
-        "dlopen", "dlclose", "dlsym", "dlvsym", "dlerror",
-        "dladdr", "dladdr1", "dlinfo", "dlmopen"
-    };
     struct dlfrz_elf64_dyn_view view;
     struct dlfrz_glibc_dlfcn_consumer_evidence result;
-    Elf64_Sym dlclose_symbol;
+    Elf64_Sym public_definitions[9];
     uint64_t glro_got_vaddr = 0;
     const char *soname;
     int strict_field_valid;
@@ -2490,24 +3017,28 @@ dlfrz_glibc_dlfcn_hook_consumer_valid(
     soname = (const char *)view.elf + view.dynstr_offset +
              (size_t)view.soname_offset;
     if (strcmp(soname, "libc.so.6") != 0 ||
-        !dlfrz_glibc_dlclose_definition(&view, &dlclose_symbol) ||
+        !dlfrz_glibc_dlfcn_public_definitions(
+            &view, public_definitions) ||
         !dlfrz_glibc_glro_got_relocation(&view, &glro_got_vaddr))
         return 0;
     if (view.ehdr.e_machine == EM_X86_64) {
         strict_field_valid = dlfrz_glibc_x86_dlfcn_consumer(
-            &view, &dlclose_symbol, glro_got_vaddr, hook_offset, &result);
+            &view, &public_definitions[1], glro_got_vaddr,
+            hook_offset, &result);
     } else if (view.ehdr.e_machine == EM_AARCH64) {
         strict_field_valid = dlfrz_glibc_aarch64_dlfcn_consumer(
-            &view, &dlclose_symbol, glro_got_vaddr, hook_offset, &result);
+            &view, &public_definitions[1], glro_got_vaddr,
+            hook_offset, &result);
     } else {
         return 0;
     }
     if (!strict_field_valid)
         return 0;
     for (unsigned int slot = 0; slot < 9U; slot++) {
-        if (!dlfrz_glibc_dlfcn_public_member_valid(
-                &view, public_names[slot], slot, glro_got_vaddr,
-                hook_offset, &result.hook_load_file_offsets[slot],
+        if (!dlfrz_glibc_dlfcn_public_definition_valid(
+                &view, &public_definitions[slot], slot,
+                glro_got_vaddr, hook_offset,
+                &result.hook_load_file_offsets[slot],
                 &result.slot_load_file_offsets[slot]))
             return 0;
     }
@@ -2515,14 +3046,11 @@ dlfrz_glibc_dlfcn_hook_consumer_valid(
             result.hook_load_file_offset ||
         result.slot_load_file_offsets[1] != result.slot_load_file_offset)
         return 0;
-    for (unsigned int slot = 9U;
-         slot < DLFRZ_GLIBC_DLFCN_HOOK_SLOTS; slot++) {
-        if (!dlfrz_glibc_dlfcn_internal_member_valid(
-                &view, slot, glro_got_vaddr, hook_offset,
-                &result.hook_load_file_offsets[slot],
-                &result.slot_load_file_offsets[slot]))
-            return 0;
-    }
+    if (!dlfrz_glibc_dlfcn_internal_members_valid(
+            &view, glro_got_vaddr, hook_offset,
+            result.hook_load_file_offsets,
+            result.slot_load_file_offsets))
+        return 0;
     if (evidence)
         *evidence = result;
     return 1;
@@ -2707,6 +3235,7 @@ dlfrz_glibc_rtld_identity(const void *data, size_t elf_size,
         !dlfrz_glibc_vaddr_file_range(
             elf, elf_size, &ehdr, strtab_address, strtab_size,
             &strtab_offset) || elf[strtab_offset] != '\0' ||
+        elf[strtab_offset + (size_t)strtab_size - 1] != '\0' ||
         !dlfrz_glibc_vaddr_file_available(
             elf, elf_size, &ehdr, symtab_address, &symtab_offset,
             &symtab_available))
@@ -2751,8 +3280,6 @@ dlfrz_glibc_rtld_identity(const void *data, size_t elf_size,
 
     for (uint32_t i = 0; i < symbol_count; i++) {
         Elf64_Sym symbol;
-        const unsigned char *name;
-        size_t name_available;
         int is_global;
         int is_global_ro;
 
@@ -2760,10 +3287,6 @@ dlfrz_glibc_rtld_identity(const void *data, size_t elf_size,
                elf + symtab_offset + (size_t)i * sizeof(symbol),
                sizeof(symbol));
         if (symbol.st_name >= strtab_size)
-            return 0;
-        name = elf + strtab_offset + symbol.st_name;
-        name_available = (size_t)strtab_size - symbol.st_name;
-        if (!memchr(name, '\0', name_available))
             return 0;
         is_global = dlfrz_glibc_dynstr_name(
             elf + strtab_offset, (size_t)strtab_size, symbol.st_name,
@@ -2842,6 +3365,7 @@ dlfrz_glibc_rtld_identity(const void *data, size_t elf_size,
  * agree with it. */
 struct dlfrz_glibc_x86_cpu_layout {
     unsigned int feature_count;
+    uint64_t object_size;
     int preferred;
     int isa_1;
     int xsave_state_size;
@@ -2853,13 +3377,43 @@ struct dlfrz_glibc_x86_cpu_layout {
     int rep_movsb_threshold;
     int rep_movsb_stop_threshold;
     int rep_stosb_threshold;
+    int level1_icache_size;
+    int level1_icache_linesize;
+    int level1_dcache_size;
+    int level1_dcache_assoc;
+    int level1_dcache_linesize;
+    int level2_cache_size;
+    int level2_cache_assoc;
+    int level2_cache_linesize;
+    int level3_cache_size;
+    int level3_cache_assoc;
+    int level3_cache_linesize;
+    int level4_cache_size;
+    int cachesize_non_temporal_divisor;
 };
+
+/* Some releases genuinely omit a member rather than placing it at a
+ * different offset.  Keep that state distinct from every valid byte offset
+ * so callers cannot accidentally reinterpret the next member as the absent
+ * one. */
+#define DLFRZ_GLIBC_X86_CPU_FIELD_ABSENT (-1)
+#define DLFRZ_GLIBC_X86_CPU_CACHE_INFO_WORDS 12U
+#define DLFRZ_GLIBC_X86_CPU_END_WRITERS_MAX 16U
 
 struct dlfrz_glibc_x86_cpu_contract {
     struct dlfrz_glibc_x86_cpu_layout layout;
     uint64_t cpu_features_offset;
+    uint64_t wrapper_vaddr;
     uint64_t initializer_vaddr;
+    uint64_t published_prefix_size;
+    uint64_t cache_info_offset;
+    uint32_t cache_info_word_count;
     uint32_t generic_kind;
+};
+
+struct dlfrz_glibc_getauxval_contract {
+    uint64_t hwcap_offset;
+    uint64_t hwcap2_offset;
 };
 
 struct dlfrz_glibc_x86_cpu_evidence {
@@ -2867,6 +3421,26 @@ struct dlfrz_glibc_x86_cpu_evidence {
     size_t wrapper_displacement_file_offset;
     size_t layout_write_displacement_file_offset;
     size_t generic_kind_immediate_file_offset;
+    size_t tail_boundary_displacement_file_offset;
+    size_t cache_info_displacement_file_offsets[
+        DLFRZ_GLIBC_X86_CPU_CACHE_INFO_WORDS];
+    size_t object_end_displacement_file_offsets[
+        DLFRZ_GLIBC_X86_CPU_END_WRITERS_MAX];
+    size_t object_end_displacement_count;
+};
+
+struct dlfrz_glibc_x86_getauxval_evidence {
+    size_t glro_displacement_file_offset;
+    size_t hwcap2_displacement_file_offset;
+};
+
+struct dlfrz_glibc_aarch64_getauxval_evidence {
+    size_t dispatcher_file_offset;
+    size_t branch_file_offsets[2];
+    size_t adrp_file_offsets[2];
+    size_t got_load_file_offsets[2];
+    size_t field_load_file_offsets[2];
+    size_t restore_file_offsets[2];
 };
 
 struct dlfrz_glibc_x86_rip_write {
@@ -2909,6 +3483,7 @@ dlfrz_glibc_x86_cpu_layout_profile(
     if (minor >= 34 && minor <= 38) {
         profile = (struct dlfrz_glibc_x86_cpu_layout){
             .feature_count = 9,
+            .object_size = minor == 38 ? 488 : 480,
             .preferred = 308,
             .isa_1 = 312,
             .xsave_state_size = 320,
@@ -2916,14 +3491,60 @@ dlfrz_glibc_x86_cpu_layout_profile(
             .data_cache_size = 336,
             .shared_cache_size = 344,
             .non_temporal_threshold = 352,
-            .memset_non_temporal_threshold = -1,
+            .memset_non_temporal_threshold =
+                DLFRZ_GLIBC_X86_CPU_FIELD_ABSENT,
             .rep_movsb_threshold = 360,
             .rep_movsb_stop_threshold = 368,
             .rep_stosb_threshold = 376,
+            .level1_icache_size = 384,
+            .level1_icache_linesize = 392,
+            .level1_dcache_size = 400,
+            .level1_dcache_assoc = 408,
+            .level1_dcache_linesize = 416,
+            .level2_cache_size = 424,
+            .level2_cache_assoc = 432,
+            .level2_cache_linesize = 440,
+            .level3_cache_size = 448,
+            .level3_cache_assoc = 456,
+            .level3_cache_linesize = 464,
+            .level4_cache_size = 472,
+            .cachesize_non_temporal_divisor =
+                minor == 38 ? 480 : DLFRZ_GLIBC_X86_CPU_FIELD_ABSENT,
         };
-    } else if (minor >= 39 && minor <= 44) {
+    } else if (minor == 39) {
         profile = (struct dlfrz_glibc_x86_cpu_layout){
             .feature_count = 10,
+            .object_size = 520,
+            .preferred = 340,
+            .isa_1 = 344,
+            .xsave_state_size = 352,
+            .xsave_state_full_size = 360,
+            .data_cache_size = 368,
+            .shared_cache_size = 376,
+            .non_temporal_threshold = 384,
+            .memset_non_temporal_threshold =
+                DLFRZ_GLIBC_X86_CPU_FIELD_ABSENT,
+            .rep_movsb_threshold = 392,
+            .rep_movsb_stop_threshold = 400,
+            .rep_stosb_threshold = 408,
+            .level1_icache_size = 416,
+            .level1_icache_linesize = 424,
+            .level1_dcache_size = 432,
+            .level1_dcache_assoc = 440,
+            .level1_dcache_linesize = 448,
+            .level2_cache_size = 456,
+            .level2_cache_assoc = 464,
+            .level2_cache_linesize = 472,
+            .level3_cache_size = 480,
+            .level3_cache_assoc = 488,
+            .level3_cache_linesize = 496,
+            .level4_cache_size = 504,
+            .cachesize_non_temporal_divisor = 512,
+        };
+    } else if (minor >= 40 && minor <= 44) {
+        profile = (struct dlfrz_glibc_x86_cpu_layout){
+            .feature_count = 10,
+            .object_size = 528,
             .preferred = 340,
             .isa_1 = 344,
             .xsave_state_size = 352,
@@ -2935,6 +3556,19 @@ dlfrz_glibc_x86_cpu_layout_profile(
             .rep_movsb_threshold = 400,
             .rep_movsb_stop_threshold = 408,
             .rep_stosb_threshold = 416,
+            .level1_icache_size = 424,
+            .level1_icache_linesize = 432,
+            .level1_dcache_size = 440,
+            .level1_dcache_assoc = 448,
+            .level1_dcache_linesize = 456,
+            .level2_cache_size = 464,
+            .level2_cache_assoc = 472,
+            .level2_cache_linesize = 480,
+            .level3_cache_size = 488,
+            .level3_cache_assoc = 496,
+            .level3_cache_linesize = 504,
+            .level4_cache_size = 512,
+            .cachesize_non_temporal_divisor = 520,
         };
     } else {
         return 0;
@@ -2942,6 +3576,98 @@ dlfrz_glibc_x86_cpu_layout_profile(
     if (profile_out)
         *profile_out = profile;
     return 1;
+}
+
+/* The cache-information tail is not otherwise consumed by dlfreeze, but it
+ * is part of glibc's private cpu_features object and is read by public
+ * sysconf queries.  Bound the complete release-profiled object, rather than
+ * stopping at the last threshold that dlfreeze writes. */
+static inline int
+dlfrz_glibc_x86_cpu_object_fits(
+    const struct dlfrz_glibc_x86_cpu_layout *layout,
+    uint64_t cpu_features_offset, uint64_t glro_size)
+{
+    return layout && layout->object_size != 0 &&
+           cpu_features_offset <= glro_size &&
+           layout->object_size <= glro_size - cpu_features_offset;
+}
+
+/* Prove that the release profile describes the complete pointer-free scalar
+ * object, not merely the fields currently used by IFUNC selection.  The
+ * fixed prefix is cpu_features_basic (five uint32_t words), followed by
+ * feature_count entries containing two four-uint32_t arrays, one preferred
+ * uint32_t, isa_1, the two XSAVE scalars, the threshold scalars, and the
+ * cache-information tail.  Known alignment holes are zero because the
+ * isolated child initializes the complete object from zero. */
+static inline int
+dlfrz_glibc_x86_cpu_object_profile_complete(
+    const struct dlfrz_glibc_x86_cpu_layout *layout)
+{
+    uint64_t threshold;
+    uint64_t cache_start;
+
+    if (!layout || layout->feature_count < 9 ||
+        layout->feature_count > 10 ||
+        layout->preferred !=
+            20 + (int)layout->feature_count * 32 ||
+        layout->isa_1 != layout->preferred + 4 ||
+        layout->xsave_state_size != layout->isa_1 + 8 ||
+        layout->xsave_state_full_size !=
+            layout->xsave_state_size + 8 ||
+        layout->data_cache_size !=
+            layout->xsave_state_full_size + 8 ||
+        layout->shared_cache_size != layout->data_cache_size + 8 ||
+        layout->non_temporal_threshold !=
+            layout->shared_cache_size + 8)
+        return 0;
+    threshold = (uint64_t)layout->non_temporal_threshold + 8;
+    if (layout->memset_non_temporal_threshold !=
+            DLFRZ_GLIBC_X86_CPU_FIELD_ABSENT) {
+        if (layout->memset_non_temporal_threshold < 0 ||
+            (uint64_t)layout->memset_non_temporal_threshold != threshold)
+            return 0;
+        threshold += 8;
+    }
+    if (layout->rep_movsb_threshold < 0 ||
+        (uint64_t)layout->rep_movsb_threshold != threshold ||
+        layout->rep_movsb_stop_threshold !=
+            layout->rep_movsb_threshold + 8 ||
+        layout->rep_stosb_threshold !=
+            layout->rep_movsb_stop_threshold + 8)
+        return 0;
+    cache_start = (uint64_t)layout->rep_stosb_threshold + 8;
+    if (layout->level1_icache_size < 0 ||
+        (uint64_t)layout->level1_icache_size != cache_start ||
+        layout->level1_icache_linesize !=
+            layout->level1_icache_size + 8 ||
+        layout->level1_dcache_size !=
+            layout->level1_icache_linesize + 8 ||
+        layout->level1_dcache_assoc !=
+            layout->level1_dcache_size + 8 ||
+        layout->level1_dcache_linesize !=
+            layout->level1_dcache_assoc + 8 ||
+        layout->level2_cache_size !=
+            layout->level1_dcache_linesize + 8 ||
+        layout->level2_cache_assoc != layout->level2_cache_size + 8 ||
+        layout->level2_cache_linesize !=
+            layout->level2_cache_assoc + 8 ||
+        layout->level3_cache_size !=
+            layout->level2_cache_linesize + 8 ||
+        layout->level3_cache_assoc != layout->level3_cache_size + 8 ||
+        layout->level3_cache_linesize !=
+            layout->level3_cache_assoc + 8 ||
+        layout->level4_cache_size !=
+            layout->level3_cache_linesize + 8)
+        return 0;
+    cache_start +=
+        DLFRZ_GLIBC_X86_CPU_CACHE_INFO_WORDS * UINT64_C(8);
+    if (layout->cachesize_non_temporal_divisor ==
+            DLFRZ_GLIBC_X86_CPU_FIELD_ABSENT)
+        return cache_start == layout->object_size;
+    return layout->cachesize_non_temporal_divisor >= 0 &&
+           (uint64_t)layout->cachesize_non_temporal_divisor == cache_start &&
+           cache_start <= UINT64_MAX - 8 &&
+           cache_start + 8 == layout->object_size;
 }
 
 /* Decode the bounded RIP-relative memory-destination forms emitted by the
@@ -3008,8 +3734,20 @@ dlfrz_glibc_x86_rip_write(const unsigned char *bytes, size_t available,
         modrm = bytes[cursor++];
         if ((modrm & UINT8_C(0xc7)) != UINT8_C(0x05))
             return 0;
-        if (second == UINT8_C(0x11) || second == UINT8_C(0x29)) {
-            width = 16;
+        if (second == UINT8_C(0x11)) {
+            if (legacy == UINT8_C(0xf2))
+                width = 8;  /* movsd */
+            else if (legacy == UINT8_C(0xf3))
+                width = 4;  /* movss */
+            else if (!legacy || legacy == UINT8_C(0x66))
+                width = 16; /* movups/movupd */
+            else
+                return 0;
+        } else if (second == UINT8_C(0x29)) {
+            if (!legacy || legacy == UINT8_C(0x66))
+                width = 16; /* movaps/movapd */
+            else
+                return 0;
         } else if (second == UINT8_C(0x7f) &&
                    (legacy == UINT8_C(0x66) ||
                     legacy == UINT8_C(0xf3))) {
@@ -3263,7 +4001,11 @@ dlfrz_glibc_x86_instruction(const unsigned char *bytes, size_t available,
         if (cursor >= available)
             return 0;
         secondary = bytes[cursor++];
-        if (secondary == UINT8_C(0x05) ||
+        if (secondary == UINT8_C(0x01) && cursor < available &&
+            bytes[cursor] == UINT8_C(0xd0)) {
+            /* xgetbv, used by update_active before its HWCAP2 test. */
+            cursor++;
+        } else if (secondary == UINT8_C(0x05) ||
             secondary == UINT8_C(0x31) ||
             secondary == UINT8_C(0xa2)) {
             /* syscall, rdtsc, cpuid */
@@ -3756,11 +4498,22 @@ dlfrz_glibc_x86_cpu_generic_kind(
 }
 
 static inline int
+dlfrz_glibc_x86_reachable_instructions(
+    const unsigned char *code, size_t code_size, uint64_t code_vaddr,
+    unsigned char *instruction_state, size_t state_size);
+
+static inline int
 dlfrz_glibc_x86_cpu_initializer_matches(
     const unsigned char *code, size_t code_size, uint64_t code_vaddr,
     size_t code_file_offset, uint64_t cpu_vaddr,
     const struct dlfrz_glibc_x86_cpu_layout *layout,
-    size_t *layout_write_file_offset)
+    size_t *layout_write_file_offset,
+    size_t *tail_boundary_file_offset,
+    size_t cache_info_file_offsets[
+        DLFRZ_GLIBC_X86_CPU_CACHE_INFO_WORDS],
+    size_t object_end_file_offsets[
+        DLFRZ_GLIBC_X86_CPU_END_WRITERS_MAX],
+    size_t *object_end_file_offset_count)
 {
     const int required_offsets[] = {
         layout->xsave_state_size,
@@ -3772,27 +4525,180 @@ dlfrz_glibc_x86_cpu_initializer_matches(
         layout->rep_movsb_stop_threshold,
         layout->rep_stosb_threshold,
     };
+    const int cache_info_offsets[DLFRZ_GLIBC_X86_CPU_CACHE_INFO_WORDS] = {
+        layout->level1_icache_size,
+        layout->level1_icache_linesize,
+        layout->level1_dcache_size,
+        layout->level1_dcache_assoc,
+        layout->level1_dcache_linesize,
+        layout->level2_cache_size,
+        layout->level2_cache_assoc,
+        layout->level2_cache_linesize,
+        layout->level3_cache_size,
+        layout->level3_cache_assoc,
+        layout->level3_cache_linesize,
+        layout->level4_cache_size,
+    };
     unsigned char covered[sizeof(required_offsets) /
                           sizeof(required_offsets[0])] = {0};
+    unsigned char cache_info_writes[
+        DLFRZ_GLIBC_X86_CPU_CACHE_INFO_WORDS] = {0};
+    size_t cache_info_displacements[
+        DLFRZ_GLIBC_X86_CPU_CACHE_INFO_WORDS] = {0};
+    size_t cache_info_positions[
+        DLFRZ_GLIBC_X86_CPU_CACHE_INFO_WORDS] = {0};
+    size_t cache_info_lengths[
+        DLFRZ_GLIBC_X86_CPU_CACHE_INFO_WORDS] = {0};
+    size_t object_end_displacements[
+        DLFRZ_GLIBC_X86_CPU_END_WRITERS_MAX] = {0};
+    size_t object_end_writes = 0;
+    unsigned char instruction_state[32769];
     size_t kind_writes = 0;
     size_t preferred_writes = 0;
     size_t data_cache_writes = 0;
     size_t data_cache_displacement = 0;
+    size_t prefix_end_writes = 0;
+    size_t tail_start_writes = 0;
+    size_t tail_start_displacement = 0;
+    uint64_t prefix_end;
+    uint64_t cache_info_end;
+    uint64_t object_end;
+    uint64_t object_end_field;
 
     if (!code || !layout || code_size < 256 || code_size > 32768 ||
-        layout->preferred < 0 || layout->data_cache_size < 0)
+        !dlfrz_glibc_x86_cpu_object_profile_complete(layout) ||
+        layout->preferred < 0 || layout->data_cache_size < 0 ||
+        layout->rep_stosb_threshold < 0 ||
+        (uint64_t)layout->rep_stosb_threshold > UINT64_MAX - 8 ||
+        (uint64_t)layout->rep_stosb_threshold + 8 >
+            layout->object_size ||
+        cpu_vaddr > UINT64_MAX -
+            ((uint64_t)layout->rep_stosb_threshold + 8))
+        return 0;
+    prefix_end = cpu_vaddr +
+                 (uint64_t)layout->rep_stosb_threshold + 8;
+    cache_info_end = (uint64_t)layout->rep_stosb_threshold + 8;
+    for (size_t field = 0;
+         field < DLFRZ_GLIBC_X86_CPU_CACHE_INFO_WORDS; field++) {
+        uint64_t expected;
+
+        if (cache_info_end > UINT64_MAX - field * UINT64_C(8))
+            return 0;
+        expected = cache_info_end + field * UINT64_C(8);
+        if (cache_info_offsets[field] < 0 ||
+            (uint64_t)cache_info_offsets[field] != expected)
+            return 0;
+    }
+    if (cache_info_end > UINT64_MAX -
+            DLFRZ_GLIBC_X86_CPU_CACHE_INFO_WORDS * UINT64_C(8))
+        return 0;
+    cache_info_end +=
+        DLFRZ_GLIBC_X86_CPU_CACHE_INFO_WORDS * UINT64_C(8);
+    if ((layout->cachesize_non_temporal_divisor ==
+             DLFRZ_GLIBC_X86_CPU_FIELD_ABSENT &&
+         cache_info_end != layout->object_size) ||
+        (layout->cachesize_non_temporal_divisor !=
+             DLFRZ_GLIBC_X86_CPU_FIELD_ABSENT &&
+         (layout->cachesize_non_temporal_divisor < 0 ||
+          (uint64_t)layout->cachesize_non_temporal_divisor !=
+              cache_info_end ||
+          cache_info_end > UINT64_MAX - 8 ||
+          cache_info_end + 8 != layout->object_size)) ||
+        cpu_vaddr > UINT64_MAX - cache_info_end ||
+        layout->object_size < 8 ||
+        cpu_vaddr > UINT64_MAX - layout->object_size)
+        return 0;
+    object_end = cpu_vaddr + layout->object_size;
+    object_end_field = object_end - UINT64_C(8);
+    if (!dlfrz_glibc_x86_reachable_instructions(
+            code, code_size, code_vaddr, instruction_state,
+            sizeof(instruction_state)))
         return 0;
     for (size_t position = 0; position < code_size; position++) {
         struct dlfrz_glibc_x86_rip_write write;
         uint64_t write_end;
 
-        if (code_vaddr > UINT64_MAX - position ||
+        if (!(instruction_state[position] & DLFRZ_X86_INSN_DECODED) ||
+            code_vaddr > UINT64_MAX - position ||
             !dlfrz_glibc_x86_rip_write(
                 code + position, code_size - position,
                 code_vaddr + position, &write) ||
             write.target_vaddr > UINT64_MAX - write.width)
             continue;
         write_end = write.target_vaddr + write.width;
+        if (write.target_vaddr < object_end && write_end > object_end)
+            return 0;
+        if (write.target_vaddr < object_end &&
+            write_end > object_end_field) {
+            size_t current_displacement = code_file_offset + position +
+                                          write.displacement_offset;
+            size_t existing;
+
+            for (existing = 0; existing < object_end_writes; existing++) {
+                if (object_end_displacements[existing] ==
+                        current_displacement)
+                    break;
+            }
+            if (existing == object_end_writes) {
+                if (!((write.width == 8 &&
+                       write.target_vaddr == object_end_field) ||
+                      (write.width == 16 && object_end >= UINT64_C(16) &&
+                       write.target_vaddr ==
+                           object_end - UINT64_C(16))) ||
+                    object_end_writes ==
+                        DLFRZ_GLIBC_X86_CPU_END_WRITERS_MAX)
+                    return 0;
+                object_end_displacements[object_end_writes++] =
+                    current_displacement;
+            }
+        }
+        if (write.target_vaddr < prefix_end && write_end > prefix_end)
+            return 0;
+        if (write.target_vaddr < prefix_end && write_end == prefix_end)
+            prefix_end_writes++;
+        if (write.target_vaddr == prefix_end) {
+            size_t current_displacement = code_file_offset + position +
+                                          write.displacement_offset;
+
+            if (!tail_start_writes ||
+                current_displacement != tail_start_displacement) {
+                tail_start_writes++;
+                tail_start_displacement = current_displacement;
+            }
+        }
+        for (size_t field = 0;
+             field < DLFRZ_GLIBC_X86_CPU_CACHE_INFO_WORDS; field++) {
+            uint64_t target = cpu_vaddr +
+                (uint64_t)cache_info_offsets[field];
+            uint64_t target_end = target + UINT64_C(8);
+            size_t current_displacement;
+
+            if (write.target_vaddr >= target_end || write_end <= target)
+                continue;
+            current_displacement = code_file_offset + position +
+                                   write.displacement_offset;
+            /* Starting at the opcode of a REX-prefixed store decodes the
+             * same displacement as a narrower apparent instruction.  It is
+             * one witness, not a second partial writer. */
+            if (cache_info_writes[field] &&
+                current_displacement ==
+                    cache_info_displacements[field])
+                continue;
+            if (!((write.width == 8 &&
+                   write.target_vaddr == target) ||
+                  (write.width == 16 &&
+                   ((field % 2U == 0 &&
+                     write.target_vaddr == target) ||
+                    (field % 2U == 1 && target >= UINT64_C(8) &&
+                     write.target_vaddr == target - UINT64_C(8))))))
+                return 0;
+            if (cache_info_writes[field])
+                return 0;
+            cache_info_writes[field] = 1;
+            cache_info_displacements[field] = current_displacement;
+            cache_info_positions[field] = position;
+            cache_info_lengths[field] = write.length;
+        }
         if (write.target_vaddr == cpu_vaddr && write.width == 4)
             kind_writes++;
         if (cpu_vaddr <= UINT64_MAX - (uint64_t)layout->preferred &&
@@ -3835,7 +4741,9 @@ dlfrz_glibc_x86_cpu_initializer_matches(
                 covered[required] = 1;
         }
     }
-    if (!kind_writes || !preferred_writes || data_cache_writes != 1)
+    if (!kind_writes || !preferred_writes || data_cache_writes != 1 ||
+        !prefix_end_writes || tail_start_writes != 1 ||
+        object_end_writes == 0)
         return 0;
     for (size_t required = 0;
          required < sizeof(required_offsets) / sizeof(required_offsets[0]);
@@ -3843,8 +4751,58 @@ dlfrz_glibc_x86_cpu_initializer_matches(
         if (!covered[required])
             return 0;
     }
+    {
+        size_t block_start = SIZE_MAX;
+        size_t block_end = 0;
+        size_t position;
+
+        for (size_t field = 0;
+             field < DLFRZ_GLIBC_X86_CPU_CACHE_INFO_WORDS; field++) {
+            size_t end;
+
+            if (cache_info_writes[field] != 1 ||
+                cache_info_positions[field] >
+                    SIZE_MAX - cache_info_lengths[field])
+                return 0;
+            end = cache_info_positions[field] +
+                  cache_info_lengths[field];
+            if (cache_info_positions[field] < block_start)
+                block_start = cache_info_positions[field];
+            if (end > block_end)
+                block_end = end;
+        }
+        /* All published cache words must have witnesses in one reachable,
+         * branch-free block.  Conditional or call-separated byte patterns
+         * are not strong enough to establish one coherent field layout. */
+        position = block_start;
+        while (position < block_end) {
+            struct dlfrz_glibc_x86_instruction instruction;
+
+            if (!dlfrz_glibc_x86_instruction(
+                    code + position, code_size - position,
+                    &instruction) ||
+                instruction.length > block_end - position ||
+                instruction.direct_branch ||
+                instruction.conditional_branch ||
+                instruction.direct_call || instruction.terminal)
+                return 0;
+            position += instruction.length;
+        }
+        if (position != block_end)
+            return 0;
+    }
     if (layout_write_file_offset)
         *layout_write_file_offset = data_cache_displacement;
+    if (tail_boundary_file_offset)
+        *tail_boundary_file_offset = tail_start_displacement;
+    if (cache_info_file_offsets)
+        memcpy(cache_info_file_offsets, cache_info_displacements,
+               sizeof(cache_info_displacements));
+    if (object_end_file_offsets)
+        memcpy(object_end_file_offsets, object_end_displacements,
+               object_end_writes * sizeof(object_end_displacements[0]));
+    if (object_end_file_offset_count)
+        *object_end_file_offset_count = object_end_writes;
     return 1;
 }
 
@@ -3863,7 +4821,7 @@ dlfrz_glibc_x86_cpu_contract_valid(
     struct dlfrz_glibc_x86_cpu_layout profile;
     struct dlfrz_glibc_x86_cpu_layout alternative;
     struct dlfrz_glibc_x86_cpu_contract contract;
-    struct dlfrz_glibc_x86_cpu_evidence evidence = {0};
+    struct dlfrz_glibc_x86_cpu_evidence evidence;
     Elf64_Sym accessor;
     const unsigned char *accessor_code;
     const unsigned char *wrapper_code;
@@ -3881,6 +4839,10 @@ dlfrz_glibc_x86_cpu_contract_valid(
     uint32_t generic_kind;
     int32_t displacement;
 
+    /* Keep this an explicit call so loader.c's private memset redirection is
+     * honored.  GCC may otherwise lower a large aggregate initializer to a
+     * bootstrap-libc import after the target thread pointer is installed. */
+    memset(&evidence, 0, sizeof(evidence));
     if (!dlfrz_glibc_x86_cpu_layout_profile(
             layout, minor, &profile) ||
         !dlfrz_elf64_dyn_view_init(data, elf_size, &view) ||
@@ -3917,10 +4879,8 @@ dlfrz_glibc_x86_cpu_contract_valid(
             accessor.st_value + accessor_cursor + 7,
             displacement, &cpu_vaddr) ||
         cpu_vaddr < glro_vaddr ||
-        cpu_vaddr - glro_vaddr > glro_size ||
-        profile.rep_stosb_threshold < 0 ||
-        (uint64_t)profile.rep_stosb_threshold + sizeof(uint64_t) >
-            glro_size - (cpu_vaddr - glro_vaddr) ||
+        !dlfrz_glibc_x86_cpu_object_fits(
+            &profile, cpu_vaddr - glro_vaddr, glro_size) ||
         accessor.st_value < 32)
         return 0;
     evidence.accessor_displacement_file_offset = accessor_offset +
@@ -3994,38 +4954,754 @@ dlfrz_glibc_x86_cpu_contract_valid(
         !dlfrz_glibc_x86_cpu_initializer_matches(
             initializer_code, (size_t)initializer_size,
             initializer_vaddr, initializer_offset, cpu_vaddr, &profile,
-            &evidence.layout_write_displacement_file_offset))
+            &evidence.layout_write_displacement_file_offset,
+            &evidence.tail_boundary_displacement_file_offset,
+            evidence.cache_info_displacement_file_offsets,
+            evidence.object_end_displacement_file_offsets,
+            &evidence.object_end_displacement_count))
         return 0;
 
-    /* The only adjacent known layout must disagree with the same target
-     * initializer.  This prevents a broad write-span match from admitting a
-     * future extension whose old prefix merely happens to overlap. */
+    /* The structurally distinct feature-array family must disagree with the
+     * same target initializer.  The 2.39 and 2.40 layouts share write
+     * positions from offset 392 onward (with different member meanings), so
+     * their distinction comes from the exact stable-release profile above,
+     * not from a misleading absence-of-write test. */
     alternative = profile;
     if (profile.feature_count == 9) {
         alternative = (struct dlfrz_glibc_x86_cpu_layout){
-            10, 340, 344, 352, 360, 368, 376, 384, 392,
-            400, 408, 416
+            .feature_count = 10,
+            .object_size = 528,
+            .preferred = 340,
+            .isa_1 = 344,
+            .xsave_state_size = 352,
+            .xsave_state_full_size = 360,
+            .data_cache_size = 368,
+            .shared_cache_size = 376,
+            .non_temporal_threshold = 384,
+            .memset_non_temporal_threshold = 392,
+            .rep_movsb_threshold = 400,
+            .rep_movsb_stop_threshold = 408,
+            .rep_stosb_threshold = 416,
+            .level1_icache_size = 424,
+            .level1_icache_linesize = 432,
+            .level1_dcache_size = 440,
+            .level1_dcache_assoc = 448,
+            .level1_dcache_linesize = 456,
+            .level2_cache_size = 464,
+            .level2_cache_assoc = 472,
+            .level2_cache_linesize = 480,
+            .level3_cache_size = 488,
+            .level3_cache_assoc = 496,
+            .level3_cache_linesize = 504,
+            .level4_cache_size = 512,
+            .cachesize_non_temporal_divisor = 520,
         };
     } else {
         alternative = (struct dlfrz_glibc_x86_cpu_layout){
-            9, 308, 312, 320, 328, 336, 344, 352, -1,
-            360, 368, 376
+            .feature_count = 9,
+            .object_size = 488,
+            .preferred = 308,
+            .isa_1 = 312,
+            .xsave_state_size = 320,
+            .xsave_state_full_size = 328,
+            .data_cache_size = 336,
+            .shared_cache_size = 344,
+            .non_temporal_threshold = 352,
+            .memset_non_temporal_threshold =
+                DLFRZ_GLIBC_X86_CPU_FIELD_ABSENT,
+            .rep_movsb_threshold = 360,
+            .rep_movsb_stop_threshold = 368,
+            .rep_stosb_threshold = 376,
+            .level1_icache_size = 384,
+            .level1_icache_linesize = 392,
+            .level1_dcache_size = 400,
+            .level1_dcache_assoc = 408,
+            .level1_dcache_linesize = 416,
+            .level2_cache_size = 424,
+            .level2_cache_assoc = 432,
+            .level2_cache_linesize = 440,
+            .level3_cache_size = 448,
+            .level3_cache_assoc = 456,
+            .level3_cache_linesize = 464,
+            .level4_cache_size = 472,
+            .cachesize_non_temporal_divisor = 480,
         };
     }
     if (dlfrz_glibc_x86_cpu_initializer_matches(
             initializer_code, (size_t)initializer_size,
             initializer_vaddr, initializer_offset, cpu_vaddr, &alternative,
-            NULL))
+            NULL, NULL, NULL, NULL, NULL))
         return 0;
 
     contract.layout = profile;
     contract.cpu_features_offset = cpu_vaddr - glro_vaddr;
+    contract.wrapper_vaddr = wrapper_vaddr;
     contract.initializer_vaddr = initializer_vaddr;
+    contract.published_prefix_size =
+        (uint64_t)profile.rep_stosb_threshold + 8;
+    contract.cache_info_offset =
+        (uint64_t)profile.level1_icache_size;
+    contract.cache_info_word_count =
+        DLFRZ_GLIBC_X86_CPU_CACHE_INFO_WORDS;
     contract.generic_kind = generic_kind;
     if (contract_out)
         *contract_out = contract;
     if (evidence_out)
         *evidence_out = evidence;
+    return 1;
+}
+
+/* Recover the two GLRO fields which target libc exposes for AT_HWCAP and
+ * AT_HWCAP2.  These offsets are distribution-build properties, not release
+ * constants: supported 2.34--2.44 libcs place HWCAP2 at several different
+ * locations.  Root both branches in the unique _rtld_global_ro GLOB_DAT
+ * relocation and require the exact leaf loads reached by the public
+ * __getauxval comparisons. */
+static inline int
+dlfrz_glibc_x86_getauxval_contract_valid(
+    const void *data, size_t elf_size, uint64_t glro_size,
+    struct dlfrz_glibc_getauxval_contract *contract_out,
+    struct dlfrz_glibc_x86_getauxval_evidence *evidence_out)
+{
+    static const unsigned char endbr64[] = { 0xf3, 0x0f, 0x1e, 0xfa };
+    struct dlfrz_glibc_getauxval_contract contract;
+    struct dlfrz_glibc_x86_getauxval_evidence evidence = {0};
+    struct dlfrz_elf64_dyn_view view;
+    Elf64_Sym function;
+    const unsigned char *code;
+    uint64_t glro_got_vaddr;
+    uint64_t load_next;
+    uint64_t load_target;
+    size_t function_offset;
+    size_t cursor = 0;
+    size_t hwcap_position;
+    size_t hwcap2_position;
+    int32_t displacement;
+    int8_t branch;
+
+    if (!dlfrz_elf64_dyn_view_init(data, elf_size, &view) ||
+        view.ehdr.e_machine != EM_X86_64 ||
+        !dlfrz_glibc_function_definition(
+            &view, "__getauxval", &function) ||
+        (function.st_size != 104 && function.st_size != 120) ||
+        !dlfrz_glibc_glro_got_relocation(&view, &glro_got_vaddr) ||
+        !dlfrz_glibc_vaddr_file_range(
+            view.elf, view.elf_size, &view.ehdr,
+            function.st_value, function.st_size, &function_offset))
+        return 0;
+    code = view.elf + function_offset;
+    if (function.st_size >= sizeof(endbr64) &&
+        memcmp(code, endbr64, sizeof(endbr64)) == 0)
+        cursor = sizeof(endbr64);
+
+    /* mov _rtld_global_ro@GOTPCREL(%rip),%rax; cmp $AT_HWCAP,%rdi;
+     * je leaf; cmp $AT_HWCAP2,%rdi; je leaf; mov dl_auxv(%rax),%rax */
+    if (cursor + 23 > function.st_size ||
+        code[cursor] != UINT8_C(0x48) ||
+        code[cursor + 1] != UINT8_C(0x8b) ||
+        code[cursor + 2] != UINT8_C(0x05) ||
+        code[cursor + 7] != UINT8_C(0x48) ||
+        code[cursor + 8] != UINT8_C(0x83) ||
+        code[cursor + 9] != UINT8_C(0xff) ||
+        code[cursor + 10] != UINT8_C(0x10) ||
+        code[cursor + 11] != UINT8_C(0x74) ||
+        code[cursor + 13] != UINT8_C(0x48) ||
+        code[cursor + 14] != UINT8_C(0x83) ||
+        code[cursor + 15] != UINT8_C(0xff) ||
+        code[cursor + 16] != UINT8_C(0x1a) ||
+        code[cursor + 17] != UINT8_C(0x74) ||
+        code[cursor + 19] != UINT8_C(0x48) ||
+        code[cursor + 20] != UINT8_C(0x8b) ||
+        code[cursor + 21] != UINT8_C(0x40) ||
+        code[cursor + 22] != UINT8_C(0x68))
+        return 0;
+    memcpy(&displacement, code + cursor + 3, sizeof(displacement));
+    if (function.st_value > UINT64_MAX - cursor - 7)
+        return 0;
+    load_next = function.st_value + cursor + 7;
+    if (!dlfrz_glibc_add_signed_u64(
+            load_next, displacement, &load_target) ||
+        load_target != glro_got_vaddr)
+        return 0;
+    evidence.glro_displacement_file_offset = function_offset + cursor + 3;
+
+    memcpy(&branch, code + cursor + 12, sizeof(branch));
+    if (branch < 0 ||
+        (size_t)branch > (size_t)function.st_size - (cursor + 13))
+        return 0;
+    hwcap_position = cursor + 13 + (size_t)branch;
+    memcpy(&branch, code + cursor + 18, sizeof(branch));
+    if (branch < 0 ||
+        (size_t)branch > (size_t)function.st_size - (cursor + 19))
+        return 0;
+    hwcap2_position = cursor + 19 + (size_t)branch;
+    if (hwcap_position > (size_t)function.st_size - 5 ||
+        code[hwcap_position] != UINT8_C(0x48) ||
+        code[hwcap_position + 1] != UINT8_C(0x8b) ||
+        code[hwcap_position + 2] != UINT8_C(0x40) ||
+        code[hwcap_position + 3] != UINT8_C(0x60) ||
+        code[hwcap_position + 4] != UINT8_C(0xc3) ||
+        hwcap2_position > (size_t)function.st_size - 8 ||
+        code[hwcap2_position] != UINT8_C(0x48) ||
+        code[hwcap2_position + 1] != UINT8_C(0x8b) ||
+        code[hwcap2_position + 2] != UINT8_C(0x80) ||
+        code[hwcap2_position + 7] != UINT8_C(0xc3))
+        return 0;
+    memcpy(&displacement, code + hwcap2_position + 3,
+           sizeof(displacement));
+    if (displacement < 0 || ((uint32_t)displacement & 7U) != 0 ||
+        (uint64_t)(uint32_t)displacement > glro_size ||
+        sizeof(uint64_t) >
+            glro_size - (uint64_t)(uint32_t)displacement ||
+        (uint32_t)displacement == UINT32_C(0x60))
+        return 0;
+    contract.hwcap_offset = UINT64_C(0x60);
+    contract.hwcap2_offset = (uint32_t)displacement;
+    evidence.hwcap2_displacement_file_offset =
+        function_offset + hwcap2_position + 3;
+    if (contract_out)
+        *contract_out = contract;
+    if (evidence_out)
+        *evidence_out = evidence;
+    return 1;
+}
+
+struct dlfrz_glibc_aarch64_getauxval_leaf {
+    uint64_t field_offset;
+    size_t start;
+    size_t end;
+    size_t adrp_position;
+    size_t got_load_position;
+    size_t field_load_position;
+    size_t restore_position;
+    int restore_before_field;
+};
+
+static inline int
+dlfrz_glibc_aarch64_getauxval_branch_target(
+    uint32_t instruction, uint64_t instruction_vaddr,
+    uint64_t *target_vaddr)
+{
+    uint32_t immediate;
+    int64_t displacement;
+
+    /* B.EQ with the architecturally reserved bit four clear. */
+    if (!target_vaddr ||
+        (instruction & UINT32_C(0xff00001f)) != UINT32_C(0x54000000))
+        return 0;
+    immediate = (instruction >> 5) & UINT32_C(0x7ffff);
+    displacement = (int64_t)immediate;
+    if (immediate & UINT32_C(0x40000))
+        displacement -= INT64_C(0x80000);
+    displacement *= INT64_C(4);
+    return dlfrz_glibc_add_signed_u64(
+        instruction_vaddr, displacement, target_vaddr);
+}
+
+static inline int
+dlfrz_glibc_aarch64_getauxval_leaf_valid(
+    const unsigned char *code, size_t code_size, uint64_t code_vaddr,
+    uint64_t target_vaddr, uint64_t glro_got_vaddr, uint64_t glro_size,
+    int framed, struct dlfrz_glibc_aarch64_getauxval_leaf *leaf_out)
+{
+    static const uint32_t restore = UINT32_C(0xa8c17bfd);
+    static const uint32_t ret = UINT32_C(0xd65f03c0);
+    struct dlfrz_glibc_aarch64_getauxval_leaf leaf = {0};
+    uint32_t adrp;
+    uint32_t got_load;
+    uint32_t field_load;
+    uint32_t immediate;
+    unsigned int page_register;
+    unsigned int glro_register;
+    int64_t page_displacement;
+    uint64_t target_page;
+    uint64_t got_vaddr;
+    size_t field_index;
+    size_t ret_index;
+    size_t required;
+
+    if (target_vaddr < code_vaddr ||
+        target_vaddr - code_vaddr > code_size ||
+        (target_vaddr - code_vaddr) % 4U != 0)
+        return 0;
+    leaf.start = (size_t)(target_vaddr - code_vaddr);
+    required = framed ? 5U * sizeof(uint32_t) : 4U * sizeof(uint32_t);
+    if (leaf.start > code_size || required > code_size - leaf.start)
+        return 0;
+
+    adrp = dlfrz_glibc_read_u32(code + leaf.start);
+    got_load = dlfrz_glibc_read_u32(
+        code + leaf.start + sizeof(uint32_t));
+    if ((adrp & UINT32_C(0x9f000000)) != UINT32_C(0x90000000) ||
+        (got_load & UINT32_C(0xffc00000)) != UINT32_C(0xf9400000))
+        return 0;
+    page_register = adrp & 31U;
+    glro_register = got_load & 31U;
+    if (page_register == 31U || glro_register == 31U ||
+        ((got_load >> 5) & 31U) != page_register)
+        return 0;
+    immediate = ((adrp >> 29) & 3U) |
+                (((adrp >> 5) & UINT32_C(0x7ffff)) << 2);
+    page_displacement =
+        dlfrz_glibc_sign_extend_21(immediate) * INT64_C(4096);
+    if (!dlfrz_glibc_add_signed_u64(
+            target_vaddr & ~UINT64_C(0xfff), page_displacement,
+            &target_page))
+        return 0;
+    immediate = (got_load >> 10) & UINT32_C(0xfff);
+    if (target_page > UINT64_MAX - (uint64_t)immediate * UINT64_C(8))
+        return 0;
+    got_vaddr = target_page + (uint64_t)immediate * UINT64_C(8);
+    if (got_vaddr != glro_got_vaddr)
+        return 0;
+
+    leaf.restore_position = SIZE_MAX;
+    if (!framed) {
+        field_index = 2U;
+        ret_index = 3U;
+        leaf.restore_before_field = 0;
+    } else if (dlfrz_glibc_read_u32(
+                   code + leaf.start + 2U * sizeof(uint32_t)) == restore) {
+        field_index = 3U;
+        ret_index = 4U;
+        leaf.restore_position = leaf.start + 2U * sizeof(uint32_t);
+        leaf.restore_before_field = 1;
+    } else if (dlfrz_glibc_read_u32(
+                   code + leaf.start + 3U * sizeof(uint32_t)) == restore) {
+        field_index = 2U;
+        ret_index = 4U;
+        leaf.restore_position = leaf.start + 3U * sizeof(uint32_t);
+        leaf.restore_before_field = 0;
+    } else {
+        return 0;
+    }
+    if (leaf.restore_before_field &&
+        (glro_register == 29U || glro_register == 30U))
+        return 0;
+
+    field_load = dlfrz_glibc_read_u32(
+        code + leaf.start + field_index * sizeof(uint32_t));
+    if ((field_load & UINT32_C(0xffc00000)) != UINT32_C(0xf9400000) ||
+        (field_load & 31U) != 0U ||
+        ((field_load >> 5) & 31U) != glro_register ||
+        dlfrz_glibc_read_u32(
+            code + leaf.start + ret_index * sizeof(uint32_t)) != ret)
+        return 0;
+    leaf.field_offset =
+        (uint64_t)((field_load >> 10) & UINT32_C(0xfff)) * UINT64_C(8);
+    if (leaf.field_offset > glro_size ||
+        sizeof(uint64_t) > glro_size - leaf.field_offset)
+        return 0;
+    leaf.end = leaf.start + required;
+    leaf.adrp_position = leaf.start;
+    leaf.got_load_position = leaf.start + sizeof(uint32_t);
+    leaf.field_load_position =
+        leaf.start + field_index * sizeof(uint32_t);
+    if (leaf_out)
+        *leaf_out = leaf;
+    return 1;
+}
+
+/* Recover AArch64 GLRO HWCAP fields from the public __getauxval control
+ * flow.  This deliberately admits only the instruction families observed
+ * in supported release fixtures.  In particular PAC prologues, alternate
+ * dispatcher orderings, non-adjacent GOT loads, and unbalanced framed
+ * epilogues fail closed until separately evidenced. */
+static inline int
+dlfrz_glibc_aarch64_getauxval_contract_valid(
+    const void *data, size_t elf_size, uint64_t glro_size,
+    struct dlfrz_glibc_getauxval_contract *contract_out,
+    struct dlfrz_glibc_aarch64_getauxval_evidence *evidence_out)
+{
+    static const uint32_t bti_c = UINT32_C(0xd503245f);
+    static const uint32_t frame_push = UINT32_C(0xa9bf7bfd);
+    static const uint32_t frame_pointer = UINT32_C(0x910003fd);
+    static const uint32_t cmp_hwcap = UINT32_C(0xf100401f);
+    static const uint32_t cmp_hwcap2 = UINT32_C(0xf100681f);
+    struct dlfrz_glibc_getauxval_contract contract;
+    struct dlfrz_glibc_aarch64_getauxval_evidence evidence;
+    struct dlfrz_glibc_aarch64_getauxval_leaf leaves[2];
+    struct dlfrz_elf64_dyn_view view;
+    Elf64_Sym function;
+    const unsigned char *code;
+    uint64_t glro_got_vaddr;
+    uint64_t targets[2];
+    size_t function_offset;
+    size_t cursor = 0;
+    size_t scan_size;
+    unsigned int quartet_count = 0;
+    int framed = 0;
+
+    memset(&evidence, 0, sizeof(evidence));
+    evidence.restore_file_offsets[0] = SIZE_MAX;
+    evidence.restore_file_offsets[1] = SIZE_MAX;
+    if (!dlfrz_elf64_dyn_view_init(data, elf_size, &view) ||
+        view.ehdr.e_machine != EM_AARCH64 ||
+        dlfrz_elf64_dyn_view_find(
+            &view, "__getauxval", &function, NULL) != 1 ||
+        ELF64_ST_BIND(function.st_info) != STB_GLOBAL ||
+        ELF64_ST_TYPE(function.st_info) != STT_FUNC ||
+        ELF64_ST_VISIBILITY(function.st_other) != STV_DEFAULT ||
+        function.st_shndx == SHN_UNDEF ||
+        function.st_shndx >= SHN_LORESERVE || function.st_value == 0 ||
+        function.st_size < 8U * sizeof(uint32_t) ||
+        function.st_size > 2048U || (function.st_value & 3U) != 0 ||
+        (function.st_size & 3U) != 0 ||
+        !dlfrz_glibc_vaddr_executable_file_range(
+            view.elf, view.elf_size, &view.ehdr,
+            function.st_value, function.st_size) ||
+        !dlfrz_glibc_glro_got_relocation(&view, &glro_got_vaddr) ||
+        !dlfrz_glibc_vaddr_file_range(
+            view.elf, view.elf_size, &view.ehdr,
+            function.st_value, function.st_size, &function_offset))
+        return 0;
+    code = view.elf + function_offset;
+    if (dlfrz_glibc_read_u32(code) == bti_c)
+        cursor += sizeof(uint32_t);
+    if (cursor + 2U * sizeof(uint32_t) <= function.st_size &&
+        dlfrz_glibc_read_u32(code + cursor) == frame_push &&
+        dlfrz_glibc_read_u32(code + cursor + sizeof(uint32_t)) ==
+            frame_pointer) {
+        framed = 1;
+        cursor += 2U * sizeof(uint32_t);
+    }
+    if (cursor + 4U * sizeof(uint32_t) > function.st_size ||
+        dlfrz_glibc_read_u32(code + cursor) != cmp_hwcap ||
+        !dlfrz_glibc_aarch64_getauxval_branch_target(
+            dlfrz_glibc_read_u32(code + cursor + sizeof(uint32_t)),
+            function.st_value + cursor + sizeof(uint32_t), &targets[0]) ||
+        dlfrz_glibc_read_u32(
+            code + cursor + 2U * sizeof(uint32_t)) != cmp_hwcap2 ||
+        !dlfrz_glibc_aarch64_getauxval_branch_target(
+            dlfrz_glibc_read_u32(
+                code + cursor + 3U * sizeof(uint32_t)),
+            function.st_value + cursor + 3U * sizeof(uint32_t),
+            &targets[1]))
+        return 0;
+
+    scan_size = (size_t)function.st_size;
+    if (scan_size > 64U)
+        scan_size = 64U;
+    for (size_t position = 0;
+         position + 4U * sizeof(uint32_t) <= scan_size;
+         position += sizeof(uint32_t)) {
+        uint64_t ignored;
+
+        if (dlfrz_glibc_read_u32(code + position) == cmp_hwcap &&
+            dlfrz_glibc_aarch64_getauxval_branch_target(
+                dlfrz_glibc_read_u32(
+                    code + position + sizeof(uint32_t)),
+                function.st_value + position + sizeof(uint32_t),
+                &ignored) &&
+            dlfrz_glibc_read_u32(
+                code + position + 2U * sizeof(uint32_t)) == cmp_hwcap2 &&
+            dlfrz_glibc_aarch64_getauxval_branch_target(
+                dlfrz_glibc_read_u32(
+                    code + position + 3U * sizeof(uint32_t)),
+                function.st_value + position + 3U * sizeof(uint32_t),
+                &ignored))
+            quartet_count++;
+    }
+    if (quartet_count != 1 ||
+        !dlfrz_glibc_aarch64_getauxval_leaf_valid(
+            code, (size_t)function.st_size, function.st_value,
+            targets[0], glro_got_vaddr, glro_size, framed, &leaves[0]) ||
+        !dlfrz_glibc_aarch64_getauxval_leaf_valid(
+            code, (size_t)function.st_size, function.st_value,
+            targets[1], glro_got_vaddr, glro_size, framed, &leaves[1]))
+        return 0;
+
+    if ((leaves[0].start < leaves[1].end &&
+         leaves[1].start < leaves[0].end) ||
+        leaves[0].field_offset == leaves[1].field_offset ||
+        (framed && leaves[0].restore_before_field !=
+                       leaves[1].restore_before_field))
+        return 0;
+    contract.hwcap_offset = leaves[0].field_offset;
+    contract.hwcap2_offset = leaves[1].field_offset;
+    evidence.dispatcher_file_offset = function_offset + cursor;
+    for (size_t i = 0; i < 2; i++) {
+        evidence.branch_file_offsets[i] =
+            function_offset + cursor +
+            (i == 0 ? 1U : 3U) * sizeof(uint32_t);
+        evidence.adrp_file_offsets[i] =
+            function_offset + leaves[i].adrp_position;
+        evidence.got_load_file_offsets[i] =
+            function_offset + leaves[i].got_load_position;
+        evidence.field_load_file_offsets[i] =
+            function_offset + leaves[i].field_load_position;
+        if (leaves[i].restore_position != SIZE_MAX)
+            evidence.restore_file_offsets[i] =
+                function_offset + leaves[i].restore_position;
+    }
+    if (contract_out)
+        *contract_out = contract;
+    if (evidence_out)
+        *evidence_out = evidence;
+    return 1;
+}
+
+/* Mark every instruction reachable through the bounded direct-control-flow
+ * subset admitted by the CPU initializer decoder.  Direct calls inside the
+ * supplied range are part of the closure; indirect transfers and unknown
+ * instruction forms fail closed. */
+static inline int
+dlfrz_glibc_x86_reachable_instructions(
+    const unsigned char *code, size_t code_size, uint64_t code_vaddr,
+    unsigned char *instruction_state, size_t state_size)
+{
+    enum { DLFRZ_X86_REACHABLE_MAX_BLOCKS = 4096 };
+    uint16_t worklist[DLFRZ_X86_REACHABLE_MAX_BLOCKS];
+    size_t head = 0;
+    size_t tail = 0;
+
+    if (!code || !instruction_state || code_size == 0 ||
+        code_size > 32768 || state_size <= code_size)
+        return 0;
+    memset(instruction_state, 0, state_size);
+    instruction_state[0] = DLFRZ_X86_INSN_START |
+                           DLFRZ_X86_INSN_QUEUED;
+    worklist[tail++] = 0;
+    while (head < tail) {
+        size_t position = worklist[head++];
+
+        instruction_state[position] &=
+            (unsigned char)~DLFRZ_X86_INSN_QUEUED;
+        if (instruction_state[position] & DLFRZ_X86_INSN_DECODED)
+            continue;
+        while (position < code_size) {
+            struct dlfrz_glibc_x86_instruction instruction;
+            size_t next;
+
+            if (instruction_state[position] & DLFRZ_X86_INSN_INTERIOR)
+                return 0;
+            if (instruction_state[position] & DLFRZ_X86_INSN_DECODED)
+                break;
+            if (!dlfrz_glibc_x86_instruction(
+                    code + position, code_size - position, &instruction) ||
+                instruction.length > code_size - position)
+                return 0;
+            next = position + instruction.length;
+            instruction_state[position] |= DLFRZ_X86_INSN_START |
+                                           DLFRZ_X86_INSN_DECODED;
+            for (size_t byte = position + 1; byte < next; byte++) {
+                if (instruction_state[byte] & DLFRZ_X86_INSN_START)
+                    return 0;
+                instruction_state[byte] |= DLFRZ_X86_INSN_INTERIOR;
+            }
+            if (instruction.direct_branch ||
+                instruction.conditional_branch ||
+                instruction.direct_call) {
+                uint64_t target_vaddr;
+
+                if (code_vaddr > UINT64_MAX - next ||
+                    !dlfrz_glibc_add_signed_u64(
+                        code_vaddr + next,
+                        instruction.branch_displacement, &target_vaddr))
+                    return 0;
+                if (target_vaddr >= code_vaddr &&
+                    target_vaddr - code_vaddr < code_size) {
+                    size_t target_position =
+                        (size_t)(target_vaddr - code_vaddr);
+
+                    if (instruction_state[target_position] &
+                            DLFRZ_X86_INSN_INTERIOR)
+                        return 0;
+                    instruction_state[target_position] |=
+                        DLFRZ_X86_INSN_START;
+                    if (!(instruction_state[target_position] &
+                          (DLFRZ_X86_INSN_QUEUED |
+                           DLFRZ_X86_INSN_DECODED))) {
+                        if (tail >= DLFRZ_X86_REACHABLE_MAX_BLOCKS)
+                            return 0;
+                        instruction_state[target_position] |=
+                            DLFRZ_X86_INSN_QUEUED;
+                        worklist[tail++] = (uint16_t)target_position;
+                    }
+                }
+            }
+            if (instruction.direct_branch || instruction.terminal)
+                break;
+            position = next;
+        }
+    }
+    instruction_state[code_size] = DLFRZ_X86_INSN_START |
+                                   DLFRZ_X86_INSN_DECODED;
+    return 1;
+}
+
+/* Starting with glibc 2.38, update_active consumes GLRO(dl_hwcap2) while
+ * constructing the active feature bitmap.  Prove that the initializer's
+ * reachable direct-call closure contains exactly one helper rooted at the
+ * same HWCAP2 offset recovered from target libc. */
+static inline int
+dlfrz_glibc_x86_cpu_hwcap2_association_valid(
+    const void *data, size_t elf_size, uint64_t glro_vaddr,
+    const struct dlfrz_glibc_x86_cpu_contract *cpu_contract,
+    const struct dlfrz_glibc_getauxval_contract *aux_contract,
+    size_t *hwcap2_displacement_file_offset_out)
+{
+    enum {
+        DLFRZ_X86_HWCAP2_CLOSURE_LIMIT = 8192,
+        DLFRZ_X86_HWCAP2_HELPER_LIMIT = 1024
+    };
+    struct dlfrz_elf64_dyn_view view;
+    const unsigned char *initializer_code;
+    unsigned char initializer_state[32769];
+    size_t initializer_offset;
+    size_t initializer_size;
+    uint64_t selected_helper = 0;
+    size_t selected_displacement = 0;
+    unsigned int selected_helpers = 0;
+
+    if (!cpu_contract || !aux_contract ||
+        cpu_contract->wrapper_vaddr <= cpu_contract->initializer_vaddr ||
+        cpu_contract->wrapper_vaddr - cpu_contract->initializer_vaddr >
+            32768 ||
+        glro_vaddr > UINT64_MAX - aux_contract->hwcap2_offset ||
+        !dlfrz_elf64_dyn_view_init(data, elf_size, &view) ||
+        view.ehdr.e_machine != EM_X86_64)
+        return 0;
+    initializer_size = (size_t)(cpu_contract->wrapper_vaddr -
+                                cpu_contract->initializer_vaddr);
+    if (!dlfrz_glibc_vaddr_file_range(
+            view.elf, view.elf_size, &view.ehdr,
+            cpu_contract->initializer_vaddr, initializer_size,
+            &initializer_offset) ||
+        !dlfrz_glibc_vaddr_executable_file_range(
+            view.elf, view.elf_size, &view.ehdr,
+            cpu_contract->initializer_vaddr, initializer_size))
+        return 0;
+    initializer_code = view.elf + initializer_offset;
+    if (!dlfrz_glibc_x86_reachable_instructions(
+            initializer_code, initializer_size,
+            cpu_contract->initializer_vaddr, initializer_state,
+            sizeof(initializer_state)))
+        return 0;
+
+    for (size_t position = 0; position < initializer_size;) {
+        struct dlfrz_glibc_x86_instruction instruction;
+        uint64_t next_vaddr;
+        uint64_t helper_vaddr;
+        size_t helper_size;
+        size_t helper_offset;
+        const unsigned char *helper_code;
+        size_t helper_matches = 0;
+        size_t helper_displacement = 0;
+        int helper_complete = 0;
+
+        if (!(initializer_state[position] & DLFRZ_X86_INSN_DECODED)) {
+            position++;
+            continue;
+        }
+        if (!dlfrz_glibc_x86_instruction(
+                initializer_code + position,
+                initializer_size - position, &instruction) ||
+            instruction.length > initializer_size - position)
+            return 0;
+        if (!instruction.direct_call) {
+            position += instruction.length;
+            continue;
+        }
+        if (cpu_contract->initializer_vaddr > UINT64_MAX - position -
+                instruction.length)
+            return 0;
+        next_vaddr = cpu_contract->initializer_vaddr + position +
+                     instruction.length;
+        if (!dlfrz_glibc_add_signed_u64(
+                next_vaddr, instruction.branch_displacement,
+                &helper_vaddr))
+            return 0;
+        if (helper_vaddr >= cpu_contract->initializer_vaddr ||
+            cpu_contract->initializer_vaddr - helper_vaddr >
+                DLFRZ_X86_HWCAP2_CLOSURE_LIMIT) {
+            position += instruction.length;
+            continue;
+        }
+        helper_size = (size_t)(cpu_contract->initializer_vaddr -
+                               helper_vaddr);
+        /* This is a direct-call target, but stripped ld.so has no reliable
+         * function-size metadata for it.  Do not let one candidate claim a
+         * witness in a later helper merely because both precede the CPU
+         * initializer in the same text range.  update_active's admitted
+         * 2.38--2.44 bodies carry the HWCAP2 test within their first KiB. */
+        if (helper_size > DLFRZ_X86_HWCAP2_HELPER_LIMIT)
+            helper_size = DLFRZ_X86_HWCAP2_HELPER_LIMIT;
+        if (!dlfrz_glibc_vaddr_file_range(
+                view.elf, view.elf_size, &view.ehdr,
+                helper_vaddr, helper_size, &helper_offset) ||
+            !dlfrz_glibc_vaddr_executable_file_range(
+                view.elf, view.elf_size, &view.ehdr,
+                helper_vaddr, helper_size))
+            return 0;
+        helper_code = view.elf + helper_offset;
+        for (size_t helper_position = 0; helper_position < helper_size;) {
+            struct dlfrz_glibc_x86_instruction helper_instruction;
+            int32_t displacement;
+            uint64_t target;
+
+            /* Establish a conservative entry-owned body boundary.  The
+             * target helper must decode linearly from its direct-call entry
+             * through a return/tail branch, and the exact HWCAP2 test must
+             * begin at an instruction boundary before that terminator.
+             * This prevents an earlier adjacent helper from borrowing the
+             * same byte sequence out of update_active. */
+            if (!dlfrz_glibc_x86_instruction(
+                    helper_code + helper_position,
+                    helper_size - helper_position,
+                    &helper_instruction) ||
+                helper_instruction.length >
+                    helper_size - helper_position) {
+                helper_matches = 0;
+                break;
+            }
+            if (helper_position + 9 <= helper_size &&
+                helper_instruction.length == 7 &&
+                helper_code[helper_position] == UINT8_C(0xf6) &&
+                helper_code[helper_position + 1] == UINT8_C(0x05) &&
+                helper_code[helper_position + 6] == UINT8_C(0x02) &&
+                helper_code[helper_position + 7] == UINT8_C(0x74) &&
+                (helper_code[helper_position + 8] == UINT8_C(0x09) ||
+                 helper_code[helper_position + 8] == UINT8_C(0x0b))) {
+                memcpy(&displacement,
+                       helper_code + helper_position + 2,
+                       sizeof(displacement));
+                if (helper_vaddr > UINT64_MAX - helper_position - 7 ||
+                    !dlfrz_glibc_add_signed_u64(
+                        helper_vaddr + helper_position + 7,
+                        displacement, &target))
+                    return 0;
+                if (target ==
+                        glro_vaddr + aux_contract->hwcap2_offset) {
+                    helper_matches++;
+                    helper_displacement = helper_offset +
+                                          helper_position + 2;
+                }
+            }
+            if (helper_instruction.direct_branch ||
+                helper_instruction.terminal) {
+                helper_complete = 1;
+                break;
+            }
+            helper_position += helper_instruction.length;
+        }
+        if (!helper_complete) {
+            position += instruction.length;
+            continue;
+        }
+        if (helper_matches > 1)
+            return 0;
+        if (helper_matches == 1 && helper_vaddr != selected_helper) {
+            selected_helper = helper_vaddr;
+            selected_displacement = helper_displacement;
+            selected_helpers++;
+        }
+        position += instruction.length;
+    }
+    if (selected_helpers != 1)
+        return 0;
+    if (hwcap2_displacement_file_offset_out)
+        *hwcap2_displacement_file_offset_out = selected_displacement;
     return 1;
 }
 
@@ -4324,6 +6000,488 @@ dlfrz_glibc_glro_relocations_valid(
     return found_mask == required_mask;
 }
 
+/* Find an exact byte literal without examining every non-candidate position
+ * in scalar code.  libc's memchr is substantially cheaper for the multi-MiB
+ * interpreter/libc images inspected during bootstrap, while the final
+ * memcmp remains authoritative. */
+static inline const unsigned char *
+dlfrz_glibc_find_literal(const unsigned char *bytes, size_t size,
+                         size_t start, const char *literal,
+                         size_t literal_size)
+{
+    const unsigned char *cursor;
+    size_t remaining;
+
+    if (!bytes || !literal || literal_size == 0 || start > size ||
+        literal_size > size - start)
+        return NULL;
+    cursor = bytes + start;
+    remaining = size - start;
+    while (remaining >= literal_size) {
+        const unsigned char *candidate =
+            (const unsigned char *)memchr(
+                cursor, (unsigned char)literal[0],
+                remaining - literal_size + 1);
+        size_t offset;
+
+        if (!candidate)
+            return NULL;
+        if (memcmp(candidate, literal, literal_size) == 0)
+            return candidate;
+        offset = (size_t)(candidate - bytes) + 1;
+        cursor = bytes + offset;
+        remaining = size - offset;
+    }
+    return NULL;
+}
+
+struct dlfrz_glibc_release_profile_state {
+    int stable_minor;
+    int stable_invalid;
+    int development;
+};
+
+static inline void
+dlfrz_glibc_release_profile_state_init(
+    struct dlfrz_glibc_release_profile_state *state)
+{
+    state->stable_minor = -1;
+    state->stable_invalid = 0;
+    state->development = 0;
+}
+
+/* Accumulate one independent byte range.  Callers which inspect multiple
+ * ELF segments retain STATE between calls, but deliberately reset literal
+ * matching at each segment boundary so disjoint file ranges cannot
+ * synthesize a witness. */
+static inline void
+dlfrz_glibc_release_profile_accumulate(
+    const unsigned char *bytes, size_t size,
+    struct dlfrz_glibc_release_profile_state *state,
+    int want_stable, int want_development)
+{
+    static const char anchor[] = "release version";
+    static const char development_prefix[] = "development ";
+    static const char stable_prefix[] = "stable ";
+    static const char stable_suffix[] = " 2.";
+    size_t search = 0;
+
+    if (!bytes || !state ||
+        ((!want_development || state->development) &&
+         (!want_stable || state->stable_invalid)))
+        return;
+    while (want_stable || want_development) {
+        const unsigned char *match = dlfrz_glibc_find_literal(
+            bytes, size, search, anchor, sizeof(anchor) - 1);
+        size_t i;
+        size_t after;
+
+        if (!match)
+            break;
+        i = (size_t)(match - bytes);
+        after = i + sizeof(anchor) - 1;
+        search = i + 1;
+
+        if (want_development && !state->development) {
+            size_t p;
+
+            /* The explicit marker has no required trailing byte, so this
+             * also recognizes a marker ending exactly at EOF. */
+            if (i >= sizeof(development_prefix) - 1 &&
+                memcmp(bytes + i - (sizeof(development_prefix) - 1),
+                       development_prefix,
+                       sizeof(development_prefix) - 1) == 0) {
+                state->development = 1;
+            } else if (after < size && bytes[after] == ' ') {
+                p = after + 1;
+                while (p < size && bytes[p] >= '0' && bytes[p] <= '9')
+                    p++;
+                if (p < size && bytes[p++] == '.') {
+                    while (p < size && bytes[p] >= '0' && bytes[p] <= '9')
+                        p++;
+                    if (p + 1 < size && bytes[p] == '.' &&
+                        bytes[p + 1] >= '0' && bytes[p + 1] <= '9')
+                        state->development = 1;
+                }
+            }
+        }
+
+        if (want_stable && !state->stable_invalid &&
+            i >= sizeof(stable_prefix) - 1 &&
+            memcmp(bytes + i - (sizeof(stable_prefix) - 1), stable_prefix,
+                   sizeof(stable_prefix) - 1) == 0 &&
+            sizeof(stable_suffix) - 1 <= size - after &&
+            memcmp(bytes + after, stable_suffix,
+                   sizeof(stable_suffix) - 1) == 0) {
+            size_t p = after + sizeof(stable_suffix) - 1;
+            int minor = 0;
+            int have_digit = 0;
+
+            while (p < size && bytes[p] >= '0' && bytes[p] <= '9') {
+                if (minor > 1000) {
+                    state->stable_invalid = 1;
+                    break;
+                }
+                minor = minor * 10 + (int)(bytes[p] - '0');
+                have_digit = 1;
+                p++;
+            }
+            if (!have_digit ||
+                (state->stable_minor >= 0 &&
+                 state->stable_minor != minor))
+                state->stable_invalid = 1;
+            else
+                state->stable_minor = minor;
+        }
+
+        if ((!want_development || state->development) &&
+            (!want_stable || state->stable_invalid))
+            break;
+    }
+}
+
+static inline void
+dlfrz_glibc_release_profile_state_finish(
+    const struct dlfrz_glibc_release_profile_state *state,
+    int *stable_minor_out, int *development_out)
+{
+    if (stable_minor_out)
+        *stable_minor_out = state->stable_invalid
+            ? -1 : state->stable_minor;
+    if (development_out)
+        *development_out = state->development;
+}
+
+/* Collect the stable minor and development-snapshot verdict in one bounded,
+ * monotonic search.  All three accepted witnesses contain the exact
+ * "release version" anchor: the explicit development marker has the
+ * "development " prefix, the stable banner has the "stable " prefix and
+ * " 2." suffix, and the generic snapshot form has a space followed by its
+ * numeric components.  Matching the common anchor once avoids rescanning a
+ * multi-MiB interpreter or libc while retaining exact byte-literal checks.
+ * Malformed/conflicting stable banners remain fail-closed. */
+static inline void
+dlfrz_glibc_release_profile(const void *data, size_t size,
+                            int *stable_minor_out,
+                            int *development_out)
+{
+    struct dlfrz_glibc_release_profile_state state;
+
+    dlfrz_glibc_release_profile_state_init(&state);
+    if (data)
+        dlfrz_glibc_release_profile_accumulate(
+            (const unsigned char *)data, size, &state,
+            stable_minor_out != NULL, development_out != NULL);
+    dlfrz_glibc_release_profile_state_finish(
+        &state, stable_minor_out, development_out);
+}
+
+/* Establish one canonical PT_LOAD envelope before immutable ELF bytes are
+ * used as runtime identity.  File-backed and virtual ranges must both be
+ * monotonic and non-overlapping.  The virtual proof includes p_memsz, so a
+ * writable BSS mapping cannot alias a supposedly immutable file witness.
+ * Keeping this geometry gate shared makes release banners and compiled
+ * configuration paths use exactly the same admission contract. */
+static inline int
+dlfrz_glibc_immutable_elf_loads(const unsigned char *elf, size_t elf_size,
+                                Elf64_Ehdr *ehdr_out)
+{
+    Elf64_Ehdr ehdr;
+    uint64_t previous_load_vaddr = 0;
+    uint64_t previous_file_end = 0;
+    uint64_t previous_memory_end = 0;
+    int have_nonempty_file = 0;
+    int have_nonempty_memory = 0;
+    int load_found = 0;
+
+    if (!elf || elf_size < sizeof(ehdr))
+        return 0;
+    memcpy(&ehdr, elf, sizeof(ehdr));
+    if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0 ||
+        ehdr.e_ident[EI_CLASS] != ELFCLASS64 ||
+        ehdr.e_ident[EI_DATA] != ELFDATA2LSB ||
+        ehdr.e_ident[EI_VERSION] != EV_CURRENT ||
+        ehdr.e_version != EV_CURRENT || ehdr.e_type != ET_DYN ||
+        (ehdr.e_machine != EM_X86_64 &&
+         ehdr.e_machine != EM_AARCH64) ||
+        ehdr.e_ehsize != sizeof(ehdr) ||
+        ehdr.e_phentsize != sizeof(Elf64_Phdr) || ehdr.e_phnum == 0 ||
+        ehdr.e_phnum == PN_XNUM || ehdr.e_phoff > elf_size ||
+        (size_t)ehdr.e_phnum >
+            (elf_size - (size_t)ehdr.e_phoff) / sizeof(Elf64_Phdr))
+        return 0;
+
+    for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
+        Elf64_Phdr phdr;
+
+        if (!dlfrz_glibc_read_phdr(elf, elf_size, &ehdr, i, &phdr))
+            return 0;
+        if (phdr.p_type != PT_LOAD)
+            continue;
+        if (phdr.p_filesz > phdr.p_memsz || phdr.p_offset > elf_size ||
+            phdr.p_filesz > (uint64_t)elf_size - phdr.p_offset ||
+            phdr.p_vaddr > UINT64_MAX - phdr.p_memsz)
+            return 0;
+        if (load_found && phdr.p_vaddr < previous_load_vaddr)
+            return 0;
+        previous_load_vaddr = phdr.p_vaddr;
+        load_found = 1;
+        if (phdr.p_memsz != 0) {
+            uint64_t memory_end = phdr.p_vaddr + phdr.p_memsz;
+
+            if (have_nonempty_memory &&
+                phdr.p_vaddr < previous_memory_end)
+                return 0;
+            previous_memory_end = memory_end;
+            have_nonempty_memory = 1;
+        }
+        if (phdr.p_filesz != 0) {
+            uint64_t file_end = phdr.p_offset + phdr.p_filesz;
+
+            if (have_nonempty_file && phdr.p_offset < previous_file_end)
+                return 0;
+            previous_file_end = file_end;
+            have_nonempty_file = 1;
+        }
+    }
+    if (!load_found || !have_nonempty_file || !have_nonempty_memory)
+        return 0;
+    if (ehdr_out)
+        *ehdr_out = ehdr;
+    return 1;
+}
+
+struct dlfrz_glibc_config_path_match {
+    const unsigned char *bytes;
+    size_t size;
+    int ambiguous;
+};
+
+static inline void
+dlfrz_glibc_config_path_match_accumulate(
+    struct dlfrz_glibc_config_path_match *match,
+    const unsigned char *candidate, size_t candidate_size,
+    const char *suffix, size_t suffix_size)
+{
+    if (!match || match->ambiguous || candidate_size < suffix_size ||
+        memcmp(candidate + candidate_size - suffix_size,
+               suffix, suffix_size) != 0)
+        return;
+    if (!match->bytes) {
+        match->bytes = candidate;
+        match->size = candidate_size;
+    } else if (match->size != candidate_size ||
+               memcmp(match->bytes, candidate, candidate_size) != 0) {
+        match->ambiguous = 1;
+    }
+}
+
+/* Walk one immutable file range once, recognizing both configured glibc
+ * paths from complete absolute C strings.  NUL-delimited iteration avoids a
+ * byte-by-byte retry at every non-candidate position.  Literal matching is
+ * deliberately reset at each PT_LOAD boundary, so disjoint ranges cannot
+ * synthesize a pathname. */
+static inline void
+dlfrz_glibc_config_paths_accumulate(
+    const unsigned char *bytes, size_t size,
+    struct dlfrz_glibc_config_path_match *cache,
+    struct dlfrz_glibc_config_path_match *preload)
+{
+    size_t offset = 0;
+
+    while (offset < size) {
+        const unsigned char *terminator =
+            (const unsigned char *)memchr(
+                bytes + offset, '\0', size - offset);
+        size_t candidate_size;
+
+        if (!terminator)
+            break;
+        candidate_size = (size_t)(terminator - (bytes + offset));
+        if (candidate_size != 0 && bytes[offset] == '/') {
+            if (cache)
+                dlfrz_glibc_config_path_match_accumulate(
+                    cache, bytes + offset, candidate_size,
+                    DLFRZ_GLIBC_CACHE_SUFFIX,
+                    sizeof(DLFRZ_GLIBC_CACHE_SUFFIX) - 1);
+            if (preload)
+                dlfrz_glibc_config_path_match_accumulate(
+                    preload, bytes + offset, candidate_size,
+                    DLFRZ_GLIBC_PRELOAD_SUFFIX,
+                    sizeof(DLFRZ_GLIBC_PRELOAD_SUFFIX) - 1);
+        }
+        offset += candidate_size + 1;
+    }
+}
+
+static inline int
+dlfrz_glibc_address_ranges_overlap(const void *left, size_t left_size,
+                                   const void *right, size_t right_size)
+{
+    uintptr_t left_begin = (uintptr_t)left;
+    uintptr_t right_begin = (uintptr_t)right;
+    uintptr_t left_end;
+    uintptr_t right_end;
+
+    if (left_size == 0 || right_size == 0)
+        return 0;
+    if (left_begin > UINTPTR_MAX - left_size ||
+        right_begin > UINTPTR_MAX - right_size)
+        return 1;
+    left_end = left_begin + left_size;
+    right_end = right_begin + right_size;
+    return left_begin < right_end && right_begin < left_end;
+}
+
+/* glibc compiles SYSCONFDIR into its interpreter and may therefore consult
+ * paths other than /etc/ld.so.cache and /etc/ld.so.preload.  Recover both
+ * identities in a single bounded pass over readable, non-writable PT_LOAD
+ * file bytes.  Duplicate copies of one exact path are harmless; distinct
+ * candidates, truncated strings, mutable aliases, malformed load geometry,
+ * and undersized or overlapping output buffers fail closed.
+ *
+ * A NULL output paired with size zero means that identity is not requested.
+ * Return one only when every requested identity has one unique complete
+ * witness.  Outputs never alias the ELF input in production; rejecting that
+ * unsupported shape also keeps final copies independent of scan storage. */
+static inline int
+dlfrz_glibc_elf_config_paths(const void *data, size_t elf_size,
+                             char *cache_path, size_t cache_path_size,
+                             char *preload_path, size_t preload_path_size)
+{
+    const unsigned char *elf = (const unsigned char *)data;
+    struct dlfrz_glibc_config_path_match cache = {0};
+    struct dlfrz_glibc_config_path_match preload = {0};
+    Elf64_Ehdr ehdr;
+    size_t cache_copy_size = 0;
+    size_t preload_copy_size = 0;
+
+    if (cache_path && cache_path_size)
+        cache_path[0] = '\0';
+    if (preload_path && preload_path_size)
+        preload_path[0] = '\0';
+    if ((!cache_path && cache_path_size != 0) ||
+        (cache_path && cache_path_size == 0) ||
+        (!preload_path && preload_path_size != 0) ||
+        (preload_path && preload_path_size == 0) ||
+        (!cache_path && !preload_path) ||
+        !dlfrz_glibc_immutable_elf_loads(elf, elf_size, &ehdr))
+        return 0;
+
+    for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
+        Elf64_Phdr phdr;
+
+        if (!dlfrz_glibc_read_phdr(elf, elf_size, &ehdr, i, &phdr))
+            return 0;
+        if (phdr.p_type != PT_LOAD || phdr.p_filesz == 0 ||
+            !(phdr.p_flags & PF_R) || (phdr.p_flags & PF_W))
+            continue;
+        dlfrz_glibc_config_paths_accumulate(
+            elf + (size_t)phdr.p_offset, (size_t)phdr.p_filesz,
+            cache_path ? &cache : NULL,
+            preload_path ? &preload : NULL);
+    }
+
+    if ((cache_path &&
+         (!cache.bytes || cache.ambiguous ||
+          cache.size >= cache_path_size)) ||
+        (preload_path &&
+         (!preload.bytes || preload.ambiguous ||
+          preload.size >= preload_path_size)))
+        return 0;
+    if (cache_path)
+        cache_copy_size = cache.size + 1;
+    if (preload_path)
+        preload_copy_size = preload.size + 1;
+    if ((cache_path && dlfrz_glibc_address_ranges_overlap(
+             elf, elf_size, cache_path, cache_copy_size)) ||
+        (preload_path && dlfrz_glibc_address_ranges_overlap(
+             elf, elf_size, preload_path, preload_copy_size)) ||
+        (cache_path && preload_path &&
+         dlfrz_glibc_address_ranges_overlap(
+             cache_path, cache_copy_size,
+             preload_path, preload_copy_size)))
+        return 0;
+    if (cache_path)
+        memcpy(cache_path, cache.bytes, cache_copy_size);
+    if (preload_path)
+        memcpy(preload_path, preload.bytes, preload_copy_size);
+    return 1;
+}
+
+/* Compatibility for single-identity callers.  This keeps the old call shape
+ * safe while routing it through immutable ELF admission; callers needing
+ * both paths should use dlfrz_glibc_elf_config_paths() to scan only once. */
+static inline int
+dlfrz_glibc_config_path(const void *data, size_t data_size,
+                        const char *suffix, size_t suffix_size,
+                        char *path_out, size_t path_size)
+{
+    if (suffix && suffix_size == sizeof(DLFRZ_GLIBC_CACHE_SUFFIX) - 1 &&
+        memcmp(suffix, DLFRZ_GLIBC_CACHE_SUFFIX, suffix_size) == 0)
+        return dlfrz_glibc_elf_config_paths(
+            data, data_size, path_out, path_size, NULL, 0);
+    if (suffix && suffix_size == sizeof(DLFRZ_GLIBC_PRELOAD_SUFFIX) - 1 &&
+        memcmp(suffix, DLFRZ_GLIBC_PRELOAD_SUFFIX, suffix_size) == 0)
+        return dlfrz_glibc_elf_config_paths(
+            data, data_size, NULL, 0, path_out, path_size);
+    if (path_out && path_size)
+        path_out[0] = '\0';
+    return 0;
+}
+
+/* Inspect only immutable runtime bytes when using a release banner as ELF
+ * identity.  Requiring PT_LOAD entries and their nonempty file and memory
+ * ranges to be monotonically ordered and non-overlapping makes this a linear
+ * proof that a byte admitted from a readable, non-writable segment has no
+ * exact PF_W file or virtual-address alias.  Memory ranges use p_memsz, so a
+ * writable segment's BSS cannot alias admitted file-backed identity bytes.
+ * Separate ranges share the conflict/development state but never
+ * literal-matching state.
+ *
+ * Final ELF permissions are page-granular.  Direct-loading callers must also
+ * retain their runtime-page overlap gate using the target kernel's AT_PAGESZ;
+ * this helper deliberately has no host- or architecture-guessed page size.
+ *
+ * Return one when the supported ELF envelope and every PT_LOAD range are
+ * structurally valid.  A valid ELF can still report no stable witness (-1),
+ * or a development witness which callers must reject for direct loading. */
+static inline int
+dlfrz_glibc_elf_release_profile(const void *data, size_t elf_size,
+                                int *stable_minor_out,
+                                int *development_out)
+{
+    const unsigned char *elf = (const unsigned char *)data;
+    struct dlfrz_glibc_release_profile_state state;
+    Elf64_Ehdr ehdr;
+
+    dlfrz_glibc_release_profile_state_init(&state);
+    if (!dlfrz_glibc_immutable_elf_loads(elf, elf_size, &ehdr))
+        goto invalid;
+
+    for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
+        Elf64_Phdr phdr;
+
+        if (!dlfrz_glibc_read_phdr(elf, elf_size, &ehdr, i, &phdr))
+            goto invalid;
+        if (phdr.p_type != PT_LOAD || phdr.p_filesz == 0 ||
+            !(phdr.p_flags & PF_R) || (phdr.p_flags & PF_W))
+            continue;
+        dlfrz_glibc_release_profile_accumulate(
+            elf + (size_t)phdr.p_offset, (size_t)phdr.p_filesz,
+            &state, stable_minor_out != NULL, development_out != NULL);
+    }
+    dlfrz_glibc_release_profile_state_finish(
+        &state, stable_minor_out, development_out);
+    return 1;
+
+invalid:
+    dlfrz_glibc_release_profile_state_init(&state);
+    dlfrz_glibc_release_profile_state_finish(
+        &state, stable_minor_out, development_out);
+    return 0;
+}
+
 /* glibc development snapshots can retain a stable release's size tuple while
  * changing code that consumes private rtld fields.  Reject both the explicit
  * development marker and the snapshot release form (for example 2.43.9000).
@@ -4332,37 +6490,10 @@ dlfrz_glibc_glro_relocations_valid(
 static inline int
 dlfrz_glibc_is_development_release(const void *data, size_t size)
 {
-    static const char marker[] = DLFRZ_GLIBC_DEVELOPMENT_MARKER;
-    static const char release[] = "release version ";
-    const unsigned char *bytes = (const unsigned char *)data;
+    int development;
 
-    if (!data)
-        return 0;
-    if (size >= sizeof(marker) - 1) {
-        for (size_t i = 0; i <= size - (sizeof(marker) - 1); i++) {
-            if (memcmp(bytes + i, marker, sizeof(marker) - 1) == 0)
-                return 1;
-        }
-    }
-    if (size <= sizeof(release) - 1)
-        return 0;
-    for (size_t i = 0; i < size - (sizeof(release) - 1); i++) {
-        size_t p;
-
-        if (memcmp(bytes + i, release, sizeof(release) - 1) != 0)
-            continue;
-        p = i + sizeof(release) - 1;
-        while (p < size && bytes[p] >= '0' && bytes[p] <= '9')
-            p++;
-        if (p >= size || bytes[p++] != '.')
-            continue;
-        while (p < size && bytes[p] >= '0' && bytes[p] <= '9')
-            p++;
-        if (p + 1 < size && bytes[p] == '.' &&
-            bytes[p + 1] >= '0' && bytes[p + 1] <= '9')
-            return 1;
-    }
-    return 0;
+    dlfrz_glibc_release_profile(data, size, NULL, &development);
+    return development;
 }
 
 /* Return the minor from glibc's canonical stable-release banner.  Private
@@ -4371,34 +6502,10 @@ dlfrz_glibc_is_development_release(const void *data, size_t size)
 static inline int
 dlfrz_glibc_stable_release_minor(const void *data, size_t size)
 {
-    static const char prefix[] = "stable release version 2.";
-    const unsigned char *bytes = (const unsigned char *)data;
-    int found = -1;
+    int stable_minor;
 
-    if (!data || size < sizeof(prefix))
-        return -1;
-    for (size_t i = 0; i <= size - (sizeof(prefix) - 1); i++) {
-        size_t p;
-        int minor = 0;
-        int digits = 0;
-
-        if (memcmp(bytes + i, prefix, sizeof(prefix) - 1) != 0)
-            continue;
-        p = i + sizeof(prefix) - 1;
-        while (p < size && bytes[p] >= '0' && bytes[p] <= '9') {
-            if (minor > 1000)
-                return -1;
-            minor = minor * 10 + (int)(bytes[p] - '0');
-            digits++;
-            p++;
-        }
-        if (!digits)
-            return -1;
-        if (found >= 0 && found != minor)
-            return -1;
-        found = minor;
-    }
-    return found;
+    dlfrz_glibc_release_profile(data, size, &stable_minor, NULL);
+    return stable_minor;
 }
 
 /* Size tuples can be retained or reused after private fields move.  Admit

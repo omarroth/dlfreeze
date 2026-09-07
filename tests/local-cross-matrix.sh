@@ -40,8 +40,10 @@ Environment:
                          Allow a targeted run without aggregate direct+UPX
                          artifacts. Aggregate runs require them by default;
                          one-environment runs do not unless explicitly set.
+  TEST_START_AT=FUNC     Start run_tests.sh at this exact test function.
+  TEST_STOP_AFTER=FUNC   Stop run_tests.sh after this exact test function.
   TEST_SUITE_TIMEOUT=N   Per-image test-suite limit in seconds. Defaults to
-                         3600 for an emulated architecture and 1200 natively.
+                         7200 for an emulated architecture and 1200 natively.
 
 Examples:
   tests/local-cross-matrix.sh
@@ -113,15 +115,19 @@ case "$(uname -m)" in
     *) HOST_ARCH=unknown ;;
 esac
 if [[ "$HOST_ARCH" == "$ARCH" ]]; then
+    DEFAULT_TEST_RUN_TIMEOUT=30
+    DEFAULT_TEST_FREEZE_TIMEOUT=180
     DEFAULT_TEST_SUITE_TIMEOUT=1200
 else
     # User-mode emulation is substantially slower, especially for the many
     # compiler-heavy direct-loader fixtures.  Keep a finite bound without
     # making the native GitHub-equivalent timeout spuriously fail locally.
-    DEFAULT_TEST_SUITE_TIMEOUT=3600
+    DEFAULT_TEST_RUN_TIMEOUT=120
+    DEFAULT_TEST_FREEZE_TIMEOUT=600
+    DEFAULT_TEST_SUITE_TIMEOUT=7200
 fi
-TEST_RUN_TIMEOUT="${TEST_RUN_TIMEOUT:-30}"
-TEST_FREEZE_TIMEOUT="${TEST_FREEZE_TIMEOUT:-180}"
+TEST_RUN_TIMEOUT="${TEST_RUN_TIMEOUT:-$DEFAULT_TEST_RUN_TIMEOUT}"
+TEST_FREEZE_TIMEOUT="${TEST_FREEZE_TIMEOUT:-$DEFAULT_TEST_FREEZE_TIMEOUT}"
 TEST_SUITE_TIMEOUT="${TEST_SUITE_TIMEOUT:-$DEFAULT_TEST_SUITE_TIMEOUT}"
 TEST_TIMEOUT_KILL_AFTER="${TEST_TIMEOUT_KILL_AFTER:-5}"
 
@@ -195,6 +201,8 @@ run_in_image() {
         -e TEST_FREEZE_TIMEOUT="$TEST_FREEZE_TIMEOUT" \
         -e TEST_SUITE_TIMEOUT="$TEST_SUITE_TIMEOUT" \
         -e TEST_TIMEOUT_KILL_AFTER="$TEST_TIMEOUT_KILL_AFTER" \
+        -e TEST_START_AT="${TEST_START_AT:-}" \
+        -e TEST_STOP_AFTER="${TEST_STOP_AFTER:-}" \
         -e RUN_TIMEOUT="$TEST_RUN_TIMEOUT" \
         -e RUN_TIMEOUT_KILL_AFTER="$TEST_TIMEOUT_KILL_AFTER" \
         "$image" \
@@ -216,6 +224,15 @@ run_in_image() {
         ' sh "$cmd"
 }
 
+matrix_status=0
+
+if [[ "$DO_BUILD" -eq 1 && "$DO_RUN" -eq 1 ]]; then
+    for stale_dir in "$FROZEN_ROOT"/frozen-*-"$ARCH"; do
+        [[ -e "$stale_dir" || -L "$stale_dir" ]] || continue
+        rm -rf "$stale_dir"
+    done
+fi
+
 if [[ "$DO_BUILD" -eq 1 ]]; then
     echo "[cross-matrix] build stage (arch=$ARCH, suite-timeout=${TEST_SUITE_TIMEOUT}s)"
     for pair in "${ENVS[@]}"; do
@@ -224,11 +241,17 @@ if [[ "$DO_BUILD" -eq 1 ]]; then
         out_dir="/frozen-all/frozen-${name}-${ARCH}"
         host_out="$FROZEN_ROOT/frozen-${name}-${ARCH}"
 
-        rm -rf "$host_out"
-        mkdir -p "$host_out"
+        if ! rm -rf "$host_out" || ! mkdir -p "$host_out"; then
+            echo "[cross-matrix] ERROR: cannot prepare frozen-${name}-${ARCH}" >&2
+            matrix_status=1
+            continue
+        fi
 
         echo "[cross-matrix] build in $image -> frozen-${name}-${ARCH}"
-        run_in_image "$image" "OUTDIR=$out_dir sh /work/tests/cross-build.sh"
+        if ! run_in_image "$image" "OUTDIR=$out_dir sh /work/tests/cross-build.sh"; then
+            echo "[cross-matrix] ERROR: build failed in $image" >&2
+            matrix_status=1
+        fi
     done
 fi
 
@@ -246,8 +269,15 @@ if [[ "$DO_RUN" -eq 1 ]]; then
         name="${pair%%|*}"
         image="${pair##*|}"
         echo "[cross-matrix] run on $image against $source_glob"
-        run_in_image "$image" "DLFREEZE_REQUIRE_DIRECT_CONTRACTS=$REQUIRE_DIRECT_CONTRACTS DLFREEZE_REQUIRE_RUNTIME_ARTIFACTS=$REQUIRE_DIRECT_CONTRACTS FROZEN_DIR=/frozen-all FROZEN_GLOB='$source_glob' sh /work/tests/cross-run.sh"
+        if ! run_in_image "$image" "DLFREEZE_REQUIRE_DIRECT_CONTRACTS=$REQUIRE_DIRECT_CONTRACTS DLFREEZE_REQUIRE_RUNTIME_ARTIFACTS=$REQUIRE_DIRECT_CONTRACTS FROZEN_DIR=/frozen-all FROZEN_GLOB='$source_glob' sh /work/tests/cross-run.sh"; then
+            echo "[cross-matrix] ERROR: run failed in $image" >&2
+            matrix_status=1
+        fi
     done
 fi
 
+if [[ "$matrix_status" -ne 0 ]]; then
+    echo "[cross-matrix] failed" >&2
+    exit "$matrix_status"
+fi
 echo "[cross-matrix] done"

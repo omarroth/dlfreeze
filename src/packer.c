@@ -3,6 +3,7 @@
 #include "dynamic_semantics.h"
 #include "elf_parser.h"
 #include "elf_sections.h"
+#include "gnu_properties.h"
 #include "glibc_layout.h"
 #include "musl_layout.h"
 #include "load_segments.h"
@@ -48,6 +49,9 @@ typedef Elf64_Xword Elf64_Relr;
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
 #endif
+#ifndef PT_GNU_PROPERTY
+#define PT_GNU_PROPERTY 0x6474e553
+#endif
 #ifndef DT_DEPAUDIT
 #define DT_DEPAUDIT 0x6ffffefb
 #endif
@@ -60,43 +64,6 @@ typedef Elf64_Xword Elf64_Relr;
 #ifndef DT_FILTER
 #define DT_FILTER 0x7fffffff
 #endif
-#ifndef DF_1_NOW
-#define DF_1_NOW 0x00000001
-#endif
-#ifndef DF_1_NODELETE
-#define DF_1_NODELETE 0x00000008
-#endif
-#ifndef DF_1_ORIGIN
-#define DF_1_ORIGIN 0x00000080
-#endif
-#ifndef DF_1_NODEFLIB
-#define DF_1_NODEFLIB 0x00000800
-#endif
-#ifndef DF_1_NODUMP
-#define DF_1_NODUMP 0x00001000
-#endif
-#ifndef DF_1_NODIRECT
-#define DF_1_NODIRECT 0x00020000
-#endif
-#ifndef DF_1_PIE
-#define DF_1_PIE 0x08000000
-#endif
-#ifndef DF_ORIGIN
-#define DF_ORIGIN 0x00000001
-#endif
-#ifndef DF_SYMBOLIC
-#define DF_SYMBOLIC 0x00000002
-#endif
-#ifndef DF_TEXTREL
-#define DF_TEXTREL 0x00000004
-#endif
-#ifndef DF_BIND_NOW
-#define DF_BIND_NOW 0x00000008
-#endif
-#ifndef DF_STATIC_TLS
-#define DF_STATIC_TLS 0x00000010
-#endif
-
 /* Fallback defines for aarch64 relocation types missing from older elf.h */
 #ifndef R_AARCH64_IRELATIVE
 #define R_AARCH64_IRELATIVE  1032
@@ -143,17 +110,8 @@ typedef Elf64_Xword Elf64_Relr;
     #define ARCH_RELOC_TLSDESC    R_AARCH64_TLSDESC
   #define ARCH_RELOC_IRELATIVE  R_AARCH64_IRELATIVE
   #define ARCH_RELOC_COPY       R_AARCH64_COPY
-    #define PRELINK_TLS_ABOVE_TP  1
-    #define PRELINK_TLS_TCB_SIZE  0x10
 #else
   #error "Unsupported architecture"
-#endif
-
-#ifndef PRELINK_TLS_ABOVE_TP
-#define PRELINK_TLS_ABOVE_TP 0
-#endif
-#ifndef PRELINK_TLS_TCB_SIZE
-#define PRELINK_TLS_TCB_SIZE 0
 #endif
 
 static int u64_add_checked(uint64_t left, uint64_t right, uint64_t *out)
@@ -228,11 +186,16 @@ static int packer_phdr_write(uint8_t *table, size_t table_size,
 /* ------------------------------------------------------------------ */
 /* Data file list helpers                                              */
 /* ------------------------------------------------------------------ */
+static int dep_file_snapshots_equal(
+    const struct dep_file_snapshot *left,
+    const struct dep_file_snapshot *right);
+
 void data_file_list_init(struct data_file_list *dl)
 {
     dl->paths      = NULL;
     dl->source_paths = NULL;
     dl->kinds      = NULL;
+    dl->snapshots  = NULL;
     dl->count      = 0;
     dl->capacity   = 0;
     dl->failed     = 0;
@@ -240,14 +203,22 @@ void data_file_list_init(struct data_file_list *dl)
 
 static void data_file_list_add_ex(struct data_file_list *dl, const char *path,
                                   const char *source_path,
-                                  enum data_file_kind kind)
+                                  enum data_file_kind kind,
+                                  const struct dep_file_snapshot *snapshot)
 {
     char *path_copy;
     char *source_copy = NULL;
 
-    if (!dl || !path ||
-        (kind == DATA_FILE_KIND_REGULAR && !source_path) || dl->failed)
+    if (!dl)
         return;
+    if (dl->failed)
+        return;
+    if (!path ||
+        (kind == DATA_FILE_KIND_REGULAR &&
+         (!source_path || !snapshot || !snapshot->valid))) {
+        dl->failed = 1;
+        return;
+    }
     /* An exact request identity may occur many times, but it must never
      * silently change kind or source during one trace.  Different request
      * aliases are deliberately allowed to name the same canonical source. */
@@ -257,7 +228,8 @@ static void data_file_list_add_ex(struct data_file_list *dl, const char *path,
         if (dl->kinds[i] != kind ||
             (kind == DATA_FILE_KIND_REGULAR &&
              (!dl->source_paths[i] ||
-              strcmp(dl->source_paths[i], source_path) != 0)))
+              strcmp(dl->source_paths[i], source_path) != 0 ||
+              !dep_file_snapshots_equal(&dl->snapshots[i], snapshot))))
             dl->failed = 1;
         return;
     }
@@ -267,6 +239,7 @@ static void data_file_list_add_ex(struct data_file_list *dl, const char *path,
         char **new_paths;
         char **new_sources;
         enum data_file_kind *new_kinds;
+        struct dep_file_snapshot *new_snapshots;
 
         if (dl->capacity > INT_MAX / 2) {
             dl->failed = 1;
@@ -275,17 +248,20 @@ static void data_file_list_add_ex(struct data_file_list *dl, const char *path,
         newcap = dl->capacity ? dl->capacity * 2 : 64;
         if ((size_t)newcap > SIZE_MAX / sizeof(*new_paths) ||
             (size_t)newcap > SIZE_MAX / sizeof(*new_sources) ||
-            (size_t)newcap > SIZE_MAX / sizeof(*new_kinds)) {
+            (size_t)newcap > SIZE_MAX / sizeof(*new_kinds) ||
+            (size_t)newcap > SIZE_MAX / sizeof(*new_snapshots)) {
             dl->failed = 1;
             return;
         }
         new_paths = malloc((size_t)newcap * sizeof(*new_paths));
         new_sources = calloc((size_t)newcap, sizeof(*new_sources));
         new_kinds = calloc((size_t)newcap, sizeof(*new_kinds));
-        if (!new_paths || !new_sources || !new_kinds) {
+        new_snapshots = calloc((size_t)newcap, sizeof(*new_snapshots));
+        if (!new_paths || !new_sources || !new_kinds || !new_snapshots) {
             free(new_paths);
             free(new_sources);
             free(new_kinds);
+            free(new_snapshots);
             dl->failed = 1;
             return;
         }
@@ -296,13 +272,17 @@ static void data_file_list_add_ex(struct data_file_list *dl, const char *path,
                    (size_t)dl->count * sizeof(*new_sources));
             memcpy(new_kinds, dl->kinds,
                    (size_t)dl->count * sizeof(*new_kinds));
+            memcpy(new_snapshots, dl->snapshots,
+                   (size_t)dl->count * sizeof(*new_snapshots));
         }
         free(dl->paths);
         free(dl->source_paths);
         free(dl->kinds);
+        free(dl->snapshots);
         dl->paths = new_paths;
         dl->source_paths = new_sources;
         dl->kinds = new_kinds;
+        dl->snapshots = new_snapshots;
         dl->capacity = newcap;
     }
 
@@ -318,28 +298,32 @@ static void data_file_list_add_ex(struct data_file_list *dl, const char *path,
     dl->paths[dl->count]      = path_copy;
     dl->source_paths[dl->count] = source_copy;
     dl->kinds[dl->count] = kind;
+    if (snapshot)
+        dl->snapshots[dl->count] = *snapshot;
     dl->count++;
 }
 
 void data_file_list_add(struct data_file_list *dl, const char *path,
-                        const char *source_path)
+                        const char *source_path,
+                        const struct dep_file_snapshot *snapshot)
 {
-    data_file_list_add_ex(dl, path, source_path, DATA_FILE_KIND_REGULAR);
+    data_file_list_add_ex(dl, path, source_path, DATA_FILE_KIND_REGULAR,
+                          snapshot);
 }
 
 void data_file_list_add_virtual(struct data_file_list *dl, const char *path)
 {
-    data_file_list_add_ex(dl, path, NULL, DATA_FILE_KIND_VIRTUAL);
+    data_file_list_add_ex(dl, path, NULL, DATA_FILE_KIND_VIRTUAL, NULL);
 }
 
 void data_file_list_add_negative(struct data_file_list *dl, const char *path)
 {
-    data_file_list_add_ex(dl, path, NULL, DATA_FILE_KIND_NEGATIVE);
+    data_file_list_add_ex(dl, path, NULL, DATA_FILE_KIND_NEGATIVE, NULL);
 }
 
 void data_file_list_add_directory(struct data_file_list *dl, const char *path)
 {
-    data_file_list_add_ex(dl, path, NULL, DATA_FILE_KIND_DIRECTORY);
+    data_file_list_add_ex(dl, path, NULL, DATA_FILE_KIND_DIRECTORY, NULL);
 }
 
 void data_file_list_free(struct data_file_list *dl)
@@ -351,9 +335,11 @@ void data_file_list_free(struct data_file_list *dl)
     free(dl->paths);
     free(dl->source_paths);
     free(dl->kinds);
+    free(dl->snapshots);
     dl->paths = NULL;
     dl->source_paths = NULL;
     dl->kinds = NULL;
+    dl->snapshots = NULL;
     dl->count = dl->capacity = dl->failed = 0;
 }
 
@@ -1032,6 +1018,16 @@ static int packer_stream_seek(FILE *stream, uint64_t offset)
     return fseeko(stream, (off_t)offset, SEEK_SET);
 }
 
+static int packer_fchmod_retry(int fd, mode_t mode)
+{
+    int result;
+
+    do {
+        result = fchmod(fd, mode);
+    } while (result < 0 && errno == EINTR);
+    return result;
+}
+
 static int create_output_transaction(const char *output_path,
                                      char transaction_path[PATH_MAX],
                                      FILE **stream_out)
@@ -1072,6 +1068,12 @@ static int create_output_transaction(const char *output_path,
     fd = mkstemp(transaction_path);
     if (fd < 0)
         return -1;
+    /* mkstemp's 0600 request is still filtered by the caller's umask.  Keep
+     * an incomplete artifact non-executable, but make its owner permissions
+     * exact so later transaction phases can safely reopen it even under a
+     * maximally restrictive umask. */
+    if (packer_fchmod_retry(fd, 0600) < 0)
+        goto fail;
     fd_flags = fcntl(fd, F_GETFD);
     if (fd_flags < 0 || fcntl(fd, F_SETFD, fd_flags | FD_CLOEXEC) < 0)
         goto fail;
@@ -1131,7 +1133,7 @@ static int sync_output_transaction(const char *path)
     fd = open(path, O_RDWR | O_CLOEXEC);
     if (fd < 0)
         return -1;
-    if (fchmod(fd, 0755) < 0)
+    if (packer_fchmod_retry(fd, 0755) < 0)
         saved_errno = errno ? errno : EIO;
     if (fsync(fd) < 0 && saved_errno == 0)
         saved_errno = errno ? errno : EIO;
@@ -1393,7 +1395,7 @@ static int make_transaction_copy(const char *path, const char *suffix,
     dst = mkstemp(copy_path);
     if (dst < 0)
         goto out;
-    if (fchmod(dst, st.st_mode & 0777) < 0)
+    if (packer_fchmod_retry(dst, st.st_mode & 0777) < 0)
         goto out;
 
     for (;;) {
@@ -1725,6 +1727,17 @@ static int bounded_elf_section_read(const struct bounded_elf_sections *table,
         free(data);
         return -1;
     }
+    /* A non-empty SHT_STRTAB describes the complete ELF string table, not a
+     * sliced range.  Admit its two ABI sentinels once so every later
+     * in-range symbol-name offset is a bounded, terminated suffix.  The ELF
+     * format also permits an empty string-table section; consumers still
+     * reject every name offset against its zero extent. */
+    if (section->sh_type == SHT_STRTAB && size != 0 &&
+        (((const char *)data)[0] != '\0' ||
+         ((const char *)data)[size - 1] != '\0')) {
+        free(data);
+        return -1;
+    }
     *data_out = data;
     *size_out = size;
     return 0;
@@ -1771,10 +1784,6 @@ static int find_named_symbol(FILE *file, const Elf64_Ehdr *ehdr,
                 break;
             }
             name = strings + symbol->st_name;
-            if (!memchr(name, '\0', strings_size - symbol->st_name)) {
-                result = -1;
-                break;
-            }
             if (symbol->st_shndx != SHN_UNDEF &&
                 strcmp(name, target) == 0) {
                 *value_out = symbol->st_value;
@@ -1832,10 +1841,6 @@ static int has_rtld_import(FILE *file, const Elf64_Ehdr *ehdr)
                 break;
             }
             name = strings + symbol->st_name;
-            if (!memchr(name, '\0', strings_size - symbol->st_name)) {
-                result = -1;
-                break;
-            }
             if (symbol->st_shndx == SHN_UNDEF &&
                 (strcmp(name, "_rtld_global") == 0 ||
                  strcmp(name, "_rtld_global_ro") == 0)) {
@@ -1933,10 +1938,6 @@ static int needs_runtime_reloc_scan(FILE *f, const Elf64_Ehdr *ehdr)
                 break;
             }
             const char *name = strtab + syms[sidx].st_name;
-            if (!memchr(name, '\0', strtab_size - syms[sidx].st_name)) {
-                needs_scan = -1;
-                break;
-            }
             (void)name;
             needs_scan = 1;
             break;
@@ -2069,21 +2070,38 @@ static int compute_lib_meta(const char *path,
     int tls_count = 0;
     int dynamic_count = 0;
     int gnu_stack_count = 0;
+    int gnu_property_count = 0;
     int phdr_count = 0;
     int saw_load_header = 0;
     int executable_stack = 0;
     Elf64_Phdr tls_phdr = {0};
     Elf64_Phdr dynamic_phdr = {0};
+    Elf64_Phdr gnu_property_phdr = {0};
     Elf64_Phdr self_phdr = {0};
     int have_tls_phdr = 0;
     int have_dynamic_phdr = 0;
+    int gnu_property_invalid = 0;
     int have_self_phdr = 0;
     for (int i = 0; i < ehdr.e_phnum; i++) {
         Elf64_Phdr ph;
 
         if (!packer_phdr_read(phdrs, phsz, (size_t)i,
-                              ehdr.e_phentsize, &ph) ||
-            ph.p_offset > (uint64_t)st.st_size ||
+                              ehdr.e_phentsize, &ph)) {
+            free(phdrs); fclose(f); return -1;
+        }
+        if (ph.p_type == PT_GNU_PROPERTY) {
+            if (++gnu_property_count != 1 || ph.p_filesz == 0 ||
+                ph.p_filesz > ph.p_memsz || ph.p_filesz > SIZE_MAX ||
+                ph.p_offset > (uint64_t)st.st_size ||
+                ph.p_filesz > (uint64_t)st.st_size - ph.p_offset ||
+                ph.p_memsz > UINT64_MAX - ph.p_vaddr) {
+                gnu_property_invalid = 1;
+            } else {
+                gnu_property_phdr = ph;
+            }
+            continue;
+        }
+        if (ph.p_offset > (uint64_t)st.st_size ||
             ph.p_filesz > (uint64_t)st.st_size - ph.p_offset ||
             ph.p_memsz > UINT64_MAX - ph.p_vaddr ||
             ((ph.p_type == PT_LOAD || ph.p_type == PT_DYNAMIC ||
@@ -2161,6 +2179,48 @@ static int compute_lib_meta(const char *path,
                 phdr_vaddr = candidate;
             if (ph.p_flags & PF_R)
                 phdr_translation_readable = 1;
+        }
+    }
+
+    if (gnu_property_count != 0) {
+        uint8_t *property_bytes = NULL;
+        int property_admitted = 0;
+
+        if (!gnu_property_invalid &&
+            dlfrz_segment_is_contained_by_load_bytes(
+                phdrs, ehdr.e_phnum, ehdr.e_phentsize,
+                &gnu_property_phdr)) {
+            property_bytes = malloc((size_t)gnu_property_phdr.p_filesz);
+            if (!property_bytes) {
+                free(phdrs);
+                fclose(f);
+                return -1;
+            }
+            if (packer_pread_exact(
+                    fileno(f), property_bytes,
+                    (size_t)gnu_property_phdr.p_filesz,
+                    gnu_property_phdr.p_offset) < 0) {
+                int saved_errno = errno ? errno : EIO;
+
+                free(property_bytes);
+                free(phdrs);
+                fclose(f);
+                errno = saved_errno;
+                return -1;
+            }
+            property_admitted = dlfrz_gnu_property_segment_parse(
+                property_bytes, (size_t)gnu_property_phdr.p_filesz, NULL);
+        }
+        free(property_bytes);
+        if (!property_admitted) {
+            fprintf(stderr,
+                    "dlfreeze: warning: %s has a malformed or unsupported "
+                    "PT_GNU_PROPERTY contract; direct-load is unavailable\n",
+                    path);
+            free(phdrs);
+            if (fclose(f) != 0)
+                return -1;
+            return 1;
         }
     }
 
@@ -2296,21 +2356,90 @@ static int compute_lib_meta(const char *path,
  * segments back to the frozen binary.
  */
 
+enum pl_relocation_table_kind {
+    PL_RELOCATION_TABLE_RELA,
+    PL_RELOCATION_TABLE_JMPREL,
+    PL_RELOCATION_TABLE_RELR
+};
+
+/* Relocation tables are ordinary PT_LOAD bytes and may legally alias one
+ * another.  Keep both the mapped address and the admitted authority so a
+ * writable table can be copied once without losing exact/partial aliases. */
+struct pl_relocation_source_range {
+    uint64_t vaddr;
+    size_t size;
+    const uint8_t *live;
+    const uint8_t *authority;
+    enum pl_relocation_table_kind kind;
+};
+
+struct pl_relocation_source_component {
+    uint64_t vaddr;
+    size_t size;
+    const uint8_t *live;
+    const uint8_t *authority;
+    uint8_t copied;
+};
+
+enum pl_control_metadata_kind {
+    PL_CONTROL_ELF_HEADER,
+    PL_CONTROL_PROGRAM_HEADERS,
+    PL_CONTROL_SECTION_HEADERS,
+    PL_CONTROL_SECTION_SYMBOLS,
+    PL_CONTROL_SECTION_STRINGS,
+    PL_CONTROL_DYNAMIC,
+    PL_CONTROL_RELA,
+    PL_CONTROL_JMPREL,
+    PL_CONTROL_RELR,
+    PL_CONTROL_DYNSTR,
+    PL_CONTROL_DYNSYM,
+    PL_CONTROL_VERSYM,
+    PL_CONTROL_GNU_HASH,
+    PL_CONTROL_SYSV_HASH,
+    PL_CONTROL_VERDEF,
+    PL_CONTROL_VERDAUX,
+    PL_CONTROL_VERNEED,
+    PL_CONTROL_VERNAUX,
+    PL_CONTROL_GNU_PROPERTY
+};
+
+/* Prelink output is one serialized file even when distinct PT_LOAD mappings
+ * alias the same input bytes.  File-coordinate control ranges make a store
+ * through any such virtual alias visible to the overlap gate. */
+struct pl_control_file_range {
+    uint64_t file_offset;
+    size_t size;
+    enum pl_control_metadata_kind kind;
+};
+
+struct pl_control_range_builder {
+    struct pl_control_file_range *ranges;
+    size_t count;
+    size_t capacity;
+};
+
+/* Only aliases declared writable by ELF need a retained byte snapshot.
+ * Read-only metadata stays zero-copy on ordinary objects. */
+struct pl_control_writable_view {
+    uint64_t file_offset;
+    uint64_t vaddr;
+    size_t size;
+    const uint8_t *live;
+    const uint8_t *authority;
+};
+
 struct prelink_obj {
-    const char       *name;
     uint64_t          base;
     uint32_t          flags;
+    size_t            file_size;
     const uint8_t    *phdr_base;
     uint16_t          phdr_num;
     uint16_t          phdr_entsz;
     const Elf64_Sym  *dynsym;
     const char       *dynstr;
     size_t            dynstr_size;
+    uint8_t           dynstr_suffixes_bounded;
     uint32_t          dynsym_count;
-    const uint32_t   *gnu_hash;
-    const uint32_t   *sysv_hash;
-    const uint16_t   *versym;
-
     const Elf64_Rela *rela;
     size_t            rela_count;
     const Elf64_Rela *jmprel;
@@ -2318,23 +2447,55 @@ struct prelink_obj {
     const Elf64_Relr *relr;
     size_t            relr_count;
 
-    int64_t           tls_tpoff;
-    size_t            tls_modid;
-    uint64_t          tls_memsz;
-    uint64_t          tls_align;
+    struct pl_relocation_source_range relocation_sources[3];
+    struct pl_relocation_source_component relocation_components[3];
+    uint8_t           relocation_source_count;
+    uint8_t           relocation_component_count;
+    void             *relocation_source_storage;
+    size_t            relocation_source_storage_size;
+    struct pl_control_file_range *control_ranges;
+    size_t            control_range_count;
+    struct pl_control_writable_view *control_writable_views;
+    size_t            control_writable_view_count;
+    void             *control_snapshot_storage;
+    size_t            control_snapshot_storage_size;
 };
+
+#ifdef DLFREEZE_PRELINK_RELOCATION_GATE
+static int g_pl_relocation_snapshot_fail_allocation;
+static size_t g_pl_relocation_snapshot_live_allocations;
+#endif
+
+static void *pl_relocation_snapshot_allocate(size_t size)
+{
+    void *storage;
+
+#ifdef DLFREEZE_PRELINK_RELOCATION_GATE
+    if (g_pl_relocation_snapshot_fail_allocation)
+        return NULL;
+#endif
+    storage = malloc(size);
+#ifdef DLFREEZE_PRELINK_RELOCATION_GATE
+    if (storage)
+        g_pl_relocation_snapshot_live_allocations++;
+#endif
+    return storage;
+}
+
+static void pl_relocation_snapshot_free(void *storage)
+{
+    if (!storage)
+        return;
+#ifdef DLFREEZE_PRELINK_RELOCATION_GATE
+    if (g_pl_relocation_snapshot_live_allocations != 0)
+        g_pl_relocation_snapshot_live_allocations--;
+#endif
+    free(storage);
+}
 
 /* ELF relocation offsets are byte addresses; a valid output field need not
  * have C's uint64_t alignment (packed data is a common example).  Keep every
  * prelink scalar access defined on strict-alignment hosts. */
-static uint64_t pl_relocation_load_u64(const void *address)
-{
-    uint64_t value;
-
-    memcpy(&value, address, sizeof(value));
-    return value;
-}
-
 static void pl_relocation_store_u64(void *address, uint64_t value)
 {
     memcpy(address, &value, sizeof(value));
@@ -2402,6 +2563,670 @@ static int pl_u64_mul(uint64_t left, uint64_t right, uint64_t *result)
     return 1;
 }
 
+static void pl_control_range_builder_release(
+    struct pl_control_range_builder *builder)
+{
+    if (!builder)
+        return;
+    free(builder->ranges);
+    memset(builder, 0, sizeof(*builder));
+}
+
+static int pl_control_range_builder_add_file(
+    const struct prelink_obj *obj,
+    struct pl_control_range_builder *builder,
+    uint64_t file_offset, size_t size,
+    enum pl_control_metadata_kind kind)
+{
+    struct pl_control_file_range *grown;
+    size_t new_capacity;
+
+    if (!obj || !builder)
+        return 0;
+    if (size == 0)
+        return 1;
+    if (file_offset > obj->file_size ||
+        size > obj->file_size - (size_t)file_offset)
+        return 0;
+    if (builder->count == builder->capacity) {
+        new_capacity = builder->capacity ? builder->capacity * 2 : 32;
+        if (new_capacity < builder->capacity ||
+            new_capacity > SIZE_MAX / sizeof(*grown))
+            return 0;
+        grown = realloc(builder->ranges, new_capacity * sizeof(*grown));
+        if (!grown)
+            return 0;
+        builder->ranges = grown;
+        builder->capacity = new_capacity;
+    }
+    builder->ranges[builder->count].file_offset = file_offset;
+    builder->ranges[builder->count].size = size;
+    builder->ranges[builder->count].kind = kind;
+    builder->count++;
+    return 1;
+}
+
+/* Translate one complete mapped, file-backed range to the serialized input
+ * bytes which created it.  More than one virtual PT_LOAD may name the same
+ * file bytes, but one virtual range must never have two different file
+ * translations. */
+static int pl_vaddr_file_range(const struct prelink_obj *obj,
+                               uint64_t vaddr, size_t size,
+                               uint32_t required_flags,
+                               uint64_t *file_offset_out)
+{
+    uint64_t selected = 0;
+    int found = 0;
+
+    if (!obj || !file_offset_out || size == 0)
+        return 0;
+    for (uint16_t i = 0; i < obj->phdr_num; i++) {
+        Elf64_Phdr ph;
+        uint64_t delta;
+        uint64_t candidate;
+
+        if (!pl_phdr_read(obj, i, &ph) || ph.p_type != PT_LOAD ||
+            (ph.p_flags & required_flags) != required_flags ||
+            vaddr < ph.p_vaddr)
+            continue;
+        delta = vaddr - ph.p_vaddr;
+        if (delta > ph.p_filesz || size > ph.p_filesz - delta ||
+            !pl_u64_add(ph.p_offset, delta, &candidate) ||
+            candidate > obj->file_size ||
+            size > obj->file_size - (size_t)candidate)
+            continue;
+        if (found && selected != candidate)
+            return 0;
+        selected = candidate;
+        found = 1;
+    }
+    if (!found)
+        return 0;
+    *file_offset_out = selected;
+    return 1;
+}
+
+static int pl_control_range_builder_add_vaddr(
+    const struct prelink_obj *obj,
+    struct pl_control_range_builder *builder,
+    uint64_t vaddr, size_t size,
+    enum pl_control_metadata_kind kind)
+{
+    uint64_t file_offset;
+
+    return size == 0 ||
+        (pl_vaddr_file_range(obj, vaddr, size, PF_R, &file_offset) &&
+         pl_control_range_builder_add_file(
+             obj, builder, file_offset, size, kind));
+}
+
+static int pl_control_file_range_compare(const void *left_pointer,
+                                         const void *right_pointer)
+{
+    const struct pl_control_file_range *left = left_pointer;
+    const struct pl_control_file_range *right = right_pointer;
+
+    if (left->file_offset < right->file_offset)
+        return -1;
+    if (left->file_offset > right->file_offset)
+        return 1;
+    if (left->size < right->size)
+        return -1;
+    if (left->size > right->size)
+        return 1;
+    return 0;
+}
+
+/* Publish a merged serialized-byte authority and snapshots of every PF_W
+ * virtual alias.  All allocation and copying completes before ownership is
+ * transferred to obj, so a failed optional prelink leaves no partial state. */
+static int pl_control_authority_admit(
+    struct prelink_obj *obj, struct pl_control_range_builder *builder)
+{
+    struct pl_control_writable_view *views = NULL;
+    uint8_t *storage = NULL;
+    size_t merged_count = 0;
+    size_t view_count = 0;
+    size_t storage_size = 0;
+
+    if (!obj || !builder || obj->control_ranges ||
+        obj->control_range_count != 0 || obj->control_writable_views ||
+        obj->control_writable_view_count != 0 ||
+        obj->control_snapshot_storage)
+        return -1;
+    if (builder->count != 0 && !builder->ranges)
+        return -1;
+
+    if (builder->count > 1)
+        qsort(builder->ranges, builder->count, sizeof(builder->ranges[0]),
+              pl_control_file_range_compare);
+    for (size_t i = 0; i < builder->count; i++) {
+        struct pl_control_file_range current = builder->ranges[i];
+        uint64_t current_end;
+
+        if (current.size == 0 ||
+            !pl_u64_add(current.file_offset, current.size, &current_end) ||
+            current_end > obj->file_size)
+            goto fail;
+        if (merged_count != 0) {
+            struct pl_control_file_range *previous =
+                &builder->ranges[merged_count - 1];
+            uint64_t previous_end;
+
+            if (!pl_u64_add(previous->file_offset, previous->size,
+                            &previous_end))
+                goto fail;
+            if (current.file_offset <= previous_end) {
+                uint64_t merged_end = current_end > previous_end
+                    ? current_end : previous_end;
+
+                if (merged_end - previous->file_offset > SIZE_MAX)
+                    goto fail;
+                previous->size =
+                    (size_t)(merged_end - previous->file_offset);
+                continue;
+            }
+        }
+        builder->ranges[merged_count++] = current;
+    }
+
+    for (size_t r = 0; r < merged_count; r++) {
+        const struct pl_control_file_range *range = &builder->ranges[r];
+        uint64_t range_end;
+
+        if (!pl_u64_add(range->file_offset, range->size, &range_end))
+            goto fail;
+        for (uint16_t i = 0; i < obj->phdr_num; i++) {
+            Elf64_Phdr ph;
+            uint64_t ph_end;
+            uint64_t start;
+            uint64_t end;
+            uint64_t extent;
+
+            if (!pl_phdr_read(obj, i, &ph))
+                goto fail;
+            if (ph.p_type != PT_LOAD)
+                continue;
+            if (ph.p_filesz > ph.p_memsz ||
+                ph.p_offset > obj->file_size ||
+                ph.p_filesz > obj->file_size - (size_t)ph.p_offset ||
+                !pl_u64_add(ph.p_offset, ph.p_filesz, &ph_end))
+                goto fail;
+            if (!(ph.p_flags & PF_W) || ph.p_filesz == 0)
+                continue;
+            start = range->file_offset > ph.p_offset
+                ? range->file_offset : ph.p_offset;
+            end = range_end < ph_end ? range_end : ph_end;
+            if (start >= end)
+                continue;
+            extent = end - start;
+            if (extent > SIZE_MAX || view_count == SIZE_MAX ||
+                (size_t)extent > SIZE_MAX - storage_size)
+                goto fail;
+            view_count++;
+            storage_size += (size_t)extent;
+        }
+    }
+    if (view_count != 0) {
+        if (view_count > SIZE_MAX / sizeof(*views))
+            goto fail;
+        views = calloc(view_count, sizeof(*views));
+        if (!views)
+            goto fail;
+        storage = pl_relocation_snapshot_allocate(storage_size);
+        if (!storage)
+            goto fail;
+    }
+
+    {
+        size_t view_cursor = 0;
+        size_t storage_cursor = 0;
+
+        for (size_t r = 0; r < merged_count; r++) {
+            const struct pl_control_file_range *range = &builder->ranges[r];
+            uint64_t range_end;
+
+            if (!pl_u64_add(range->file_offset, range->size, &range_end))
+                goto fail;
+            for (uint16_t i = 0; i < obj->phdr_num; i++) {
+                struct pl_control_writable_view *view;
+                Elf64_Phdr ph;
+                uint64_t ph_end;
+                uint64_t start;
+                uint64_t end;
+                uint64_t delta;
+                uint64_t vaddr;
+                size_t extent;
+                uintptr_t live;
+
+                if (!pl_phdr_read(obj, i, &ph))
+                    goto fail;
+                if (ph.p_type != PT_LOAD)
+                    continue;
+                if (ph.p_filesz > ph.p_memsz ||
+                    ph.p_offset > obj->file_size ||
+                    ph.p_filesz > obj->file_size - (size_t)ph.p_offset ||
+                    !pl_u64_add(ph.p_offset, ph.p_filesz, &ph_end))
+                    goto fail;
+                if (!(ph.p_flags & PF_W) || ph.p_filesz == 0)
+                    continue;
+                start = range->file_offset > ph.p_offset
+                    ? range->file_offset : ph.p_offset;
+                end = range_end < ph_end ? range_end : ph_end;
+                if (start >= end)
+                    continue;
+                delta = start - ph.p_offset;
+                if (!pl_u64_add(ph.p_vaddr, delta, &vaddr) ||
+                    vaddr > UINTPTR_MAX || obj->base > UINTPTR_MAX - vaddr)
+                    goto fail;
+                live = (uintptr_t)(obj->base + vaddr);
+                extent = (size_t)(end - start);
+                if (view_cursor >= view_count ||
+                    extent > UINTPTR_MAX - live ||
+                    extent > storage_size - storage_cursor)
+                    goto fail;
+                view = &views[view_cursor++];
+                view->file_offset = start;
+                view->vaddr = vaddr;
+                view->size = extent;
+                view->live = (const uint8_t *)live;
+                view->authority = storage + storage_cursor;
+                memcpy(storage + storage_cursor, view->live, extent);
+                storage_cursor += extent;
+            }
+        }
+        if (view_cursor != view_count || storage_cursor != storage_size)
+            goto fail;
+    }
+
+    obj->control_ranges = builder->ranges;
+    obj->control_range_count = merged_count;
+    obj->control_writable_views = views;
+    obj->control_writable_view_count = view_count;
+    obj->control_snapshot_storage = storage;
+    obj->control_snapshot_storage_size = storage_size;
+    memset(builder, 0, sizeof(*builder));
+    return 0;
+
+fail:
+    pl_relocation_snapshot_free(storage);
+    free(views);
+    return -1;
+}
+
+static void pl_control_authority_release(struct prelink_obj *obj)
+{
+    if (!obj)
+        return;
+    pl_relocation_snapshot_free(obj->control_snapshot_storage);
+    free(obj->control_writable_views);
+    free(obj->control_ranges);
+    obj->control_ranges = NULL;
+    obj->control_range_count = 0;
+    obj->control_writable_views = NULL;
+    obj->control_writable_view_count = 0;
+    obj->control_snapshot_storage = NULL;
+    obj->control_snapshot_storage_size = 0;
+}
+
+static int pl_control_authority_unchanged(const struct prelink_obj *obj)
+{
+    if (!obj)
+        return 0;
+    for (size_t i = 0; i < obj->control_writable_view_count; i++) {
+        const struct pl_control_writable_view *view =
+            &obj->control_writable_views[i];
+
+        if (!view->live || !view->authority || view->size == 0 ||
+            memcmp(view->live, view->authority, view->size) != 0)
+            return 0;
+    }
+    return 1;
+}
+
+static int pl_vaddr_range_overlaps_writable_load(
+    const struct prelink_obj *obj, uint64_t vaddr, size_t size,
+    int *overlap_out)
+{
+    uint64_t end;
+
+    if (!obj || !overlap_out || size == 0 ||
+        !pl_u64_add(vaddr, (uint64_t)size, &end))
+        return 0;
+    *overlap_out = 0;
+    for (uint16_t i = 0; i < obj->phdr_num; i++) {
+        Elf64_Phdr ph;
+        uint64_t ph_end;
+
+        if (!pl_phdr_read(obj, i, &ph))
+            return 0;
+        if (ph.p_type != PT_LOAD || ph.p_memsz == 0)
+            continue;
+        if (ph.p_filesz > ph.p_memsz ||
+            !pl_u64_add(ph.p_vaddr, ph.p_memsz, &ph_end))
+            return 0;
+        if ((ph.p_flags & PF_W) != 0 &&
+            vaddr < ph_end && ph.p_vaddr < end) {
+            *overlap_out = 1;
+            return 1;
+        }
+    }
+    return 1;
+}
+
+static int pl_relocation_source_range_initialize(
+    struct pl_relocation_source_range *range,
+    enum pl_relocation_table_kind kind, uint64_t vaddr, size_t size,
+    const void *live, const struct prelink_obj *obj)
+{
+    uintptr_t expected;
+
+    if (!range || !obj || !live || size == 0 ||
+        vaddr > UINTPTR_MAX || obj->base > UINTPTR_MAX - vaddr)
+        return 0;
+    expected = (uintptr_t)(obj->base + vaddr);
+    if ((uintptr_t)live != expected)
+        return 0;
+    range->vaddr = vaddr;
+    range->size = size;
+    range->live = (const uint8_t *)live;
+    range->authority = (const uint8_t *)live;
+    range->kind = kind;
+    return 1;
+}
+
+/* Publish one immutable relocation-byte authority for every table.  Common
+ * read-only tables remain zero-copy.  Writable exact/partial aliases are
+ * merged before copying so every table observes the same admitted bytes. */
+static int pl_relocation_sources_admit(
+    struct prelink_obj *obj,
+    uint64_t rela_vaddr, size_t rela_size,
+    uint64_t jmprel_vaddr, size_t jmprel_size,
+    uint64_t relr_vaddr, size_t relr_size)
+{
+    struct pl_relocation_source_range ranges[3];
+    struct pl_relocation_source_component components[3];
+    size_t source_count = 0;
+    size_t component_count = 0;
+    size_t storage_size = 0;
+    uint8_t *storage = NULL;
+
+    if (!obj || obj->relocation_source_count != 0 ||
+        obj->relocation_component_count != 0 ||
+        obj->relocation_source_storage)
+        return -1;
+    memset(ranges, 0, sizeof(ranges));
+    memset(components, 0, sizeof(components));
+#define PL_ADD_RELOCATION_SOURCE(kind_value, vaddr_value, size_value, live_value) do { \
+        if ((size_value) != 0) { \
+            if (source_count >= sizeof(ranges) / sizeof(ranges[0]) || \
+                !pl_relocation_source_range_initialize( \
+                    &ranges[source_count], (kind_value), (vaddr_value), \
+                    (size_value), (live_value), obj)) \
+                return -1; \
+            source_count++; \
+        } \
+    } while (0)
+    PL_ADD_RELOCATION_SOURCE(
+        PL_RELOCATION_TABLE_RELA, rela_vaddr, rela_size, obj->rela);
+    PL_ADD_RELOCATION_SOURCE(
+        PL_RELOCATION_TABLE_JMPREL, jmprel_vaddr, jmprel_size,
+        obj->jmprel);
+    PL_ADD_RELOCATION_SOURCE(
+        PL_RELOCATION_TABLE_RELR, relr_vaddr, relr_size, obj->relr);
+#undef PL_ADD_RELOCATION_SOURCE
+
+    for (size_t i = 1; i < source_count; i++) {
+        struct pl_relocation_source_range value = ranges[i];
+        size_t position = i;
+
+        while (position != 0 &&
+               (value.vaddr < ranges[position - 1].vaddr ||
+                (value.vaddr == ranges[position - 1].vaddr &&
+                 value.size < ranges[position - 1].size))) {
+            ranges[position] = ranges[position - 1];
+            position--;
+        }
+        ranges[position] = value;
+    }
+
+    for (size_t i = 0; i < source_count; i++) {
+        uint64_t range_end;
+
+        if (!pl_u64_add(ranges[i].vaddr, (uint64_t)ranges[i].size,
+                        &range_end))
+            return -1;
+        if (component_count != 0) {
+            struct pl_relocation_source_component *component =
+                &components[component_count - 1];
+            uint64_t component_end;
+
+            if (!pl_u64_add(component->vaddr, (uint64_t)component->size,
+                            &component_end))
+                return -1;
+            if (ranges[i].vaddr <= component_end) {
+                uint64_t merged_end = range_end > component_end
+                    ? range_end : component_end;
+
+                if (merged_end - component->vaddr > SIZE_MAX)
+                    return -1;
+                component->size = (size_t)(merged_end - component->vaddr);
+                continue;
+            }
+        }
+        if (component_count >=
+            sizeof(components) / sizeof(components[0]))
+            return -1;
+        components[component_count].vaddr = ranges[i].vaddr;
+        components[component_count].size = ranges[i].size;
+        components[component_count].live = ranges[i].live;
+        components[component_count].authority = ranges[i].live;
+        component_count++;
+    }
+
+    for (size_t i = 0; i < component_count; i++) {
+        struct pl_relocation_source_component *component = &components[i];
+        int writable_overlap;
+
+        if (!pl_vaddr_range_overlaps_writable_load(
+                obj, component->vaddr, component->size,
+                &writable_overlap))
+            return -1;
+        if (!writable_overlap)
+            continue;
+        component->copied = 1;
+        if (component->size > SIZE_MAX - storage_size)
+            return -1;
+        storage_size += component->size;
+    }
+    if (storage_size != 0) {
+        size_t cursor = 0;
+
+        storage = pl_relocation_snapshot_allocate(storage_size);
+        if (!storage)
+            return -1;
+        for (size_t i = 0; i < component_count; i++) {
+            struct pl_relocation_source_component *component =
+                &components[i];
+
+            if (!component->copied)
+                continue;
+            memcpy(storage + cursor, component->live, component->size);
+            component->authority = storage + cursor;
+            cursor += component->size;
+        }
+        if (cursor != storage_size)
+            goto fail;
+    }
+
+    for (size_t i = 0; i < source_count; i++) {
+        uint64_t range_end;
+        int found = 0;
+
+        if (!pl_u64_add(ranges[i].vaddr, (uint64_t)ranges[i].size,
+                        &range_end))
+            goto fail;
+        for (size_t j = 0; j < component_count; j++) {
+            uint64_t component_end;
+            uint64_t delta;
+
+            if (!pl_u64_add(components[j].vaddr,
+                            (uint64_t)components[j].size,
+                            &component_end) ||
+                ranges[i].vaddr < components[j].vaddr ||
+                range_end > component_end)
+                continue;
+            delta = ranges[i].vaddr - components[j].vaddr;
+            if (delta > SIZE_MAX ||
+                (size_t)delta > components[j].size ||
+                ranges[i].size > components[j].size - (size_t)delta)
+                goto fail;
+            ranges[i].authority = components[j].authority + (size_t)delta;
+            found = 1;
+            break;
+        }
+        if (!found)
+            goto fail;
+    }
+
+    memcpy(obj->relocation_sources, ranges,
+           source_count * sizeof(ranges[0]));
+    memcpy(obj->relocation_components, components,
+           component_count * sizeof(components[0]));
+    obj->relocation_source_count = (uint8_t)source_count;
+    obj->relocation_component_count = (uint8_t)component_count;
+    obj->relocation_source_storage = storage;
+    obj->relocation_source_storage_size = storage_size;
+    for (size_t i = 0; i < source_count; i++) {
+        switch (ranges[i].kind) {
+        case PL_RELOCATION_TABLE_RELA:
+            obj->rela = (const Elf64_Rela *)ranges[i].authority;
+            break;
+        case PL_RELOCATION_TABLE_JMPREL:
+            obj->jmprel = (const Elf64_Rela *)ranges[i].authority;
+            break;
+        case PL_RELOCATION_TABLE_RELR:
+            obj->relr = (const Elf64_Relr *)ranges[i].authority;
+            break;
+        }
+    }
+    return 0;
+
+fail:
+    pl_relocation_snapshot_free(storage);
+    return -1;
+}
+
+static void pl_relocation_sources_release(struct prelink_obj *obj)
+{
+    if (!obj)
+        return;
+    for (size_t i = 0; i < obj->relocation_source_count; i++) {
+        const struct pl_relocation_source_range *range =
+            &obj->relocation_sources[i];
+
+        switch (range->kind) {
+        case PL_RELOCATION_TABLE_RELA:
+            obj->rela = (const Elf64_Rela *)range->live;
+            break;
+        case PL_RELOCATION_TABLE_JMPREL:
+            obj->jmprel = (const Elf64_Rela *)range->live;
+            break;
+        case PL_RELOCATION_TABLE_RELR:
+            obj->relr = (const Elf64_Relr *)range->live;
+            break;
+        }
+    }
+    pl_relocation_snapshot_free(obj->relocation_source_storage);
+    memset(obj->relocation_sources, 0, sizeof(obj->relocation_sources));
+    memset(obj->relocation_components, 0,
+           sizeof(obj->relocation_components));
+    obj->relocation_source_count = 0;
+    obj->relocation_component_count = 0;
+    obj->relocation_source_storage = NULL;
+    obj->relocation_source_storage_size = 0;
+}
+
+static int pl_relocation_destination_overlaps_admitted_metadata(
+    const struct prelink_obj *obj, uint64_t vaddr, size_t size)
+{
+    uint64_t end;
+    int writable_containing_load = 0;
+
+    if (!obj || size == 0 ||
+        !pl_u64_add(vaddr, (uint64_t)size, &end))
+        return size != 0;
+    for (size_t i = 0; i < obj->relocation_component_count; i++) {
+        const struct pl_relocation_source_component *component =
+            &obj->relocation_components[i];
+        uint64_t component_end;
+
+        if (!pl_u64_add(component->vaddr, (uint64_t)component->size,
+                        &component_end))
+            return 1;
+        if (vaddr < component_end && component->vaddr < end)
+            return 1;
+    }
+    /* A distinct PT_LOAD can serialize the target bytes at another file
+     * offset even when that alias is not itself PF_W.  The store is permitted
+     * through any containing writable mapping, but writeback emits every
+     * containing mapping.  Check every persisted translation.  A store which
+     * straddles p_filesz checks only its serialized prefix. */
+    for (uint16_t i = 0; i < obj->phdr_num; i++) {
+        Elf64_Phdr ph;
+        uint64_t delta;
+        uint64_t persisted;
+        uint64_t file_offset;
+        uint64_t file_end;
+
+        if (!pl_phdr_read(obj, i, &ph))
+            return 1;
+        if (ph.p_type != PT_LOAD || vaddr < ph.p_vaddr)
+            continue;
+        delta = vaddr - ph.p_vaddr;
+        if (delta > ph.p_memsz || size > ph.p_memsz - delta)
+            continue;
+        if (ph.p_flags & PF_W)
+            writable_containing_load = 1;
+        if (delta >= ph.p_filesz)
+            continue;
+        persisted = ph.p_filesz - delta;
+        if (persisted > size)
+            persisted = size;
+        if (!pl_u64_add(ph.p_offset, delta, &file_offset) ||
+            !pl_u64_add(file_offset, persisted, &file_end) ||
+            file_end > obj->file_size)
+            return 1;
+        for (size_t r = 0; r < obj->control_range_count; r++) {
+            const struct pl_control_file_range *range =
+                &obj->control_ranges[r];
+            uint64_t range_end;
+
+            if (!pl_u64_add(range->file_offset, range->size, &range_end))
+                return 1;
+            if (file_offset < range_end && range->file_offset < file_end)
+                return 1;
+        }
+    }
+    return !writable_containing_load;
+}
+
+static int pl_relocation_sources_unchanged(const struct prelink_obj *obj)
+{
+    if (!obj)
+        return 0;
+    for (size_t i = 0; i < obj->relocation_component_count; i++) {
+        const struct pl_relocation_source_component *component =
+            &obj->relocation_components[i];
+
+        if (component->copied &&
+            memcmp(component->live, component->authority,
+                   component->size) != 0)
+            return 0;
+    }
+    return 1;
+}
+
 static const Elf64_Sym *pl_dynsym(const struct prelink_obj *obj,
                                   uint32_t index)
 {
@@ -2410,16 +3235,29 @@ static const Elf64_Sym *pl_dynsym(const struct prelink_obj *obj,
     return &obj->dynsym[index];
 }
 
-static const char *pl_dynstr(const struct prelink_obj *obj, uint32_t offset)
+static const char *pl_dynstr_length(const struct prelink_obj *obj,
+                                    uint32_t offset, size_t *length_out)
 {
     const char *value;
+    const char *end;
 
     if (!obj || !obj->dynstr || offset >= obj->dynstr_size)
         return NULL;
     value = obj->dynstr + offset;
-    if (!memchr(value, '\0', obj->dynstr_size - offset))
+    end = memchr(value, '\0', obj->dynstr_size - offset);
+    if (!end)
         return NULL;
+    if (length_out)
+        *length_out = (size_t)(end - value);
     return value;
+}
+
+static const char *pl_dynstr(const struct prelink_obj *obj, uint32_t offset)
+{
+    if (!obj || !obj->dynstr || !obj->dynstr_suffixes_bounded ||
+        offset >= obj->dynstr_size)
+        return NULL;
+    return obj->dynstr + offset;
 }
 
 static const char *pl_symbol_name(const struct prelink_obj *obj,
@@ -2459,7 +3297,8 @@ static int pl_file_bytes_available(const struct prelink_obj *obj,
 
 static int pl_validate_sysv_hash(struct prelink_obj *obj, uint64_t address,
                                  const uint32_t **table_out,
-                                 uint32_t *symbol_count_out)
+                                 uint32_t *symbol_count_out,
+                                 size_t *table_size_out)
 {
     const uint32_t *header;
     const uint32_t *buckets;
@@ -2494,12 +3333,15 @@ static int pl_validate_sysv_hash(struct prelink_obj *obj, uint64_t address,
     }
     *table_out = header;
     *symbol_count_out = nchain;
+    if (table_size_out)
+        *table_size_out = (size_t)bytes;
     return 1;
 }
 
 static int pl_validate_gnu_hash(struct prelink_obj *obj, uint64_t address,
                                 const uint32_t **table_out,
-                                uint32_t *symbol_count_out)
+                                uint32_t *symbol_count_out,
+                                size_t *table_size_out)
 {
     const uint32_t *header;
     const uint32_t *buckets;
@@ -2587,25 +3429,19 @@ static int pl_validate_gnu_hash(struct prelink_obj *obj, uint64_t address,
     }
     *table_out = header;
     *symbol_count_out = count;
+    if (table_size_out)
+        *table_size_out = (size_t)total_bytes;
     return 1;
 }
 
-static uint32_t pl_gnu_hash(const char *name)
-{
-    uint32_t h = 5381;
-    for (const uint8_t *p = (const uint8_t *)name; *p; p++)
-        h = h * 33 + *p;
-    return h;
-}
-
-static uint32_t pl_sysv_hash(const char *name)
+static uint32_t pl_sysv_hash_n(const char *name, size_t length)
 {
     uint32_t h = 0;
 
-    for (const uint8_t *p = (const uint8_t *)name; *p; p++) {
+    for (size_t i = 0; i < length; i++) {
         uint32_t high;
 
-        h = (h << 4) + *p;
+        h = (h << 4) + (uint8_t)name[i];
         high = h & 0xf0000000U;
         if (high)
             h ^= high >> 24;
@@ -2614,177 +3450,197 @@ static uint32_t pl_sysv_hash(const char *name)
     return h;
 }
 
-static const Elf64_Sym *pl_lookup_gnu(const struct prelink_obj *obj,
-                                       const char *name, uint32_t gh)
+static int pl_version_file_budgets(const struct prelink_obj *obj,
+                                   size_t *record_bytes,
+                                   size_t *auxiliary_budget)
 {
-    const uint32_t *ht = obj->gnu_hash;
-    if (!ht) return NULL;
-    uint32_t nbuckets = ht[0], symoffset = ht[1], bloom_size = ht[2], bloom_shift = ht[3];
-    if (nbuckets == 0 || bloom_size == 0 || bloom_shift >= 32)
-        return NULL;
-    const uint64_t *bloom = (const uint64_t *)&ht[4];
-    const uint32_t *buckets = (const uint32_t *)(bloom + bloom_size);
-    const uint32_t *chain = &buckets[nbuckets];
+    size_t bytes = 0;
 
-    uint64_t word = bloom[(gh / 64) % bloom_size];
-    uint64_t mask = (1ULL << (gh % 64)) | (1ULL << ((gh >> bloom_shift) % 64));
-    if ((word & mask) != mask) return NULL;
+    if (!obj || !record_bytes || !auxiliary_budget)
+        return 0;
+    for (uint16_t i = 0; i < obj->phdr_num; i++) {
+        Elf64_Phdr ph;
 
-    uint32_t idx = buckets[gh % nbuckets];
-    if (idx < symoffset || idx >= obj->dynsym_count) return NULL;
-
-    const Elf64_Sym *fallback = NULL;
-    while (idx < obj->dynsym_count) {
-        uint32_t hv = chain[idx - symoffset];
-        if ((hv | 1) == (gh | 1)) {
-            const Elf64_Sym *s = pl_dynsym(obj, idx);
-            const char *symbol_name = pl_symbol_name(obj, s);
-
-            if (!s || !symbol_name)
-                return NULL;
-            if (s->st_shndx != 0 && strcmp(symbol_name, name) == 0) {
-                /* Prefer default version (versym without HIDDEN bit) */
-                if (!obj->versym || !(obj->versym[idx] & 0x8000))
-                    return s;
-                if (!fallback)
-                    fallback = s;
-            }
-        }
-        if (hv & 1) break;
-        idx++;
+        if (!pl_phdr_read(obj, i, &ph))
+            return 0;
+        if (ph.p_type != PT_LOAD)
+            continue;
+        if (ph.p_filesz > SIZE_MAX ||
+            (size_t)ph.p_filesz > SIZE_MAX - bytes)
+            return 0;
+        bytes += (size_t)ph.p_filesz;
     }
-    return fallback;
+    *record_bytes = bytes;
+    *auxiliary_budget = bytes / sizeof(Elf64_Verdaux);
+    return 1;
 }
 
-static const Elf64_Sym *pl_lookup_linear(const struct prelink_obj *obj,
-                                          const char *name)
+static int pl_add_verdef_control_ranges(
+    struct prelink_obj *obj, struct pl_control_range_builder *builder,
+    uint64_t address, uint32_t count, size_t record_bytes,
+    size_t *auxiliary_budget)
 {
-    const Elf64_Sym *fallback = NULL;
-    for (uint32_t i = 1; i < obj->dynsym_count; i++) {
-        const Elf64_Sym *s = pl_dynsym(obj, i);
-        const char *symbol_name = pl_symbol_name(obj, s);
+    uint64_t cursor = address;
+    int have_base = 0;
 
-        if (!s || !symbol_name)
-            return NULL;
-        if (s->st_shndx == 0) continue;
-        if (strcmp(symbol_name, name) == 0) {
-            if (!obj->versym || !(obj->versym[i] & 0x8000))
-                return s;
-            if (!fallback)
-                fallback = s;
+    if (!obj || !builder || !auxiliary_budget || count == 0 ||
+        count > record_bytes / sizeof(Elf64_Verdef))
+        return 0;
+    for (uint32_t i = 0; i < count; i++) {
+        Elf64_Verdef definition;
+        uint64_t auxiliary_address;
+        void *pointer;
+        uint16_t version;
+
+        if ((cursor & (_Alignof(Elf64_Verdef) - 1)) != 0 ||
+            !pl_vaddr_pointer(obj, cursor, sizeof(definition), 1, PF_R,
+                              &pointer))
+            return 0;
+        memcpy(&definition, pointer, sizeof(definition));
+        version = definition.vd_ndx & UINT16_C(0x7fff);
+        if (definition.vd_version != VER_DEF_CURRENT ||
+            definition.vd_cnt == 0 ||
+            (definition.vd_flags &
+             ~(VER_FLG_BASE | VER_FLG_WEAK | UINT16_C(0x4))) != 0 ||
+            version == VER_NDX_LOCAL ||
+            ((version == VER_NDX_GLOBAL) !=
+             ((definition.vd_flags & VER_FLG_BASE) != 0)) ||
+            (version == VER_NDX_GLOBAL && have_base) ||
+            definition.vd_aux < sizeof(definition) ||
+            definition.vd_aux % 4 != 0 ||
+            ((i + 1 < count) != (definition.vd_next != 0)) ||
+            (definition.vd_next != 0 &&
+             (definition.vd_next < sizeof(definition) ||
+              definition.vd_next % 4 != 0)) ||
+            !pl_u64_add(cursor, definition.vd_aux,
+                        &auxiliary_address) ||
+            !pl_control_range_builder_add_vaddr(
+                obj, builder, cursor, sizeof(definition),
+                PL_CONTROL_VERDEF))
+            return 0;
+        if (version == VER_NDX_GLOBAL)
+            have_base = 1;
+
+        for (uint16_t a = 0; a < definition.vd_cnt; a++) {
+            Elf64_Verdaux auxiliary;
+            const char *name;
+            size_t name_length;
+
+            if (*auxiliary_budget == 0 ||
+                (auxiliary_address &
+                 (_Alignof(Elf64_Verdaux) - 1)) != 0 ||
+                !pl_vaddr_pointer(obj, auxiliary_address,
+                                  sizeof(auxiliary), 1, PF_R, &pointer))
+                return 0;
+            (*auxiliary_budget)--;
+            memcpy(&auxiliary, pointer, sizeof(auxiliary));
+            name = pl_dynstr_length(obj, auxiliary.vda_name,
+                                    &name_length);
+            if (!name ||
+                (a == 0 &&
+                 (name_length == 0 ||
+                  definition.vd_hash !=
+                      pl_sysv_hash_n(name, name_length))) ||
+                ((a + 1 < definition.vd_cnt) !=
+                 (auxiliary.vda_next != 0)) ||
+                (auxiliary.vda_next != 0 &&
+                 (auxiliary.vda_next < sizeof(auxiliary) ||
+                  auxiliary.vda_next % 4 != 0)) ||
+                !pl_control_range_builder_add_vaddr(
+                    obj, builder, auxiliary_address, sizeof(auxiliary),
+                    PL_CONTROL_VERDAUX))
+                return 0;
+            if (auxiliary.vda_next != 0 &&
+                !pl_u64_add(auxiliary_address, auxiliary.vda_next,
+                            &auxiliary_address))
+                return 0;
         }
+        if (definition.vd_next != 0 &&
+            !pl_u64_add(cursor, definition.vd_next, &cursor))
+            return 0;
     }
-    return fallback;
+    return 1;
 }
 
-static const Elf64_Sym *pl_lookup_sysv(const struct prelink_obj *obj,
-                                        const char *name)
+static int pl_add_verneed_control_ranges(
+    struct prelink_obj *obj, struct pl_control_range_builder *builder,
+    uint64_t address, uint32_t count, size_t record_bytes,
+    size_t *auxiliary_budget)
 {
-    const uint32_t *ht = obj->sysv_hash;
-    uint32_t nbuckets;
-    uint32_t nchain;
-    const uint32_t *buckets;
-    const uint32_t *chains;
-    uint32_t idx;
-    const Elf64_Sym *fallback = NULL;
+    uint64_t cursor = address;
 
-    if (!ht)
-        return NULL;
-    nbuckets = ht[0];
-    nchain = ht[1];
-    if (nbuckets == 0 || nchain == 0)
-        return NULL;
-    buckets = &ht[2];
-    chains = &buckets[nbuckets];
-    idx = buckets[pl_sysv_hash(name) % nbuckets];
+    if (!obj || !builder || !auxiliary_budget || count == 0 ||
+        count > record_bytes / sizeof(Elf64_Verneed))
+        return 0;
+    for (uint32_t i = 0; i < count; i++) {
+        Elf64_Verneed need;
+        uint64_t auxiliary_address;
+        const char *provider;
+        size_t provider_length;
+        void *pointer;
 
-    for (uint32_t steps = 0; idx != STN_UNDEF && steps < nchain; steps++) {
-        const Elf64_Sym *sym;
+        if ((cursor & (_Alignof(Elf64_Verneed) - 1)) != 0 ||
+            !pl_vaddr_pointer(obj, cursor, sizeof(need), 1, PF_R,
+                              &pointer))
+            return 0;
+        memcpy(&need, pointer, sizeof(need));
+        provider = pl_dynstr_length(obj, need.vn_file, &provider_length);
+        if (need.vn_version != VER_NEED_CURRENT || need.vn_cnt == 0 ||
+            !provider || provider_length == 0 ||
+            need.vn_aux < sizeof(need) || need.vn_aux % 4 != 0 ||
+            ((i + 1 < count) != (need.vn_next != 0)) ||
+            (need.vn_next != 0 &&
+             (need.vn_next < sizeof(need) || need.vn_next % 4 != 0)) ||
+            !pl_u64_add(cursor, need.vn_aux, &auxiliary_address) ||
+            !pl_control_range_builder_add_vaddr(
+                obj, builder, cursor, sizeof(need), PL_CONTROL_VERNEED))
+            return 0;
 
-        if (idx >= nchain || idx >= obj->dynsym_count)
-            return NULL;
-        sym = pl_dynsym(obj, idx);
-        if (!sym || !pl_symbol_name(obj, sym))
-            return NULL;
-        if (sym->st_shndx != SHN_UNDEF &&
-            ELF64_ST_BIND(sym->st_info) != STB_LOCAL &&
-            strcmp(pl_symbol_name(obj, sym), name) == 0) {
-            if (!obj->versym || !(obj->versym[idx] & 0x8000))
-                return sym;
-            if (!fallback)
-                fallback = sym;
+        for (uint16_t a = 0; a < need.vn_cnt; a++) {
+            Elf64_Vernaux auxiliary;
+            const char *name;
+            size_t name_length;
+
+            if (*auxiliary_budget == 0 ||
+                (auxiliary_address &
+                 (_Alignof(Elf64_Vernaux) - 1)) != 0 ||
+                !pl_vaddr_pointer(obj, auxiliary_address,
+                                  sizeof(auxiliary), 1, PF_R, &pointer))
+                return 0;
+            (*auxiliary_budget)--;
+            memcpy(&auxiliary, pointer, sizeof(auxiliary));
+            name = pl_dynstr_length(obj, auxiliary.vna_name, &name_length);
+            if ((auxiliary.vna_flags &
+                 ~(VER_FLG_WEAK | UINT16_C(0x4))) != 0 ||
+                (auxiliary.vna_other & UINT16_C(0x7fff)) <=
+                    VER_NDX_GLOBAL ||
+                !name || name_length == 0 ||
+                auxiliary.vna_hash != pl_sysv_hash_n(name, name_length) ||
+                ((a + 1 < need.vn_cnt) !=
+                 (auxiliary.vna_next != 0)) ||
+                (auxiliary.vna_next != 0 &&
+                 (auxiliary.vna_next < sizeof(auxiliary) ||
+                  auxiliary.vna_next % 4 != 0)) ||
+                !pl_control_range_builder_add_vaddr(
+                    obj, builder, auxiliary_address, sizeof(auxiliary),
+                    PL_CONTROL_VERNAUX))
+                return 0;
+            if (auxiliary.vna_next != 0 &&
+                !pl_u64_add(auxiliary_address, auxiliary.vna_next,
+                            &auxiliary_address))
+                return 0;
         }
-        idx = chains[idx];
+        if (need.vn_next != 0 &&
+            !pl_u64_add(cursor, need.vn_next, &cursor))
+            return 0;
     }
-    return fallback;
-}
-
-/* ---- Prelinker symbol resolution cache -------------------------------- */
-#define PL_CACHE_SIZE 4096  /* must be power of 2 */
-static struct {
-    const char *name;
-    uint32_t    hash;
-    uint64_t    value;
-    uint8_t     used;
-} pl_sym_cache[PL_CACHE_SIZE];
-
-static void pl_cache_init(void)
-{
-    memset(pl_sym_cache, 0, sizeof(pl_sym_cache));
-}
-
-static uint64_t pl_resolve_sym(struct prelink_obj *objs, int nobj,
-                                const char *name)
-{
-    uint32_t gh = pl_gnu_hash(name);
-
-    /* Check cache */
-    uint32_t ci = gh & (PL_CACHE_SIZE - 1);
-    for (uint32_t n = 0; n < PL_CACHE_SIZE; n++) {
-        if (!pl_sym_cache[ci].used) break;
-        if (pl_sym_cache[ci].hash == gh &&
-            strcmp(pl_sym_cache[ci].name, name) == 0)
-            return pl_sym_cache[ci].value;
-        ci = (ci + 1) & (PL_CACHE_SIZE - 1);
-    }
-
-    /* Cache miss — do full lookup */
-    uint64_t result = 0;
-    for (int i = 0; i < nobj; i++) {
-        const Elf64_Sym *sym = objs[i].gnu_hash
-            ? pl_lookup_gnu(&objs[i], name, gh)
-            : (objs[i].sysv_hash
-                ? pl_lookup_sysv(&objs[i], name)
-                : pl_lookup_linear(&objs[i], name));
-        if (sym) {
-            if (ELF64_ST_TYPE(sym->st_info) == STT_GNU_IFUNC) {
-                result = 0;
-            } else {
-                result = objs[i].base + sym->st_value;
-            }
-            break;
-        }
-    }
-
-    /* Store in cache */
-    ci = gh & (PL_CACHE_SIZE - 1);
-    for (uint32_t n = 0; n < PL_CACHE_SIZE; n++) {
-        if (!pl_sym_cache[ci].used) {
-            pl_sym_cache[ci].name  = name;
-            pl_sym_cache[ci].hash  = gh;
-            pl_sym_cache[ci].value = result;
-            pl_sym_cache[ci].used  = 1;
-            break;
-        }
-        ci = (ci + 1) & (PL_CACHE_SIZE - 1);
-    }
-
-    return result;
+    return 1;
 }
 
 static int pl_parse_dynamic(struct prelink_obj *obj, uint64_t base,
                             const uint8_t *phdr_base,
-                            uint16_t phdr_num, uint16_t phdr_entsz)
+                            uint16_t phdr_num, uint16_t phdr_entsz,
+                            struct pl_control_range_builder *control_builder)
 {
     Elf64_Phdr dyn_ph = {0};
     const Elf64_Dyn *dyn;
@@ -2796,16 +3652,26 @@ static int pl_parse_dynamic(struct prelink_obj *obj, uint64_t base,
     uint64_t v_relr = 0, relr_sz = 0, relr_ent = 0;
     uint64_t gnu_hash_addr = 0, sysv_hash_addr = 0;
     uint64_t versym_addr = 0;
+    uint64_t verdef_addr = 0, verdef_num = 0;
+    uint64_t verneed_addr = 0, verneed_num = 0;
     uint64_t dynamic_flags = 0, dynamic_flags_1 = 0;
+    const uint32_t *validated_hash_table;
+    size_t dynsym_size = 0, versym_size = 0;
+    size_t gnu_hash_size = 0, sysv_hash_size = 0;
     int have_symtab = 0, have_strtab = 0, have_strsz = 0, have_syment = 0;
     int have_rela = 0, have_relasz = 0, have_relaent = 0;
     int have_jmprel = 0, have_pltrelsz = 0, have_pltrel = 0;
     int have_relr = 0, have_relrsz = 0, have_relrent = 0;
     int have_gnu_hash = 0, have_sysv_hash = 0, have_versym = 0;
+    int have_verdef = 0, have_verdefnum = 0;
+    int have_verneed = 0, have_verneednum = 0;
     int have_dynamic_flags = 0, have_dynamic_flags_1 = 0;
     int have_dyn_ph = 0;
     int saw_null = 0;
 
+    if (!obj || !control_builder)
+        return -1;
+    obj->dynstr_suffixes_bounded = 0;
     obj->phdr_base = phdr_base;
     obj->phdr_num = phdr_num;
     obj->phdr_entsz = phdr_entsz;
@@ -2824,7 +3690,7 @@ static int pl_parse_dynamic(struct prelink_obj *obj, uint64_t base,
         }
     }
     if (!have_dyn_ph)
-        return 0;
+        return pl_control_authority_admit(obj, control_builder);
     if (dyn_ph.p_filesz == 0 || dyn_ph.p_filesz > dyn_ph.p_memsz ||
         dyn_ph.p_filesz > SIZE_MAX ||
         (dyn_ph.p_vaddr & (_Alignof(Elf64_Dyn) - 1)) != 0 ||
@@ -2834,6 +3700,13 @@ static int pl_parse_dynamic(struct prelink_obj *obj, uint64_t base,
         return -1;
     dyn = (const Elf64_Dyn *)pointer;
     dyn_count = (size_t)dyn_ph.p_filesz / sizeof(Elf64_Dyn);
+    if (!pl_control_range_builder_add_file(
+            obj, control_builder, dyn_ph.p_offset,
+            (size_t)dyn_ph.p_filesz, PL_CONTROL_DYNAMIC) ||
+        !pl_control_range_builder_add_vaddr(
+            obj, control_builder, dyn_ph.p_vaddr,
+            (size_t)dyn_ph.p_filesz, PL_CONTROL_DYNAMIC))
+        return -1;
 
 #define PL_SET_DYNAMIC(seen, storage, value) do { \
         uint64_t dynamic_value = (uint64_t)(value); \
@@ -2892,6 +3765,19 @@ static int pl_parse_dynamic(struct prelink_obj *obj, uint64_t base,
         case DT_VERSYM:
             PL_SET_DYNAMIC(have_versym, versym_addr, dyn[i].d_un.d_ptr);
             break;
+        case DT_VERDEF:
+            PL_SET_DYNAMIC(have_verdef, verdef_addr, dyn[i].d_un.d_ptr);
+            break;
+        case DT_VERDEFNUM:
+            PL_SET_DYNAMIC(have_verdefnum, verdef_num, dyn[i].d_un.d_val);
+            break;
+        case DT_VERNEED:
+            PL_SET_DYNAMIC(have_verneed, verneed_addr, dyn[i].d_un.d_ptr);
+            break;
+        case DT_VERNEEDNUM:
+            PL_SET_DYNAMIC(have_verneednum, verneed_num,
+                           dyn[i].d_un.d_val);
+            break;
         case DT_FLAGS:
             PL_SET_DYNAMIC(have_dynamic_flags, dynamic_flags,
                            dyn[i].d_un.d_val);
@@ -2946,30 +3832,29 @@ static int pl_parse_dynamic(struct prelink_obj *obj, uint64_t base,
           relr_sz % sizeof(Elf64_Relr) != 0)) ||
         (have_gnu_hash && gnu_hash_addr == 0) ||
         (have_sysv_hash && sysv_hash_addr == 0) ||
-        (have_versym && versym_addr == 0))
+        (have_versym && versym_addr == 0) ||
+        have_verdef != have_verdefnum ||
+        have_verneed != have_verneednum ||
+        verdef_num > UINT32_MAX || verneed_num > UINT32_MAX ||
+        (have_verdef && (verdef_addr == 0 || verdef_num == 0)) ||
+        (have_verneed && (verneed_addr == 0 || verneed_num == 0)))
         return -1;
 
-    {
-        const uint64_t flags_allowed =
-            DF_ORIGIN | DF_SYMBOLIC | DF_BIND_NOW | DF_STATIC_TLS;
-        const uint64_t flags_1_allowed =
-            DF_1_NOW | DF_1_NODELETE | DF_1_ORIGIN | DF_1_NODEFLIB |
-            DF_1_NODUMP | DF_1_NODIRECT | DF_1_PIE;
-
-        if ((dynamic_flags & ~flags_allowed) != 0 ||
-            (dynamic_flags_1 & ~flags_1_allowed) != 0 ||
-            ((dynamic_flags_1 & DF_1_PIE) != 0 &&
-             (obj->flags & DLFRZ_FLAG_MAIN_EXE) == 0))
-            return -1;
-    }
+    if (!dlfrz_dynamic_flags_are_supported(
+            dynamic_flags, dynamic_flags_1,
+            (obj->flags & DLFRZ_FLAG_MAIN_EXE) != 0))
+        return -1;
 
     if (have_strtab) {
         if (strsz > SIZE_MAX ||
             !pl_vaddr_pointer(obj, strtab, (size_t)strsz, 1, PF_R,
-                              &pointer))
+                              &pointer) ||
+            ((const char *)pointer)[0] != '\0' ||
+            ((const char *)pointer)[(size_t)strsz - 1] != '\0')
             return -1;
         obj->dynstr = (const char *)pointer;
         obj->dynstr_size = (size_t)strsz;
+        obj->dynstr_suffixes_bounded = 1;
     }
 
     if (have_rela) {
@@ -3000,7 +3885,11 @@ static int pl_parse_dynamic(struct prelink_obj *obj, uint64_t base,
 
         for (size_t table = 0; table < 2; table++) {
             for (size_t i = 0; i < counts[table]; i++) {
-                uint32_t index = ELF64_R_SYM(tables[table][i].r_info);
+                Elf64_Rela relocation;
+                uint32_t index;
+
+                memcpy(&relocation, &tables[table][i], sizeof(relocation));
+                index = ELF64_R_SYM(relocation.r_info);
 
                 if (index == UINT32_MAX)
                     return -1;
@@ -3016,14 +3905,16 @@ static int pl_parse_dynamic(struct prelink_obj *obj, uint64_t base,
 
         if (have_sysv_hash) {
             if (!pl_validate_sysv_hash(obj, sysv_hash_addr,
-                                       &obj->sysv_hash, &sysv_count) ||
+                                       &validated_hash_table, &sysv_count,
+                                       &sysv_hash_size) ||
                 sysv_count < obj->dynsym_count)
                 return -1;
             obj->dynsym_count = sysv_count;
         }
         if (have_gnu_hash) {
             if (!pl_validate_gnu_hash(obj, gnu_hash_addr,
-                                      &obj->gnu_hash, &gnu_count) ||
+                                      &validated_hash_table, &gnu_count,
+                                      &gnu_hash_size) ||
                 (sysv_count != 0 && gnu_count > sysv_count))
                 return -1;
             if (gnu_count > obj->dynsym_count)
@@ -3055,6 +3946,7 @@ static int pl_parse_dynamic(struct prelink_obj *obj, uint64_t base,
         if (!pl_vaddr_pointer(obj, symtab, bytes, 1, PF_R, &pointer))
             return -1;
         obj->dynsym = (const Elf64_Sym *)pointer;
+        dynsym_size = bytes;
         for (uint32_t i = 0; i < obj->dynsym_count; i++) {
             const Elf64_Sym *symbol = pl_dynsym(obj, i);
 
@@ -3062,7 +3954,7 @@ static int pl_parse_dynamic(struct prelink_obj *obj, uint64_t base,
                 return -1;
         }
     } else if (have_gnu_hash || have_sysv_hash || have_versym ||
-               obj->dynsym_count != 0) {
+               have_verdef || have_verneed || obj->dynsym_count != 0) {
         return -1;
     }
 
@@ -3075,7 +3967,7 @@ static int pl_parse_dynamic(struct prelink_obj *obj, uint64_t base,
         bytes = (size_t)obj->dynsym_count * sizeof(uint16_t);
         if (!pl_vaddr_pointer(obj, versym_addr, bytes, 1, PF_R, &pointer))
             return -1;
-        obj->versym = (const uint16_t *)pointer;
+        versym_size = bytes;
     }
 
     if (have_relr) {
@@ -3088,82 +3980,234 @@ static int pl_parse_dynamic(struct prelink_obj *obj, uint64_t base,
         obj->relr_count = (size_t)relr_sz / sizeof(Elf64_Relr);
     }
 
-    for (int i = 0; i < phdr_num; i++) {
-        Elf64_Phdr ph;
+    {
+        size_t record_bytes;
+        size_t auxiliary_budget;
 
-        if (!pl_phdr_read(obj, (uint16_t)i, &ph))
+        if ((have_verdef || have_verneed) &&
+            (!pl_version_file_budgets(obj, &record_bytes,
+                                      &auxiliary_budget) ||
+             (have_verdef &&
+              !pl_add_verdef_control_ranges(
+                  obj, control_builder, verdef_addr,
+                  (uint32_t)verdef_num, record_bytes,
+                  &auxiliary_budget)) ||
+             (have_verneed &&
+              !pl_add_verneed_control_ranges(
+                  obj, control_builder, verneed_addr,
+                  (uint32_t)verneed_num, record_bytes,
+                  &auxiliary_budget))))
             return -1;
-        if (ph.p_type == PT_TLS) {
-            if ((ph.p_align > 1 &&
-                 (ph.p_align & (ph.p_align - 1)) != 0) ||
-                ph.p_filesz > ph.p_memsz)
-                return -1;
-            obj->tls_memsz  = ph.p_memsz;
-            obj->tls_align  = ph.p_align ? ph.p_align : 1;
-            break;
+
+#define PL_ADD_CONTROL(kind_value, vaddr_value, size_value) do { \
+            if ((size_value) != 0 && \
+                !pl_control_range_builder_add_vaddr( \
+                    obj, control_builder, (vaddr_value), (size_value), \
+                    (kind_value))) \
+                return -1; \
+        } while (0)
+        PL_ADD_CONTROL(PL_CONTROL_RELA, v_rela, (size_t)rela_sz);
+        PL_ADD_CONTROL(PL_CONTROL_JMPREL, jmprel, (size_t)pltrelsz);
+        PL_ADD_CONTROL(PL_CONTROL_RELR, v_relr, (size_t)relr_sz);
+        PL_ADD_CONTROL(PL_CONTROL_DYNSTR, strtab, (size_t)strsz);
+        PL_ADD_CONTROL(PL_CONTROL_DYNSYM, symtab, dynsym_size);
+        PL_ADD_CONTROL(PL_CONTROL_VERSYM, versym_addr, versym_size);
+        PL_ADD_CONTROL(PL_CONTROL_GNU_HASH, gnu_hash_addr, gnu_hash_size);
+        PL_ADD_CONTROL(PL_CONTROL_SYSV_HASH, sysv_hash_addr,
+                       sysv_hash_size);
+#undef PL_ADD_CONTROL
+
+        if (pl_relocation_sources_admit(
+                obj, v_rela, (size_t)rela_sz,
+                jmprel, (size_t)pltrelsz,
+                v_relr, (size_t)relr_sz) < 0)
+            return -1;
+        if (pl_control_authority_admit(obj, control_builder) < 0) {
+            pl_relocation_sources_release(obj);
+            return -1;
         }
     }
     (void)base;
     return 0;
 }
 
+static int pl_uint64_compare(const void *left, const void *right)
+{
+    const uint64_t lhs = *(const uint64_t *)left;
+    const uint64_t rhs = *(const uint64_t *)right;
+
+    return lhs < rhs ? -1 : lhs > rhs;
+}
+
+static int pl_sorted_relocation_destination_overlaps(
+    const uint64_t *values, size_t count, uint64_t sought)
+{
+    size_t low = 0;
+    size_t high = count;
+    uint64_t sought_end;
+
+    if (sought > UINT64_MAX - sizeof(uint64_t))
+        return 1;
+    sought_end = sought + sizeof(uint64_t);
+
+    while (low < high) {
+        size_t middle = low + (high - low) / 2;
+
+        if (values[middle] < sought)
+            low = middle + 1;
+        else
+            high = middle;
+    }
+    if (low < count && values[low] < sought_end)
+        return 1;
+    if (low != 0) {
+        uint64_t predecessor = values[low - 1];
+
+        if (predecessor > UINT64_MAX - sizeof(uint64_t) ||
+            predecessor + sizeof(uint64_t) > sought)
+            return 1;
+    }
+    return 0;
+}
+
+/* A persisted RELA RELATIVE destination is already base+addend in the
+ * serialized payload.  Runtime RELR replay must never add base to that value
+ * after the pack-time RELA write.  Collect those exact destinations once so
+ * the RELR walk can reject cross-table aliases without quadratic work. */
+static int pl_persisted_relative_destinations(
+    const struct prelink_obj *obj, uint64_t **destinations_out,
+    size_t *destination_count_out)
+{
+    const Elf64_Rela *tables[2];
+    size_t counts[2];
+    uint64_t *destinations = NULL;
+    size_t capacity;
+    size_t used = 0;
+
+    if (!obj || !destinations_out || !destination_count_out ||
+        obj->rela_count > SIZE_MAX - obj->jmprel_count)
+        return -1;
+    tables[0] = obj->rela;
+    tables[1] = obj->jmprel;
+    counts[0] = obj->rela_count;
+    counts[1] = obj->jmprel_count;
+    *destinations_out = NULL;
+    *destination_count_out = 0;
+    capacity = obj->rela_count + obj->jmprel_count;
+    if (capacity != 0) {
+        if (capacity > SIZE_MAX / sizeof(*destinations))
+            return -1;
+        destinations = malloc(capacity * sizeof(*destinations));
+        if (!destinations)
+            return -1;
+    }
+
+    for (size_t table = 0; table < 2; table++) {
+        if (counts[table] != 0 && !tables[table]) {
+            free(destinations);
+            return -1;
+        }
+        for (size_t i = 0; i < counts[table]; i++) {
+            Elf64_Rela relocation;
+
+            memcpy(&relocation, &tables[table][i], sizeof(relocation));
+            if (ELF64_R_TYPE(relocation.r_info) != ARCH_RELOC_RELATIVE)
+                continue;
+            if (ELF64_R_SYM(relocation.r_info) != 0) {
+                free(destinations);
+                return -1;
+            }
+            if (relocation.r_offset > UINT64_MAX - sizeof(uint64_t)) {
+                free(destinations);
+                return -1;
+            }
+            if (pl_vaddr_pointer(obj, relocation.r_offset,
+                                 sizeof(uint64_t), 1, PF_W, NULL))
+                destinations[used++] = relocation.r_offset;
+        }
+    }
+
+    if (used > 1)
+        qsort(destinations, used, sizeof(*destinations),
+              pl_uint64_compare);
+    *destinations_out = destinations;
+    *destination_count_out = used;
+    return 0;
+}
+
 static int pl_apply_relr(struct prelink_obj *obj)
 {
-    uint64_t base = obj->base;
-    const Elf64_Relr *relr = obj->relr;
-    size_t count = obj->relr_count;
+    const Elf64_Relr *relr;
+    size_t count;
+    uint64_t *persisted_relative_destinations = NULL;
+    size_t persisted_relative_count = 0;
     uint64_t where_offset = 0;
     int have_where = 0;
+    int result = -1;
 
+    if (!obj)
+        return -1;
+    relr = obj->relr;
+    count = obj->relr_count;
     if (count != 0 && !relr)
+        return -1;
+    if (count == 0)
+        return 0;
+    if (pl_persisted_relative_destinations(
+            obj, &persisted_relative_destinations,
+            &persisted_relative_count) < 0)
         return -1;
 
     for (size_t i = 0; i < count; i++) {
-        Elf64_Relr entry = relr[i];
-        if ((entry & 1) == 0) {
-            void *where;
+        Elf64_Relr entry;
 
+        memcpy(&entry, &relr[i], sizeof(entry));
+        if ((entry & 1) == 0) {
             if ((entry & (sizeof(uint64_t) - 1)) != 0 ||
-                /* The transaction serializes only PT_LOAD p_filesz bytes.
-                 * A RELR destination in the zero-fill suffix would be reset
-                 * when the frozen object is mapped again.  RELR has no
-                 * compact runtime-fixup encoding, so decline prelinking and
-                 * let the ordinary runtime RELR pass handle this object. */
-                !pl_vaddr_pointer(obj, entry, sizeof(uint64_t), 1, PF_W,
-                                  &where) ||
-                entry > UINT64_MAX - sizeof(uint64_t))
-                return -1;
-            pl_relocation_store_u64(
-                where, pl_relocation_load_u64(where) + base);
+                !pl_vaddr_pointer(obj, entry, sizeof(uint64_t), 0, PF_W,
+                                  NULL) ||
+                entry > UINT64_MAX - sizeof(uint64_t) ||
+                pl_relocation_destination_overlaps_admitted_metadata(
+                    obj, entry, sizeof(uint64_t)) ||
+                pl_sorted_relocation_destination_overlaps(
+                    persisted_relative_destinations,
+                    persisted_relative_count, entry))
+                goto out;
             where_offset = entry + sizeof(uint64_t);
             have_where = 1;
         } else {
             uint64_t bitmap = entry >> 1;
 
             if (!have_where)
-                return -1;
+                goto out;
             for (unsigned int j = 0; bitmap; j++, bitmap >>= 1) {
                 uint64_t offset;
-                void *where;
 
                 if (!(bitmap & 1))
                     continue;
                 if (where_offset > UINT64_MAX -
                                    (uint64_t)j * sizeof(uint64_t))
-                    return -1;
+                    goto out;
                 offset = where_offset + (uint64_t)j * sizeof(uint64_t);
-                if (!pl_vaddr_pointer(obj, offset, sizeof(uint64_t), 1, PF_W,
-                                      &where))
-                    return -1;
-                pl_relocation_store_u64(
-                    where, pl_relocation_load_u64(where) + base);
+                if (offset > UINT64_MAX - sizeof(uint64_t) ||
+                    !pl_vaddr_pointer(obj, offset, sizeof(uint64_t), 0,
+                                      PF_W, NULL) ||
+                    pl_relocation_destination_overlaps_admitted_metadata(
+                        obj, offset, sizeof(uint64_t)) ||
+                    pl_sorted_relocation_destination_overlaps(
+                        persisted_relative_destinations,
+                        persisted_relative_count, offset))
+                    goto out;
             }
             if (where_offset > UINT64_MAX - 63 * sizeof(uint64_t))
-                return -1;
+                goto out;
             where_offset += 63 * sizeof(uint64_t);
         }
     }
-    return 0;
+    result = 0;
+out:
+    free(persisted_relative_destinations);
+    return result;
 }
 
 static int pl_signed_offset_pointer(const struct prelink_obj *obj,
@@ -3266,89 +4310,59 @@ static int pl_validate_rela_record(struct prelink_obj *obj,
 }
 
 static int pl_apply_rela(struct prelink_obj *obj,
-                          const Elf64_Rela *rtab, size_t count,
-                          struct prelink_obj *all, int nobj, int pass)
+                         const Elf64_Rela *rtab, size_t count)
 {
     uint64_t base = obj->base;
+
+    if (count != 0 && !rtab)
+        return -1;
     for (size_t i = 0; i < count; i++) {
-        const Elf64_Rela *r = &rtab[i];
+        Elf64_Rela relocation;
+        const Elf64_Rela *r = &relocation;
         void *slot = NULL;
-        uint32_t type  = ELF64_R_TYPE(r->r_info);
-        uint32_t sidx  = ELF64_R_SYM(r->r_info);
+        uint32_t type;
+
+        memcpy(&relocation, &rtab[i], sizeof(relocation));
+        type = ELF64_R_TYPE(r->r_info);
 
         if (!pl_validate_rela_record(obj, r, &slot))
             return -1;
-
-        if (type == ARCH_RELOC_IRELATIVE) {
-            /* Skip IRELATIVE at pre-link time — resolver needs a seeded
-             * _rtld_global_ro GOT entry.  Loader handles these at runtime. */
-            continue;
-        }
-        if (type == ARCH_RELOC_COPY) {
-            /* COPY targets live in .bss (memsz > filesz) which is not
-             * written back to the frozen file.  Defer to the loader. */
-            continue;
-        }
-        if (pass != 0) continue;
 
         switch (type) {
         case 0: /* R_X86_64_NONE / R_AARCH64_NONE */
             break;
 
-        case ARCH_RELOC_RELATIVE:
-            pl_relocation_store_u64(slot, base + r->r_addend);
+        case ARCH_RELOC_RELATIVE: {
+            void *persisted_slot;
+
+            /* Only a complete PF_W p_filesz destination survives the
+             * transaction's PT_LOAD writeback.  Zero-fill destinations are
+             * represented in the compact runtime-fixup table instead. */
+            if (!pl_vaddr_pointer(obj, r->r_offset, sizeof(uint64_t),
+                                  1, PF_W, &persisted_slot))
+                break;
+            if (persisted_slot != slot ||
+                pl_relocation_destination_overlaps_admitted_metadata(
+                    obj, r->r_offset, sizeof(uint64_t)))
+                return -1;
+            pl_relocation_store_u64(persisted_slot, base + r->r_addend);
             break;
+        }
 
         case ARCH_RELOC_GLOB_DAT:
-        case ARCH_RELOC_JUMP_SLOT: {
-            /* ELF ABI: S (no addend).  glibc ≥2.39 stores the PLT stub
-             * address in r_addend for JUMP_SLOT; applying it would point
-             * the GOT at the wrong function. */
-            const Elf64_Sym *symbol;
-            const char *name;
-
-            uint64_t addr = 0;
-
-            if (sidx != 0) {
-                symbol = pl_dynsym(obj, sidx);
-                name = pl_symbol_name(obj, symbol);
-                if (!name)
-                    return -1;
-                addr = pl_resolve_sym(all, nobj, name);
-            }
-            pl_relocation_store_u64(slot, addr);
-            break;
-        }
-        case ARCH_RELOC_ABS: {
-            const Elf64_Sym *symbol;
-            const char *name;
-
-            uint64_t addr = 0;
-
-            if (sidx != 0) {
-                symbol = pl_dynsym(obj, sidx);
-                name = pl_symbol_name(obj, symbol);
-                if (!name)
-                    return -1;
-                addr = pl_resolve_sym(all, nobj, name);
-            }
-            pl_relocation_store_u64(slot, addr + r->r_addend);
-            break;
-        }
-
+        case ARCH_RELOC_JUMP_SLOT:
+        case ARCH_RELOC_ABS:
         case ARCH_RELOC_TPOFF:
         case ARCH_RELOC_DTPMOD:
         case ARCH_RELOC_DTPOFF:
-            /* TLS relocations depend on the final runtime TLS layout.
-             * Keep the on-disk value untouched and let the loader resolve
-             * them after it has built the live TLS image. */
-            break;
-
         case ARCH_RELOC_TLSDESC:
-            /* TLSDESC descriptors embed resolver function pointers.
-             * These must be synthesized by the runtime loader, where the
-             * loader stub addresses are known, so keep the file contents
-             * untouched and record a runtime fixup instead. */
+        case ARCH_RELOC_IRELATIVE:
+        case ARCH_RELOC_COPY:
+            /* Symbol binding, IFUNC execution, COPY source selection, and
+             * TLS layout are runtime contracts.  Every such relocation is
+             * already mandatory in the compact runtime-fixup table, so
+             * prelink validates its record but leaves its destination
+             * untouched. */
             break;
 
         default:
@@ -3383,9 +4397,13 @@ static int prelink_obj_collect_runtime_fixups(const struct prelink_obj *obj,
 
     for (int t = 0; t < 2; t++) {
         for (size_t i = 0; i < counts[t]; i++) {
-            const Elf64_Rela *rel = &tabs[t][i];
-            uint32_t type = ELF64_R_TYPE(rel->r_info);
+            Elf64_Rela relocation;
+            const Elf64_Rela *rel = &relocation;
+            uint32_t type;
             int needs_fixup = 0;
+
+            memcpy(&relocation, &tabs[t][i], sizeof(relocation));
+            type = ELF64_R_TYPE(rel->r_info);
 
             if (type == ARCH_RELOC_RELATIVE) {
                 /* A zero-fill destination is not persisted by the prelink
@@ -3428,12 +4446,20 @@ static int prelink_obj_collect_runtime_fixups(const struct prelink_obj *obj,
             if (!needs_fixup)
                 continue;
 
-            if (*fixup_count >= UINT32_MAX)
+            if (*fixup_count >= UINT32_MAX ||
+                i >= PRELINK_FIXUP_JMPREL)
                 return -1;
 
             if (*fixup_count == *fixup_cap) {
-                size_t newcap = *fixup_cap ? *fixup_cap * 2 : 256;
-                uint32_t *grown = realloc(*fixups, newcap * sizeof(**fixups));
+                size_t newcap;
+                uint32_t *grown;
+
+                if (*fixup_cap > SIZE_MAX / 2)
+                    return -1;
+                newcap = *fixup_cap ? *fixup_cap * 2 : 256;
+                if (newcap > SIZE_MAX / sizeof(**fixups))
+                    return -1;
+                grown = realloc(*fixups, newcap * sizeof(**fixups));
                 if (!grown)
                     return -1;
                 *fixups = grown;
@@ -3554,6 +4580,270 @@ static int prelink_load_header_valid(const Elf64_Phdr *phdr,
            phdr->p_memsz <= meta->vaddr_hi - phdr->p_vaddr;
 }
 
+/* The direct loader consumes section metadata from the embedded file bytes
+ * when deriving the target-libc thread contract.  Only candidate symbol
+ * tables and their linked string tables are evidence; SHF_ALLOC section
+ * contents named by symbol values remain ordinary relocatable data. */
+static int pl_collect_section_control_ranges(
+    FILE *file, const struct dlfrz_entry *entry, const Elf64_Ehdr *ehdr,
+    const struct prelink_obj *obj,
+    struct pl_control_range_builder *builder)
+{
+    uint8_t *section_table = NULL;
+    uint64_t table_size64;
+    uint64_t absolute_offset;
+    size_t table_size;
+    int result = 0;
+
+    if (!file || !entry || !ehdr || !obj || !builder)
+        return 0;
+    /* lookup_exact_elf_object_addr() treats either zero field as an omitted
+     * table and does not implement extended section counts. */
+    if (ehdr->e_shoff == 0 || ehdr->e_shnum == 0)
+        return 1;
+    if (ehdr->e_shentsize < sizeof(Elf64_Shdr) ||
+        !pl_u64_mul(ehdr->e_shnum, ehdr->e_shentsize, &table_size64) ||
+        table_size64 > SIZE_MAX || ehdr->e_shoff > obj->file_size ||
+        table_size64 > obj->file_size - (size_t)ehdr->e_shoff)
+        return 0;
+    table_size = (size_t)table_size64;
+    if (!pl_control_range_builder_add_file(
+            obj, builder, ehdr->e_shoff, table_size,
+            PL_CONTROL_SECTION_HEADERS) ||
+        !pl_u64_add(entry->data_offset, ehdr->e_shoff,
+                    &absolute_offset))
+        return 0;
+    section_table = malloc(table_size);
+    if (!section_table)
+        return 0;
+    if (packer_stream_seek(file, absolute_offset) < 0 ||
+        fread(section_table, 1, table_size, file) != table_size)
+        goto out;
+
+    for (uint16_t i = 0; i < ehdr->e_shnum; i++) {
+        Elf64_Shdr symbol_section;
+        Elf64_Shdr string_section;
+
+        memcpy(&symbol_section,
+               section_table + (size_t)i * ehdr->e_shentsize,
+               sizeof(symbol_section));
+        if (symbol_section.sh_type != SHT_SYMTAB &&
+            symbol_section.sh_type != SHT_DYNSYM)
+            continue;
+        if (symbol_section.sh_entsize < sizeof(Elf64_Sym) ||
+            symbol_section.sh_size % symbol_section.sh_entsize != 0 ||
+            symbol_section.sh_link >= ehdr->e_shnum)
+            goto out;
+        memcpy(&string_section,
+               section_table +
+                   (size_t)symbol_section.sh_link * ehdr->e_shentsize,
+               sizeof(string_section));
+        if (string_section.sh_type != SHT_STRTAB ||
+            symbol_section.sh_size > SIZE_MAX ||
+            string_section.sh_size > SIZE_MAX ||
+            !pl_control_range_builder_add_file(
+                obj, builder, symbol_section.sh_offset,
+                (size_t)symbol_section.sh_size,
+                PL_CONTROL_SECTION_SYMBOLS) ||
+            !pl_control_range_builder_add_file(
+                obj, builder, string_section.sh_offset,
+                (size_t)string_section.sh_size,
+                PL_CONTROL_SECTION_STRINGS))
+            goto out;
+    }
+    result = 1;
+
+out:
+    free(section_table);
+    return result;
+}
+
+static int pl_collect_object_control_ranges(
+    FILE *file, const struct dlfrz_entry *entry, const Elf64_Ehdr *ehdr,
+    const struct prelink_obj *obj,
+    struct pl_control_range_builder *builder)
+{
+    size_t phdr_size;
+    unsigned int property_segments = 0;
+
+    if (!file || !entry || !ehdr || !obj || !builder ||
+        obj->phdr_num == 0)
+        return 0;
+    phdr_size = (size_t)obj->phdr_num * sizeof(Elf64_Phdr);
+    if (!pl_control_range_builder_add_file(
+            obj, builder, 0, sizeof(*ehdr), PL_CONTROL_ELF_HEADER) ||
+        !pl_control_range_builder_add_file(
+            obj, builder, ehdr->e_phoff, phdr_size,
+            PL_CONTROL_PROGRAM_HEADERS) ||
+        !pl_collect_section_control_ranges(
+            file, entry, ehdr, obj, builder))
+        return 0;
+
+    for (uint16_t i = 0; i < obj->phdr_num; i++) {
+        Elf64_Phdr ph;
+
+        if (!pl_phdr_read(obj, i, &ph))
+            return 0;
+        if (ph.p_type != PT_GNU_PROPERTY)
+            continue;
+        if (++property_segments != 1 || ph.p_filesz == 0 ||
+            ph.p_filesz > ph.p_memsz || ph.p_filesz > SIZE_MAX ||
+            !pl_control_range_builder_add_file(
+                obj, builder, ph.p_offset, (size_t)ph.p_filesz,
+                PL_CONTROL_GNU_PROPERTY) ||
+            !pl_control_range_builder_add_vaddr(
+                obj, builder, ph.p_vaddr, (size_t)ph.p_filesz,
+                PL_CONTROL_GNU_PROPERTY))
+            return 0;
+    }
+    return 1;
+}
+
+struct pl_serialized_load_view {
+    uint64_t file_offset;
+    size_t size;
+    const uint8_t *live;
+};
+
+static int pl_serialized_load_view_compare(const void *left_pointer,
+                                           const void *right_pointer)
+{
+    const struct pl_serialized_load_view *left = left_pointer;
+    const struct pl_serialized_load_view *right = right_pointer;
+
+    if (left->file_offset < right->file_offset)
+        return -1;
+    if (left->file_offset > right->file_offset)
+        return 1;
+    if (left->size < right->size)
+        return -1;
+    if (left->size > right->size)
+        return 1;
+    return 0;
+}
+
+/* Distinct PT_LOAD mappings may name overlapping serialized file bytes.
+ * MAP_PRIVATE gives each virtual mapping independent contents, while the
+ * transaction ultimately has only one byte sequence.  Require every
+ * overlap-connected component to describe one coherent sequence before any
+ * PT_LOAD is written back. */
+static int pl_serialized_loads_coherent(const struct prelink_obj *obj)
+{
+    struct pl_serialized_load_view *views = NULL;
+    size_t count = 0;
+    int result = 0;
+
+    if (!obj || !obj->phdr_base ||
+        obj->phdr_entsz != sizeof(Elf64_Phdr))
+        return 0;
+    if (obj->phdr_num != 0) {
+        views = calloc(obj->phdr_num, sizeof(*views));
+        if (!views)
+            return 0;
+    }
+    for (uint16_t i = 0; i < obj->phdr_num; i++) {
+        Elf64_Phdr ph;
+        uintptr_t live;
+
+        if (!pl_phdr_read(obj, i, &ph))
+            goto out;
+        if (ph.p_type != PT_LOAD || ph.p_filesz == 0)
+            continue;
+        if (ph.p_filesz > ph.p_memsz || ph.p_filesz > SIZE_MAX ||
+            ph.p_offset > obj->file_size ||
+            (size_t)ph.p_filesz > obj->file_size - (size_t)ph.p_offset ||
+            ph.p_vaddr > UINTPTR_MAX ||
+            obj->base > UINTPTR_MAX - ph.p_vaddr)
+            goto out;
+        live = (uintptr_t)(obj->base + ph.p_vaddr);
+        if ((size_t)ph.p_filesz > UINTPTR_MAX - live)
+            goto out;
+        views[count].file_offset = ph.p_offset;
+        views[count].size = (size_t)ph.p_filesz;
+        views[count].live = (const uint8_t *)live;
+        count++;
+    }
+    if (count > 1)
+        qsort(views, count, sizeof(*views),
+              pl_serialized_load_view_compare);
+
+    for (size_t first = 0; first < count;) {
+        uint64_t component_start = views[first].file_offset;
+        uint64_t component_end;
+        size_t after = first + 1;
+
+        if (!pl_u64_add(component_start, views[first].size,
+                        &component_end))
+            goto out;
+        while (after < count &&
+               views[after].file_offset < component_end) {
+            uint64_t view_end;
+
+            if (!pl_u64_add(views[after].file_offset, views[after].size,
+                            &view_end))
+                goto out;
+            if (view_end > component_end)
+                component_end = view_end;
+            after++;
+        }
+        if (after - first > 1) {
+            uint8_t *canonical;
+            size_t component_size;
+            size_t filled;
+
+            if (component_end - component_start > SIZE_MAX)
+                goto out;
+            component_size = (size_t)(component_end - component_start);
+            canonical = pl_relocation_snapshot_allocate(component_size);
+            if (!canonical)
+                goto out;
+            memcpy(canonical, views[first].live, views[first].size);
+            filled = views[first].size;
+
+            for (size_t i = first + 1; i < after; i++) {
+                uint64_t delta64 =
+                    views[i].file_offset - component_start;
+                size_t delta;
+                size_t overlap;
+
+                if (delta64 > SIZE_MAX || (size_t)delta64 >= filled) {
+                    pl_relocation_snapshot_free(canonical);
+                    goto out;
+                }
+                delta = (size_t)delta64;
+                overlap = filled - delta;
+                if (overlap > views[i].size)
+                    overlap = views[i].size;
+                if (memcmp(canonical + delta, views[i].live,
+                           overlap) != 0) {
+                    pl_relocation_snapshot_free(canonical);
+                    goto out;
+                }
+                if (views[i].size > overlap) {
+                    size_t tail = views[i].size - overlap;
+
+                    if (tail > component_size - filled) {
+                        pl_relocation_snapshot_free(canonical);
+                        goto out;
+                    }
+                    memcpy(canonical + filled,
+                           views[i].live + overlap, tail);
+                    filled += tail;
+                }
+            }
+            pl_relocation_snapshot_free(canonical);
+            if (filled != component_size)
+                goto out;
+        }
+        first = after;
+    }
+    result = 1;
+
+out:
+    free(views);
+    return result;
+}
+
 static int prelink_objects(const char *output_path,
                            const struct dlfrz_entry *entries,
                            struct dlfrz_lib_meta *metas,
@@ -3619,8 +4909,6 @@ static int prelink_objects(const char *output_path,
         _exit(1);
     output_size = (size_t)output_st.st_size;
 
-    pl_cache_init();
-
     struct prelink_obj *objs = calloc(nobj, sizeof(*objs));
     uint32_t *runtime_fixups = NULL;
     size_t runtime_fixup_count = 0;
@@ -3631,6 +4919,7 @@ static int prelink_objects(const char *output_path,
     for (int i = 0; i < nobj; i++) {
         const struct dlfrz_lib_meta *m = &metas[i];
         uint64_t base = m->base_addr;
+        struct pl_control_range_builder control_builder = {0};
 
             /* Skip ld.so — the loader never maps it at runtime */
             if (m->flags & DLFRZ_FLAG_INTERP) continue;
@@ -3681,7 +4970,7 @@ static int prelink_objects(const char *output_path,
 
         objs[i].base = base;
         objs[i].flags = m->flags;
-        objs[i].name = "";
+        objs[i].file_size = (size_t)entries[i].data_size;
         objs[i].phdr_base = phdr_buf;
         objs[i].phdr_num = m->phdr_num;
         objs[i].phdr_entsz = m->phdr_entsz;
@@ -3711,58 +5000,34 @@ static int prelink_objects(const char *output_path,
                        0, (size_t)(ph.p_memsz - ph.p_filesz));
         }
 
-        /* 2. Parse PT_DYNAMIC */
-        if (pl_parse_dynamic(&objs[i], base,
+        /* 2. Admit every runtime-control byte before applying even the
+         * first relocation.  The builder remains transactional until the
+         * dynamic parser publishes its PF_W alias snapshots. */
+        if (!pl_collect_object_control_ranges(
+                outf, &entries[i], &embedded_ehdr, &objs[i],
+                &control_builder) ||
+            pl_parse_dynamic(&objs[i], base,
                              objs[i].phdr_base,
-                             m->phdr_num, m->phdr_entsz) < 0)
+                             m->phdr_num, m->phdr_entsz,
+                             &control_builder) < 0) {
+            pl_control_range_builder_release(&control_builder);
             _exit(1);
+        }
+        pl_control_range_builder_release(&control_builder);
 
         /* pl_vaddr_pointer() uses these headers throughout relocation and
          * hash validation.  The prelink worker exits after this transaction,
          * so retain the small buffer for the child's lifetime. */
     }
 
-    /* 3. Compute TLS layout (same algorithm as loader).
-     * modid must match the loader's scheme: modid = (non-INTERP index) + 1.
-     * The loader iterates only non-INTERP, non-DLOPEN objects and assigns
-     * oi+1, so we must count the same way. */
-    uint64_t total_tls = PRELINK_TLS_ABOVE_TP ? PRELINK_TLS_TCB_SIZE : 0;
-    int oi = 0;  /* non-INTERP, non-DLOPEN object counter; matches loader's oi */
-    for (int i = 0; i < nobj; i++) {
-        if (metas[i].flags & DLFRZ_FLAG_INTERP) continue;
-        if (metas[i].flags & DLFRZ_FLAG_DLOPEN) continue;
-        if (metas[i].flags & DLFRZ_FLAG_DATA) continue;
-        if (startup_aliases[i] >= 0)
-            continue;
-        if (objs[i].tls_memsz > 0) {
-            uint64_t align = objs[i].tls_align;
-            uint64_t next_tls;
-
-            if (PRELINK_TLS_ABOVE_TP) {
-                if (!u64_align_up_checked(total_tls, align, &next_tls) ||
-                    next_tls > INT64_MAX)
-                    _exit(1);
-                total_tls = next_tls;
-                objs[i].tls_tpoff = (int64_t)total_tls;
-                if (!u64_add_checked(total_tls, objs[i].tls_memsz,
-                                     &total_tls) ||
-                    total_tls > INT64_MAX)
-                    _exit(1);
-            } else {
-                if (!u64_add_checked(total_tls, objs[i].tls_memsz,
-                                     &next_tls) ||
-                    !u64_align_up_checked(next_tls, align, &total_tls) ||
-                    total_tls > INT64_MAX)
-                    _exit(1);
-                objs[i].tls_tpoff = -(int64_t)total_tls;
-            }
-            objs[i].tls_modid = (size_t)(oi + 1);  /* matches loader's oi+1 */
-        }
-        oi++;
-    }
-
-    /* 4. Apply relocations */
-    /* Pass 0: all except IRELATIVE/COPY */
+    /* 3. Pre-apply only RELA RELATIVE relocations.  Their explicit addends
+     * make the serialized bytes safe to hand to a native loader, which will
+     * overwrite each destination during extraction.  RELR uses the current
+     * destination as its implicit addend, so pre-applying it would make an
+     * extraction fallback add the load bias twice.  Validate RELR here but
+     * leave it byte-for-byte original for one-shot runtime replay.  Symbolic,
+     * IFUNC, COPY, and TLS RELA forms are likewise validated here and
+     * resolved by the audited runtime loader through compact fixups. */
     for (int i = 0; i < nobj; i++) {
             if (metas[i].flags & DLFRZ_FLAG_INTERP) continue;
             if (metas[i].flags & DLFRZ_FLAG_DLOPEN) continue;
@@ -3772,46 +5037,23 @@ static int prelink_objects(const char *output_path,
         if (pl_apply_relr(&objs[i]) < 0)
             _exit(1);
         if (objs[i].rela_count > 0 &&
-            pl_apply_rela(&objs[i], objs[i].rela, objs[i].rela_count,
-                          objs, nobj, 0) < 0)
+            pl_apply_rela(&objs[i], objs[i].rela,
+                          objs[i].rela_count) < 0)
             _exit(1);
         if (objs[i].jmprel_count > 0 &&
-            pl_apply_rela(&objs[i], objs[i].jmprel, objs[i].jmprel_count,
-                          objs, nobj, 0) < 0)
+            pl_apply_rela(&objs[i], objs[i].jmprel,
+                          objs[i].jmprel_count) < 0)
             _exit(1);
     }
-    /* Pass 1: IRELATIVE (resolvers can read populated GOTs) */
-    for (int i = 0; i < nobj; i++) {
-            if (metas[i].flags & DLFRZ_FLAG_INTERP) continue;
-            if (metas[i].flags & DLFRZ_FLAG_DLOPEN) continue;
-            if (metas[i].flags & DLFRZ_FLAG_DATA) continue;
-            if (startup_aliases[i] >= 0)
-                continue;
-        if (objs[i].rela_count > 0 &&
-            pl_apply_rela(&objs[i], objs[i].rela, objs[i].rela_count,
-                          objs, nobj, 1) < 0)
+
+    /* Every compact runtime fixup and every written relocation table must
+     * describe the same admitted bytes.  Store-side overlap gates above make
+     * divergence impossible for accepted inputs; retain this final check as
+     * a transaction boundary against missed or newly added write forms. */
+    for (int i = 0; i < nobj; i++)
+        if (!pl_relocation_sources_unchanged(&objs[i]) ||
+            !pl_control_authority_unchanged(&objs[i]))
             _exit(1);
-        if (objs[i].jmprel_count > 0 &&
-            pl_apply_rela(&objs[i], objs[i].jmprel, objs[i].jmprel_count,
-                          objs, nobj, 1) < 0)
-            _exit(1);
-    }
-    /* Pass 2: COPY after source DSOs have already been fully relocated. */
-    for (int i = 0; i < nobj; i++) {
-            if (metas[i].flags & DLFRZ_FLAG_INTERP) continue;
-            if (metas[i].flags & DLFRZ_FLAG_DLOPEN) continue;
-            if (metas[i].flags & DLFRZ_FLAG_DATA) continue;
-            if (startup_aliases[i] >= 0)
-                continue;
-        if (objs[i].rela_count > 0 &&
-            pl_apply_rela(&objs[i], objs[i].rela, objs[i].rela_count,
-                          objs, nobj, 2) < 0)
-            _exit(1);
-        if (objs[i].jmprel_count > 0 &&
-            pl_apply_rela(&objs[i], objs[i].jmprel, objs[i].jmprel_count,
-                          objs, nobj, 2) < 0)
-            _exit(1);
-    }
 
     for (int i = 0; i < nobj; i++) {
         uint32_t fixup_off = 0, fixup_count = 0;
@@ -3866,7 +5108,22 @@ static int prelink_objects(const char *output_path,
             metas[i].flags &= ~DLFRZ_FLAG_RUNTIME_SCAN;
     }
 
-    /* 5. Write patched segments back to frozen binary */
+    /* Collection must not race or alter any admitted authority.  Also prove
+     * that overlapping serialized PT_LOAD aliases agree before the first
+     * output byte is replaced. */
+    for (int i = 0; i < nobj; i++) {
+        if (metas[i].flags & DLFRZ_FLAG_INTERP) continue;
+        if (metas[i].flags & DLFRZ_FLAG_DLOPEN) continue;
+        if (metas[i].flags & DLFRZ_FLAG_DATA) continue;
+        if (startup_aliases[i] >= 0)
+            continue;
+        if (!pl_relocation_sources_unchanged(&objs[i]) ||
+            !pl_control_authority_unchanged(&objs[i]) ||
+            !pl_serialized_loads_coherent(&objs[i]))
+            _exit(1);
+    }
+
+    /* 4. Write patched segments back to frozen binary */
     for (int i = 0; i < nobj; i++) {
         const struct dlfrz_lib_meta *m = &metas[i];
             if (m->flags & DLFRZ_FLAG_INTERP) continue;
@@ -3959,6 +5216,10 @@ static int prelink_objects(const char *output_path,
             output_error = 1;
         if (output_error)
             _exit(1);
+    }
+    for (int i = 0; i < nobj; i++) {
+        pl_control_authority_release(&objs[i]);
+        pl_relocation_sources_release(&objs[i]);
     }
     free(runtime_fixups);
     free(objs);
@@ -5791,6 +7052,8 @@ static enum dlfrz_glibc_layout_id elf_glibc_layout(const char *path,
     enum dlfrz_glibc_layout_id layout = DLFRZ_GLIBC_LAYOUT_UNKNOWN;
     struct dlfrz_glibc_rtld_identity identity;
     struct packer_stable_file_image image = {0};
+    int development_release;
+    int minor;
 
     if (minor_out)
         *minor_out = -1;
@@ -5798,16 +7061,15 @@ static enum dlfrz_glibc_layout_id elf_glibc_layout(const char *path,
     if (packer_read_stable_file(path, &image) < 0 ||
         image.size < sizeof(Elf64_Ehdr))
         goto out;
-    if (dlfrz_glibc_is_development_release(image.bytes, image.size))
+    if (!dlfrz_glibc_elf_release_profile(
+            image.bytes, image.size, &minor, &development_release) ||
+        development_release)
         goto out;
     if (!dlfrz_glibc_rtld_identity(image.bytes, image.size, &identity))
         goto out;
     layout = dlfrz_glibc_layout_lookup(
         identity.machine, identity.global_ro_size, identity.global_size);
     {
-        int minor = dlfrz_glibc_stable_release_minor(
-            image.bytes, image.size);
-
         if (minor < 0 ||
             !dlfrz_glibc_layout_release_is_supported(layout, minor) ||
             !dlfrz_glibc_glro_relocations_valid(
@@ -5833,11 +7095,14 @@ static int file_glibc_release_minor(const char *path)
 {
     struct packer_stable_file_image image = {0};
     int minor = -1;
+    int development_release;
 
     if (packer_read_stable_file(path, &image) < 0)
         goto out;
-    if (!dlfrz_glibc_is_development_release(image.bytes, image.size))
-        minor = dlfrz_glibc_stable_release_minor(image.bytes, image.size);
+    if (!dlfrz_glibc_elf_release_profile(
+            image.bytes, image.size, &minor, &development_release) ||
+        development_release)
+        minor = -1;
 
 out:
     packer_stable_file_image_free(&image);
@@ -6066,6 +7331,8 @@ int pack_frozen(const struct pack_options *opts)
     int transaction_live = 0;
     int saved_errno = 0;
     int direct_supported;
+    int traced_requires_native_loader_semantics;
+    const char *native_loader_semantics_reason = NULL;
     int has_pathful_needed = 0;
     int has_pathful_traced_dlopen = 0;
     int has_unreproducible_bare_dlopen = 0;
@@ -6076,7 +7343,7 @@ int pack_frozen(const struct pack_options *opts)
          (opts->data_files->failed || opts->data_files->count < 0 ||
           (opts->data_files->count > 0 &&
            (!opts->data_files->paths || !opts->data_files->source_paths ||
-            !opts->data_files->kinds))))) {
+            !opts->data_files->kinds || !opts->data_files->snapshots))))) {
         fprintf(stderr, "dlfreeze: incomplete file manifest\n");
         return -1;
     }
@@ -6090,7 +7357,8 @@ int pack_frozen(const struct pack_options *opts)
                 kind > DATA_FILE_KIND_DIRECTORY ||
                 (kind == DATA_FILE_KIND_REGULAR &&
                  (!opts->data_files->source_paths[i] ||
-                  opts->data_files->source_paths[i][0] != '/')) ||
+                  opts->data_files->source_paths[i][0] != '/' ||
+                  !opts->data_files->snapshots[i].valid)) ||
                 (kind != DATA_FILE_KIND_REGULAR &&
                  opts->data_files->source_paths[i])) {
                 fprintf(stderr, "dlfreeze: incomplete captured-file entry\n");
@@ -6102,7 +7370,19 @@ int pack_frozen(const struct pack_options *opts)
         fprintf(stderr, "dlfreeze: incomplete dependency source manifest\n");
         return -1;
     }
+    if (opts->deps->traced_requires_native_loader_semantics) {
+        traced_requires_native_loader_semantics = 1;
+        native_loader_semantics_reason =
+            "a failed traced dynamic-loader call";
+    } else if (opts->deps->runtime_family == DEP_RUNTIME_GNU &&
+               opts->deps->traced_requires_native_lazy_semantics) {
+        traced_requires_native_loader_semantics = 1;
+        native_loader_semantics_reason = "a traced RTLD_LAZY request";
+    } else {
+        traced_requires_native_loader_semantics = 0;
+    }
     direct_supported = opts->direct_load &&
+                       !traced_requires_native_loader_semantics &&
                        direct_runtime_supported(opts, &dep_source_plan);
     for (int i = 0; i < opts->deps->count; i++) {
         const struct resolved_lib *lib = &opts->deps->libs[i];
@@ -6121,6 +7401,17 @@ int pack_frozen(const struct pack_options *opts)
             strcmp(lib->dlopen_request,
                    packed_library_extraction_basename(lib)) != 0)
             has_unreproducible_bare_dlopen = 1;
+    }
+    if (traced_requires_native_loader_semantics &&
+        (has_pathful_needed || has_pathful_traced_dlopen ||
+         has_unreproducible_bare_dlopen ||
+         (opts->data_files && opts->data_files->count > 0))) {
+        fprintf(stderr,
+                "dlfreeze: %s requires native loader semantics, but this "
+                "manifest requires direct-load semantics\n",
+                native_loader_semantics_reason);
+        packed_dep_source_plan_free(&dep_source_plan);
+        return -1;
     }
     if (has_pathful_needed && !direct_supported) {
         fprintf(stderr,
@@ -6158,7 +7449,7 @@ int pack_frozen(const struct pack_options *opts)
             return -1;
         }
     }
-    if (opts->direct_load &&
+    if (direct_supported &&
         dep_mark_dlopen_early_closures(opts->deps) < 0) {
         fprintf(stderr,
                 "dlfreeze: cannot classify traced static-TLS closures\n");
@@ -6412,7 +7703,9 @@ int pack_frozen(const struct pack_options *opts)
             if (write_pad(out, &off, 8) < 0)
                 goto fail2;
             entries[eidx].data_offset = off;
-            if (append_file(out, source_path, NULL, &written, NULL) < 0)
+            if (append_file(out, source_path,
+                            &opts->data_files->snapshots[i], &written,
+                            NULL) < 0)
                 goto fail2;
         }
         entries[eidx].data_size = written;
@@ -6510,7 +7803,12 @@ int pack_frozen(const struct pack_options *opts)
 
     /* 6b. loader metadata (direct-load mode) ----------------------- */
     size_t meta_off = 0;
-    if (opts->direct_load && !direct_supported) {
+    if (opts->direct_load && traced_requires_native_loader_semantics) {
+        fprintf(stderr,
+                "dlfreeze: warning: %s requires native loader semantics; "
+                "creating an extraction-mode binary\n",
+                native_loader_semantics_reason);
+    } else if (opts->direct_load && !direct_supported) {
         fprintf(stderr,
                 "dlfreeze: warning: direct-load is unavailable for runtime %s; "
                 "creating an extraction-mode binary\n",

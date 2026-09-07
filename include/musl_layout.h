@@ -71,78 +71,164 @@ static const struct dlfrz_musl_layout dlfrz_musl_layouts[] = {
     DLFRZ_MUSL_AARCH64_12X(6),
 };
 
-static inline int dlfrz_musl_has_bytes(const uint8_t *data, size_t size,
-                                       const char *needle, size_t len)
+static inline int dlfrz_musl_scan_word_has_byte(uintptr_t word,
+                                                unsigned char byte)
 {
-    if (!data || !needle || len == 0 || len > size)
-        return 0;
-    for (size_t i = 0; i <= size - len; i++)
-        if (memcmp(data + i, needle, len) == 0)
-            return 1;
-    return 0;
-}
+    const uintptr_t ones = UINTPTR_MAX / UINT8_MAX;
+    const uintptr_t high_bits = ones << 7;
+    uintptr_t candidate = word ^ (ones * byte);
 
-static inline int dlfrz_musl_has_cstring(const uint8_t *data, size_t size,
-                                         const char *value, size_t len)
-{
-    if (!data || !value || len == 0 || len >= size)
-        return 0;
-    for (size_t i = 0; i <= size - (len + 1); i++) {
-        if (i != 0 && data[i - 1] != '\0')
-            continue;
-        if (memcmp(data + i, value, len) == 0 && data[i + len] == '\0')
-            return 1;
-    }
-    return 0;
+    return ((candidate - ones) & ~candidate & high_bits) != 0;
 }
 
 static inline const struct dlfrz_musl_layout *
 dlfrz_musl_layout_lookup(uint16_t machine, const uint8_t *data, size_t size)
 {
+    struct dlfrz_musl_version_candidate {
+        const struct dlfrz_musl_layout *layout;
+        char version[8];
+        size_t length;
+        int present;
+    } candidates[sizeof(dlfrz_musl_layouts) /
+                 sizeof(dlfrz_musl_layouts[0])];
+    static const char version_marker[] = "Version %s";
+    static const char loader_marker[] = "Dynamic Program Loader";
     const char *arch_marker;
+    size_t arch_marker_length;
+    size_t candidate_count = 0;
+    int have_arch_marker = 0;
+    int have_version_marker = 0;
+    int have_loader_marker = 0;
     const struct dlfrz_musl_layout *matched = NULL;
 
+    if (!data)
+        return NULL;
     if (machine == EM_X86_64)
         arch_marker = "musl libc (x86_64)";
     else if (machine == EM_AARCH64)
         arch_marker = "musl libc (aarch64)";
     else
         return NULL;
+    arch_marker_length = strlen(arch_marker);
 
-    if (!dlfrz_musl_has_bytes(data, size, arch_marker, strlen(arch_marker)) ||
-        !dlfrz_musl_has_bytes(data, size, "Version %s", 10) ||
-        !dlfrz_musl_has_bytes(data, size, "Dynamic Program Loader", 22))
-        return NULL;
-
+    /* Prepare the architecture's admitted release strings once.  The scan
+     * below visits the image once regardless of how many release profiles
+     * are admitted; adding a profile must not add another full-image pass. */
     for (size_t i = 0;
          i < sizeof(dlfrz_musl_layouts) / sizeof(dlfrz_musl_layouts[0]); i++) {
         const struct dlfrz_musl_layout *layout = &dlfrz_musl_layouts[i];
-        char version[8];
-        int len;
+        struct dlfrz_musl_version_candidate *candidate;
 
         if (layout->machine != machine)
             continue;
-        version[0] = (char)('0' + layout->major);
-        version[1] = '.';
-        version[2] = (char)('0' + layout->minor);
-        version[3] = '.';
+        candidate = &candidates[candidate_count++];
+        candidate->layout = layout;
+        candidate->version[0] = (char)('0' + layout->major);
+        candidate->version[1] = '.';
+        candidate->version[2] = (char)('0' + layout->minor);
+        candidate->version[3] = '.';
         if (layout->patch >= 10) {
-            version[4] = (char)('0' + layout->patch / 10);
-            version[5] = (char)('0' + layout->patch % 10);
-            len = 6;
+            candidate->version[4] =
+                (char)('0' + layout->patch / 10);
+            candidate->version[5] =
+                (char)('0' + layout->patch % 10);
+            candidate->length = 6;
         } else {
-            version[4] = (char)('0' + layout->patch);
-            len = 5;
+            candidate->version[4] = (char)('0' + layout->patch);
+            candidate->length = 5;
         }
-        version[len] = '\0';
-        /* The release identifier is a standalone NUL-terminated object.
-         * More than one admitted release identity is ambiguous and must not
-         * select whichever profile happens to appear first. */
-        if (dlfrz_musl_has_cstring(data, size, version, (size_t)len)) {
-            if (matched)
-                return NULL;
-            matched = layout;
+        candidate->version[candidate->length] = '\0';
+        candidate->present = 0;
+    }
+
+    for (size_t offset = 0; offset < size;) {
+        size_t chunk = 1;
+        size_t remaining = size - offset;
+
+        /* Most bytes cannot begin any identity token.  Inspect a native word
+         * at a time, but only when memcpy can read the whole word inside the
+         * caller's range.  The byte loop still examines every position in a
+         * candidate word, preserving tokens which straddle word boundaries. */
+        if (remaining >= sizeof(uintptr_t)) {
+            uintptr_t word;
+            int candidate_word;
+
+            memcpy(&word, data + offset, sizeof(word));
+            candidate_word =
+                (!have_arch_marker && dlfrz_musl_scan_word_has_byte(
+                    word, (unsigned char)arch_marker[0])) ||
+                (!have_version_marker && dlfrz_musl_scan_word_has_byte(
+                    word, (unsigned char)version_marker[0])) ||
+                (!have_loader_marker && dlfrz_musl_scan_word_has_byte(
+                    word, (unsigned char)loader_marker[0]));
+            for (size_t i = 0; !candidate_word && i < candidate_count; i++)
+                candidate_word = !candidates[i].present &&
+                    dlfrz_musl_scan_word_has_byte(
+                        word, (unsigned char)candidates[i].version[0]);
+            if (!candidate_word) {
+                offset += sizeof(word);
+                continue;
+            }
+            chunk = sizeof(word);
         }
+
+        for (size_t within = 0; within < chunk; within++) {
+            size_t position = offset + within;
+            size_t position_remaining = size - position;
+            uint8_t first = data[position];
+
+            if (!have_arch_marker &&
+                first == (uint8_t)arch_marker[0] &&
+                arch_marker_length <= position_remaining &&
+                memcmp(data + position, arch_marker,
+                       arch_marker_length) == 0)
+                have_arch_marker = 1;
+            if (!have_version_marker &&
+                first == (uint8_t)version_marker[0] &&
+                sizeof(version_marker) - 1 <= position_remaining &&
+                memcmp(data + position, version_marker,
+                       sizeof(version_marker) - 1) == 0)
+                have_version_marker = 1;
+            if (!have_loader_marker &&
+                first == (uint8_t)loader_marker[0] &&
+                sizeof(loader_marker) - 1 <= position_remaining &&
+                memcmp(data + position, loader_marker,
+                       sizeof(loader_marker) - 1) == 0)
+                have_loader_marker = 1;
+
+            /* The release identifier is a standalone NUL-terminated object.
+             * More than one admitted release identity is ambiguous and must
+             * not select whichever profile happens to appear first.  Test
+             * release candidates only at possible C-string starts; repeated
+             * copies of the same release remain one identity, matching the
+             * old presence predicate. */
+            if (position != 0 && data[position - 1] != '\0')
+                continue;
+            for (size_t i = 0; i < candidate_count; i++) {
+                struct dlfrz_musl_version_candidate *candidate =
+                    &candidates[i];
+
+                if (candidate->present ||
+                    first != (uint8_t)candidate->version[0] ||
+                    candidate->length >= position_remaining ||
+                    data[position + candidate->length] != '\0' ||
+                    memcmp(data + position, candidate->version,
+                           candidate->length) != 0)
+                    continue;
+                candidate->present = 1;
+            }
+        }
+        offset += chunk;
+    }
+
+    if (!have_arch_marker || !have_version_marker || !have_loader_marker)
+        return NULL;
+    for (size_t i = 0; i < candidate_count; i++) {
+        if (!candidates[i].present)
+            continue;
+        if (matched)
+            return NULL;
+        matched = candidates[i].layout;
     }
     return matched;
 }

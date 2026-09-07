@@ -161,6 +161,27 @@ static int selftest(void)
         "musl libc (x86_64)\0Version %s\0Dynamic Program Loader\0"
         "1.2.5\0"
         "1.2.6\0";
+    /* Pass the exact byte count without the compiler-added trailing NUL.
+     * The un-terminated loader marker ends at the final admitted byte, while
+     * the release at offset zero exercises the special C-string boundary. */
+    static const char exact_boundaries[] =
+        "1.2.4\0"
+        "musl libc (x86_64)"
+        "Version %s"
+        "Dynamic Program Loader";
+    static const char repeated_identity[] =
+        "1.2.5\0"
+        "musl libc (x86_64)\0Version %s\0Dynamic Program Loader\0"
+        "1.2.5\0";
+    static const char prefixed_identity[] =
+        "musl libc (x86_64)\0Version %s\0Dynamic Program Loader\0"
+        "x1.2.6\0";
+    static const char wrong_arch_marker[] =
+        "musl libc (aarch64)\0Version %s\0Dynamic Program Loader\0"
+        "1.2.6\0";
+    static const char truncated_tail[] =
+        "musl libc (x86_64)\0Version %s\0Dynamic Program Loade\0"
+        "1.2.6\0";
     const struct dlfrz_musl_layout *layout;
 
     layout = dlfrz_musl_layout_lookup(
@@ -175,6 +196,10 @@ static int selftest(void)
         !profile_matches(EM_X86_64, x86_126, sizeof(x86_126), 6, 200, 48) ||
         !profile_matches(EM_AARCH64, arm_123, sizeof(arm_123), 3, 200, 32) ||
         !profile_matches(EM_AARCH64, arm_125, sizeof(arm_125), 5, 200, 32) ||
+        !profile_matches(EM_X86_64, exact_boundaries,
+                         sizeof(exact_boundaries) - 1, 4, 200, 48) ||
+        !profile_matches(EM_X86_64, repeated_identity,
+                         sizeof(repeated_identity), 5, 200, 48) ||
         dlfrz_musl_layout_lookup(EM_X86_64,
                                  (const uint8_t *)unknown,
                                  sizeof(unknown)) ||
@@ -187,6 +212,15 @@ static int selftest(void)
         dlfrz_musl_layout_lookup(EM_X86_64,
                                  (const uint8_t *)ambiguous,
                                  sizeof(ambiguous)) ||
+        dlfrz_musl_layout_lookup(EM_X86_64,
+                                 (const uint8_t *)prefixed_identity,
+                                 sizeof(prefixed_identity)) ||
+        dlfrz_musl_layout_lookup(EM_X86_64,
+                                 (const uint8_t *)wrong_arch_marker,
+                                 sizeof(wrong_arch_marker)) ||
+        dlfrz_musl_layout_lookup(EM_X86_64,
+                                 (const uint8_t *)truncated_tail,
+                                 sizeof(truncated_tail) - 1) ||
         dlfrz_musl_layout_lookup(EM_386,
                                  (const uint8_t *)x86_126,
                                  sizeof(x86_126)))

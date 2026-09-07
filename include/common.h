@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 #define DLFRZ_MAGIC    "DLFREEZ"   /* 7 chars + NUL = 8 bytes */
-#define DLFRZ_VERSION  4
+#define DLFRZ_VERSION  5
 
 /* The direct loader uses fixed-capacity startup object state.  The packer
  * must never emit direct metadata whose ELF closure exceeds this contract. */

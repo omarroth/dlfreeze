@@ -119,76 +119,6 @@ static int run_external_ie_late_rejection(void)
     return 0;
 }
 
-static int run_preloaded_trace(void)
-{
-    void *root_a;
-    void *root_b;
-    void *external_ie;
-
-    if (!getenv("DLFREEZE_DIRECT_EARLY_PRELOADED") ||
-        strcmp(getenv("DLFREEZE_DIRECT_EARLY_PRELOADED"), "1") != 0) {
-        fputs("preloaded trace stage lacks its recursion marker\n", stderr);
-        return 32;
-    }
-
-    dlerror();
-    root_a = dlopen(ROOT_A_PATH, RTLD_NOW | RTLD_GLOBAL);
-    if (!root_a) {
-        fprintf(stderr, "preloaded trace root A: %s\n", dlerror());
-        return 33;
-    }
-    root_b = dlopen(ROOT_B_PATH, RTLD_NOW | RTLD_GLOBAL);
-    if (!root_b) {
-        fprintf(stderr, "preloaded trace root B: %s\n", dlerror());
-        return 34;
-    }
-    external_ie = dlopen(EXTERNAL_IE_PATH, RTLD_NOW | RTLD_GLOBAL);
-    if (!external_ie) {
-        fprintf(stderr, "preloaded trace external IE: %s\n", dlerror());
-        return 35;
-    }
-    return 0;
-}
-
-static int exec_preloaded_trace(void)
-{
-    const char *old_preload = getenv("LD_PRELOAD");
-    const char *trace_file = getenv("DLFREEZE_TRACE_FILE");
-    char *preload = NULL;
-    char *const trace_argv[] = {
-        (char *)"direct-early-tls-trace", (char *)"trace-preloaded", NULL
-    };
-    int length;
-
-    if (getenv("DLFREEZE_DIRECT_EARLY_PRELOADED")) {
-        fputs("preloaded trace recursion detected\n", stderr);
-        return 36;
-    }
-    if (!old_preload || !old_preload[0] || !trace_file || !trace_file[0]) {
-        fputs("preloaded trace requires the dlfreeze tracer\n", stderr);
-        return 37;
-    }
-
-    length = asprintf(&preload, "%s:%s:%s", old_preload,
-                      DEP_PATH, EXTERNAL_IE_OWNER_PATH);
-    if (length < 0 || !preload) {
-        fputs("could not allocate preloaded trace environment\n", stderr);
-        free(preload);
-        return 38;
-    }
-    if (setenv("DLFREEZE_DIRECT_EARLY_PRELOADED", "1", 1) != 0 ||
-        setenv("LD_PRELOAD", preload, 1) != 0) {
-        perror("could not configure preloaded trace environment");
-        free(preload);
-        return 39;
-    }
-    free(preload);
-
-    execv("/proc/self/exe", trace_argv);
-    perror("could not re-exec preloaded trace fixture");
-    return 40;
-}
-
 int main(int argc, char **argv)
 {
     pthread_t existing;
@@ -206,11 +136,6 @@ int main(int argc, char **argv)
         return run_late_rejection();
     if (argc == 2 && strcmp(argv[1], "external-late") == 0)
         return run_external_ie_late_rejection();
-    if (argc == 2 && strcmp(argv[1], "trace") == 0)
-        return exec_preloaded_trace();
-    if (argc == 2 && strcmp(argv[1], "trace-preloaded") == 0)
-        return run_preloaded_trace();
-
     dlerror();
     if (events[0] != '\0' ||
         dlsym(RTLD_DEFAULT, "direct_early_tls_root_read") != NULL ||

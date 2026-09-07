@@ -676,10 +676,10 @@ int main(void)
         return 17;
     if (!direct_interval_and_object_count_gate())
         return 16;
-    if (classify_extraction_fallback(0, 0, 0, 0, 0) !=
+    if (classify_extraction_fallback(0, 0, 0, 0) !=
         EXTRACTION_FALLBACK_ALLOWED)
         return 11;
-    if (classify_extraction_fallback(0, 0, 0, 0, 1) !=
+    if (classify_extraction_fallback(0, 0, 0, 1) !=
         EXTRACTION_REFUSE_LOGICAL_NAME)
         return 12;
     {

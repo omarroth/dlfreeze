@@ -26,7 +26,10 @@ static int build_valid_image(unsigned char image[IMAGE_SIZE])
     Elf64_Dyn dynamic[6] = {{0}};
     Elf64_Sym symbols[2] = {{0}};
     uint64_t bloom = UINT64_MAX;
-    const char strings[] = "\0gnu_hash_shift_probe";
+    /* Keep an unused trailing string after the exported name.  This proves
+     * parser admission checks the declared table's final sentinel rather
+     * than relying on a terminator reached from one particular symbol. */
+    const char strings[] = "\0gnu_hash_shift_probe\0unused";
     const uint32_t name_hash =
         dlfrz_elf64_gnu_name_hash("gnu_hash_shift_probe");
 
@@ -123,6 +126,9 @@ int main(void)
 {
     _Alignas(8) unsigned char image[IMAGE_SIZE];
     struct dlfrz_elf64_dyn_view view;
+    Elf64_Dyn strsz;
+    Elf64_Sym symbol;
+    size_t strings_size;
 
     if (!build_valid_image(image) ||
         !dlfrz_elf64_dyn_view_init(image, sizeof(image), &view) ||
@@ -137,9 +143,47 @@ int main(void)
         return 1;
 
     store_u32(image + GNU_HASH_SHIFT_OFFSET, 31);
+    memcpy(&strsz, image + DYNAMIC_OFFSET + 2 * sizeof(strsz),
+           sizeof(strsz));
+    if (strsz.d_tag != DT_STRSZ || strsz.d_un.d_val > SIZE_MAX) {
+        fputs("invalid dynamic-string fixture tag\n", stderr);
+        return 1;
+    }
+    strings_size = (size_t)strsz.d_un.d_val;
+    if (strings_size < 2 || strings_size > IMAGE_SIZE - DYNSTR_OFFSET ||
+        image[DYNSTR_OFFSET + strings_size - 1] != '\0') {
+        fputs("invalid dynamic-string fixture geometry\n", stderr);
+        return 1;
+    }
+
+    /* Every in-range suffix is valid once the complete table is admitted.
+     * Point at an overlapping suffix and update the GNU chain hash to prove
+     * that optimization does not require string-start offsets. */
+    memcpy(&symbol, image + DYNSYM_OFFSET + sizeof(symbol), sizeof(symbol));
+    symbol.st_name = 2;
+    memcpy(image + DYNSYM_OFFSET + sizeof(symbol), &symbol, sizeof(symbol));
+    store_u32(image + GNU_HASH_OFFSET + 28,
+              dlfrz_elf64_gnu_name_hash("nu_hash_shift_probe") | 1U);
     if (!dlfrz_elf64_dyn_view_init(image, sizeof(image), &view) ||
         dlfrz_elf64_dyn_view_find(
-            &view, "gnu_hash_shift_probe", NULL, NULL) != 1) {
+            &view, "nu_hash_shift_probe", NULL, NULL) != 1) {
+        fputs("overlapping dynamic-string suffix was rejected\n", stderr);
+        return 1;
+    }
+
+    /* The exported suffix still has its own earlier terminator.  Corrupting
+     * only the unused declared final byte must nevertheless reject the
+     * malformed complete table, even though zero-filled bytes follow it. */
+    image[DYNSTR_OFFSET + strings_size - 1] = 'X';
+    if (dlfrz_elf64_dyn_view_init(image, sizeof(image), &view)) {
+        fputs("non-NUL final dynamic-string byte was admitted\n", stderr);
+        return 1;
+    }
+    image[DYNSTR_OFFSET + strings_size - 1] = '\0';
+
+    if (!dlfrz_elf64_dyn_view_init(image, sizeof(image), &view) ||
+        dlfrz_elf64_dyn_view_find(
+            &view, "nu_hash_shift_probe", NULL, NULL) != 1) {
         fputs("valid GNU hash control did not survive mutation restore\n",
               stderr);
         return 1;

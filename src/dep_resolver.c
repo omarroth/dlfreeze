@@ -2,6 +2,7 @@
 #include "elf_parser.h"
 #include "glibc_layout.h"
 #include "libc_semantics.h"
+#include "dynamic_semantics.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,6 +10,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/auxv.h>
 #include <sys/utsname.h>
@@ -233,18 +235,18 @@ static enum dep_runtime_family detect_interpreter_family(
             if (is_musl && !is_gnu)
                 family = DEP_RUNTIME_MUSL;
             else if (is_gnu && !is_musl &&
-                     dlfrz_glibc_config_path(
-                         image, image_size,
-                         DLFRZ_GLIBC_CACHE_SUFFIX,
-                         sizeof(DLFRZ_GLIBC_CACHE_SUFFIX) - 1,
-                         gnu_cache_path, PATH_MAX)) {
-                int minor = dlfrz_glibc_stable_release_minor(
-                    image, image_size);
+                     dlfrz_glibc_elf_config_paths(
+                         image, image_size, gnu_cache_path, PATH_MAX,
+                         NULL, 0)) {
+                int development = 0;
+                int minor = -1;
 
                 /* Cache behavior changes by target release.  A development
                  * or unrecognized loader cannot safely inherit the packer's
                  * host policy. */
-                if (minor >= 0) {
+                if (dlfrz_glibc_elf_release_profile(
+                        image, image_size, &minor, &development) &&
+                    !development && minor >= 0) {
                     *gnu_release_minor_out = minor;
                     family = DEP_RUNTIME_GNU;
                 }
@@ -1678,6 +1680,13 @@ static int dep_list_add(struct dep_list *deps, const char *name,
         if (!dlopen_request && deps->libs[i].from_dlopen &&
             deps->libs[i].dlopen_request)
             continue;
+        /* Draining each completed traced closure before the next record can
+         * expose the reverse order: a dependency identity is known before a
+         * later direct request for it.  Preserve both manifest roles rather
+         * than replacing the dependency identity with the request alias. */
+        if (dlopen_request && deps->libs[i].from_dlopen &&
+            !deps->libs[i].dlopen_request)
+            continue;
         /* Distinct dlopen requests and distinct ordinary DT_NEEDED names are
          * lookup aliases for one native map.  Keep separate manifest records
          * so every spelling remains resolvable, while the BFS caller uses
@@ -2560,9 +2569,49 @@ struct bfs_item {
     struct rpath_scope *inherited_rpath;
 };
 
+struct trace_process_identity {
+    uint64_t pid;
+    dev_t device;
+    ino_t inode;
+};
+
+struct trace_loader_operation {
+    uint64_t pid;
+    uint64_t attempt;
+    uint64_t evidence_count;
+    char kind;
+};
+
+struct trace_descriptor_operation {
+    uint64_t pid;
+    uint64_t attempt;
+};
+
+struct trace_initial_identity {
+    struct dep_file_snapshot snapshot;
+};
+
+#define TRACE_PROCESS_IDENTITY_LIMIT 65536
+#define TRACE_PENDING_EXEC_LIMIT 4096
+
 struct bfs_queue {
     struct bfs_item *items;
     int    head, tail, cap;
+    struct trace_process_identity *trace_identities;
+    int trace_identity_count;
+    int trace_identity_capacity;
+    uint64_t *pending_exec_attempts;
+    int pending_exec_count;
+    int pending_exec_capacity;
+    struct trace_loader_operation *loader_operations;
+    int loader_operation_count;
+    int loader_operation_capacity;
+    struct trace_descriptor_operation *descriptor_operations;
+    int descriptor_operation_count;
+    int descriptor_operation_capacity;
+    struct trace_initial_identity *initial_identities;
+    int initial_identity_count;
+    int initial_identity_capacity;
 };
 
 static int bfs_init(struct bfs_queue *q)
@@ -2570,7 +2619,314 @@ static int bfs_init(struct bfs_queue *q)
     q->cap   = 256;
     q->items = calloc((size_t)q->cap, sizeof(*q->items));
     q->head  = q->tail = 0;
+    q->trace_identities = NULL;
+    q->trace_identity_count = 0;
+    q->trace_identity_capacity = 0;
+    q->pending_exec_attempts = NULL;
+    q->pending_exec_count = 0;
+    q->pending_exec_capacity = 0;
+    q->loader_operations = NULL;
+    q->loader_operation_count = 0;
+    q->loader_operation_capacity = 0;
+    q->descriptor_operations = NULL;
+    q->descriptor_operation_count = 0;
+    q->descriptor_operation_capacity = 0;
+    q->initial_identities = NULL;
+    q->initial_identity_count = 0;
+    q->initial_identity_capacity = 0;
     return q->items ? 0 : -1;
+}
+
+/* Return one only for the first observation of this mapped-file identity in
+ * a traced process.  Fork records can interleave, so a global first-seen bit
+ * or adjacency test cannot establish which $ORIGIN closure that process had
+ * already inherited. */
+static int bfs_trace_identity_first(
+    struct bfs_queue *q, uint64_t pid,
+    const struct dep_file_snapshot *snapshot)
+{
+    if (!q || pid == 0 || !snapshot || !snapshot->valid)
+        return -1;
+    for (int i = 0; i < q->trace_identity_count; i++) {
+        if (q->trace_identities[i].pid == pid &&
+            q->trace_identities[i].device == snapshot->device &&
+            q->trace_identities[i].inode == snapshot->inode)
+            return 0;
+    }
+    if (q->trace_identity_count >= TRACE_PROCESS_IDENTITY_LIMIT)
+        return -1;
+    if (q->trace_identity_count >= q->trace_identity_capacity) {
+        int new_capacity;
+        struct trace_process_identity *new_identities;
+
+        if (q->trace_identity_capacity > INT_MAX / 2)
+            return -1;
+        new_capacity = q->trace_identity_capacity
+            ? q->trace_identity_capacity * 2 : 64;
+        if ((size_t)new_capacity > SIZE_MAX / sizeof(*new_identities))
+            return -1;
+        new_identities = realloc(
+            q->trace_identities,
+            (size_t)new_capacity * sizeof(*new_identities));
+        if (!new_identities)
+            return -1;
+        q->trace_identities = new_identities;
+        q->trace_identity_capacity = new_capacity;
+    }
+    q->trace_identities[q->trace_identity_count].pid = pid;
+    q->trace_identities[q->trace_identity_count].device = snapshot->device;
+    q->trace_identities[q->trace_identity_count].inode = snapshot->inode;
+    q->trace_identity_count++;
+    return 1;
+}
+
+static int bfs_exec_attempt_update(struct bfs_queue *q, uint64_t attempt,
+                                   int begin)
+{
+    int index;
+
+    if (!q || attempt == 0)
+        return -1;
+    for (index = 0; index < q->pending_exec_count; index++) {
+        if (q->pending_exec_attempts[index] == attempt)
+            break;
+    }
+    if (!begin) {
+        if (index == q->pending_exec_count)
+            return -1;
+        q->pending_exec_count--;
+        q->pending_exec_attempts[index] =
+            q->pending_exec_attempts[q->pending_exec_count];
+        return 0;
+    }
+    if (index != q->pending_exec_count ||
+        q->pending_exec_count >= TRACE_PENDING_EXEC_LIMIT)
+        return -1;
+    if (q->pending_exec_count >= q->pending_exec_capacity) {
+        int new_capacity = q->pending_exec_capacity
+            ? q->pending_exec_capacity * 2 : 16;
+        uint64_t *new_attempts;
+
+        if (new_capacity > TRACE_PENDING_EXEC_LIMIT)
+            new_capacity = TRACE_PENDING_EXEC_LIMIT;
+        new_attempts = realloc(q->pending_exec_attempts,
+                               (size_t)new_capacity *
+                                   sizeof(*new_attempts));
+        if (!new_attempts)
+            return -1;
+        q->pending_exec_attempts = new_attempts;
+        q->pending_exec_capacity = new_capacity;
+    }
+    q->pending_exec_attempts[q->pending_exec_count++] = attempt;
+    return 0;
+}
+
+static int bfs_descriptor_operation_update(
+    struct bfs_queue *q, uint64_t pid, uint64_t attempt, int begin)
+{
+    int index;
+
+    if (!q || pid == 0 || attempt == 0)
+        return -1;
+    for (index = 0; index < q->descriptor_operation_count; index++) {
+        if (q->descriptor_operations[index].pid == pid &&
+            q->descriptor_operations[index].attempt == attempt)
+            break;
+    }
+    if (!begin) {
+        if (index == q->descriptor_operation_count)
+            return -1;
+        q->descriptor_operation_count--;
+        q->descriptor_operations[index] =
+            q->descriptor_operations[q->descriptor_operation_count];
+        return 0;
+    }
+    if (index != q->descriptor_operation_count ||
+        q->descriptor_operation_count >= TRACE_PENDING_EXEC_LIMIT)
+        return -1;
+    if (q->descriptor_operation_count >=
+        q->descriptor_operation_capacity) {
+        int new_capacity = q->descriptor_operation_capacity
+            ? q->descriptor_operation_capacity * 2 : 16;
+        struct trace_descriptor_operation *operations;
+
+        if (new_capacity > TRACE_PENDING_EXEC_LIMIT)
+            new_capacity = TRACE_PENDING_EXEC_LIMIT;
+        operations = realloc(q->descriptor_operations,
+                             (size_t)new_capacity * sizeof(*operations));
+        if (!operations)
+            return -1;
+        q->descriptor_operations = operations;
+        q->descriptor_operation_capacity = new_capacity;
+    }
+    q->descriptor_operations[q->descriptor_operation_count].pid = pid;
+    q->descriptor_operations[q->descriptor_operation_count].attempt =
+        attempt;
+    q->descriptor_operation_count++;
+    return 0;
+}
+
+static struct trace_loader_operation *bfs_loader_operation_find(
+    struct bfs_queue *q, uint64_t pid, uint64_t attempt)
+{
+    if (!q)
+        return NULL;
+    for (int index = 0; index < q->loader_operation_count; index++) {
+        if (q->loader_operations[index].pid == pid &&
+            q->loader_operations[index].attempt == attempt)
+            return &q->loader_operations[index];
+    }
+    return NULL;
+}
+
+static int bfs_loader_operation_begin(
+    struct bfs_queue *q, uint64_t pid, uint64_t attempt, char kind)
+{
+    struct trace_loader_operation *operations;
+    int capacity;
+
+    if (!q || pid == 0 || attempt == 0 || (kind != 'A' && kind != 'B') ||
+        bfs_loader_operation_find(q, pid, attempt) ||
+        q->loader_operation_count >= TRACE_PENDING_EXEC_LIMIT)
+        return -1;
+    if (q->loader_operation_count >= q->loader_operation_capacity) {
+        capacity = q->loader_operation_capacity
+            ? q->loader_operation_capacity * 2 : 16;
+        if (capacity > TRACE_PENDING_EXEC_LIMIT)
+            capacity = TRACE_PENDING_EXEC_LIMIT;
+        operations = realloc(q->loader_operations,
+                             (size_t)capacity * sizeof(*operations));
+        if (!operations)
+            return -1;
+        q->loader_operations = operations;
+        q->loader_operation_capacity = capacity;
+    }
+    q->loader_operations[q->loader_operation_count].pid = pid;
+    q->loader_operations[q->loader_operation_count].attempt = attempt;
+    q->loader_operations[q->loader_operation_count].evidence_count = 0;
+    q->loader_operations[q->loader_operation_count].kind = kind;
+    q->loader_operation_count++;
+    return 0;
+}
+
+static int bfs_loader_operation_evidence(
+    struct bfs_queue *q, uint64_t pid, uint64_t attempt, char kind)
+{
+    struct trace_loader_operation *operation =
+        bfs_loader_operation_find(q, pid, attempt);
+
+    if (!operation || operation->kind != kind ||
+        operation->evidence_count == UINT64_MAX)
+        return -1;
+    operation->evidence_count++;
+    return 0;
+}
+
+static int bfs_loader_operation_commit(
+    struct bfs_queue *q, uint64_t pid, uint64_t attempt, char kind,
+    uint64_t evidence_count)
+{
+    struct trace_loader_operation *operation =
+        bfs_loader_operation_find(q, pid, attempt);
+    int index;
+
+    if (!operation || operation->kind != kind ||
+        operation->evidence_count != evidence_count)
+        return -1;
+    index = (int)(operation - q->loader_operations);
+    q->loader_operation_count--;
+    q->loader_operations[index] =
+        q->loader_operations[q->loader_operation_count];
+    return 0;
+}
+
+static int trace_snapshots_equal(const struct dep_file_snapshot *left,
+                                 const struct dep_file_snapshot *right)
+{
+    return left && right && left->valid && right->valid &&
+           left->device == right->device && left->inode == right->inode &&
+           left->size == right->size &&
+           left->mtime_sec == right->mtime_sec &&
+           left->mtime_nsec == right->mtime_nsec &&
+           left->ctime_sec == right->ctime_sec &&
+           left->ctime_nsec == right->ctime_nsec;
+}
+
+static int trace_initial_snapshot_expected(
+    const struct dep_list *deps, const struct dep_file_snapshot *snapshot)
+{
+    if (!deps || !snapshot || !snapshot->valid)
+        return 0;
+    if (trace_snapshots_equal(&deps->main_snapshot, snapshot) ||
+        trace_snapshots_equal(&deps->interp_snapshot, snapshot))
+        return 1;
+    for (int index = 0; index < deps->count; index++) {
+        if (!deps->libs[index].from_dlopen &&
+            trace_snapshots_equal(&deps->libs[index].snapshot, snapshot))
+            return 1;
+    }
+    return 0;
+}
+
+static int bfs_initial_identity_add(
+    struct bfs_queue *q, const struct dep_list *deps,
+    const struct dep_file_snapshot *snapshot)
+{
+    struct trace_initial_identity *identities;
+    int capacity;
+
+    if (!q || !trace_initial_snapshot_expected(deps, snapshot))
+        return -1;
+    for (int index = 0; index < q->initial_identity_count; index++) {
+        if (trace_snapshots_equal(
+                &q->initial_identities[index].snapshot, snapshot))
+            return -1;
+    }
+    if (q->initial_identity_count >= TRACE_PROCESS_IDENTITY_LIMIT)
+        return -1;
+    if (q->initial_identity_count >= q->initial_identity_capacity) {
+        capacity = q->initial_identity_capacity
+            ? q->initial_identity_capacity * 2 : 16;
+        if (capacity > TRACE_PROCESS_IDENTITY_LIMIT)
+            capacity = TRACE_PROCESS_IDENTITY_LIMIT;
+        identities = realloc(q->initial_identities,
+                             (size_t)capacity * sizeof(*identities));
+        if (!identities)
+            return -1;
+        q->initial_identities = identities;
+        q->initial_identity_capacity = capacity;
+    }
+    q->initial_identities[q->initial_identity_count++].snapshot = *snapshot;
+    return 0;
+}
+
+static int bfs_initial_snapshot_seen(
+    const struct bfs_queue *q, const struct dep_file_snapshot *snapshot)
+{
+    if (!q || !snapshot)
+        return 0;
+    for (int index = 0; index < q->initial_identity_count; index++) {
+        if (trace_snapshots_equal(
+                snapshot, &q->initial_identities[index].snapshot))
+            return 1;
+    }
+    return 0;
+}
+
+static int bfs_initial_evidence_is_complete(
+    const struct bfs_queue *q, const struct dep_list *deps)
+{
+    if (!q || !deps || q->initial_identity_count == 0)
+        return 0;
+    if (!bfs_initial_snapshot_seen(q, &deps->main_snapshot) ||
+        !bfs_initial_snapshot_seen(q, &deps->interp_snapshot))
+        return 0;
+    for (int index = 0; index < deps->count; index++) {
+        if (!deps->libs[index].from_dlopen &&
+            !bfs_initial_snapshot_seen(q, &deps->libs[index].snapshot))
+            return 0;
+    }
+    return 1;
 }
 
 static int bfs_push(struct bfs_queue *q, const char *path,
@@ -2649,6 +3005,24 @@ static void bfs_free(struct bfs_queue *q)
         rpath_scope_free(q->items[i].inherited_rpath);
     }
     free(q->items);
+    free(q->trace_identities);
+    free(q->pending_exec_attempts);
+    free(q->loader_operations);
+    free(q->descriptor_operations);
+    free(q->initial_identities);
+    q->items = NULL;
+    q->trace_identities = NULL;
+    q->pending_exec_attempts = NULL;
+    q->loader_operations = NULL;
+    q->descriptor_operations = NULL;
+    q->initial_identities = NULL;
+    q->head = q->tail = q->cap = 0;
+    q->trace_identity_count = q->trace_identity_capacity = 0;
+    q->pending_exec_count = q->pending_exec_capacity = 0;
+    q->loader_operation_count = q->loader_operation_capacity = 0;
+    q->descriptor_operation_count =
+        q->descriptor_operation_capacity = 0;
+    q->initial_identity_count = q->initial_identity_capacity = 0;
 }
 
 static const struct rpath_scope *rpath_scope_for_children(
@@ -2970,6 +3344,7 @@ int dep_resolve_aux_dependency(struct dep_list *deps,
     const struct rpath_scope *inherited_rpath = NULL;
     enum library_lookup_result lookup_result;
     struct dep_file_snapshot snapshot;
+    int musl_self_dependency;
     int result = -1;
 
     if (path_out)
@@ -2998,9 +3373,19 @@ int dep_resolve_aux_dependency(struct dep_list *deps,
         main_scope.origin = deps->main_origin;
         inherited_rpath = &main_scope;
     }
-    resolved = find_library(name, info.rpath, info.runpath, origin,
-                            inherited_rpath, info.flags_1, deps, 0,
-                            &lookup_result, NULL, &snapshot);
+    /* The musl interpreter is also its libc provider.  Its reserved self
+     * names bind to the already-loaded PT_INTERP object before filesystem
+     * search, including when that exact runtime was copied or renamed.  Keep
+     * auxiliary helper resolution consistent with the ordinary dependency
+     * walk instead of consulting a path file relative to the copied name. */
+    musl_self_dependency = musl_dependency_is_self(name, deps);
+    resolved = musl_self_dependency
+        ? validated_candidate(deps->interp_path, deps,
+                              CANDIDATE_NON_GNU, &lookup_result,
+                              NULL, &snapshot)
+        : find_library(name, info.rpath, info.runpath, origin,
+                       inherited_rpath, info.flags_1, deps, 0,
+                       &lookup_result, NULL, &snapshot);
     if (!resolved) {
         result = lookup_result == LIBRARY_LOOKUP_MISS ? 0 : -1;
         goto out;
@@ -3021,7 +3406,13 @@ out:
 /* ------------------------------------------------------------------ */
 /*  Merge dlopen-traced libraries                                     */
 /* ------------------------------------------------------------------ */
-#define DLOPEN_TRACE_READY "#DLFREEZE_DLOPEN_TRACE_V4"
+#define DLOPEN_TRACE_READY "#DLFREEZE_DLOPEN_TRACE_V8"
+#define DLOPEN_TRACE_OLD_READY "#DLFREEZE_DLOPEN_TRACE_V7"
+#define DLOPEN_TRACE_LEGACY_READY "#DLFREEZE_DLOPEN_TRACE_V6"
+#define DLOPEN_TRACE_LINE_SIZE (6U * PATH_MAX + 196U)
+
+_Static_assert(PATH_MAX <= (SIZE_MAX - 196U) / 6U,
+               "dlopen trace line size overflows size_t");
 
 static int trace_hex_value(char value)
 {
@@ -3048,14 +3439,188 @@ static int trace_hex_decode(const char *hex, size_t hex_len,
     return 0;
 }
 
-int dep_add_dlopen_libs(struct dep_list *deps, const char *trace_file)
+static int trace_u32_hex_decode(const char *hex, size_t hex_len,
+                                uint32_t *value_out)
 {
-    if (!deps || !trace_file || !trace_file[0]) {
+    uint32_t value = 0;
+
+    if (!hex || !value_out || hex_len != 8)
+        return -1;
+    for (size_t i = 0; i < hex_len; i++) {
+        int digit = trace_hex_value(hex[i]);
+
+        if (digit < 0)
+            return -1;
+        value = (value << 4) | (uint32_t)digit;
+    }
+    *value_out = value;
+    return 0;
+}
+
+static int trace_u64_hex_decode(const char *hex, size_t hex_len,
+                                uint64_t *value_out)
+{
+    uint64_t value = 0;
+
+    if (!hex || !value_out || hex_len != 16)
+        return -1;
+    for (size_t i = 0; i < hex_len; i++) {
+        int digit = trace_hex_value(hex[i]);
+
+        if (digit < 0)
+            return -1;
+        value = (value << 4) | (uint64_t)digit;
+    }
+    *value_out = value;
+    return 0;
+}
+
+static int trace_split_fields(char *line, char **fields, size_t field_count)
+{
+    if (!line || !line[0] || !fields || field_count == 0)
+        return -1;
+    fields[0] = line;
+    for (size_t i = 1; i < field_count; i++) {
+        char *separator = strchr(fields[i - 1], ' ');
+
+        if (!separator || separator == fields[i - 1])
+            return -1;
+        *separator = '\0';
+        fields[i] = separator + 1;
+    }
+    if (!fields[field_count - 1][0] ||
+        strchr(fields[field_count - 1], ' '))
+        return -1;
+    return 0;
+}
+
+/* Compare in the fixed-width wire domain.  This avoids accepting truncation
+ * when a trace produced on a target with wider stat fields is consumed by a
+ * narrower packer, and retains two's-complement negative timestamps exactly. */
+static int trace_snapshot_matches_dep(
+    const uint64_t fields[8], const struct dep_file_snapshot *snapshot)
+{
+    return fields && snapshot && snapshot->valid &&
+           fields[0] == (uint64_t)snapshot->device &&
+           fields[1] == (uint64_t)snapshot->inode &&
+           fields[2] == (uint64_t)S_IFREG &&
+           fields[3] == (uint64_t)snapshot->size &&
+           fields[4] == (uint64_t)snapshot->mtime_sec &&
+           fields[5] == (uint64_t)snapshot->mtime_nsec &&
+           fields[6] == (uint64_t)snapshot->ctime_sec &&
+           fields[7] == (uint64_t)snapshot->ctime_nsec;
+}
+
+static char *validate_traced_elf_object(
+    struct dep_list *deps, const char *logical, const char *source,
+    const uint64_t trace_snapshot[8], struct dep_file_snapshot *snapshot,
+    struct elf_info *info)
+{
+    char *resolved;
+    struct stat status;
+
+    if (!deps || !logical || logical[0] != '/' || !source ||
+        source[0] != '/' || !trace_snapshot || !snapshot || !info ||
+        trace_snapshot[2] != (uint64_t)S_IFREG ||
+        trace_snapshot[5] > 999999999 ||
+        trace_snapshot[7] > 999999999)
+        return NULL;
+    resolved = realpath(source, NULL);
+    if (!resolved || strcmp(resolved, source) != 0 ||
+        stat(resolved, &status) < 0 || !S_ISREG(status.st_mode) ||
+        status.st_size < 0) {
+        free(resolved);
+        errno = ESTALE;
+        return NULL;
+    }
+    dep_snapshot_from_stat(snapshot, &status);
+    if (!trace_snapshot_matches_dep(trace_snapshot, snapshot)) {
+        free(resolved);
+        errno = ESTALE;
+        return NULL;
+    }
+    memset(info, 0, sizeof(*info));
+    if (elf_parse_path_snapshot(resolved, snapshot, info, NULL) < 0 ||
+        !info->is_dynamic || info->ei_class != deps->target_ei_class ||
+        info->e_machine != deps->target_e_machine) {
+        elf_info_free(info);
+        free(resolved);
+        return NULL;
+    }
+    return resolved;
+}
+
+/* Drain one traced root's closure before interpreting the next trace record.
+ * The native dlopen which produced that record completed the same closure
+ * before returning.  Mirroring that discovery order preserves first-owner
+ * logical paths and lets a later direct request retain a distinct alias from
+ * a dependency record already discovered through an earlier root. */
+static int resolve_dlopen_dependency_queue(struct dep_list *deps,
+                                           struct bfs_queue *q)
+{
+    struct bfs_item item;
+
+    while (bfs_pop(q, &item)) {
+        char *lib_path = item.path;
+        struct elf_info info = {0};
+        char *directory_copy;
+        char *origin;
+
+        if (elf_parse_path_snapshot(
+                lib_path, &item.snapshot, &info, NULL) < 0 ||
+            !info.is_dynamic ||
+            info.ei_class != deps->target_ei_class ||
+            info.e_machine != deps->target_e_machine) {
+            elf_info_free(&info);
+            bfs_item_free(&item);
+            return -1;
+        }
+
+        directory_copy = strdup(item.logical_path);
+        origin = directory_copy ? strdup(dirname(directory_copy)) : NULL;
+        if (!directory_copy || !origin ||
+            resolve_needed(&info, origin, deps, q, 1,
+                           item.inherited_rpath) < 0) {
+            free(origin);
+            free(directory_copy);
+            elf_info_free(&info);
+            bfs_item_free(&item);
+            return -1;
+        }
+        free(origin);
+        free(directory_copy);
+        elf_info_free(&info);
+        bfs_item_free(&item);
+    }
+    q->head = 0;
+    q->tail = 0;
+    return 0;
+}
+
+static int dep_add_dlopen_libs_internal(
+    struct dep_list *deps, const char *trace_file, int trace_fd)
+{
+    if (!deps || (trace_fd < 0 && (!trace_file || !trace_file[0]))) {
         errno = EINVAL;
         return -1;
     }
-    FILE *f = fopen(trace_file, "r");
-    if (!f) return -1;
+    FILE *f = trace_fd >= 0 ? fdopen(trace_fd, "r")
+                            : fopen(trace_file, "r");
+    if (!f) {
+        if (trace_fd >= 0)
+            close(trace_fd);
+        return -1;
+    }
+    /* The trace helper holds this OFD lock across the owner and every fork
+     * descendant.  Do not parse a prefix while a daemonized child can still
+     * append or while the supervised root is incompletely torn down. */
+    if (flock(fileno(f), LOCK_EX | LOCK_NB) < 0) {
+        fprintf(stderr,
+                "dlfreeze: dlopen trace is still owned by a live traced "
+                "process\n");
+        fclose(f);
+        return -1;
+    }
 
     struct bfs_queue q;
     if (bfs_init(&q) < 0) {
@@ -3063,16 +3628,24 @@ int dep_add_dlopen_libs(struct dep_list *deps, const char *trace_file)
         return -1;
     }
 
-    char line[6 * PATH_MAX + 24];
+    char line[DLOPEN_TRACE_LINE_SIZE];
     int saw_header = 0;
+    int saw_owner = 0;
+    int saw_initial_begin = 0;
+    int saw_initial_commit = 0;
+    int saw_call = 0;
+    uint64_t owner_pid = 0;
     while (fgets(line, sizeof(line), f)) {
         size_t len = strlen(line);
         char request[PATH_MAX];
         char logical[PATH_MAX];
         char source[PATH_MAX];
-        char *first_separator;
-        char *second_separator;
-        size_t request_hex_len, logical_hex_len, source_hex_len;
+        char *fields[16];
+        uint64_t trace_snapshot[8];
+        uint64_t record_pid;
+        uint64_t operation_attempt;
+        uint64_t operation_evidence_count;
+        uint32_t mode;
         int pathful;
 
         if (len == 0 || line[len - 1] != '\n') {
@@ -3083,53 +3656,457 @@ int dep_add_dlopen_libs(struct dep_list *deps, const char *trace_file)
         }
         line[--len] = '\0';
         if (strcmp(line, DLOPEN_TRACE_READY) == 0) {
+            if (saw_header) {
+                fprintf(stderr,
+                        "dlfreeze: duplicate dlopen trace version header\n");
+                fclose(f);
+                bfs_free(&q);
+                return -1;
+            }
             saw_header = 1;
             continue;
         }
-        if (saw_header && len > 2 && line[0] == '!' && line[1] == ' ') {
+        if (strcmp(line, DLOPEN_TRACE_OLD_READY) == 0) {
             fprintf(stderr,
-                    "dlfreeze: preload helper reported an incomplete "
-                    "dlopen trace: %s\n",
-                    line + 2);
+                    "dlfreeze: dlopen trace V7 has no descriptor-operation "
+                    "transactions and is unsupported\n");
             fclose(f);
             bfs_free(&q);
             return -1;
         }
-        if (!saw_header || len < 6 ||
-            (line[0] != 'P' && line[0] != 'S') || line[1] != ' ') {
+        if (strcmp(line, DLOPEN_TRACE_LEGACY_READY) == 0) {
+            fprintf(stderr,
+                    "dlfreeze: dlopen trace V6 has no mapped-object or "
+                    "owner-exec provenance and is unsupported\n");
+            fclose(f);
+            bfs_free(&q);
+            return -1;
+        }
+        if (saw_header && len == 18 && line[0] == 'O' && line[1] == ' ') {
+            if (saw_owner || saw_call ||
+                trace_u64_hex_decode(line + 2, 16, &owner_pid) < 0 ||
+                owner_pid == 0) {
+                fprintf(stderr,
+                        "dlfreeze: malformed or duplicate dlopen trace "
+                        "owner record\n");
+                fclose(f);
+                bfs_free(&q);
+                return -1;
+            }
+            saw_owner = 1;
+            continue;
+        }
+        if (saw_header && len > 0 && line[0] == 'O') {
+            fprintf(stderr,
+                    "dlfreeze: malformed or duplicate dlopen trace owner "
+                    "record\n");
+            fclose(f);
+            bfs_free(&q);
+            return -1;
+        }
+        if (saw_header && saw_owner && saw_initial_commit && len == 35 &&
+            (line[0] == 'V' || line[0] == 'W') && line[1] == ' ' &&
+            line[18] == ' ') {
+            uint64_t attempt;
+
+            if (trace_u64_hex_decode(line + 2, 16, &record_pid) < 0 ||
+                record_pid == 0 ||
+                trace_u64_hex_decode(line + 19, 16, &attempt) < 0 ||
+                bfs_descriptor_operation_update(
+                    &q, record_pid, attempt, line[0] == 'V') < 0) {
+                fprintf(stderr,
+                        "dlfreeze: malformed descriptor-operation trace "
+                        "record\n");
+                fclose(f);
+                bfs_free(&q);
+                return -1;
+            }
+            saw_call = 1;
+            continue;
+        }
+        if (saw_header && len > 0 &&
+            (line[0] == 'V' || line[0] == 'W')) {
+            fprintf(stderr,
+                    "dlfreeze: malformed descriptor-operation trace "
+                    "record\n");
+            fclose(f);
+            bfs_free(&q);
+            return -1;
+        }
+        if (saw_header && saw_owner && len == 35 &&
+            (line[0] == 'A' || line[0] == 'B') && line[1] == ' ' &&
+            line[18] == ' ') {
+            uint64_t attempt;
+            int initial = line[0] == 'A';
+
+            if (trace_u64_hex_decode(line + 2, 16, &record_pid) < 0 ||
+                record_pid == 0 ||
+                trace_u64_hex_decode(line + 19, 16, &attempt) < 0 ||
+                attempt == 0 ||
+                (initial &&
+                 (record_pid != owner_pid || saw_initial_begin ||
+                  saw_initial_commit || saw_call)) ||
+                (!initial && !saw_initial_commit) ||
+                bfs_loader_operation_begin(
+                    &q, record_pid, attempt, initial ? 'A' : 'B') < 0) {
+                fprintf(stderr,
+                        "dlfreeze: malformed dlopen trace operation begin\n");
+                fclose(f);
+                bfs_free(&q);
+                return -1;
+            }
+            if (initial)
+                saw_initial_begin = 1;
+            else
+                saw_call = 1;
+            continue;
+        }
+        if (saw_header && saw_owner && len == 52 && line[0] == 'K' &&
+            line[1] == ' ' && line[18] == ' ' && line[35] == ' ') {
+            uint64_t attempt;
+            uint64_t evidence_count;
+
+            if (trace_u64_hex_decode(line + 2, 16, &record_pid) < 0 ||
+                record_pid != owner_pid ||
+                trace_u64_hex_decode(line + 19, 16, &attempt) < 0 ||
+                trace_u64_hex_decode(line + 36, 16, &evidence_count) < 0 ||
+                evidence_count == 0 ||
+                !saw_initial_begin || saw_initial_commit ||
+                !bfs_initial_evidence_is_complete(&q, deps) ||
+                bfs_loader_operation_commit(
+                    &q, record_pid, attempt, 'A', evidence_count) < 0) {
+                fprintf(stderr,
+                        "dlfreeze: malformed dlopen trace initialization "
+                        "commit\n");
+                fclose(f);
+                bfs_free(&q);
+                return -1;
+            }
+            saw_initial_commit = 1;
+            continue;
+        }
+        if (saw_header && saw_owner && saw_initial_commit && len == 35 &&
+            line[0] == 'Q' && line[1] == ' ' && line[18] == ' ') {
+            uint64_t attempt;
+
+            if (trace_u64_hex_decode(line + 2, 16, &record_pid) < 0 ||
+                record_pid == 0 ||
+                trace_u64_hex_decode(line + 19, 16, &attempt) < 0 ||
+                attempt == 0 ||
+                bfs_loader_operation_commit(
+                    &q, record_pid, attempt, 'B', 0) < 0) {
+                fprintf(stderr,
+                        "dlfreeze: malformed no-object loader commit\n");
+                fclose(f);
+                bfs_free(&q);
+                return -1;
+            }
+            saw_call = 1;
+            continue;
+        }
+        if (saw_header && len > 0 &&
+            (line[0] == 'A' || line[0] == 'B' || line[0] == 'K' ||
+             line[0] == 'Q')) {
+            fprintf(stderr,
+                    "dlfreeze: malformed dlopen trace operation record\n");
+            fclose(f);
+            bfs_free(&q);
+            return -1;
+        }
+        if (saw_header && saw_owner && saw_initial_commit && len == 35 &&
+            (line[0] == 'E' || line[0] == 'C') && line[1] == ' ' &&
+            line[18] == ' ') {
+            uint64_t attempt;
+
+            if (trace_u64_hex_decode(line + 2, 16, &record_pid) < 0 ||
+                record_pid != owner_pid ||
+                trace_u64_hex_decode(line + 19, 16, &attempt) < 0 ||
+                bfs_exec_attempt_update(&q, attempt, line[0] == 'E') < 0) {
+                fprintf(stderr,
+                        "dlfreeze: malformed dlopen trace exec record\n");
+                fclose(f);
+                bfs_free(&q);
+                return -1;
+            }
+            saw_call = 1;
+            continue;
+        }
+        if (saw_header && len > 0 &&
+            (line[0] == 'E' || line[0] == 'C')) {
+            fprintf(stderr,
+                    "dlfreeze: malformed dlopen trace exec record\n");
+            fclose(f);
+            bfs_free(&q);
+            return -1;
+        }
+        if (saw_header && saw_owner && len >= 20 && line[0] == '!' &&
+            line[1] == ' ' && line[18] == ' ' && line[19] != '\0') {
+            int reason_valid = 1;
+
+            for (size_t i = 19; i < len; i++) {
+                if (!((line[i] >= 'a' && line[i] <= 'z') ||
+                      (line[i] >= '0' && line[i] <= '9') ||
+                      line[i] == '-')) {
+                    reason_valid = 0;
+                    break;
+                }
+            }
+            if (!reason_valid ||
+                trace_u64_hex_decode(line + 2, 16, &record_pid) < 0 ||
+                record_pid == 0) {
+                fprintf(stderr,
+                        "dlfreeze: malformed dlopen trace terminal record\n");
+                fclose(f);
+                bfs_free(&q);
+                return -1;
+            }
+            fprintf(stderr,
+                    "dlfreeze: preload helper reported an incomplete "
+                    "dlopen trace: %s\n",
+                    line + 19);
+            fclose(f);
+            bfs_free(&q);
+            return -1;
+        }
+        if (saw_header && len > 0 && line[0] == '!') {
+            fprintf(stderr,
+                    "dlfreeze: malformed dlopen trace terminal record\n");
+            fclose(f);
+            bfs_free(&q);
+            return -1;
+        }
+        if (saw_header && saw_owner && len > 0 &&
+            (line[0] == 'I' || line[0] == 'R')) {
+            struct dep_file_snapshot snapshot = {0};
+            struct elf_info info = {0};
+            uint64_t attempt;
+            char evidence_kind = line[0] == 'I' ? 'A' : 'B';
+            char *resolved;
+
+            if (trace_split_fields(line, fields, 13) < 0 ||
+                strlen(fields[0]) != 1 ||
+                trace_u64_hex_decode(fields[1], strlen(fields[1]),
+                                     &record_pid) < 0 ||
+                record_pid == 0 ||
+                trace_u64_hex_decode(fields[2], strlen(fields[2]),
+                                     &attempt) < 0 ||
+                attempt == 0 ||
+                (evidence_kind == 'A' && record_pid != owner_pid) ||
+                (evidence_kind == 'B' && !saw_initial_commit) ||
+                trace_hex_decode(fields[3], strlen(fields[3]),
+                                 logical, sizeof(logical)) < 0 ||
+                trace_hex_decode(fields[4], strlen(fields[4]),
+                                 source, sizeof(source)) < 0) {
+                fprintf(stderr,
+                        "dlfreeze: malformed mapped-object trace evidence\n");
+                fclose(f);
+                bfs_free(&q);
+                return -1;
+            }
+            for (size_t index = 0; index < 8; index++) {
+                if (trace_u64_hex_decode(
+                        fields[5 + index], strlen(fields[5 + index]),
+                        &trace_snapshot[index]) < 0) {
+                    fprintf(stderr,
+                            "dlfreeze: malformed mapped-object trace "
+                            "snapshot\n");
+                    fclose(f);
+                    bfs_free(&q);
+                    return -1;
+                }
+            }
+            resolved = validate_traced_elf_object(
+                deps, logical, source, trace_snapshot, &snapshot, &info);
+            if (!resolved ||
+                bfs_loader_operation_evidence(
+                    &q, record_pid, attempt, evidence_kind) < 0 ||
+                (evidence_kind == 'A' &&
+                 bfs_initial_identity_add(&q, deps, &snapshot) < 0)) {
+                fprintf(stderr,
+                        "dlfreeze: mapped object changed after tracing or "
+                        "has no pending operation: %s\n", source);
+                elf_info_free(&info);
+                free(resolved);
+                fclose(f);
+                bfs_free(&q);
+                return -1;
+            }
+            if (evidence_kind == 'B' &&
+                !is_kernel_virtual_lib(resolved) &&
+                !snapshot_is_interpreter(&snapshot, deps)) {
+                const char *base = strrchr(logical, '/');
+                const char *name;
+                int identity_index = dependency_snapshot_index(
+                    deps, &snapshot);
+                int startup_owned = identity_index >= 0 &&
+                    !deps->libs[identity_index].from_dlopen;
+                int first_in_process = startup_owned
+                    ? 0 : bfs_trace_identity_first(
+                              &q, record_pid, &snapshot);
+                int added;
+
+                base = base ? base + 1 : logical;
+                name = info.soname && info.soname[0] ? info.soname : base;
+                if (first_in_process < 0) {
+                    elf_info_free(&info);
+                    free(resolved);
+                    fclose(f);
+                    bfs_free(&q);
+                    return -1;
+                }
+                /* A nested constructor dlopen can commit while its caller's
+                 * transaction is still pending.  The outer post-scan then
+                 * sees the same mapping as R evidence.  Count and validate
+                 * that evidence, but do not invent a requestless alias once
+                 * this process has already established the identity. */
+                if (first_in_process == 0) {
+                    saw_call = 1;
+                    elf_info_free(&info);
+                    free(resolved);
+                    continue;
+                }
+                added = dep_list_add(
+                    deps, name, resolved, logical, &snapshot,
+                    1, 0, 0, 0, NULL);
+                if (added < 0) {
+                    elf_info_free(&info);
+                    free(resolved);
+                    fclose(f);
+                    bfs_free(&q);
+                    return -1;
+                }
+                saw_call = 1;
+            }
+            elf_info_free(&info);
+            free(resolved);
+            continue;
+        }
+        /* Failed-load records intentionally carry no pathname: there is no
+         * successful link_map identity to package, and direct replay cannot
+         * reproduce the native loader's observable dlerror state.  Preserve
+         * the API, NULL-vs-non-NULL filename, namespace, and exact mode in a
+         * fixed-width grammar, together with the originating process.  Every
+         * uint32_t mode and uint64_t namespace is meaningful here because
+         * invalid arguments can themselves be the reason the native
+         * operation failed. */
+        if (saw_header && saw_owner && saw_initial_commit && len == 65 &&
+            line[0] == 'F' && line[1] == ' ' && line[18] == ' ' &&
+            line[35] == ' ' &&
+            (line[36] == 'D' || line[36] == 'M') && line[37] == ' ' &&
+            (line[38] == 'N' || line[38] == 'P') && line[39] == ' ' &&
+            line[56] == ' ') {
+            uint64_t namespace_id;
+            uint64_t attempt;
+
+            if (trace_u64_hex_decode(line + 2, 16, &record_pid) < 0 ||
+                record_pid == 0 ||
+                trace_u64_hex_decode(line + 19, 16, &attempt) < 0 ||
+                attempt == 0 ||
+                trace_u64_hex_decode(line + 40, 16, &namespace_id) < 0 ||
+                trace_u32_hex_decode(line + 57, 8, &mode) < 0 ||
+                (line[36] == 'D' && namespace_id != 0) ||
+                bfs_loader_operation_commit(
+                    &q, record_pid, attempt, 'B', 0) < 0) {
+                fprintf(stderr,
+                        "dlfreeze: unsupported or malformed failed-load "
+                        "trace record\n");
+                fclose(f);
+                bfs_free(&q);
+                return -1;
+            }
+            deps->traced_requires_native_loader_semantics = 1;
+            saw_call = 1;
+            continue;
+        }
+        if (saw_header && len > 0 && line[0] == 'F') {
+            fprintf(stderr,
+                    "dlfreeze: unsupported or malformed failed-load "
+                    "trace record\n");
+            fclose(f);
+            bfs_free(&q);
+            return -1;
+        }
+        if (!saw_header || !saw_owner || !saw_initial_commit || len < 15 ||
+            trace_split_fields(line, fields,
+                               sizeof(fields) / sizeof(fields[0])) < 0 ||
+            strlen(fields[0]) != 1 ||
+            (fields[0][0] != 'P' && fields[0][0] != 'S')) {
             fprintf(stderr,
                     "dlfreeze: unsupported or malformed dlopen trace format\n");
             fclose(f);
             bfs_free(&q);
             return -1;
         }
-        first_separator = strchr(line + 2, ' ');
-        second_separator = first_separator
-            ? strchr(first_separator + 1, ' ') : NULL;
-        if (!first_separator || !second_separator ||
-            strchr(second_separator + 1, ' ')) {
-            fprintf(stderr, "dlfreeze: malformed dlopen trace record\n");
+        if (trace_u64_hex_decode(fields[1], strlen(fields[1]),
+                                 &record_pid) < 0 ||
+            record_pid == 0) {
+            fprintf(stderr,
+                    "dlfreeze: malformed dlopen trace process identity\n");
             fclose(f);
             bfs_free(&q);
             return -1;
         }
-        request_hex_len = (size_t)(first_separator - (line + 2));
-        logical_hex_len =
-            (size_t)(second_separator - (first_separator + 1));
-        source_hex_len = strlen(second_separator + 1);
-        if (trace_hex_decode(line + 2, request_hex_len,
+        if (trace_u64_hex_decode(fields[2], strlen(fields[2]),
+                                 &operation_attempt) < 0 ||
+            operation_attempt == 0 ||
+            trace_u64_hex_decode(fields[3], strlen(fields[3]),
+                                 &operation_evidence_count) < 0 ||
+            trace_u32_hex_decode(fields[4], strlen(fields[4]), &mode) < 0 ||
+            !dlfrz_dlopen_mode_is_supported((int)mode)) {
+            fprintf(stderr,
+                    "dlfreeze: unsupported or malformed dlopen trace mode\n");
+            fclose(f);
+            bfs_free(&q);
+            return -1;
+        }
+        {
+            struct trace_loader_operation *operation =
+                bfs_loader_operation_find(
+                    &q, record_pid, operation_attempt);
+
+            if (!operation || operation->kind != 'B' ||
+                operation->evidence_count != operation_evidence_count) {
+                fprintf(stderr,
+                        "dlfreeze: dlopen trace root has no matching "
+                        "operation evidence\n");
+                fclose(f);
+                bfs_free(&q);
+                return -1;
+            }
+        }
+        if (trace_hex_decode(fields[5], strlen(fields[5]),
                              request, sizeof(request)) < 0 ||
-            trace_hex_decode(first_separator + 1, logical_hex_len,
+            trace_hex_decode(fields[6], strlen(fields[6]),
                              logical, sizeof(logical)) < 0 ||
-            trace_hex_decode(second_separator + 1, source_hex_len,
+            trace_hex_decode(fields[7], strlen(fields[7]),
                              source, sizeof(source)) < 0) {
             fprintf(stderr, "dlfreeze: malformed dlopen trace encoding\n");
             fclose(f);
             bfs_free(&q);
             return -1;
         }
+        for (size_t i = 0; i < 8; i++) {
+            if (trace_u64_hex_decode(fields[8 + i],
+                                     strlen(fields[8 + i]),
+                                     &trace_snapshot[i]) < 0) {
+                fprintf(stderr,
+                        "dlfreeze: malformed dlopen trace source snapshot\n");
+                fclose(f);
+                bfs_free(&q);
+                return -1;
+            }
+        }
+        if (trace_snapshot[2] != (uint64_t)S_IFREG ||
+            trace_snapshot[5] > 999999999 ||
+            trace_snapshot[7] > 999999999) {
+            fprintf(stderr,
+                    "dlfreeze: malformed dlopen trace source snapshot\n");
+            fclose(f);
+            bfs_free(&q);
+            return -1;
+        }
         pathful = strchr(request, '/') != NULL;
-        if (pathful != (line[0] == 'P') || logical[0] != '/' ||
+        if (pathful != (fields[0][0] == 'P') || logical[0] != '/' ||
             source[0] != '/') {
             fprintf(stderr, "dlfreeze: inconsistent dlopen trace record\n");
             fclose(f);
@@ -3145,10 +4122,12 @@ int dep_add_dlopen_libs(struct dep_list *deps, const char *trace_file)
             bfs_free(&q);
             return -1;
         }
+        saw_call = 1;
 
-        /* V4 stores the first loader-visible spelling and canonical source
-         * separately.  Refuse a stale/non-canonical source instead of
-         * silently replacing the recorded l_name and its $ORIGIN owner. */
+        /* V8 stores the exact mode, first loader-visible spelling, canonical
+         * source, and the source revision observed immediately after the
+         * native load.  Refuse pathname replacement instead of silently
+         * packing bytes which were never associated with this record. */
         struct dep_file_snapshot snapshot = {0};
         char *rp = validated_candidate(
             source, deps, CANDIDATE_NON_GNU, NULL, NULL, &snapshot);
@@ -3161,14 +4140,32 @@ int dep_add_dlopen_libs(struct dep_list *deps, const char *trace_file)
             bfs_free(&q);
             return -1;
         }
+        if (!trace_snapshot_matches_dep(trace_snapshot, &snapshot)) {
+            fprintf(stderr,
+                    "dlfreeze: traced dlopen object changed after tracing: %s\n",
+                    source);
+            free(rp);
+            fclose(f);
+            bfs_free(&q);
+            errno = ESTALE;
+            return -1;
+        }
 
         const char *base = strrchr(logical, '/');
         const char *name;
-        struct elf_info info;
+        struct elf_info info = {0};
 
         base = base ? base + 1 : logical;
         if (is_kernel_virtual_lib(rp) ||
             snapshot_is_interpreter(&snapshot, deps)) {
+            if (bfs_loader_operation_commit(
+                    &q, record_pid, operation_attempt, 'B',
+                    operation_evidence_count) < 0) {
+                free(rp);
+                fclose(f);
+                bfs_free(&q);
+                return -1;
+            }
             free(rp);
             continue;
         }
@@ -3189,14 +4186,41 @@ int dep_add_dlopen_libs(struct dep_list *deps, const char *trace_file)
         name = info.soname && info.soname[0] ? info.soname : base;
 
         /* Native loaders traverse one dependency closure for the first map
-         * of a filesystem identity.  Later request aliases need their own
-         * manifest identities, but must not re-run DT_NEEDED resolution with
-         * a later alias's $ORIGIN. */
-        int identity_was_known =
-            dependency_snapshot_index(deps, &snapshot) >= 0;
+         * of a filesystem identity in each process.  Later request aliases
+         * need their own manifest identities, but must not re-run DT_NEEDED
+         * resolution with a later alias's $ORIGIN in that process. */
+        int identity_index = dependency_snapshot_index(deps, &snapshot);
+        /* One pid-tagged append-only trace is intentionally inherited across
+         * fork and can also contain multiple dlmopen namespaces or an
+         * unload/reload sequence.  An earlier record therefore does not prove
+         * that this identity was visible in the process/namespace which
+         * issued the current pure-LAZY request.  The immutable startup graph
+         * is the only safe visibility proof available in V8. */
+        int identity_was_startup_owned =
+            identity_index >= 0 && !deps->libs[identity_index].from_dlopen;
+        int first_in_process = identity_was_startup_owned
+            ? 0 : bfs_trace_identity_first(&q, record_pid, &snapshot);
+
+        if (first_in_process < 0) {
+            elf_info_free(&info);
+            free(rp);
+            fclose(f);
+            bfs_free(&q);
+            return -1;
+        }
         int added = dep_list_add(deps, name, rp, logical, &snapshot,
                                  1, 1, pathful, 0, request);
-        if (added > 0 && !identity_was_known &&
+        if (added < 0) {
+            elf_info_free(&info);
+            free(rp);
+            fclose(f);
+            bfs_free(&q);
+            return -1;
+        }
+        if (!identity_was_startup_owned &&
+            dlfrz_dlopen_mode_requires_lazy_binding((int)mode))
+            deps->traced_requires_native_lazy_semantics = 1;
+        if (added > 0 && first_in_process &&
             bfs_push(&q, rp, logical, &snapshot, NULL) < 0) {
             elf_info_free(&info);
             free(rp);
@@ -3206,53 +4230,72 @@ int dep_add_dlopen_libs(struct dep_list *deps, const char *trace_file)
         }
         elf_info_free(&info);
         free(rp);
-        if (added < 0) {
+        if (added > 0 && first_in_process &&
+            resolve_dlopen_dependency_queue(deps, &q) < 0) {
+            fclose(f);
+            bfs_free(&q);
+            return -1;
+        }
+        if (bfs_loader_operation_commit(
+                &q, record_pid, operation_attempt, 'B',
+                operation_evidence_count) < 0) {
+            fprintf(stderr,
+                    "dlfreeze: dlopen trace operation evidence count "
+                    "does not match its root commit\n");
             fclose(f);
             bfs_free(&q);
             return -1;
         }
     }
-    if (ferror(f) || !saw_header) {
-        if (!ferror(f))
-            fprintf(stderr, "dlfreeze: missing dlopen trace version header\n");
+    if (ferror(f) || !saw_header || !saw_owner || !saw_initial_begin ||
+        !saw_initial_commit || q.pending_exec_count != 0 ||
+        q.loader_operation_count != 0 ||
+        q.descriptor_operation_count != 0) {
+        if (!ferror(f)) {
+            if (!saw_header)
+                fprintf(stderr,
+                        "dlfreeze: missing dlopen trace version header\n");
+            else if (!saw_owner)
+                fprintf(stderr,
+                        "dlfreeze: missing dlopen trace owner record\n");
+            else if (!saw_initial_begin || !saw_initial_commit)
+                fprintf(stderr,
+                        "dlfreeze: incomplete initial mapped-object "
+                        "evidence\n");
+            else if (q.pending_exec_count != 0)
+                fprintf(stderr,
+                        "dlfreeze: traced owner replaced its process image "
+                        "during dlopen tracing\n");
+            else if (q.descriptor_operation_count != 0)
+                fprintf(stderr,
+                        "dlfreeze: incomplete descriptor operation during "
+                        "dlopen tracing\n");
+            else
+                fprintf(stderr,
+                        "dlfreeze: incomplete dlopen operation evidence\n");
+        }
         fclose(f);
         bfs_free(&q);
         return -1;
     }
     fclose(f);
 
-    /* resolve transitive deps of dlopen'd libs */
-    struct bfs_item item;
-    while (bfs_pop(&q, &item)) {
-        char *lib_path = item.path;
-        struct elf_info li;
-        if (elf_parse_path_snapshot(lib_path, &item.snapshot, &li, NULL) < 0 ||
-            !li.is_dynamic ||
-            li.ei_class != deps->target_ei_class ||
-            li.e_machine != deps->target_e_machine) {
-            elf_info_free(&li);
-            bfs_item_free(&item);
-            bfs_free(&q);
-            return -1;
-        }
-
-        char *dt = strdup(item.logical_path);
-        char *lo = dt ? strdup(dirname(dt)) : NULL;
-        if (!dt || !lo ||
-            resolve_needed(&li, lo, deps, &q, 1,
-                           item.inherited_rpath) < 0) {
-            free(lo); free(dt);
-            elf_info_free(&li);
-            bfs_item_free(&item);
-            bfs_free(&q);
-            return -1;
-        }
-        free(lo); free(dt);
-        elf_info_free(&li);
-        bfs_item_free(&item);
-    }
     bfs_free(&q);
     return 0;
+}
+
+int dep_add_dlopen_libs(struct dep_list *deps, const char *trace_file)
+{
+    return dep_add_dlopen_libs_internal(deps, trace_file, -1);
+}
+
+int dep_add_dlopen_libs_fd(struct dep_list *deps, int trace_fd)
+{
+    if (trace_fd < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    return dep_add_dlopen_libs_internal(deps, NULL, trace_fd);
 }
 
 static int dependency_snapshot_index(
