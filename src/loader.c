@@ -745,8 +745,8 @@ static int g_executable_probe_forced_munmap_errno;
  * not expose it.  Bootstrap admission has already exercised this exact
  * syscall form inside a disposable child, so this wrapper is reached only
  * for a positively proven startup source. */
-static void *loader_mremap_dontunmap(void *source, size_t length,
-                                     void *target)
+static void *loader_mremap_flags(void *source, size_t length,
+                                 void *target, int extra_flags)
 {
 #if defined(SYS_mremap)
     long result;
@@ -762,7 +762,7 @@ static void *loader_mremap_dontunmap(void *source, size_t length,
 #endif
     result = arch_raw_syscall5(
         SYS_mremap, (long)source, (long)length, (long)length,
-        MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP,
+        MREMAP_MAYMOVE | MREMAP_FIXED | extra_flags,
         (long)target);
     if (raw_syscall_failed(result)) {
         set_loader_errno((int)-result);
@@ -776,6 +776,7 @@ static void *loader_mremap_dontunmap(void *source, size_t length,
     (void)source;
     (void)length;
     (void)target;
+    (void)extra_flags;
     set_loader_errno(ENOSYS);
     return MAP_FAILED;
 #endif
@@ -1449,6 +1450,38 @@ static int g_perf_mode;
  * mapping.  The first kernel refusal disables subsequent attempts, avoiding
  * one denied syscall per segment on old kernels or RET_ERRNO seccomp. */
 static int g_startup_mremap_disabled;
+static struct dlfrz_premap_range g_kernel_premaps[DLFRZ_PREMAP_MAX_PHDRS];
+static size_t g_kernel_premap_count;
+static void release_kernel_premaps(void);
+
+int loader_install_kernel_premap(const struct dlfrz_premap_range *ranges,
+                                 size_t count)
+{
+    if (!ranges || count == 0 || count > DLFRZ_PREMAP_MAX_PHDRS ||
+        g_kernel_premap_count != 0)
+        return -1;
+    for (size_t i = 0; i < count; i++) {
+        if (!ranges[i].length || ranges[i].source < DLFRZ_PREMAP_LO ||
+            ranges[i].source >= DLFRZ_PREMAP_HI ||
+            ranges[i].length > DLFRZ_PREMAP_HI - ranges[i].source ||
+            ((ranges[i].source | ranges[i].target | ranges[i].length |
+              ranges[i].file_offset) & 4095U) ||
+            ranges[i].target > UINTPTR_MAX - ranges[i].length ||
+            ranges[i].file_offset > UINT64_MAX - ranges[i].length ||
+            (ranges[i].target < DLFRZ_PREMAP_HI &&
+             ranges[i].target + ranges[i].length > DLFRZ_PREMAP_LO))
+            return -1;
+        for (size_t j = 0; j < i; j++)
+            if ((ranges[i].source < ranges[j].source + ranges[j].length &&
+                 ranges[j].source < ranges[i].source + ranges[i].length) ||
+                (ranges[i].target < ranges[j].target + ranges[j].length &&
+                 ranges[j].target < ranges[i].target + ranges[i].length))
+                return -1;
+    }
+    memcpy(g_kernel_premaps, ranges, count * sizeof(*ranges));
+    g_kernel_premap_count = count;
+    return 0;
+}
 static int g_is_musl_runtime;
 static char g_glibc_cache_path[PATH_MAX];
 static char g_glibc_preload_path[PATH_MAX];
@@ -14985,8 +15018,10 @@ static void release_frozen_source_fd_after_tls(void)
     /* The contained syscall proof covers only the inherited startup policy.
      * A program may install a stricter filter before a later dlopen, so never
      * issue this optional syscall after target TLS/application handoff. */
-    g_frozen_source_flags &= ~DLFRZ_SOURCE_MREMAP_DONTUNMAP;
+    g_frozen_source_flags &= ~(DLFRZ_SOURCE_MREMAP_DONTUNMAP |
+                               DLFRZ_SOURCE_KERNEL_PREMAP);
     g_startup_mremap_disabled = 1;
+    release_kernel_premaps();
     if (fd >= 0)
         (void)arch_raw_close(fd);
 }
@@ -32236,16 +32271,25 @@ static int map_fileback_segment(void *target, size_t length, int prot,
     return 1;
 }
 
-/* Transfer resident payload pages to their final address without keeping a
- * source fd.  A failed DONTUNMAP operation is recoverable because bootstrap
- * positively proved exact clean file VMAs and exercised this geometry in a
- * disposable child; the retained source therefore refaults from the same
- * file.  Recreate the destination as anonymous PROT_NONE before copying:
- * this also makes fallback safe on kernels which can partially process a
- * range spanning multiple VMAs.
- *
- * Return 1 for a moved range, 0 for a restored copy destination, and -1 only
- * when the destination invariant could not be re-established. */
+/* Release only still-owned stages, never previously consumed holes. */
+static void release_kernel_premaps(void)
+{
+    for (size_t i = 0; i < g_kernel_premap_count; i++) {
+        if (g_kernel_premaps[i].length &&
+            munmap((void *)(uintptr_t)g_kernel_premaps[i].source,
+                   (size_t)g_kernel_premaps[i].length) < 0)
+            loader_exit(127);
+        g_kernel_premaps[i].length = 0;
+    }
+    g_kernel_premap_count = 0;
+}
+
+/* Transfer proven startup pages without retaining a source fd. The default
+ * format uses DONTUNMAP on exact clean file VMAs; -p instead consumes its
+ * independent staging aliases. Both forms preserve the canonical payload
+ * for fallback. Recreate the destination as anonymous PROT_NONE before
+ * copying, including after a partially processed mapping failure.
+ * Return 1 for transfer, 0 for restored copy fallback, -1 for lost ownership. */
 static int map_mapped_payload_segment(void *source, void *target,
                                       size_t length)
 {
@@ -32253,7 +32297,30 @@ static int map_mapped_payload_segment(void *source, void *target,
 
     if (g_startup_mremap_disabled)
         return 0;
-    mapping = loader_mremap_dontunmap(source, length, target);
+    if (g_kernel_premap_count) {
+        struct dlfrz_premap_range *range = NULL;
+        for (size_t i = 0; i < g_kernel_premap_count; i++)
+            if (g_kernel_premaps[i].target == (uint64_t)(uintptr_t)target &&
+                g_kernel_premaps[i].length == length) {
+                range = &g_kernel_premaps[i];
+                break;
+            }
+        if (!range)
+            return 0;
+        /* A stage has exactly one consumer. Clear ownership before moving;
+         * never later unmap a hole that another loader allocation may use. */
+        void *stage = (void *)(uintptr_t)range->source;
+        range->length = 0;
+        mapping = loader_mremap_flags(stage, length, target, 0);
+        if (mapping != target) {
+            /* No intervening allocations: even a partial failed move leaves
+             * this original stage interval safe to discard immediately. */
+            if (munmap(stage, length) < 0)
+                return -1;
+        }
+    } else {
+        mapping = loader_mremap_flags(source, length, target, MREMAP_DONTUNMAP);
+    }
     if (mapping == target)
         return 1;
     if (mapping != MAP_FAILED)
@@ -32717,7 +32784,8 @@ static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         srcfd >= 0 &&
         (source_flags & DLFRZ_SOURCE_EXACT_CLEAN_FILE) != 0;
     mremap_mode =
-        (source_flags & DLFRZ_SOURCE_MREMAP_DONTUNMAP) != 0;
+        (source_flags & (DLFRZ_SOURCE_MREMAP_DONTUNMAP |
+                         DLFRZ_SOURCE_KERNEL_PREMAP)) != 0;
     anonymous_copy_mode = !fileback_mode && !mremap_mode;
     if (anonymous_copy_mode &&
         make_anonymous_load_runs_writable(
@@ -37490,7 +37558,8 @@ static int initialize_target_tunable_service(
     /* The service copy is placed at a runtime-selected address which the
      * bootstrap could not exercise in its exact DONTUNMAP plan. */
     if (map_object(mem, mem_foff, srcfd,
-                   source_flags & ~DLFRZ_SOURCE_MREMAP_DONTUNMAP,
+                   source_flags & ~(DLFRZ_SOURCE_MREMAP_DONTUNMAP |
+                                    DLFRZ_SOURCE_KERNEL_PREMAP),
                    &service_meta, entry, obj, 1) < 0 ||
         revalidate_loaded_gnu_properties(obj) < 0)
         goto fail;
@@ -47612,9 +47681,14 @@ static int embedded_glibc_config_paths(
 static int loader_source_contract_is_valid(int srcfd, uint32_t source_flags)
 {
     const uint32_t known = DLFRZ_SOURCE_EXACT_CLEAN_FILE |
-                           DLFRZ_SOURCE_MREMAP_DONTUNMAP;
+                           DLFRZ_SOURCE_MREMAP_DONTUNMAP |
+                           DLFRZ_SOURCE_KERNEL_PREMAP;
 
     if ((source_flags & ~known) != 0)
+        return 0;
+    if ((source_flags & DLFRZ_SOURCE_KERNEL_PREMAP) != 0 &&
+        (!g_kernel_premap_count ||
+         (source_flags & DLFRZ_SOURCE_MREMAP_DONTUNMAP)))
         return 0;
     /* At initial handoff an exact token must name the still-open descriptor
      * whose clean private view is byte-equivalent to mem.  The descriptor is
@@ -47677,7 +47751,8 @@ static int loader_run_impl(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     if (!loader_source_contract_is_valid(srcfd, source_flags))
         return -1;
     g_startup_mremap_disabled =
-        (source_flags & DLFRZ_SOURCE_MREMAP_DONTUNMAP) == 0;
+        (source_flags & (DLFRZ_SOURCE_MREMAP_DONTUNMAP |
+                         DLFRZ_SOURCE_KERNEL_PREMAP)) == 0;
 
     g_target_tls_active = 0;
     g_target_errno_ready = 0;

@@ -7,6 +7,7 @@
 #include "glibc_layout.h"
 #include "musl_layout.h"
 #include "load_segments.h"
+#include "premap.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7037,6 +7038,183 @@ static int patch_elf_for_mapped_payload_inplace(
     return 0;
 }
 
+/* This operates only on the unpublished outer transaction. Failure discards
+ * the entire output; no malformed kernel ELF can become the destination. */
+static int pack_kernel_premap(const char *path, struct stat *identity,
+                              size_t bootstrap_size, size_t *size_io,
+                              const struct dlfrz_entry *entries,
+                              const struct dlfrz_lib_meta *metas, size_t n)
+{
+    Elf64_Phdr ph[DLFRZ_PREMAP_MAX_PHDRS];
+    Elf64_Ehdr eh;
+    struct dlfrz_footer footer;
+    struct dlfrz_premap_info info = {{'D','L','F','R','Z','P','M','1'},0,0};
+    const uint64_t page = PAYLOAD_ALIGN;
+    uint64_t cursor = DLFRZ_PREMAP_LO + PAYLOAD_ALIGN, table_offset, table_address;
+    size_t count = 1, stages = 0, info_offset = SIZE_MAX;
+    size_t old_size = *size_io;
+    const size_t mapping_size = *size_io;
+    int fd = open_owned_transaction(path, O_RDWR, identity, NULL);
+    FILE *out = fd >= 0 ? fdopen(fd, "r+b") : NULL;
+    struct stat status;
+    uint8_t *mem = MAP_FAILED;
+    int result = -1;
+
+    if (!out) {
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    if (!metas || !entries || bootstrap_size > old_size ||
+        old_size < sizeof(eh) + sizeof(footer) ||
+        fstat(fd, &status) < 0 || status.st_size < 0 ||
+        (uintmax_t)status.st_size != old_size) goto done;
+    mem = mmap(NULL, old_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (mem == MAP_FAILED) goto done;
+    memcpy(&eh, mem, sizeof(eh));
+    memcpy(&footer, mem + old_size - sizeof(footer), sizeof(footer));
+    if (eh.e_phentsize != sizeof(*ph) || eh.e_phoff > bootstrap_size ||
+        eh.e_phnum > (bootstrap_size - eh.e_phoff) / sizeof(*ph) ||
+        eh.e_phnum + 4U > DLFRZ_PREMAP_MAX_PHDRS ||
+        memcmp(footer.magic, DLFRZ_MAGIC, 8)) goto done;
+    if (!u64_align_up_checked(bootstrap_size, page, &table_offset) ||
+        table_offset > DLFRZ_PREMAP_HI - DLFRZ_PREMAP_LO - page ||
+        table_offset > old_size || page > old_size - table_offset ||
+        n == 0 || entries[0].data_offset != table_offset + page)
+        goto done;
+    for (uint64_t i = 0; i < page; i++)
+        if (mem[table_offset + i] != 0) goto done;
+    table_address = DLFRZ_PREMAP_LO + table_offset;
+    for (size_t i = 0; i < eh.e_phnum; i++) {
+        Elf64_Phdr p;
+        memcpy(&p, mem + eh.e_phoff + i * sizeof(p), sizeof(p));
+        if (p.p_type != PT_PHDR) ph[count++] = p;
+        if (p.p_type == PT_LOAD && (p.p_flags & PF_W)) {
+            if (p.p_offset > bootstrap_size ||
+                p.p_filesz > bootstrap_size - p.p_offset) goto done;
+            for (uint64_t j = 0; j + sizeof(info) <= p.p_filesz; j++) {
+                struct dlfrz_premap_info candidate;
+                memcpy(&candidate, mem + p.p_offset + j, sizeof(candidate));
+                if (memcmp(&candidate, &info, sizeof(info))) continue;
+                if (info_offset != SIZE_MAX) goto done;
+                info_offset = (size_t)(p.p_offset + j);
+            }
+        }
+    }
+    if (info_offset == SIZE_MAX) goto done;
+    /* Older qemu-user derives AT_PHDR as lowest_LOAD + e_phoff. A small
+     * offset-zero header alias plus a congruent table owner satisfies that
+     * convention AND Linux's exact table-owner rule, without mapping the
+     * intervening file or changing the bootstrap's linked load addresses. */
+    ph[count++] = (Elf64_Phdr){PT_LOAD, PF_R, 0, DLFRZ_PREMAP_LO,
+                               DLFRZ_PREMAP_LO, page, page, page};
+
+    /* One alias per startup LOAD, rounded to the architecture's maximum
+     * page size. Padding is private staging only; the runtime transfers
+     * exclusively the bounded pages selected by its normal loader plan.
+     * Keep one slot for the new table owner. Excess segments use copying. */
+    for (size_t i = 0; i < n && count + 1 < DLFRZ_PREMAP_MAX_PHDRS; i++) {
+        Elf64_Ehdr object;
+        if (metas[i].flags & (DLFRZ_FLAG_DATA | DLFRZ_FLAG_INTERP)) continue;
+        if ((metas[i].flags & DLFRZ_FLAG_DLOPEN) &&
+            !(metas[i].flags & DLFRZ_FLAG_DLOPEN_EARLY)) continue;
+        int duplicate = 0;
+        for (size_t j = 0; j < i; j++)
+            if (entries[j].data_offset == entries[i].data_offset &&
+                entries[j].data_size == entries[i].data_size &&
+                metas[j].base_addr == metas[i].base_addr &&
+                !(metas[j].flags & (DLFRZ_FLAG_DATA | DLFRZ_FLAG_INTERP)) &&
+                (!(metas[j].flags & DLFRZ_FLAG_DLOPEN) ||
+                 (metas[j].flags & DLFRZ_FLAG_DLOPEN_EARLY))) duplicate = 1;
+        if (duplicate) continue;
+        if (entries[i].data_offset > old_size ||
+            entries[i].data_size > old_size - entries[i].data_offset ||
+            entries[i].data_size < sizeof(object)) goto done;
+        const uint8_t *elf = mem + entries[i].data_offset;
+        memcpy(&object, elf, sizeof(object));
+        if (object.e_phentsize != sizeof(Elf64_Phdr) ||
+            object.e_phoff > entries[i].data_size ||
+            object.e_phnum >
+                (entries[i].data_size - object.e_phoff) / sizeof(Elf64_Phdr))
+            goto done;
+        for (size_t j = 0; j < object.e_phnum &&
+             count + 1 < DLFRZ_PREMAP_MAX_PHDRS; j++) {
+            Elf64_Phdr p;
+            uint64_t file, target, length, delta, raw_end;
+            memcpy(&p, elf + object.e_phoff + j * sizeof(p), sizeof(p));
+            if (p.p_type != PT_LOAD || !p.p_filesz) continue;
+            if (p.p_offset > entries[i].data_size ||
+                p.p_filesz > entries[i].data_size - p.p_offset ||
+                !u64_add_checked(entries[i].data_offset, p.p_offset, &file) ||
+                !u64_add_checked(metas[i].base_addr, p.p_vaddr, &target))
+                goto done;
+            if ((file ^ target) & (page - 1)) continue;
+            delta = file & (page - 1);
+            if (!u64_add_checked(delta, p.p_filesz, &raw_end) ||
+                !u64_align_up_checked(raw_end, page, &length)) goto done;
+            file -= delta;
+            target -= delta;
+            if (cursor < table_address + page &&
+                (cursor >= table_address || length > table_address - cursor))
+                cursor = table_address + page;
+            if (length > old_size - file || length > DLFRZ_PREMAP_HI - cursor)
+                continue;
+            ph[count++] = (Elf64_Phdr){PT_LOAD, PF_R, file, cursor,
+                                       target, length, length, page};
+            cursor += length;
+            stages++;
+        }
+    }
+    if (!stages || cursor > DLFRZ_PREMAP_HI ||
+        table_offset > SIZE_MAX - DLFRZ_PREMAP_MAX_PHDRS * sizeof(*ph) -
+                                     sizeof(footer)) goto done;
+    info.phdr_vaddr = table_address;
+    info.phdr_count = count + 1;
+    ph[0] = (Elf64_Phdr){PT_PHDR, PF_R, table_offset, table_address, table_address,
+                         info.phdr_count * sizeof(*ph),
+                         info.phdr_count * sizeof(*ph), 8};
+    ph[count++] = (Elf64_Phdr){PT_LOAD, PF_R, table_offset, table_address, table_address,
+                               ph[0].p_filesz, ph[0].p_filesz, page};
+    /* Sort only LOAD slots; preserve non-LOAD semantics and leading PHDR. */
+    for (size_t i = 1; i < count; i++) {
+        if (ph[i].p_type != PT_LOAD) continue;
+        for (size_t j = i + 1; j < count; j++)
+            if (ph[j].p_type == PT_LOAD && ph[j].p_vaddr < ph[i].p_vaddr) {
+                Elf64_Phdr swap = ph[i]; ph[i] = ph[j]; ph[j] = swap;
+            }
+    }
+    if (!dlfrz_premap_headers_valid(ph, count, table_address, old_size, page))
+        goto done;
+    /* Staging and the table must not occupy even a dormant target's guards.
+     * Refuse this experimental layout rather than silently changing bases. */
+    for (size_t i = 0; i < n; i++) {
+        size_t span;
+        void *address;
+        if (metas[i].flags & DLFRZ_FLAG_DATA) continue;
+        if (!prelink_mapping_span(&metas[i], &span, &address)) goto done;
+        if ((uint64_t)(uintptr_t)address < UINT64_C(0x40000000) &&
+            (uint64_t)(uintptr_t)address + span > DLFRZ_PREMAP_LO) goto done;
+    }
+    eh.e_phoff = table_offset;
+    eh.e_phnum = (uint16_t)count;
+    if (fseeko(out, (off_t)table_offset, SEEK_SET) ||
+        fwrite(ph, sizeof(*ph), count, out) != count ||
+        fseeko(out, (off_t)info_offset, SEEK_SET) ||
+        fwrite(&info, sizeof(info), 1, out) != 1 ||
+        fseeko(out, 0, SEEK_SET) || fwrite(&eh, sizeof(eh), 1, out) != 1 ||
+        fflush(out) || fsync(fd)) goto done;
+    printf("  pre-mapped : %zu startup segments (experimental; no UPX guarantee)\n",
+           stages);
+    result = 0;
+done:
+    if (mem != MAP_FAILED) munmap(mem, mapping_size);
+    if (fclose(out) != 0) result = -1;
+    if (result < 0) {
+        fprintf(stderr, "dlfreeze: cannot represent -p kernel staging layout\n");
+        errno = ENOTSUP;
+    }
+    return result;
+}
+
 static int patch_elf_for_mapped_payload(const char *path,
                                         struct stat *path_identity,
                                         size_t bootstrap_sz,
@@ -9570,6 +9748,13 @@ int pack_frozen(const struct pack_options *opts)
     /* 2. main executable ------------------------------------------- */
     if (write_pad(out, &off, PAYLOAD_ALIGN) < 0)
         goto fail2;
+    /* The optional outer PHDR table has its own page outside every original
+     * LOAD and before the canonical payload. This keeps e_phoff small even
+     * for multi-gigabyte payloads and preserves a unique table owner. */
+    if (opts->performance &&
+        (fputc(0, out) == EOF || size_add_assign(&off, 1) < 0 ||
+         write_pad(out, &off, PAYLOAD_ALIGN) < 0))
+        goto fail2;
     payload_off = off;   /* start of the payload region */
     entries[eidx].data_offset = off;
     entries[eidx].flags       = DLFRZ_FLAG_MAIN_EXE;
@@ -10179,6 +10364,11 @@ int pack_frozen(const struct pack_options *opts)
     /* 10. publish the canonical mapped-payload ELF ABI --------------
      * Must happen LAST so payload_filesz includes everything appended
      * after the footer (symtab, section headers, re-appended footer). */
+    if (opts->performance && (!opts->direct_load || !metas)) {
+        fprintf(stderr, "dlfreeze: -p requires a supported direct-load target\n");
+        errno = ENOTSUP;
+        goto fail2;
+    }
     if (filesize(transaction_path, &transaction_identity, &total_sz) < 0) {
         fprintf(stderr, "dlfreeze: cannot inspect completed output: %s\n",
                 strerror(errno));
@@ -10203,6 +10393,11 @@ int pack_frozen(const struct pack_options *opts)
         goto fail2;
     }
 #endif
+    if (opts->performance &&
+        pack_kernel_premap(transaction_path, &transaction_identity,
+                           bootstrap_sz, &total_sz, entries_copy, metas,
+                           (size_t)eidx_save) < 0)
+        goto fail2;
     if (sync_output_transaction(transaction_path,
                                 &transaction_identity) < 0) {
         fprintf(stderr, "dlfreeze: cannot sync completed output %s: %s\n",

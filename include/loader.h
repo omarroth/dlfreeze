@@ -7,6 +7,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "premap.h"
 
 /* Forward declarations — full definitions in common.h */
 struct dlfrz_lib_meta;
@@ -39,6 +40,15 @@ struct dlfrz_entry;
  * retained source descriptor and makes no claim about unselected payload
  * pages. */
 #define DLFRZ_SOURCE_MREMAP_DONTUNMAP (1U << 1)
+
+/* Same contained startup proof, but move separately owned kernel staging
+ * aliases with ordinary MREMAP_FIXED. Canonical payload pages never move. */
+#define DLFRZ_SOURCE_KERNEL_PREMAP (1U << 2)
+
+/* Bootstrap transfers only validated, trimmed, independently owned ranges.
+ * Unconsumed ranges are released before any target callback. */
+int loader_install_kernel_premap(const struct dlfrz_premap_range *ranges,
+                                 size_t count);
 
 /* A bootstrap-owned anonymous page whose MADV_WIPEONFORK state was positively
  * verified before any target callback.  The loader consumes the armed word;

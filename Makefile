@@ -135,7 +135,7 @@ BOOTSTRAP_AARCH64_CFLAGS := $(if $(filter aarch64,$(STATIC_CC_ARCH)),$(call supp
 BOOTSTRAP_ARCH_CFLAGS := $(strip $(BOOTSTRAP_X86_CFLAGS) $(BOOTSTRAP_AARCH64_CFLAGS))
 INC      = include
 
-$(BOOTSTRAP): $(SRC)/bootstrap.c $(SRC)/loader.c $(SRC)/lazy_trampoline.S $(INC)/common.h $(INC)/dynamic_semantics.h $(INC)/gnu_properties.h $(INC)/glibc_layout.h $(INC)/libc_semantics.h $(INC)/load_segments.h $(INC)/musl_layout.h $(INC)/loader.h $(BUILD_STAMP_FILE)
+$(BOOTSTRAP): $(SRC)/bootstrap.c $(SRC)/loader.c $(SRC)/lazy_trampoline.S $(INC)/common.h $(INC)/dynamic_semantics.h $(INC)/gnu_properties.h $(INC)/glibc_layout.h $(INC)/libc_semantics.h $(INC)/load_segments.h $(INC)/musl_layout.h $(INC)/loader.h $(INC)/premap.h $(BUILD_STAMP_FILE)
 	@if [ -z "$(STATIC_IMAGE_BASE_LDFLAG)" ]; then \
 		echo "dlfreeze-bootstrap: static linker cannot place the ET_EXEC image at 0x40000000" >&2; \
 		exit 1; \

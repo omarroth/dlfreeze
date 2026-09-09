@@ -1014,7 +1014,7 @@ static int mremap_source_ready(
     return bs_startup_mremap_source_ready(
         fixture->source, 0, &fixture->meta, &fixture->entry, 1,
         fixture->file ? fileno(fixture->file) : -1,
-        fixture->file != NULL, 0, 0, 0, NULL);
+        fixture->file != NULL, (uintptr_t)fixture->source, fixture->size, 0, NULL);
 }
 
 #ifdef DLFREEZE_TEST_HAVE_SECCOMP
@@ -1056,6 +1056,58 @@ static int mremap_seccomp_decline(
     return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 #endif
+
+static int kernel_premap_proof_gate(void)
+{
+    struct mremap_proof_fixture fixture;
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    unsigned char *stage = MAP_FAILED;
+    int ok = 1;
+    if (!mremap_proof_fixture_init(&fixture, BS_MREMAP_MIN_STARTUP_BYTES,
+                                   MREMAP_FIXTURE_CLEAN))
+        return 0;
+    stage = mmap((void *)(uintptr_t)DLFRZ_PREMAP_LO, fixture.size, PROT_READ,
+                  MAP_PRIVATE | MAP_FIXED_NOREPLACE, fileno(fixture.file), 0);
+    if (stage == MAP_FAILED) { ok = 0; goto out; }
+    g_bs_premaps[0] = (struct dlfrz_premap_range){(uintptr_t)stage,
+        (uintptr_t)fixture.target, fixture.size, 0};
+    g_bs_premap_count = 1;
+    ok &= expect_value("kernel staging exact clean dual-alias proof",
+                       mremap_source_ready(&fixture), test_signal_zero_clone_available);
+#ifdef DLFREEZE_TEST_HAVE_SECCOMP
+    ok &= expect_value("kernel staging errno denial uses copy fallback",
+        mremap_seccomp_decline(&fixture, SYS_mremap,
+                               SECCOMP_RET_ERRNO | EPERM), 1);
+    ok &= expect_value("kernel staging fatal denial is contained",
+        mremap_seccomp_decline(&fixture, SYS_mremap, SECCOMP_RET_KILL_PROCESS), 1);
+    ok &= expect_value("kernel staging SIGSYS denial is contained",
+        mremap_seccomp_decline(&fixture, SYS_mremap, SECCOMP_RET_TRAP), 1);
+#endif
+    if (mprotect(stage, fixture.size, PROT_READ | PROT_WRITE) < 0) {
+        ok = 0; goto out;
+    }
+    stage[page] ^= 1;
+    if (mprotect(stage, fixture.size, PROT_READ) < 0) { ok = 0; goto out; }
+    ok &= expect_value("dirty kernel stage cannot override canonical bytes",
+                       mremap_source_ready(&fixture), 0);
+    if (munmap(stage, fixture.size) < 0) { ok = 0; goto out; }
+    stage = mmap((void *)(uintptr_t)DLFRZ_PREMAP_LO, fixture.size, PROT_READ,
+                  MAP_PRIVATE | MAP_FIXED_NOREPLACE, fileno(fixture.file), 0);
+    if (stage == MAP_FAILED ||
+        mprotect(fixture.source, fixture.size, PROT_READ | PROT_WRITE) < 0) {
+        ok = 0; goto out;
+    }
+    fixture.source[page] ^= 1;
+    if (mprotect(fixture.source, fixture.size, PROT_READ) < 0) { ok = 0; goto out; }
+    ok &= expect_value("dirty canonical payload cannot use clean kernel stage",
+                       mremap_source_ready(&fixture), 0);
+out:
+    g_bs_premap_count = 0;
+    memset(g_bs_premap_selected, 0, sizeof(g_bs_premap_selected));
+    if (stage != MAP_FAILED) munmap(stage, fixture.size);
+    mremap_proof_fixture_destroy(&fixture);
+    return ok;
+}
 
 static int mremap_proof_gate(void)
 {
@@ -1670,5 +1722,7 @@ int main(void)
         return 7;
     if (!runtime_cookie_gate())
         return 8;
+    if (!kernel_premap_proof_gate())
+        return 10;
     return 0;
 }

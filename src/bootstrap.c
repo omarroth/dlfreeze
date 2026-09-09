@@ -87,6 +87,13 @@ static volatile struct dlfrz_loader_info g_loader_info
     __attribute__((used, section(".data")))
     = { {'D','L','F','R','Z','L','D','R'}, 0, 0, 0 };
 
+static volatile struct dlfrz_premap_info g_premap_info
+    __attribute__((used, section(".data")))
+    = { {'D','L','F','R','Z','P','M','1'}, 0, 0 };
+static struct dlfrz_premap_range g_bs_premaps[DLFRZ_PREMAP_MAX_PHDRS];
+static struct dlfrz_premap_range g_bs_premap_selected[DLFRZ_PREMAP_MAX_PHDRS];
+static size_t g_bs_premap_count;
+
 /* ---- globals ----------------------------------------------------- */
 static volatile pid_t g_child;
 static volatile sig_atomic_t g_forwarded_signal;
@@ -4285,7 +4292,115 @@ struct bs_startup_mremap_plan {
     struct bs_mremap_range *targets;
     size_t count;
     uint64_t total_bytes;
+    int kernel_premap;
 };
+
+static int bs_kernel_premap_admit(
+    const struct bs_live_phdr_table *live,
+    uint64_t table_address, uint64_t table_count,
+    uint64_t payload_offset, uint64_t payload_size,
+    const struct dlfrz_lib_meta *metas, size_t n)
+{
+    Elf64_Phdr ph[DLFRZ_PREMAP_MAX_PHDRS];
+    uint64_t payload_end;
+#if defined(__aarch64__)
+    const uint64_t page = 65536;
+#else
+    const uint64_t page = 4096;
+#endif
+    if (!table_address && !table_count) return 1;
+    if (!live || live->live_address != table_address ||
+        live->count != table_count || table_count > DLFRZ_PREMAP_MAX_PHDRS ||
+        !u64_add_checked(payload_offset, payload_size, &payload_end))
+        return 0;
+    for (size_t i = 0; i < table_count; i++)
+        if (!bs_live_phdr_read(live, i, &ph[i])) return 0;
+    if (!table_count || ph[0].p_offset > payload_offset ||
+        payload_offset - ph[0].p_offset != page ||
+        table_address < DLFRZ_PREMAP_LO ||
+        table_address >= DLFRZ_PREMAP_HI ||
+        !dlfrz_premap_headers_valid(ph, table_count, table_address,
+                                    payload_end, page)) return 0;
+    size_t count = 0;
+    for (size_t i = 1; i < table_count; i++) {
+        const Elf64_Phdr *p = &ph[i];
+        if (p->p_type != PT_LOAD || p->p_paddr == p->p_vaddr) continue;
+        if (p->p_offset < payload_offset || p->p_offset > payload_end ||
+            p->p_filesz > payload_end - p->p_offset) return 0;
+        g_bs_premaps[count++] = (struct dlfrz_premap_range){
+            p->p_vaddr, p->p_paddr, p->p_filesz, p->p_offset};
+    }
+    /* Authenticate ownership against every manifest reservation, including
+     * lazy ranges and guards, before any unmap or optional fixed syscall. */
+    for (size_t i = 0; i < n; i++) {
+        uint64_t lo, hi;
+        if (metas[i].flags & DLFRZ_FLAG_DATA) continue;
+        if (!u64_add_checked(metas[i].base_addr,
+                             metas[i].vaddr_lo & ~(page - 1), &lo) ||
+            !u64_align_up_checked(metas[i].vaddr_hi, page, &hi) ||
+            !u64_add_checked(hi, metas[i].base_addr, &hi) ||
+            !u64_add_checked(hi, 4 * page, &hi)) return 0;
+        if (lo < UINT64_C(0x40000000) && hi > DLFRZ_PREMAP_LO) return 0;
+    }
+    g_bs_premap_count = count;
+    return count != 0;
+}
+
+/* Select only transfers independently derived from admitted input ELFs.
+ * Each whole kernel stage has one consumer; boundary padding is trimmed
+ * after the child proof, never transferred into an object or its guards. */
+static int bs_kernel_premap_select(struct bs_startup_mremap_plan *plan)
+{
+    size_t count = 0;
+    uint64_t bytes = 0;
+    memset(g_bs_premap_selected, 0, sizeof(g_bs_premap_selected));
+    for (size_t i = 0; i < plan->count; i++) {
+        struct bs_mremap_range r = plan->ranges[i];
+        for (size_t j = 0; j < g_bs_premap_count; j++) {
+            const struct dlfrz_premap_range *s = &g_bs_premaps[j];
+            uint64_t delta;
+            if (g_bs_premap_selected[j].length || r.target < s->target)
+                continue;
+            delta = r.target - s->target;
+            if (delta > s->length || r.length > s->length - delta ||
+                r.file_offset < s->file_offset ||
+                r.file_offset - s->file_offset != delta) continue;
+            r.source = (uintptr_t)(s->source + delta);
+            g_bs_premap_selected[j] = (struct dlfrz_premap_range){
+                r.source, r.target, r.length, r.file_offset};
+            plan->ranges[count] = r;
+            plan->targets[count++] = r;
+            bytes += r.length;
+            break;
+        }
+    }
+    plan->count = count;
+    plan->total_bytes = bytes;
+    plan->kernel_premap = 1;
+    return count != 0;
+}
+
+/* Called before handoff even when the optional proof declined. Unmap only
+ * still-owned intervals; after trimming, the loader owns the exact survivors. */
+static int bs_kernel_premap_finish(int ready)
+{
+    struct dlfrz_premap_range kept[DLFRZ_PREMAP_MAX_PHDRS];
+    size_t count = 0;
+    for (size_t i = 0; i < g_bs_premap_count; i++) {
+        const struct dlfrz_premap_range *s = &g_bs_premaps[i];
+        const struct dlfrz_premap_range *r = &g_bs_premap_selected[i];
+        uint64_t prefix = ready && r->length ? r->source - s->source : s->length;
+        uint64_t suffix = ready && r->length ?
+            s->length - prefix - r->length : 0;
+        if (prefix && munmap((void *)(uintptr_t)s->source, (size_t)prefix) < 0)
+            return 0;
+        if (suffix && munmap((void *)(uintptr_t)(r->source + r->length),
+                             (size_t)suffix) < 0) return 0;
+        if (ready && r->length) kept[count++] = *r;
+    }
+    g_bs_premap_count = 0;
+    return !ready || (count && loader_install_kernel_premap(kept, count) == 0);
+}
 
 static void bs_startup_mremap_plan_destroy(
     struct bs_startup_mremap_plan *plan)
@@ -4744,7 +4859,8 @@ static int bs_startup_mremap_transfer_batch(
         void *moved = (void *)syscall(
             SYS_mremap, (void *)range->source,
             range->length, range->length,
-            MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP,
+            MREMAP_MAYMOVE | MREMAP_FIXED |
+                (plan->kernel_premap ? 0 : MREMAP_DONTUNMAP),
             (void *)range->target);
 
         if (moved != (void *)range->target)
@@ -4991,7 +5107,7 @@ static void bs_startup_mremap_probe_child(
         if (source_fd < 0 || fstat(source_fd, &executable) < 0)
             goto out;
     } else {
-        if (!bs_startup_mremap_plan_matches_payload(
+        if (!plan->kernel_premap && !bs_startup_mremap_plan_matches_payload(
                 plan, payload_vaddr, payload_filesz, payload_foff))
             goto out;
         executable_fd = bs_proc_self_executable_open(&context);
@@ -5038,8 +5154,50 @@ static void bs_startup_mremap_probe_child(
     if (!smaps)
         goto out;
     smaps_fd = -1;
-    ready = bs_mremap_targets_smaps_stream_matches(
-        smaps, &executable, plan);
+    if (plan->kernel_premap) {
+        /* Authenticate BOTH aliases in one smaps pass. A dirty/reconstructed
+         * canonical payload is not interchangeable with a clean stage.
+         * Proving both exact file translations avoids faulting every page
+         * merely to compare equal bytes. */
+        struct bs_mremap_range evidence[2 * DLFRZ_PREMAP_MAX_PHDRS];
+        struct bs_startup_mremap_plan proof = *plan;
+        if (plan->count > DLFRZ_PREMAP_MAX_PHDRS) goto out;
+        for (size_t i = 0; i < plan->count; i++) {
+            const struct bs_mremap_range *r = &plan->ranges[i];
+            if (r->file_offset < payload_foff ||
+                r->file_offset - payload_foff > payload_filesz ||
+                r->length > payload_filesz - (r->file_offset - payload_foff))
+                goto out;
+            evidence[2 * i] = *r;
+            evidence[2 * i + 1] = *r;
+            evidence[2 * i + 1].target = (uintptr_t)(payload_vaddr +
+                r->file_offset - payload_foff);
+        }
+        proof.count *= 2;
+        proof.targets = evidence;
+        qsort(evidence, proof.count, sizeof(*evidence), bs_mremap_target_cmp);
+        /* Shared source pages are allowed in the loader plan; union exact
+         * same-file translations before feeding the non-overlapping proof. */
+        size_t merged = 0;
+        for (size_t i = 0; i < proof.count; i++) {
+            struct bs_mremap_range *r = &evidence[i];
+            if (merged && r->target < evidence[merged - 1].target +
+                                     evidence[merged - 1].length) {
+                struct bs_mremap_range *prev = &evidence[merged - 1];
+                uint64_t delta = r->target - prev->target;
+                if (r->file_offset < prev->file_offset ||
+                    r->file_offset - prev->file_offset != delta) goto out;
+                if (delta + r->length > prev->length)
+                    prev->length = (size_t)(delta + r->length);
+            } else {
+                evidence[merged++] = *r;
+            }
+        }
+        proof.count = merged;
+        ready = bs_mremap_targets_smaps_stream_matches(smaps, &executable, &proof);
+    } else {
+        ready = bs_mremap_targets_smaps_stream_matches(smaps, &executable, plan);
+    }
     if (fclose(smaps) < 0)
         ready = 0;
     smaps = NULL;
@@ -5106,8 +5264,17 @@ static int bs_startup_mremap_source_ready(
             mem, mem_foff, metas, entries, num_entries,
             (uint64_t)page_value, &plan))
         return 0;
+    if (g_bs_premap_count) {
+        if (!bs_kernel_premap_select(&plan)) {
+            bs_startup_mremap_plan_destroy(&plan);
+            return 0;
+        }
+        qsort(plan.targets, plan.count, sizeof(*plan.targets),
+               bs_mremap_target_cmp);
+    }
     if (plan.total_bytes < BS_MREMAP_MIN_STARTUP_BYTES ||
         (!exact_clean_source &&
+         !plan.kernel_premap &&
          !bs_startup_mremap_plan_matches_payload(
              &plan, payload_vaddr, payload_filesz, payload_foff))) {
         bs_startup_mremap_plan_destroy(&plan);
@@ -5566,12 +5733,32 @@ int main(int argc, char **argv)
          * mapping already has its source fd and uses the ordinary exact-file
          * mmap path instead. */
         volatile uint32_t *runtime_fork_cookie = NULL;
+        if (!bs_kernel_premap_admit(
+                have_live_phdrs ? &live_phdrs : NULL,
+                g_premap_info.phdr_vaddr, g_premap_info.phdr_count,
+                loader_payload_foff, loader_payload_filesz,
+                metas, ft.num_entries)) {
+            fprintf(stderr, "dlfreeze-bootstrap: invalid kernel pre-map layout\n");
+            return 127;
+        }
+        const int kernel_premap = g_bs_premap_count != 0;
+        int transfer_ready = 0;
         if (from_memory && mapped_payload_file_backed &&
             bs_startup_mremap_source_ready(
                 ldr_mem, ldr_mem_foff, metas, ent, ft.num_entries,
                 -1, 0, loader_payload_vaddr, loader_payload_filesz,
                 loader_payload_foff, &runtime_fork_cookie))
-            source_flags |= DLFRZ_SOURCE_MREMAP_DONTUNMAP;
+            transfer_ready = 1;
+        if (kernel_premap && !bs_kernel_premap_finish(transfer_ready)) {
+            fprintf(stderr, "dlfreeze-bootstrap: cannot release kernel staging\n");
+            return 127;
+        }
+        if (transfer_ready)
+            source_flags |= kernel_premap ? DLFRZ_SOURCE_KERNEL_PREMAP :
+                                           DLFRZ_SOURCE_MREMAP_DONTUNMAP;
+        if (kernel_premap && bs_debug_enabled())
+            fprintf(stderr, "dlfreeze-bootstrap: kernel pre-map %s\n",
+                    transfer_ready ? "ready" : "copy fallback");
 
         const enum extraction_fallback_refusal fallback_refusal =
             classify_extraction_fallback(

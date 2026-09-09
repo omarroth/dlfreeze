@@ -37,6 +37,7 @@ struct pack_options {
     const char      *bootstrap_path;  /* statically-linked bootstrap   */
     struct dep_list *deps;            /* resolved dependencies         */
     int              direct_load;     /* 1 = embed loader metadata     */
+    int              performance;     /* opt-in kernel staging layout */
     struct data_file_list *data_files; /* non-ELF files to embed       */
 };
 

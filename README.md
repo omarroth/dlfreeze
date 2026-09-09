@@ -74,12 +74,38 @@ dlfreeze [options] [--] <executable> [args...]
 Options:
   -o <path>   Output file  (default: <name>.frozen)
   -d          Prefer direct-load mode (the default)
+  -p          Experimental kernel pre-mapping (direct only; not UPX)
   -x          Force extraction mode instead of direct loading
   -t          Trace runtime loading by running the program (TTY preserved)
   -f <glob>   Embed data files matching glob (requires -t, repeatable)
   -v          Verbose
   -h          Help
 ```
+
+`-p` selects an experimental, self-contained outer ELF layout. For example:
+
+```sh
+./build/dlfreeze -p -d -t -f '/usr/*' -- python3 test.py
+```
+
+The kernel maps read-only aliases of eligible startup library pages into a
+low-address staging area. Before application code runs, the loader moves
+admitted pages into its independently reserved object ranges and discards
+unused staging mappings. The original payload remains available for copy
+fallback. No persistent cache or runtime extraction is introduced, and lazy
+`dlopen` constructors/TLS activation retain their normal timing.
+
+This layout relocates the outer program-header table and is **not guaranteed
+to work with UPX or other ELF rewriters**. It uses additional temporary virtual
+address space, caps the outer table at 73 headers for older 4 KiB Linux kernels,
+and copies segments beyond that budget normally. Unsupported direct targets
+or conflicting staging addresses are rejected at pack time; `-p` cannot be
+combined with `-x`. Small startup closures retain copying to avoid probe
+overhead. A denied/unavailable transfer proof also selects copying;
+`DLFREEZE_NO_FORK=1` skips the optional probe entirely. As in the default
+format, policies killing the initial probe's `clone`/parent `wait4` require
+that override. Benchmark your workload: `-p` is not a promise of native parity
+or a speedup on every host. Without `-p`, the existing format is unchanged.
 
 When `-t` is used, `[args...]` are passed to the traced run so the program
 exercises the code paths that trigger `dlopen()` and resource access. The

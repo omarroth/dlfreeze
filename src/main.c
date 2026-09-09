@@ -292,6 +292,7 @@ static void usage(const char *prog)
         "Options:\n"
         "  -o <path>   Output file  (default: <name>.frozen)\n"
         "  -d          Prefer direct-load mode (the default)\n"
+        "  -p          Experimental kernel pre-mapping (direct only; not UPX)\n"
         "  -x          Force extraction mode instead of direct loading\n"
         "  -t          Trace runtime loading by running the program (TTY preserved)\n"
         "  -f <glob>   Embed data files matching glob (requires -t, repeatable)\n"
@@ -2224,7 +2225,7 @@ int main(int argc, char **argv)
 {
     const char *out_path = NULL;
     int do_trace = 0, verbose = 0, direct_load = 1;
-    int direct_option = 0, extraction_option = 0;
+    int direct_option = 0, extraction_option = 0, performance = 0;
     const char **file_patterns;
     int nfile_patterns = 0;
 
@@ -2240,10 +2241,11 @@ int main(int argc, char **argv)
     }
 
     int opt;
-    while ((opt = getopt(argc, argv, "+o:f:dtxvh")) != -1) {
+    while ((opt = getopt(argc, argv, "+o:f:dptxvh")) != -1) {
         switch (opt) {
         case 'o': out_path = optarg;  break;
         case 'd': direct_load = 1; direct_option = 1; break;
+        case 'p': performance = 1; break;
         case 'x': direct_load = 0; extraction_option = 1; break;
         case 't': do_trace = 1;      break;
         case 'f':
@@ -2263,6 +2265,11 @@ int main(int argc, char **argv)
     if (direct_option && extraction_option) {
         fprintf(stderr,
                 "dlfreeze: -d and -x select incompatible runtime modes\n");
+        free(file_patterns);
+        return 1;
+    }
+    if (performance && extraction_option) {
+        fprintf(stderr, "dlfreeze: -p requires direct loading, not -x\n");
         free(file_patterns);
         return 1;
     }
@@ -2554,6 +2561,7 @@ int main(int argc, char **argv)
         .bootstrap_path = bootstrap,
         .deps           = &deps,
         .direct_load    = direct_load,
+        .performance    = performance,
         .data_files     = data_files.count > 0 ? &data_files : NULL,
     };
     if (fflush(stdout) != 0) {

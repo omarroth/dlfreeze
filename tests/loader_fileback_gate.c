@@ -830,6 +830,68 @@ out:
 }
 
 
+static int gate_kernel_premap_transfer(int forced_errno)
+{
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    FILE *file = gate_temporary_file();
+    unsigned char *source = MAP_FAILED, *target = MAP_FAILED;
+    void *stage = MAP_FAILED, *replacement = MAP_FAILED;
+    struct dlfrz_premap_range ranges[2];
+    int ok = 0;
+    if (!file || !page || ftruncate(fileno(file), 2 * page) < 0) goto out;
+    source = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_SHARED,
+                   fileno(file), 0);
+    if (source == MAP_FAILED) goto out;
+    memset(source, 0x5a, 2 * page);
+    if (msync(source, 2 * page, MS_SYNC) < 0) goto out;
+    stage = mmap((void *)(uintptr_t)DLFRZ_PREMAP_LO, 2 * page, PROT_READ,
+                  MAP_PRIVATE | MAP_FIXED_NOREPLACE, fileno(file), 0);
+    target = mmap(NULL, page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (stage == MAP_FAILED || target == MAP_FAILED) goto out;
+    ranges[0] = (struct dlfrz_premap_range){(uintptr_t)stage, (uintptr_t)target,
+                                          page, 0};
+    ranges[1] = (struct dlfrz_premap_range){(uintptr_t)stage + page,
+                                          (uintptr_t)target + page, page, page};
+    if (loader_install_kernel_premap(ranges, 2) < 0 ||
+        !loader_source_contract_is_valid(-1, DLFRZ_SOURCE_KERNEL_PREMAP)) goto out;
+    reset_fileback_counters();
+    g_mremap_forced_errno = forced_errno;
+    int result = map_mapped_payload_segment(source, target, page);
+    g_mremap_forced_errno = 0;
+    if (result != (forced_errno ? 0 : 1) || g_mremap_attempts != 1 ||
+        g_kernel_premaps[0].length != 0) goto out;
+    if (mprotect(target, page, PROT_READ | PROT_WRITE) < 0) goto out;
+    if (forced_errno) memcpy(target, source, page);
+    if (memcmp(target, source, page)) goto out;
+    target[0] = 0xa5;
+    if (source[0] != 0x5a) goto out;
+    if (map_mapped_payload_segment(source, target, page) != 0 ||
+        g_mremap_attempts != 1) goto out;
+    replacement = mmap(stage, page, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    if (replacement != stage) goto out;
+    *(unsigned char *)replacement = 0xa5;
+    g_frozen_srcfd = -1;
+    g_frozen_source_flags = DLFRZ_SOURCE_KERNEL_PREMAP;
+    release_frozen_source_fd_after_tls();
+    if (g_kernel_premap_count || g_frozen_source_flags ||
+        *(unsigned char *)replacement != 0xa5) goto out;
+    /* The unused second stage was released, without touching the new owner
+     * of the consumed first stage's old address. */
+    unsigned char resident;
+    if (mincore((char *)stage + page, page, &resident) == 0) goto out;
+    ok = 1;
+out:
+    g_mremap_forced_errno = 0;
+    release_kernel_premaps();
+    if (replacement != MAP_FAILED) munmap(replacement, page);
+    if (stage != MAP_FAILED) munmap(stage, 2 * page);
+    if (target != MAP_FAILED) munmap(target, page);
+    if (source != MAP_FAILED) munmap(source, 2 * page);
+    if (file) fclose(file);
+    return ok;
+}
+
 static int gate_fd_lifecycle(void)
 {
     int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
@@ -1161,6 +1223,10 @@ int main(void)
 {
     if (!gate_source_contract())
         return 1;
+    if (!gate_kernel_premap_transfer(0) ||
+        !gate_kernel_premap_transfer(ENOSYS) ||
+        !gate_kernel_premap_transfer(EPERM))
+        return 25;
     if (!gate_executable_probe_cleanup_is_terminal())
         return 24;
     if (!gate_map_case("clean nonzero-mem_foff file map",
