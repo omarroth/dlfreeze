@@ -12,6 +12,7 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include "../include/linux_syscalls.h"
 
 enum descriptor_mock_kind {
     DESCRIPTOR_MOCK_NONE = 0,

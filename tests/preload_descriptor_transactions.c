@@ -16,6 +16,7 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include "../include/linux_syscalls.h"
 
 #if defined(__has_include)
 # if __has_include(<linux/filter.h>) && \

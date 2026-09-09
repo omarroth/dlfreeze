@@ -32,6 +32,9 @@ struct sysv_hash_fixture {
 
 static void initialize_symbol_scope(void)
 {
+    /* This synthetic GNU scope invokes IFUNCs without running startup's
+     * target-runtime discovery.  Supply its ABI explicitly on every host. */
+    g_glibc_minor = 30;
     memset(g_all_objs, 0, 2 * sizeof(g_all_objs[0]));
     memset(requester_symbols, 0, sizeof(requester_symbols));
     memset(provider_symbols, 0, sizeof(provider_symbols));
@@ -494,8 +497,16 @@ static int cache_collision_gate(void)
 
 static size_t phase_ifunc_calls;
 
+#if defined(__aarch64__)
+static uint64_t phase_ifunc_resolver(uint64_t hwcap, const void *arguments)
+#else
 static uint64_t phase_ifunc_resolver(void)
+#endif
 {
+#if defined(__aarch64__)
+    (void)hwcap;
+    (void)arguments;
+#endif
     phase_ifunc_calls++;
     return UINT64_C(0x1020304050607080);
 }

@@ -332,6 +332,29 @@ static int test_init_contract_decoder(void)
         return 0;
     *(uint32_t *)(contract_image + CONTRACT_INIT_TLS_OFF) = saved;
 
+    {
+        uint32_t *stub = (uint32_t *)(contract_image + CONTRACT_INIT_TLS_OFF);
+        static const uint32_t framed[] = {
+            0xd503233f, 0xa9bf7bfd, 0x910003fd,
+            0xa8c17bfd, 0xd50323bf, 0xd65f03c0,
+        };
+        memcpy(stub, framed, sizeof(framed));
+        if (!decode_aarch64_musl_init_libc(
+                &contract_obj, 200, &decoded, &canary) || canary != 184)
+            return 0;
+        stub[4] = 0xd50323ff; /* authentication key must match */
+        if (decode_aarch64_musl_init_libc(
+                &contract_obj, 200, &decoded, &canary))
+            return 0;
+        stub[4] = framed[4];
+        stub[3] = 0xa8c27bfd; /* stack restore must balance the save */
+        if (decode_aarch64_musl_init_libc(
+                &contract_obj, 200, &decoded, &canary))
+            return 0;
+        memset(stub, 0, sizeof(framed));
+        stub[0] = saved;
+    }
+
     start[2] = encode_bl((uintptr_t)&start[2],
                          (uintptr_t)(contract_image + CONTRACT_INIT_TLS_OFF));
     if (decode_aarch64_musl_init_libc(
@@ -399,6 +422,33 @@ static int test_init_contract_decoder(void)
         return 0; /* conflicting canary offsets are ambiguous */
     ssp[10] = 0xd65f03c0u;
     ssp[11] = 0;
+
+    /* GCC 11 schedules the multiplier before the GOT load and reuses the
+     * multiplication result directly for the TCB store. */
+    memset(ssp, 0, 160);
+    ssp[0] = encode_adrp((uintptr_t)&ssp[0],
+                         (uintptr_t)(contract_image + CONTRACT_GUARD_GOT_OFF), 1);
+    ssp[1] = 0xd289cda0;
+    ssp[2] = 0xf2a838c0;
+    ssp[3] = encode_ldrstr64(1, 1, 1,
+        (uintptr_t)(contract_image + CONTRACT_GUARD_GOT_OFF) & 0xfff);
+    ssp[4] = 0x9b007c20; /* mul x0, x1, x0 */
+    ssp[5] = encode_ldrstr64(0, 0, 1, 0);
+    ssp[6] = 0xd53bd041;
+    ssp[7] = 0xf81f0020;
+    ssp[8] = 0xd65f03c0;
+    if (!decode_aarch64_musl_init_libc(
+            &contract_obj, 200, &decoded, &canary) || canary != 184)
+        return 0;
+    ssp[7] = 0xf81f0022;
+    if (decode_aarch64_musl_init_libc(
+            &contract_obj, 200, &decoded, &canary))
+        return 0;
+    ssp[7] = 0xf81f0020;
+    ssp[1] ^= 1u << 5;
+    if (decode_aarch64_musl_init_libc(
+            &contract_obj, 200, &decoded, &canary))
+        return 0;
 
     /* GCC 10 places the guard-page ADRP before a CBZ and shares it across
      * the seeded arm, the post-call join, and the out-of-line fallback. */
@@ -608,6 +658,26 @@ static int test_target_contract_decoders(void)
             200, &locale_offset, &global))
         return 0;
     locale[5] = saved;
+
+    /* The equivalent direct-TP signed store does not materialize self. */
+    locale[3] = 0x910003fd; /* unrelated frame setup */
+    locale[5] = 0xf81d0040; /* stur x0, [x2, #-48] */
+    if (!decode_aarch64_musl_uselocale(
+            &contract_obj, (const uint8_t *)locale, 8 * sizeof(*locale),
+            200, &locale_offset, &global) || locale_offset != 152 ||
+        global != expected_global)
+        return 0;
+    locale[5] = 0xf81d8040; /* mismatched store offset */
+    if (decode_aarch64_musl_uselocale(
+            &contract_obj, (const uint8_t *)locale, 8 * sizeof(*locale),
+            200, &locale_offset, &global))
+        return 0;
+    locale[5] = 0xf81d0040;
+    locale[3] = 0xaa1f03e2; /* lost TP provenance */
+    if (decode_aarch64_musl_uselocale(
+            &contract_obj, (const uint8_t *)locale, 8 * sizeof(*locale),
+            200, &locale_offset, &global))
+        return 0;
 
     build_derived_self_uselocale(locale, expected_global);
     if (!decode_aarch64_musl_uselocale(
@@ -887,6 +957,39 @@ static int expect_gpr_writes(const char *label, uint32_t instruction,
                 label, writes, expected);
         return 0;
     }
+    return 1;
+}
+
+static int test_scheduled_tp_access(void)
+{
+    uint32_t code[] = {
+        0xd503233f, /* paciasp */
+        0xa9bf7bfd, /* stp x29, x30, [sp, #-16]! */
+        0xd53bd040, /* mrs x0, tpidr_el0 */
+        0x910003fd, /* mov x29, sp (scheduled between TP operations) */
+        0xd1032000, /* sub x0, x0, #200 */
+        0xa8c17bfd, /* ldp x29, x30, [sp], #16 */
+        0xd50323bf, /* autiasp */
+        0xd65f03c0, /* ret */
+    };
+    size_t delta = 0;
+    int64_t relative = 0;
+
+    if (!decode_aarch64_musl_self_delta((const uint8_t *)code,
+                                        sizeof(code), &delta) || delta != 200)
+        return 0;
+    code[4] = 0xd1029000; /* errno is TP - 164 */
+    if (!decode_aarch64_musl_tp_relative((const uint8_t *)code,
+                                         sizeof(code), &relative) || relative != -164)
+        return 0;
+    code[3] = 0xaa0103e0; /* clobber the TP register */
+    if (decode_aarch64_musl_self_delta((const uint8_t *)code, sizeof(code), &delta) ||
+        decode_aarch64_musl_tp_relative((const uint8_t *)code, sizeof(code), &relative))
+        return 0;
+    code[3] = 0x14000002; /* branch around the address calculation */
+    if (decode_aarch64_musl_self_delta((const uint8_t *)code, sizeof(code), &delta) ||
+        decode_aarch64_musl_tp_relative((const uint8_t *)code, sizeof(code), &relative))
+        return 0;
     return 1;
 }
 
@@ -1310,6 +1413,11 @@ int main(void)
     if (!expect_detach_layout("clobbered direct base", direct_mutated, 3,
                               0, -1))
         return 1;
+
+    if (!test_scheduled_tp_access()) {
+        fprintf(stderr, "AArch64 scheduled TP access decoder failed\n");
+        return 1;
+    }
 
     if (!test_init_contract_decoder()) {
         fprintf(stderr, "AArch64 musl init contract decoder failed\n");

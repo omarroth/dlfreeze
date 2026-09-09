@@ -85,6 +85,7 @@ static int inspect_module_tls(struct dl_phdr_info *info, size_t size,
 
 struct iterate_main_state {
     ElfW(Addr) base;
+    const ElfW(Dyn) *dynamic;
     const char *name;
     int matches;
 };
@@ -96,6 +97,17 @@ static int inspect_main_name(struct dl_phdr_info *info, size_t size,
 
     (void)size;
     if (!info || !state || info->dlpi_addr != state->base)
+        return 0;
+    /* Load bias is not an object identity: the fixed-address bootstrap and
+     * a non-PIE target can both have bias zero.  Match the dynamic table
+     * exposed by the main link_map as well. */
+    int main_dynamic = 0;
+    for (ElfW(Half) i = 0; i < info->dlpi_phnum; i++)
+        if (info->dlpi_phdr[i].p_type == PT_DYNAMIC &&
+            info->dlpi_addr + info->dlpi_phdr[i].p_vaddr ==
+                (uintptr_t)state->dynamic)
+            main_dynamic = 1;
+    if (!main_dynamic)
         return 0;
     state->matches++;
     state->name = info->dlpi_name;
@@ -488,6 +500,7 @@ int main(int argc, char **argv)
         return fail(66);
     memset(&iterate_main, 0, sizeof(iterate_main));
     iterate_main.base = main_map->l_addr;
+    iterate_main.dynamic = main_map->l_ld;
     if (dl_iterate_phdr(inspect_main_name, &iterate_main) != 0 ||
         iterate_main.matches != 1 || !iterate_main.name ||
         (target_has_glibc_api ? iterate_main.name[0] != '\0'

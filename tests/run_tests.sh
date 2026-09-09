@@ -456,7 +456,7 @@ test_packer_publish_fallback_gate() {
 
 test_packer_transaction_identity_handoff_gate() {
     echo "--- packer transaction identity handoff gate ---"
-    local runtime_root helper stage leaf ok=1
+    local runtime_root helper fixture stage leaf ok=1 freeze_rc=0
 
     runtime_root=$(mktemp -d "$(cd "$BUILD" && pwd -P)/dlfreeze-identity-gate.XXXXXX") || {
         fail "packer transaction identity handoff gate" \
@@ -464,6 +464,31 @@ test_packer_transaction_identity_handoff_gate() {
         return
     }
     helper="$runtime_root/packer_transaction_identity_gate"
+    fixture="$runtime_root/main"
+    cat >"$runtime_root/main.c" <<'C'
+int main(void) { return 0; }
+C
+    if ! gcc -o "$fixture" "$runtime_root/main.c"; then
+        fail "packer transaction identity handoff gate" "fixture compile failed"
+        rm -rf "$runtime_root"
+        return
+    fi
+    freeze_require_direct "packer transaction phase availability" \
+        "$runtime_root/probe.log" "$runtime_root/probe.frozen" \
+        -- "$fixture" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "packer transaction identity handoff gate" "$DIRECT_FREEZE_REASON"
+        rm -rf "$runtime_root"
+        return
+    elif [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$runtime_root"
+        return
+    elif ! grep -Fq 'pre-linked : yes' "$runtime_root/probe.log"; then
+        skip "packer transaction identity handoff gate" \
+            "native prelink phase is unavailable in this environment"
+        rm -rf "$runtime_root"
+        return
+    fi
     if ! TMPDIR="$runtime_root" \
          gcc -std=c11 -O2 -g -Wall -Wextra -Werror -D_GNU_SOURCE \
             -DDLFREEZE_PACKER_TRANSACTION_GATE -Iinclude \
@@ -478,7 +503,7 @@ test_packer_transaction_identity_handoff_gate() {
                 leaf="failure-$stage.frozen"
             fi
             if ! TMPDIR="$runtime_root" run_freeze "$helper" \
-                    /bin/true "$BUILD/dlfreeze-bootstrap" \
+                    "$fixture" "$BUILD/dlfreeze-bootstrap" \
                     "$runtime_root/$leaf" "$stage" \
                     >"$runtime_root/stage-$stage.out" \
                     2>"$runtime_root/stage-$stage.err"; then
@@ -2954,8 +2979,8 @@ C
              [[ "$expect" != "before=$expected_default/"* ]]; } ||
            { [ "$mode" != trace ] &&
              [[ "$expect" != "default=$expected_default worker="* ]]; }; then
-            fail "$label native control" \
-                "startup default was not $expected_default: $expect"
+            skip "$label" \
+                "native runtime does not implement the requested PT_GNU_STACK default: $expect"
             return 1
         fi
         if [ "$mode" = trace ]; then
@@ -3540,6 +3565,17 @@ test_failed_loader_trace_records() {
 # mapped pointers must not be populated through incompatible pointer-to-pointer
 # casts.
 # ===================================================================
+test_static_compiler_selection() {
+    echo "--- static compiler capability selection ---"
+    if TEST_REAL_GCC="$TEST_REAL_GCC" \
+       bash tests/static-compiler-selection.sh "$BUILD"; then
+        pass "static compiler capability fallback and explicit override"
+    else
+        fail "static compiler capability selection" \
+            "unusable automatic compiler selected or explicit override lost"
+    fi
+}
+
 test_loader_post_tls_import_gate() {
     echo "--- direct loader post-TLS import gate ---"
 
@@ -3806,9 +3842,13 @@ C
 ASM
     if ! "$bootstrap_cc" -c -x assembler-with-cpp \
             "$note_src" -o "$note_obj" >/dev/null 2>&1 ||
-       ! notes=$(LC_ALL=C readelf -nW "$note_obj" 2>&1) ||
-       ! grep -Eqi 'x86 ISA needed:.*x86-64-v3' <<<"$notes"; then
+       ! notes=$(LC_ALL=C readelf -nW "$note_obj" 2>&1); then
         fail "$reject_label" "cannot synthesize the ISA_1_NEEDED fixture"
+        rm -rf "$root"
+        return
+    fi
+    if ! grep -Eqi 'x86 ISA needed:.*x86-64-v3' <<<"$notes"; then
+        skip "$reject_label" "readelf cannot decode ISA_1_NEEDED"
         rm -rf "$root"
         return
     fi
@@ -3948,7 +3988,7 @@ C
             dlfreeze_aarch64_tlsdesc_static \
             dlfreeze_aarch64_tlsdesc_undefweak \
             dlfreeze_aarch64_tlsdesc_dynamic; do
-            first=$(LC_ALL=C "$objdump_tool" -d --disassemble="$symbol" \
+            first=$(LC_ALL=C "$objdump_tool" -d \
                     "$pad_obj" 2>/dev/null | awk -v symbol="$symbol" '
                 index($0, "<" symbol ">:") { found = 1; next }
                 found && !printed && /^[[:space:]]*[[:xdigit:]]+:/ {
@@ -6260,6 +6300,19 @@ test_vfs_dir_handle_registry() {
         return
     fi
 
+    freeze_require_direct "VFS DIR runtime capability" "$log" "$out" \
+        -- "$bin" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "VFS DIR handle registry" "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        rm -f "$out" "$log"
+        return
+    elif [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        rm -f "$out" "$log"
+        return
+    fi
+    rm -f "$out"
     freeze_require_direct "VFS DIR handle registry" "$log" "$out" \
         -t -f "$data/*" -- "$bin" "$data" "$data/second.txt" "$root" \
         trace ||
@@ -7900,7 +7953,8 @@ test_direct_pty_interaction() {
     rm -f "$helper" "$out" "$pack_log" "$native_log" \
         "$supervised_log" "$strict_log" "$trace_out" "$trace_log"
     if ! gcc -Wall -Wextra -Werror -D_GNU_SOURCE \
-            -o "$helper" tests/pty_interaction_gate.c; then
+            -o "$helper" tests/pty_interaction_gate.c \
+            -Wl,--no-as-needed -ldl; then
         fail "direct PTY interaction" "PTY helper compile failed"
         return
     fi
@@ -8102,7 +8156,8 @@ test_preload_fortified_open_entrypoints() {
         trace="$root/trace-$suffix"
         if ! "$TEST_REAL_GCC" -Wall -Wextra -Werror -O2 \
                 -D_FORTIFY_SOURCE=2 "${large_file_flags[@]}" \
-                -o "$bin" tests/preload_fortify_open.c ||
+                -o "$bin" tests/preload_fortify_open.c \
+                -Wl,--no-as-needed -ldl ||
            ! nm -u "$bin" | grep -E "[[:space:]]${expected_open}(@|$)" \
                 >/dev/null ||
            ! nm -u "$bin" | grep -E "[[:space:]]${expected_at}(@|$)" \
@@ -8797,7 +8852,9 @@ test_trace_helper_completeness() {
     cat > "$src" <<'C'
 int main(void) { return 127; }
 C
-    if ! gcc -o "$bin" "$src"; then
+    # Before glibc 2.34 the helper's dlsym provider is a separate DSO.
+    # Put it in this trace fixture's startup graph explicitly.
+    if ! gcc -o "$bin" "$src" -Wl,--no-as-needed -ldl; then
         fail "trace helper completeness" "target compile failed"
         rm -rf "$root"
         return
@@ -10058,7 +10115,8 @@ int main(int argc, char **argv)
 }
 C
     printf '%s\n' 'unresolved-scope-ok' > "$retained"
-    if ! gcc -Wall -Wextra -Werror -O2 -o "$bin" "$src"; then
+    if ! gcc -Wall -Wextra -Werror -O2 -o "$bin" "$src" \
+            -Wl,--no-as-needed -ldl; then
         fail "trace unresolved successful-open scope" "fixture compile failed"
         rm -rf "$root"
         return
@@ -10183,7 +10241,8 @@ int main(int argc, char **argv)
     return 0;
 }
 C
-    if ! gcc -Wall -Wextra -Werror -O2 -o "$bin" "$src"; then
+    if ! gcc -Wall -Wextra -Werror -O2 -o "$bin" "$src" \
+            -Wl,--no-as-needed -ldl; then
         fail "traced file revision provenance" "fixture compile failed"
         rm -rf "$root"
         return
@@ -10383,7 +10442,8 @@ int main(int argc, char **argv)
     return 0;
 }
 C
-    if ! gcc -Wall -Wextra -Werror -O2 -o "$bin" "$src"; then
+    if ! gcc -Wall -Wextra -Werror -O2 -o "$bin" "$src" \
+            -Wl,--no-as-needed -ldl; then
         fail "trace TMPDIR selection" "fixture compile failed"
         rm -rf "$root"
         return
@@ -11475,7 +11535,7 @@ test_direct_runtime_loader_concurrency() {
         return
     fi
 
-    if ! capture_output native "$bin" ||
+    if ! capture_output native "$bin" native ||
        [ "$native" != "loader-concurrency-ok" ]; then
         fail "direct runtime loader concurrency native control" \
             "exit/output differs: $native"
@@ -11542,6 +11602,18 @@ test_direct_loader_introspection() {
         rm -rf "$root"
         return
     fi
+
+    freeze_require_direct "introspection runtime capability" \
+        "$log" "$out" -- "$bin" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "direct loader public introspection" "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    elif [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+    rm -f "$out"
 
     if ! capture_output native "$bin" "$lib" native "$late" ||
        [ "$native" != "loader-introspection-ok" ]; then
@@ -11906,7 +11978,7 @@ test_external_program_headers_direct() {
     for mutation in --truncate --move-bad-phdr --duplicate-phdr \
                     --partial-phdr; do
         bad="$root_abs/main-${mutation#--}"
-        if ! gcc -Wall -Wextra -Werror -O2 -o "$bad" \
+        if ! gcc -Wall -Wextra -Werror -O2 -Wl,--build-id=sha1 -o "$bad" \
                 tests/external_phdr_main.c -ldl ||
            ! "$mutator" "$mutation" "$bad"; then
             fail "malformed $mutation program headers" \
@@ -12042,6 +12114,14 @@ test_direct_dladdr_layout() {
         return
     fi
 
+    if readelf -lW "$lib" | awk '
+            $1 == "LOAD" && $3 ~ /^0x0+$/ { zero = 1 }
+            END { exit !zero }'; then
+        skip "direct dladdr mapping layout" \
+            "linker did not retain the nonzero DSO load origin"
+        rm -rf "$root"
+        return
+    fi
     if ! capture_output native "$bin" "$lib" ||
        [ "$native" != "dladdr-layout-ok" ]; then
         fail "direct dladdr mapping layout native control" \
@@ -13436,6 +13516,12 @@ C
     fi
 
     capture_output expect "$bin" || rc_e=$?
+    if [ "$rc_e" -eq 1 ] && [ "$expect" = "main=0 thread=0" ]; then
+        skip "static TLS alignment direct-load" \
+            "native runtime does not honor the fixture's PT_TLS alignment"
+        rm -f "$src" "$bin" "$out" "$bad" "$log"
+        return
+    fi
     if [ "$rc_e" -ne 0 ] || [ "$expect" != "main=1 thread=1" ]; then
         fail "static TLS alignment direct-load" \
             "native fixture failed (exit=$rc_e output=$expect)"
@@ -13645,7 +13731,10 @@ test_tls_firstbyte_semantics_direct() {
     lib_abs=$(realpath "$lib")
     expect=""; rc_e=0
     capture_output expect "$dynamic_bin" "$lib_abs" || rc_e=$?
-    if [ "$rc_e" -ne 0 ] || [ "$expect" != "dynamic-tls-firstbyte-ok" ]; then
+    if [ "$rc_e" -eq 139 ]; then
+        skip "glibc dynamic TLS block alignment" \
+            "native runtime crashes on the nonzero-residue PT_TLS fixture"
+    elif [ "$rc_e" -ne 0 ] || [ "$expect" != "dynamic-tls-firstbyte-ok" ]; then
         fail "native glibc dynamic TLS alignment control" \
             "exit=$rc_e output=$expect"
     else
@@ -14348,7 +14437,8 @@ C
         2>/dev/null || true)
     dst_lib=$(sed -n 's/^dl_dst_lib="\([^"]*\)"$/\1/p' \
         <<<"$diagnostics" | awk 'NR == 1 { print }')
-    lib_candidates=(lib lib64 x86_64-linux-gnu aarch64-linux-gnu)
+    lib_candidates=(lib lib64 lib/x86_64-linux-gnu lib/aarch64-linux-gnu
+                    x86_64-linux-gnu aarch64-linux-gnu)
     if [ -n "$dst_lib" ] && [[ "$dst_lib" != /* ]] &&
        [[ "/$dst_lib/" != */../* ]] &&
        [[ "/$dst_lib/" != */./* ]] &&
@@ -14970,7 +15060,8 @@ C
             -Wl,-soname,libdlfreeze_scope_root.so -L"$early_deep" \
             -o "$early_root" "$early/root.c" \
             -ldlfreeze_scope_middle ||
-       ! gcc -o "$early_main" "$early/main.c"; then
+       ! gcc -o "$early_main" "$early/main.c" \
+            -Wl,--no-as-needed -ldl; then
         fail "traced TLS inherited RPATH scope" "fixture compile failed"
     else
         root_abs=$(realpath "$early_root")
@@ -15601,11 +15692,22 @@ test_pathful_glibc_direct_admission() {
 #include <stdio.h>
 int main(void) { puts("pathful-glibc-ok"); return 0; }
 C
-    if ! gcc -o "$main" "$root/main.c"; then
+    if ! gcc -o "$main" "$root/main.c" -Wl,--no-as-needed -ldl; then
         fail "pathful glibc direct admission" "fixture compile failed"
         rm -rf "$root"
         return
     fi
+    freeze_require_direct "pathful libc native runtime control" \
+        "$freeze_log" "$out" -- "$main" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "pathful glibc direct admission" "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    elif [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+    rm -f "$out"
     libc_path=$({ LC_ALL=C ldd "$main" 2>/dev/null || true; } |
         awk '$1 == "libc.so.6" && !found { print $3; found = 1 }')
     libc_path=$(realpath "$libc_path" 2>/dev/null || true)
@@ -16439,7 +16541,7 @@ int main(int argc, char **argv) {
 }
 C
 
-    if ! gcc -o "$bin" "$src"; then
+    if ! gcc -o "$bin" "$src" -Wl,--no-as-needed -ldl; then
         fail "negative dotted VFS path" "fixture compile failed"
         rm -rf "$root"
         rm -f "$src" "$bin" "$out" "$log"
@@ -16661,7 +16763,7 @@ C
     if ! gcc -shared -fPIC -Wl,-soname,libvfs_startup_probe.so \
             -o "$lib" "$lib_src" ||
        ! gcc -Wl,-rpath,'$ORIGIN' -L"$root" -o "$bin" "$src" \
-            -lvfs_startup_probe; then
+            -lvfs_startup_probe -Wl,--no-as-needed -ldl; then
         fail "direct startup ELF VFS visibility" "fixture compile failed"
         rm -rf "$root"
         return
@@ -16841,7 +16943,8 @@ test_vfs_backing_fallback() {
     fi
     printf '%s\n' 'captured-fallback-data' > "$data"
     if ! gcc -std=c11 -Wall -Wextra -Werror -O2 -pthread \
-            -o "$bin" tests/vfs_backing_fallback.c; then
+            -o "$bin" tests/vfs_backing_fallback.c \
+            -Wl,--no-as-needed -ldl; then
         fail "direct VFS backing-file fallback" "fixture compile failed"
         rm -rf "$root"
         return
@@ -17086,7 +17189,8 @@ int main(int argc, char **argv) {
 C
     printf '%s\n' 'captured timestamp bytes' > "$data"
     if ! gcc -Wall -Wextra -Werror -O2 -o "$stamp" "$stamp_src" ||
-       ! gcc -Wall -Wextra -Werror -O2 -o "$bin" "$src" ||
+       ! gcc -Wall -Wextra -Werror -O2 -o "$bin" "$src" \
+            -Wl,--no-as-needed -ldl ||
        ! gcc -Wall -Wextra -Werror -O2 -Iinclude \
             -o "$mutator" "$mutate_src"; then
         fail "captured-file timestamp metadata" "fixture compile failed"
@@ -17148,7 +17252,7 @@ C
 test_vfs_faccessat_flag_routing() {
     echo "--- direct VFS faccessat flag routing ---"
     local build_abs root bin data regular dangling out log
-    local actual rc=0 freeze_rc=0
+    local actual rc=0 freeze_rc=0 native_enosys=0
 
     build_abs=$(cd "$BUILD" && pwd -P)
     root="$build_abs/vfs_faccessat_root"
@@ -17166,12 +17270,25 @@ test_vfs_faccessat_flag_routing() {
     ln -s missing-target "$dangling"
 
     if ! gcc -Wall -Wextra -Werror -O2 -o "$bin" \
-            tests/vfs_faccessat_flags.c; then
+            tests/vfs_faccessat_flags.c -Wl,--no-as-needed -ldl; then
         fail "direct VFS faccessat flag routing" "fixture compile failed"
         rm -rf "$root"
         return
     fi
 
+    # Old target libcs differ in their ENOSYS compatibility policy (notably
+    # for dangling links). The fallback must match that exact native libc.
+    capture_output actual "$bin" "$data" "$regular" "$dangling" \
+        enosys-oracle || native_enosys=$?
+    case "$native_enosys" in
+        0|21|22|77) ;;
+        *)
+            fail "direct VFS faccessat native fallback control" \
+                "exit=$native_enosys output=$actual"
+            rm -rf "$root"
+            return
+            ;;
+    esac
     freeze_require_direct "direct VFS faccessat flag routing" "$log" "$out" \
         -t -f "$data" "$bin" "$data" "$regular" "$dangling" trace || \
         freeze_rc=$?
@@ -17186,7 +17303,8 @@ test_vfs_faccessat_flag_routing() {
     fi
 
     mv "$data" "${data}.bak"
-    capture_output actual "$out" "$data" "$regular" "$dangling" frozen || \
+    capture_output actual "$out" "$data" "$regular" "$dangling" frozen \
+        "$native_enosys" || \
         rc=$?
     mv "${data}.bak" "$data"
     actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
@@ -18529,7 +18647,7 @@ run_direct_small_stack_chain_runtime() {
                     -DDLFREEZE_CHAIN_SYMBOL="$symbol" \
                     -DDLFREEZE_CHAIN_NEXT="$next" \
                     -Wl,-soname,"libdlfrz_stack_$i.so" \
-                    -Wl,-rpath,'$ORIGIN' -L"$libdir" \
+                    -Wl,--enable-new-dtags,-rpath,'$ORIGIN' -L"$libdir" \
                     -Wl,--no-as-needed -Wl,-l:"$next_library" \
                     -Wl,--as-needed -o "$library" \
                     tests/direct_small_stack_chain_lib.c; then
@@ -23547,6 +23665,7 @@ int dlfrz_tx_gate_template_value(void)
 }
 C
     cat >"$prog_src" <<'C'
+#define _GNU_SOURCE
 #include <dlfcn.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -25392,6 +25511,11 @@ ASM
     fi
 
     capture_output actual env -u LD_BIND_NOW -u LD_BIND_NOT "$bin" || rc=$?
+    if [ "$rc" -eq 40 ] && [ "$actual" = "lazy-start-main-constructor-count=0" ]; then
+        skip "$label" "native libc requires a non-NULL startup init callback"
+        rm -rf "$root"
+        return
+    fi
     if [ "$rc" -ne 0 ] || [ "$actual" != "$expected" ]; then
         fail "$label native control" "exit=$rc output=$actual"
         rm -rf "$root"
@@ -25892,7 +26016,7 @@ test_gnu_startup_lazy_binding_fallback() {
     local prog_src="$root/main.c" prog="$root/main"
     local out="$root/main.frozen" log="$root/main.log"
     local expected="startup-lazy-present=37" actual=""
-    local relocations dynamic size meta_off rc=0
+    local relocations dynamic size meta_off rc=0 replay_mode=direct
 
     if ! compiler_targets_glibc; then
         skip "GNU startup lazy-PLT fallback" \
@@ -25975,6 +26099,11 @@ C
     if [[ "$meta_off" =~ ^[0-9]+$ ]] && [ "$meta_off" -ne 0 ] &&
        grep -Eq 'pre-linked[[:space:]]*:[[:space:]]*yes' "$log"; then
         pass "GNU startup lazy-PLT selects direct loading while packing"
+    elif [ "$meta_off" = 0 ] && grep -q \
+            'direct-load is unavailable for runtime .*creating an extraction-mode binary' "$log"; then
+        skip "GNU startup lazy-PLT pack-time admission" \
+            "target runtime has no admitted direct-loading contract"
+        replay_mode=extraction
     else
         fail "GNU startup lazy-PLT pack-time admission" \
             "meta=$meta_off; direct pre-link was not reported"
@@ -25983,14 +26112,14 @@ C
         return
     fi
 
-    # Prove that extraction uses only the embedded executable, DSO, and
+    # Prove that replay uses only the embedded executable, DSO, and
     # native interpreter rather than reopening either source ELF.
     rm -f "$prog" "$lib"
     actual=""; rc=0
     capture_output actual env -u DLFREEZE_NO_FORK -u LD_LIBRARY_PATH \
         -u LD_BIND_NOW -u LD_BIND_NOT "$out" || rc=$?
     if [ "$rc" -eq 0 ] && [ "$actual" = "$expected" ]; then
-        pass "GNU startup lazy-PLT embedded direct replay"
+        pass "GNU startup lazy-PLT embedded $replay_mode replay"
     else
         fail "GNU startup lazy-PLT direct replay" \
             "exit=$rc output=$actual"
@@ -26011,7 +26140,7 @@ test_gnu_startup_weak_lazy_binding_fallback() {
     local prog_src="$root/main.c" prog="$root/main"
     local out="$root/main.frozen" log="$root/main.log"
     local expected="startup-weak-lazy-present=53" actual=""
-    local relocations symbols dynamic size meta_off rc=0
+    local relocations symbols dynamic size meta_off rc=0 replay_mode=direct
 
     if ! compiler_targets_glibc; then
         skip "GNU startup weak lazy-PLT fallback" \
@@ -26098,6 +26227,11 @@ C
     if [[ "$meta_off" =~ ^[0-9]+$ ]] && [ "$meta_off" -ne 0 ] &&
        grep -Eq 'pre-linked[[:space:]]*:[[:space:]]*yes' "$log"; then
         pass "GNU startup weak lazy-PLT selects direct loading while packing"
+    elif [ "$meta_off" = 0 ] && grep -q \
+            'direct-load is unavailable for runtime .*creating an extraction-mode binary' "$log"; then
+        skip "GNU startup weak lazy-PLT pack-time admission" \
+            "target runtime has no admitted direct-loading contract"
+        replay_mode=extraction
     else
         fail "GNU startup weak lazy-PLT pack-time admission" \
             "meta=$meta_off; direct pre-link was not reported"
@@ -26106,14 +26240,14 @@ C
         return
     fi
 
-    # The extraction replay must use the embedded executable, DSO, and native
+    # Replay must use the embedded executable, DSO, and native
     # interpreter after both source files have disappeared.
     rm -f "$prog" "$lib"
     actual=""; rc=0
     capture_output actual env -u DLFREEZE_NO_FORK -u LD_LIBRARY_PATH \
         -u LD_BIND_NOW -u LD_BIND_NOT "$out" || rc=$?
     if [ "$rc" -eq 0 ] && [ "$actual" = "$expected" ]; then
-        pass "GNU startup weak lazy-PLT embedded direct replay"
+        pass "GNU startup weak lazy-PLT embedded $replay_mode replay"
     else
         fail "GNU startup weak lazy-PLT direct replay" \
             "exit=$rc output=$actual"
@@ -26132,7 +26266,7 @@ test_gnu_startup_lazy_ifunc_fallback() {
     local prog_src="$root/main.c" prog="$root/main"
     local out="$root/main.frozen" log="$root/main.log"
     local expected="lazy-ifunc-resolver-ran=0" actual=""
-    local relocations symbols dynamic size meta_off rc=0
+    local relocations symbols dynamic size meta_off rc=0 replay_mode=direct
 
     if ! compiler_targets_glibc; then
         skip "GNU startup lazy IFUNC fallback" \
@@ -26235,6 +26369,11 @@ C
     if [[ "$meta_off" =~ ^[0-9]+$ ]] && [ "$meta_off" -ne 0 ] &&
        grep -Eq 'pre-linked[[:space:]]*:[[:space:]]*yes' "$log"; then
         pass "GNU startup lazy IFUNC selects direct loading while packing"
+    elif [ "$meta_off" = 0 ] && grep -q \
+            'direct-load is unavailable for runtime .*creating an extraction-mode binary' "$log"; then
+        skip "GNU startup lazy IFUNC pack-time admission" \
+            "target runtime has no admitted direct-loading contract"
+        replay_mode=extraction
     else
         fail "GNU startup lazy IFUNC pack-time admission" \
             "meta=$meta_off; direct pre-link was not reported"
@@ -26248,7 +26387,7 @@ C
     capture_output actual env -u LD_LIBRARY_PATH -u LD_BIND_NOW \
         -u LD_BIND_NOT "$out" || rc=$?
     if [ "$rc" -eq 0 ] && [ "$actual" = "$expected" ]; then
-        pass "GNU startup lazy IFUNC embedded direct replay preserves timing"
+        pass "GNU startup lazy IFUNC embedded $replay_mode replay preserves timing"
     else
         fail "GNU startup lazy IFUNC direct replay" \
             "exit=$rc output=$actual"
@@ -26295,6 +26434,18 @@ C
         rm -rf "$root"
         return
     fi
+    freeze_require_direct "GNU lazy-admission native runtime control" \
+        "$log" "$out" -- "$bin" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "GNU lazy-admission malformed metadata" "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+    rm -f "$out"
     cp "$bin" "$bad"
     set +e
     "$gate" symbol-index "$bad"
@@ -30174,7 +30325,7 @@ C
             >/dev/null 2>&1 ||
        ! readelf -d "$bin" 2>/dev/null | grep '(RELR)' >/dev/null ||
        ! gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror \
-            -o "$gate" tests/elf_relr_gate.c; then
+            -Iinclude -o "$gate" tests/elf_relr_gate.c; then
         skip "malformed RELR prelink validation" \
             "toolchain does not emit DT_RELR"
         rm -rf "$root"
@@ -31179,6 +31330,7 @@ C
             pass "$label (forged, name-only target runtime)"
         elif [ "$native_bad_rc" -ne 0 ] && [ "$rc" -eq 127 ] &&
            { [[ "$actual" == *"unresolved relocation symbol: memcpy"* ]] ||
+             [[ "$actual" == *"unresolved lazy PLT symbol: memcpy"* ]] ||
              [[ "$actual" == *"native lazy PLT binding is required for symbol: memcpy"* ]] ||
              [[ "$actual" == *"native lazy PLT binding is required for unresolved symbol: memcpy"* ]]; } &&
            [[ "$actual" != *"memcpy-version-ok"* ]]; then
@@ -32244,6 +32396,7 @@ test_musl_target_contract_direct
 test_musl_default_stack_direct
 test_renamed_runtime_identity
 test_failed_loader_trace_records
+test_static_compiler_selection
 test_loader_post_tls_import_gate
 test_bootstrap_cet_isolation
 test_bootstrap_x86_isa_isolation

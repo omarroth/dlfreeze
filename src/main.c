@@ -559,6 +559,7 @@ static int preload_target_score(const char *path, struct dep_list *deps,
 {
     struct elf_info info;
     int score = -1;
+    int native_musl_dependency = 0;
 
     if (elf_parse(path, &info) < 0)
         return -1;
@@ -591,6 +592,9 @@ static int preload_target_score(const char *path, struct dep_list *deps,
                 score = -1;
                 goto out;
             }
+            if (info.version_requirement_count == 0 &&
+                dlfrz_musl_reserved_soname(info.needed[i]))
+                native_musl_dependency = 1;
             score++;
             continue;
         }
@@ -622,6 +626,13 @@ static int preload_target_score(const char *path, struct dep_list *deps,
 
 out:
     elf_info_free(&info);
+    /* A renamed musl interpreter can also satisfy a GNU helper's libc.so.6
+     * shortname.  That is a valid compatibility fallback, but prefer an
+     * unversioned libc helper over one whose version requirements musl
+     * would ignore. GNU-specific imports may otherwise fail before trace
+     * readiness is published, despite identical dependency shortnames. */
+    if (score >= 0 && deps->runtime_family == DEP_RUNTIME_MUSL)
+        return native_musl_dependency ? 2 : score > 0 ? 1 : 0;
     return score;
 }
 

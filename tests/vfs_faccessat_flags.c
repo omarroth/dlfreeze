@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
@@ -144,13 +145,16 @@ int main(int argc, char **argv)
     int enosys_status;
     int kernel_has_faccessat2 = 1;
 
-    if (argc != 5)
+    if (argc != 5 && argc != 6)
         return 2;
 
     fd = open(argv[1], O_RDONLY);
     if (fd < 0 || read(fd, &byte, 1) != 1)
         return 3;
     close(fd);
+
+    if (strcmp(argv[4], "enosys-oracle") == 0)
+        return run_child(check_enosys, argv[2], argv[3]);
 
     if (strcmp(argv[4], "trace") == 0) {
         puts("vfs-faccessat-trace-ok");
@@ -196,8 +200,8 @@ int main(int argc, char **argv)
     enosys_status = run_child(check_enosys, argv[2], argv[3]);
     if (dispatch_status != 0 && dispatch_status != 77)
         return dispatch_status;
-    if (enosys_status != 0 && enosys_status != 77)
-        return enosys_status;
+    if (enosys_status != (argc == 6 ? atoi(argv[5]) : 0) && enosys_status != 77)
+        return enosys_status ? enosys_status : 23;
     if ((dispatch_status == 77) != (enosys_status == 77))
         return 15;
 

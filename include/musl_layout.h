@@ -114,6 +114,7 @@ dlfrz_musl_layout_lookup(uint16_t machine, const uint8_t *data, size_t size)
     /* Prepare the architecture's admitted release strings once.  The scan
      * below visits the image once regardless of how many release profiles
      * are admitted; adding a profile must not add another full-image pass. */
+    memset(candidates, 0, sizeof(candidates));
     for (size_t i = 0;
          i < sizeof(dlfrz_musl_layouts) / sizeof(dlfrz_musl_layouts[0]); i++) {
         const struct dlfrz_musl_layout *layout = &dlfrz_musl_layouts[i];

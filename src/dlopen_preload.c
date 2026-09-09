@@ -29,6 +29,7 @@
 #include <sys/sysmacros.h>
 
 #include "dynamic_semantics.h"
+#include "linux_syscalls.h"
 
 #if defined(__GLIBC__)
 #define DLFREEZE_HAVE_GLIBC_STAT_ALIASES 1
@@ -3399,7 +3400,7 @@ static void trace_access_result(
     if (g_trace_depth || g_file_trace_fd < 0)
         goto out;
 
-    if (rc == 0 && real_fstatat) {
+    if (rc == 0) {
         struct stat st;
         int stat_rc;
 
@@ -3414,7 +3415,10 @@ static void trace_access_result(
               | AT_NO_AUTOMOUNT
 #endif
               ;
-        stat_rc = real_fstatat(dirfd, path, &st, flags);
+        /* This is our metadata observation, not an application fstatat
+         * call. Older libcs expose only versioned stat aliases; use the
+         * same raw classifier as successful-open tracing. */
+        stat_rc = raw_fstatat(dirfd, path, &st, flags);
         g_trace_depth--;
         if (stat_rc < 0) {
             write_file_failure("successful-access-cannot-be-classified");
@@ -3423,8 +3427,6 @@ static void trace_access_result(
             trace_path_kind(dirfd, path, S_ISDIR(st.st_mode), &snapshot,
                             observation);
         }
-    } else if (rc == 0) {
-        write_file_failure("successful-access-cannot-be-classified");
     } else if (rc < 0 && (saved_errno == ENOENT || saved_errno == ENOTDIR)) {
         trace_failed_path(dirfd, path, observation);
     }

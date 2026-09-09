@@ -2,7 +2,7 @@
 #define _GNU_SOURCE
 #endif
 
-#include <elf.h>
+#include "glibc_layout.h"
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -74,8 +74,8 @@ int main(int argc, char **argv)
         else if (dynamic[i].d_tag == DT_RELRENT)
             relr_ent = dynamic[i].d_un.d_val;
     }
-    if (relr_vaddr == 0 || relr_size < sizeof(Elf64_Relr) ||
-        relr_ent != sizeof(Elf64_Relr))
+    if (relr_vaddr == 0 || relr_size < sizeof(Elf64_Xword) ||
+        relr_ent != sizeof(Elf64_Xword))
         goto unmap;
     for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
         uint64_t delta;
@@ -85,18 +85,21 @@ int main(int argc, char **argv)
             continue;
         delta = relr_vaddr - phdrs[i].p_vaddr;
         if (delta <= phdrs[i].p_filesz &&
-            sizeof(Elf64_Relr) <= phdrs[i].p_filesz - delta) {
+            sizeof(Elf64_Xword) <= phdrs[i].p_filesz - delta) {
             relr_offset = phdrs[i].p_offset + delta;
             break;
         }
     }
     if (relr_offset == UINT64_MAX ||
-        !range_fits(relr_offset, sizeof(Elf64_Relr), (size_t)st.st_size))
+        !range_fits(relr_offset, sizeof(Elf64_Xword), (size_t)st.st_size))
         goto unmap;
 
     /* A bitmap has no base address until a preceding even entry establishes
      * the current relocation word. */
-    *(Elf64_Relr *)(image + relr_offset) = 3;
+    {
+        Elf64_Xword invalid_bitmap = 3;
+        memcpy(image + relr_offset, &invalid_bitmap, sizeof(invalid_bitmap));
+    }
     if (msync(image, (size_t)st.st_size, MS_SYNC) < 0)
         goto unmap;
     rc = 0;

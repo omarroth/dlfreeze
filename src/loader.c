@@ -2152,7 +2152,7 @@ static int restore_crash_handlers(struct crash_handler_state *state)
  * prefix and continue without them. */
 static int install_crash_handlers(struct crash_handler_state *state)
 {
-    struct sigaction sa = {0};
+    struct sigaction sa;
 
     if (!state)
         return -1;
@@ -2160,6 +2160,7 @@ static int install_crash_handlers(struct crash_handler_state *state)
     if (!g_debug)
         return 0;
 
+    memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = crash_handler;
     sa.sa_flags = SA_SIGINFO;
     if (sigemptyset(&sa.sa_mask) < 0)
@@ -8229,6 +8230,79 @@ static int x86_64_musl_branched_guard_initialization(
     return 1;
 }
 
+/* Some compilers put the fallback arm after the return and jump backwards
+ * to the common TCB store. Both arms must produce the same value register,
+ * from the same relocation-proven guard, at that exact instruction boundary. */
+static int x86_64_musl_backward_guard_join(
+    const struct loaded_obj *obj, const uint8_t *code, size_t len,
+    const struct x86_64_musl_guard_load *loads, size_t count,
+    size_t fallback, size_t store_end, unsigned int value_reg,
+    size_t *matched_offset, int *have_match)
+{
+    size_t jump_end;
+    int64_t displacement;
+    size_t join;
+
+    if (store_end + 2 > len)
+        return 0;
+    if (code[store_end] == 0xeb) {
+        jump_end = store_end + 2;
+        displacement = (int8_t)code[store_end + 1];
+    } else if (code[store_end] == 0xe9 && store_end + 5 <= len) {
+        jump_end = store_end + 5;
+        displacement = read_i32_le(code + store_end + 1);
+    } else {
+        return 0;
+    }
+    if (displacement >= 0 || (uint64_t)-displacement > jump_end)
+        return 0;
+    join = jump_end - (size_t)-displacement;
+    if (join >= fallback)
+        return 0;
+    for (size_t g = 0; g < count; g++) {
+        size_t begin = loads[g].end;
+        int branch_found = 0;
+
+        if (begin < 7 || begin >= join ||
+            !x86_64_musl_callee_saved(loads[g].reg))
+            continue;
+        for (size_t b = 0; b + 2 <= begin - 7; b++) {
+            size_t end, target;
+
+            if (x86_64_forward_conditional_branch(
+                    code, len, b, &end, &target) && target == fallback &&
+                end == begin - 7)
+                branch_found = 1;
+        }
+        if (!branch_found)
+            continue;
+        for (size_t v = begin; v + 3 <= join; v++) {
+            size_t offset, end;
+            unsigned int base, destination;
+
+            if ((code[v] & 0xf8) != 0x48 || code[v + 1] != 0x8b ||
+                !decode_x86_64_mem_disp(code, len, v, 2, &offset, &base) ||
+                !x86_64_modrm_end(code, len, v + 2, &end) ||
+                end != join || offset != 0 || base != loads[g].reg)
+                continue;
+            destination = ((code[v + 2] >> 3) & 7) |
+                          ((code[v] & 4) ? 8 : 0);
+            /* This arm must cross the entropy-copy call, not merely keep
+             * the address live without ever initializing the guard. */
+            if (destination != value_reg ||
+                x86_64_musl_gap_safe(code, begin, v, loads[g].reg, 0) ||
+                !x86_64_musl_guard_reaches_clear(
+                    obj, code, len, begin, loads[g].reg, v))
+                continue;
+            if (x86_64_musl_guard_copy_chain(
+                    code, len, v, loads[g].reg,
+                    matched_offset, have_match) < 0)
+                return -1;
+        }
+    }
+    return 0;
+}
+
 static int decode_x86_64_musl_init_ssp_canary(
     const struct loaded_obj *obj, uintptr_t address, size_t *offset_out)
 {
@@ -8376,6 +8450,11 @@ static int decode_x86_64_musl_init_ssp_canary(
                          ((store_rex & 4) ? 8 : 0);
                 if (source != value_reg)
                     continue;
+                if (x86_64_musl_backward_guard_join(
+                        obj, code, 160, guard_loads, guard_load_count,
+                        guard_loads[g].end - 7, store_end, value_reg,
+                        &matched_offset, &have_match) < 0)
+                    return 0;
                 if (x86_64_musl_guard_copy_chain(
                         code, 160, store_end, guard_reg,
                         &matched_offset, &have_match) < 0)
@@ -8491,6 +8570,30 @@ static int aarch64_exact_return_stub(const struct loaded_obj *obj,
         return 0;
     if (read_u32_le(code) == 0xd503245fu) /* BTI c */
         offset = 4;
+    if (read_u32_le(code + offset) == 0xd65f03c0u)
+        return 1;
+
+    /* A frame-pointer-preserving compiler can give even this empty stub
+     * a balanced frame and pointer authentication.  Admit only the exact
+     * save/restore sequence, with a matching authentication key. */
+    if (!musl_target_executable_address(obj, address, offset + 24))
+        return 0;
+    uint32_t authentication = 0;
+    uint32_t first = read_u32_le(code + offset);
+    if (first == 0xd503233fu || first == 0xd503237fu) {
+        authentication = first + 0x80; /* PACIASP/BSP -> AUTIASP/BSP */
+        offset += 4;
+    }
+    if (read_u32_le(code + offset) != 0xa9bf7bfdu ||
+        read_u32_le(code + offset + 4) != 0x910003fdu ||
+        read_u32_le(code + offset + 8) != 0xa8c17bfdu)
+        return 0;
+    offset += 12;
+    if (authentication) {
+        if (read_u32_le(code + offset) != authentication)
+            return 0;
+        offset += 4;
+    }
     return read_u32_le(code + offset) == 0xd65f03c0u;
 }
 
@@ -8757,6 +8860,46 @@ static int aarch64_musl_branched_guard_initialization(
     return 1;
 }
 
+static int aarch64_musl_fallback_value_to_tcb(
+    const uint8_t *code, size_t len, size_t ready, unsigned int value_reg,
+    size_t self_delta, size_t *matched_offset, int *have_match)
+{
+    for (size_t tp = ready; tp + 4 <= len && tp <= ready + 32; tp += 4) {
+        int tp_reg;
+
+        if (!aarch64_is_mrs_tpidr_el0(read_u32_le(code + tp), &tp_reg) ||
+            (unsigned int)tp_reg == value_reg)
+            continue;
+        for (size_t pos = tp + 4; pos + 4 <= len && pos <= tp + 32; pos += 4) {
+            uint32_t store = read_u32_le(code + pos);
+            int64_t relative;
+            size_t candidate;
+
+            if ((store & 0xffe00c00u) != 0xf8000000u ||
+                ((store >> 5) & 31) != (unsigned int)tp_reg ||
+                (store & 31) != value_reg ||
+                !aarch64_musl_no_control_flow(code, ready, pos) ||
+                !aarch64_musl_registers_preserved(
+                    code, ready, pos, UINT32_C(1) << value_reg) ||
+                !aarch64_musl_registers_preserved(
+                    code, tp + 4, pos, UINT32_C(1) << (unsigned int)tp_reg))
+                continue;
+            relative = (store >> 12) & 0x1ff;
+            if (relative & 0x100)
+                relative -= 0x200;
+            if ((int64_t)self_delta + relative < 0 ||
+                (int64_t)self_delta + relative >= MUSL_THREAD_PROBE_LIMIT)
+                return -1;
+            candidate = (size_t)((int64_t)self_delta + relative);
+            if (*have_match && *matched_offset != candidate)
+                return -1;
+            *matched_offset = candidate;
+            *have_match = 1;
+        }
+    }
+    return 0;
+}
+
 static int decode_aarch64_musl_init_ssp_canary(
     const struct loaded_obj *obj, uintptr_t address, size_t self_delta,
     size_t *offset_out)
@@ -8868,7 +9011,9 @@ static int decode_aarch64_musl_init_ssp_canary(
         size_t begin = guard_loads[g].end;
         size_t limit = begin + 48 < 160 ? begin + 48 : 160;
 
-        for (size_t i = begin; i + 8 <= limit; i += 4) {
+        /* Constant materialization may precede the scheduled GOT load. */
+        size_t constant_begin = begin >= 12 ? begin - 12 : 0;
+        for (size_t i = constant_begin; i + 8 <= limit; i += 4) {
             uint32_t movz = read_u32_le(code + i);
             uint32_t movk = read_u32_le(code + i + 4);
             unsigned int constant_reg;
@@ -8879,11 +9024,7 @@ static int decode_aarch64_musl_init_ssp_canary(
                 (movk & 0xff800000u) != 0xf2800000u ||
                 ((movk >> 21) & 3) != 1 ||
                 ((movk >> 5) & 0xffff) != 0x41c6 ||
-                (movz & 0x1f) != (movk & 0x1f) ||
-                !aarch64_musl_no_control_flow(code, begin, i) ||
-                !aarch64_musl_registers_preserved(
-                    code, begin, i,
-                    UINT32_C(1) << guard_loads[g].reg))
+                (movz & 0x1f) != (movk & 0x1f))
                 continue;
             constant_reg = movz & 0x1f;
             if (constant_reg == 31 ||
@@ -8897,12 +9038,14 @@ static int decode_aarch64_musl_init_ssp_canary(
                 unsigned int left_reg;
                 unsigned int right_reg;
 
-                if ((multiply & 0xffe0fc00u) != 0x9b007c00u ||
-                    !aarch64_musl_no_control_flow(code, i + 8, j) ||
+                if (j < begin ||
+                    (multiply & 0xffe0fc00u) != 0x9b007c00u ||
+                    !aarch64_musl_no_control_flow(
+                        code, i < begin ? i : begin, j) ||
                     !aarch64_musl_registers_preserved(
-                        code, i + 8, j,
-                        (UINT32_C(1) << constant_reg) |
-                        (UINT32_C(1) << guard_loads[g].reg)))
+                        code, i + 8, j, UINT32_C(1) << constant_reg) ||
+                    !aarch64_musl_registers_preserved(
+                        code, begin, j, UINT32_C(1) << guard_loads[g].reg))
                     continue;
                 result_reg = multiply & 0x1f;
                 left_reg = (multiply >> 5) & 0x1f;
@@ -8933,6 +9076,12 @@ static int decode_aarch64_musl_init_ssp_canary(
                             (UINT32_C(1) << guard_loads[g].reg)))
                         continue;
 
+                    /* The stored fallback value may be reused directly;
+                     * it need not be loaded back from __stack_chk_guard. */
+                    if (aarch64_musl_fallback_value_to_tcb(
+                            code, 160, k + 4, result_reg, self_delta,
+                            &matched_offset, &have_match) < 0)
+                        return 0;
                     if (aarch64_musl_guard_copy_chain(
                             code, 160, k + 4, k + 4,
                             guard_loads[g].reg, self_delta,
@@ -9329,7 +9478,7 @@ static int x86_64_musl_copy_return_register(
 
         if (!x86_64_decode_mov64_register(
                 code, len, i, &source, &destination) || source != 0 ||
-            !x86_64_musl_callee_saved(destination) ||
+            (!x86_64_musl_callee_saved(destination) && destination != 9) ||
             !x86_64_musl_gap_safe(code, begin, i, 0, 0))
             continue;
         *register_out = destination;
@@ -9620,6 +9769,27 @@ static int x86_64_musl_clone_instruction(
         return 1;
     }
 
+    if (opcode == 0xc6 || opcode == 0xc7) {
+        size_t end;
+        size_t immediate = opcode == 0xc6 ? 1 : 4;
+        uint8_t modrm;
+
+        if (!x86_64_modrm_end(code, len, p, &end) || immediate > len - end)
+            return 0;
+        modrm = code[p];
+        if (((modrm >> 3) & 7) != 0)
+            return 0;
+        if ((modrm >> 6) == 3) {
+            unsigned int destination = (modrm & 7) | ((rex & 1) ? 8 : 0);
+            if (opcode == 0xc6 && !rex && destination >= 4)
+                destination -= 4; /* AH/CH/DH/BH alias the low four registers. */
+            decoded->writes = 1u << destination;
+        } else
+            decoded->writes_memory = 1;
+        decoded->end = end + immediate;
+        return 1;
+    }
+
     if (opcode == 0x0f) {
         size_t end;
         uint8_t secondary;
@@ -9629,10 +9799,32 @@ static int x86_64_musl_clone_instruction(
         if (p >= len)
             return 0;
         secondary = code[p++];
-        if (secondary < 0x40 || secondary > 0x4f ||
-            !x86_64_modrm_end(code, len, p, &end))
+        if (!x86_64_modrm_end(code, len, p, &end))
             return 0;
         modrm = code[p];
+        if (secondary >= 0x90 && secondary <= 0x9f) { /* SETcc */
+            if ((modrm >> 6) == 3) {
+                destination = (modrm & 7) | ((rex & 1) ? 8 : 0);
+                if (!rex && destination >= 4)
+                    destination -= 4;
+                decoded->writes = 1u << destination;
+            } else
+                decoded->writes_memory = 1;
+            decoded->end = end;
+            return 1;
+        }
+        if (secondary == 0xba && end < len && ((modrm >> 3) & 7) >= 4) {
+            if (((modrm >> 3) & 7) != 4) { /* BTS/BTR/BTC, not BT */
+                if ((modrm >> 6) == 3)
+                    decoded->writes = 1u << ((modrm & 7) | ((rex & 1) ? 8 : 0));
+                else
+                    decoded->writes_memory = 1;
+            }
+            decoded->end = end + 1;
+            return 1;
+        }
+        if (secondary < 0x40 || secondary > 0x4f)
+            return 0;
         destination = ((modrm >> 3) & 7) | ((rex & 4) ? 8 : 0);
         decoded->writes = UINT32_C(1) << destination;
         decoded->end = end;
@@ -9666,7 +9858,8 @@ static int x86_64_musl_clone_instruction(
     }
 
     if (opcode == 0x89 || opcode == 0x8b || opcode == 0x8d ||
-        opcode == 0x31 || opcode == 0x39 || opcode == 0x85) {
+        opcode == 0x31 || opcode == 0x29 || opcode == 0x21 ||
+        opcode == 0x39 || opcode == 0x85) {
         size_t end;
         uint8_t modrm;
         unsigned int mod;
@@ -9680,12 +9873,14 @@ static int x86_64_musl_clone_instruction(
                 ((modrm >> 3) & 7) | ((rex & 4) ? 8 : 0);
 
             decoded->writes = UINT32_C(1) << destination;
-        } else if ((opcode == 0x89 || opcode == 0x31) && mod == 3) {
+        } else if ((opcode == 0x89 || opcode == 0x31 ||
+                    opcode == 0x29 || opcode == 0x21) && mod == 3) {
             unsigned int destination =
                 (modrm & 7) | ((rex & 1) ? 8 : 0);
 
             decoded->writes = UINT32_C(1) << destination;
-        } else if ((opcode == 0x89 || opcode == 0x31) && mod != 3) {
+        } else if ((opcode == 0x89 || opcode == 0x31 ||
+                    opcode == 0x29 || opcode == 0x21) && mod != 3) {
             decoded->writes_memory = 1;
         }
         decoded->end = end;
@@ -9708,7 +9903,8 @@ static int x86_64_musl_clone_gap(
             instruction.end <= cursor || instruction.end > end ||
             (instruction.writes & protected) != 0 ||
             (forbid_stack_and_memory &&
-             (instruction.changes_stack || instruction.writes_memory)))
+             (instruction.changes_stack || (instruction.writes & (1u << 4)) ||
+              instruction.writes_memory)))
             return 0;
         cursor = instruction.end;
     }
@@ -9745,9 +9941,221 @@ static int x86_64_musl_rip_lea(
     return 1;
 }
 
+/* Return the signed displacement of a direct RBP-relative operand. */
+static int x86_64_musl_frame_operand(const uint8_t *code, size_t len,
+                                     size_t start, int *offset)
+{
+    size_t p = start;
+    uint8_t rex = 0;
+    unsigned int mod;
+
+    if (p >= len)
+        return 0;
+    if ((code[p] & 0xf0) == 0x40)
+        rex = code[p++];
+    if (p >= len || (rex & 1))
+        return 0;
+    if (code[p++] == 0x0f)
+        p++;
+    if (p >= len || (code[p] & 7) != 5)
+        return 0;
+    mod = code[p++] >> 6;
+    if (mod == 1 && p < len)
+        *offset = (int8_t)code[p];
+    else if (mod == 2 && len - p >= 4)
+        *offset = read_i32_le(code + p);
+    else
+        return 0;
+    return 1;
+}
+
+static size_t x86_64_musl_fixed_frame_size(const uint8_t *code, size_t len)
+{
+    size_t p = 0, size = 0;
+
+    if (len < 32)
+        return 0;
+    if (memcmp(code, "\xf3\x0f\x1e\xfa", 4) == 0)
+        p = 4;
+    if (code[p++] != 0x55)
+        return 0;
+    if (memcmp(code + p, "\x66\x0f\xef\xc0", 4) == 0)
+        p += 4; /* independent vector zeroing scheduled in the prologue */
+    if (memcmp(code + p, "\x48\x89\xe5", 3) != 0)
+        return 0;
+    p += 3;
+    while (p + 2 < len && p < 48) {
+        if (code[p] == 0x53 || code[p] == 0x56 || code[p] == 0x57) {
+            p++;
+        } else if (code[p] == 0x41 && code[p + 1] >= 0x54 &&
+                   code[p + 1] <= 0x57) {
+            p += 2;
+        } else {
+            break;
+        }
+        size += 8;
+    }
+    if (p + 7 <= len && memcmp(code + p, "\x48\x81\xec", 3) == 0) {
+        uint32_t allocation = read_u32_le(code + p + 3);
+        if (allocation > MUSL_THREAD_PROBE_LIMIT - size)
+            return 0;
+        return size + allocation;
+    }
+    return 0;
+}
+
+/* Both successors of every branch must reach the same use with the protected
+ * registers intact. Calls are allowed only while the pointer is in its
+ * private frame slot, never while a volatile register is the authority. */
+static int x86_64_musl_pointer_path(
+    const struct loaded_obj *obj, const uint8_t *code, size_t len,
+    size_t pc, size_t end, uint32_t protected, int frame_slot,
+    int allow_calls, unsigned int depth, unsigned int *budget)
+{
+    if (depth > 8)
+        return 0;
+    while (pc != end) {
+        struct x86_64_musl_clone_instruction instruction;
+        size_t next = 0;
+        int64_t displacement = 0;
+        int conditional = 0;
+        uintptr_t target;
+
+        if (!*budget || pc >= len)
+            return 0;
+        --*budget;
+        if (pc + 2 <= len && (code[pc] == 0xeb ||
+                              (code[pc] >= 0x70 && code[pc] <= 0x7f))) {
+            next = pc + 2;
+            displacement = (int8_t)code[pc + 1];
+            conditional = code[pc] != 0xeb;
+        } else if (pc + 5 <= len && code[pc] == 0xe9) {
+            next = pc + 5;
+            displacement = read_i32_le(code + pc + 1);
+        } else if (pc + 6 <= len && code[pc] == 0x0f &&
+                   code[pc + 1] >= 0x80 && code[pc + 1] <= 0x8f) {
+            next = pc + 6;
+            displacement = read_i32_le(code + pc + 2);
+            conditional = 1;
+        }
+        if (next) {
+            int64_t destination = (int64_t)next + displacement;
+            if (destination < 0 || (uint64_t)destination >= len ||
+                (conditional && !x86_64_musl_pointer_path(
+                    obj, code, len, next, end, protected, frame_slot,
+                    allow_calls, depth + 1, budget)))
+                return 0;
+            pc = (size_t)destination;
+            continue;
+        }
+        if (x86_64_direct_call_target(code, len, pc, &target)) {
+            if (!allow_calls || !musl_target_executable_address(obj, target, 1))
+                return 0;
+            pc += 5;
+            continue;
+        }
+        if (!x86_64_musl_clone_instruction(code, len, pc, &instruction) ||
+            instruction.end <= pc || (instruction.writes & protected))
+            return 0;
+        if (instruction.writes & (1u << 4)) {
+            /* Extra outgoing argument space can only move RSP down. */
+            if (pc + 4 > len || code[pc] != 0x48 || code[pc + 2] != 0xec ||
+                !((code[pc + 1] == 0x83 && (int8_t)code[pc + 3] >= 0) ||
+                  (code[pc + 1] == 0x81 && pc + 7 <= len &&
+                   read_i32_le(code + pc + 3) >= 0)))
+                return 0;
+        }
+        if (frame_slot && instruction.writes_memory) {
+            int offset;
+            if (x86_64_musl_frame_operand(code, len, pc, &offset) &&
+                (int64_t)offset < (int64_t)frame_slot + 8 &&
+                (int64_t)offset + 8 > frame_slot)
+                return 0;
+        }
+        pc = instruction.end;
+    }
+    return 1;
+}
+
+static int x86_64_musl_spilled_tls_argument(
+    const struct loaded_obj *obj, const uint8_t *code, size_t len,
+    size_t copy_call, size_t clone_call)
+{
+    size_t frame = x86_64_musl_fixed_frame_size(code, len);
+
+    if (!frame || copy_call >= clone_call)
+        return 0;
+    for (size_t move = copy_call + 5; move + 3 <= clone_call &&
+         move <= copy_call + 64; move++) {
+        unsigned int source, destination;
+
+        if (!x86_64_decode_mov64_register(code, len, move, &source, &destination) ||
+            source != 0 || destination != 9 ||
+            !x86_64_musl_gap_safe(code, copy_call + 5, move, 0, 0))
+            continue;
+        for (size_t spill = move + 3; spill + 4 <= clone_call; spill++) {
+            int slot;
+            size_t spill_end;
+            unsigned int budget = 256;
+
+            if (code[spill] != 0x4c || code[spill + 1] != 0x89 ||
+                ((code[spill + 2] >> 3) & 7) != 1 ||
+                !x86_64_musl_frame_operand(code, len, spill, &slot) ||
+                slot > -8 || slot < -(int)frame ||
+                !x86_64_modrm_end(code, len, spill + 2, &spill_end) ||
+                !x86_64_musl_pointer_path(obj, code, len, move + 3, spill,
+                    (1u << 9) | (1u << 5) | (1u << 4), 0, 0, 0, &budget))
+                continue;
+            for (size_t reload = spill_end; reload + 4 <= clone_call; reload++) {
+                int loaded_slot;
+                size_t reload_end;
+
+                if (code[reload] != 0x4c || code[reload + 1] != 0x8b ||
+                    ((code[reload + 2] >> 3) & 7) != 1 ||
+                    !x86_64_musl_frame_operand(code, len, reload, &loaded_slot) ||
+                    loaded_slot != slot ||
+                    !x86_64_modrm_end(code, len, reload + 2, &reload_end))
+                    continue;
+                budget = 256;
+                if (x86_64_musl_pointer_path(obj, code, len, spill_end, reload,
+                        (1u << 5) | (1u << 4), slot, 1, 0, &budget) &&
+                    x86_64_musl_pointer_path(obj, code, len, reload_end, clone_call,
+                        (1u << 9) | (1u << 5), 0, 0, 0, &budget))
+                    return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static int x86_64_musl_pushed_ctid_gap(
+    const uint8_t *code, size_t len, size_t begin, size_t end, int spilled_tls)
+{
+    size_t frame = spilled_tls ? x86_64_musl_fixed_frame_size(code, len) : 0;
+
+    for (size_t pc = begin; pc < end;) {
+        struct x86_64_musl_clone_instruction instruction;
+        int offset;
+
+        if (!x86_64_musl_clone_instruction(code, len, pc, &instruction) ||
+            instruction.end <= pc || instruction.end > end ||
+            instruction.changes_stack ||
+            (instruction.writes & ((1u << 4) | (1u << 5))))
+            return 0;
+        if (instruction.writes_memory &&
+            (!frame || code[pc] != 0x4c || code[pc + 1] != 0x89 ||
+             ((code[pc + 2] >> 3) & 7) != 1 ||
+             !x86_64_musl_frame_operand(code, len, pc, &offset) ||
+             offset > -8 || offset < -(int)frame))
+            return 0;
+        pc = instruction.end;
+    }
+    return 1;
+}
+
 static int decode_x86_64_musl_clone_ctid(
     const struct loaded_obj *libc_obj, const uint8_t *code, size_t len,
-    unsigned int new_reg, size_t tid_offset, uintptr_t *ctid_out)
+    unsigned int new_reg, size_t copy_call, size_t tid_offset, uintptr_t *ctid_out)
 {
     uintptr_t matched = 0;
     unsigned int matching_calls = 0;
@@ -9764,6 +10172,9 @@ static int decode_x86_64_musl_clone_ctid(
         if (!x86_64_direct_call_target(code, len, call, &target) ||
             !x86_64_musl_clone_wrapper(libc_obj, target))
             continue;
+        if (new_reg == 9 &&
+            x86_64_musl_spilled_tls_argument(libc_obj, code, len, copy_call, call))
+            tls_moves = 1;
         begin = call > 160 ? call - 160 : 0;
         for (size_t i = begin; i + 3 <= call; i++) {
             unsigned int source;
@@ -9829,8 +10240,8 @@ static int decode_x86_64_musl_clone_ctid(
                     !x86_64_musl_clone_gap(
                         code, len, i + 7, push,
                         UINT32_C(1) << address_reg, 0) ||
-                    !x86_64_musl_clone_gap(
-                        code, len, push_end, call, 0, 1))
+                    !x86_64_musl_pushed_ctid_gap(
+                        code, len, push_end, call, new_reg == 9 && tls_moves == 1))
                     continue;
                 if (call_ctid && call_ctid != address)
                     return 0;
@@ -9864,6 +10275,7 @@ static int decode_x86_64_musl_pthread_geometry(
     uintptr_t *tls_cnt_out)
 {
     uintptr_t copy_tls = 0;
+    size_t copy_call = 0;
     size_t pthread_size = 0;
     unsigned int copy_candidates = 0;
     unsigned int new_reg = UINT_MAX;
@@ -9897,6 +10309,7 @@ static int decode_x86_64_musl_pthread_geometry(
                 create, create_len, i, &candidate_reg))
             continue;
         copy_tls = target;
+        copy_call = i;
         pthread_size = candidate_size;
         new_reg = candidate_reg;
         copy_candidates++;
@@ -9917,7 +10330,7 @@ static int decode_x86_64_musl_pthread_geometry(
         return 0;
     }
     if (!decode_x86_64_musl_clone_ctid(
-            libc_obj, create, create_len, new_reg,
+            libc_obj, create, create_len, new_reg, copy_call,
             tid_offset, thread_list_lock_out)) {
         ldr_dbg("[loader] musl geometry: clone ctid contract\n");
         return 0;
@@ -10346,6 +10759,12 @@ static int aarch64_decode_ldur64_signed(uint32_t insn, int rn,
     return 1;
 }
 
+static int aarch64_musl_registers_preserved(const uint8_t *code,
+                                             size_t begin, size_t end,
+                                             uint32_t protected);
+static int aarch64_musl_no_control_flow(const uint8_t *code,
+                                         size_t begin, size_t end);
+
 static int decode_aarch64_musl_self_delta(const uint8_t *code, size_t len,
                                           size_t *delta_out)
 {
@@ -10355,15 +10774,18 @@ static int decode_aarch64_musl_self_delta(const uint8_t *code, size_t len,
 
         if (!aarch64_is_mrs_tpidr_el0(insn, &rt))
             continue;
-        if (i + 8 <= len && read_u32_le(code + i + 4) == 0xd65f03c0u &&
-            rt == 0) {
-            *delta_out = 0;
-            return 1;
-        }
-        if (i + 8 <= len) {
+        for (size_t j = i + 4; j + 4 <= len; j += 4) {
             int64_t imm;
 
-            if (aarch64_decode_addsub_imm(read_u32_le(code + i + 4), rt, 0, &imm) &&
+            if (!aarch64_musl_no_control_flow(code, i + 4, j) ||
+                !aarch64_musl_registers_preserved(
+                    code, i + 4, j, 1u << rt))
+                break;
+            if (read_u32_le(code + j) == 0xd65f03c0u && rt == 0) {
+                *delta_out = 0;
+                return 1;
+            }
+            if (aarch64_decode_addsub_imm(read_u32_le(code + j), rt, 0, &imm) &&
                 imm <= 0) {
                 *delta_out = (size_t)-imm;
                 return *delta_out < MUSL_THREAD_PROBE_LIMIT;
@@ -10382,9 +10804,15 @@ static int decode_aarch64_musl_tp_relative(const uint8_t *code, size_t len,
 
         if (!aarch64_is_mrs_tpidr_el0(insn, &rt))
             continue;
-        if (aarch64_decode_addsub_imm(read_u32_le(code + i + 4), rt, 0,
-                                      tp_rel_out))
-            return 1;
+        for (size_t j = i + 4; j + 4 <= len; j += 4) {
+            if (!aarch64_musl_no_control_flow(code, i + 4, j) ||
+                !aarch64_musl_registers_preserved(
+                    code, i + 4, j, 1u << rt))
+                break;
+            if (aarch64_decode_addsub_imm(read_u32_le(code + j), rt, 0,
+                                          tp_rel_out))
+                return 1;
+        }
     }
     return 0;
 }
@@ -11444,6 +11872,22 @@ static int decode_aarch64_musl_uselocale(
                 return 0;
             loaded_locale = candidate;
         }
+        /* Some compilers use STUR directly through TP instead of first
+         * materializing struct pthread.  Require the same signed field as
+         * the load, the X0 locale argument, and preserved TP provenance. */
+        if (tp_reg >= 0 && (insn & 0xffe00c1fu) == 0xf8000000u &&
+            aarch64_decode_ldur64_signed(
+                insn | UINT32_C(0x00400000), tp_reg, &relative) &&
+            relative + (int64_t)self_delta >= 0 &&
+            relative + (int64_t)self_delta < MUSL_THREAD_PROBE_LIMIT &&
+            aarch64_musl_registers_preserved(
+                code, tp_ready, i, UINT32_C(1) << (unsigned int)tp_reg)) {
+            size_t candidate = (size_t)(relative + (int64_t)self_delta);
+
+            if (stored_locale != SIZE_MAX && stored_locale != candidate)
+                return 0;
+            stored_locale = candidate;
+        }
         if (tp_reg >= 0 && self_reg < 0) {
             int64_t delta;
 
@@ -11523,7 +11967,7 @@ static int decode_aarch64_musl_uselocale(
             global_uses++;
         }
     }
-    if (tp_reg < 0 || self_reg < 0 || loaded_locale == SIZE_MAX ||
+    if (tp_reg < 0 || loaded_locale == SIZE_MAX ||
         loaded_locale != stored_locale || !global || global_uses < 2)
         return 0;
     *locale_out = loaded_locale;
@@ -34259,8 +34703,10 @@ static int admit_lazy_plt(struct loaded_obj *targets, int ntargets,
             obj->lazy_plt = 0;
             continue;
         }
+        /* Writable lookup tables are valid ELF (including images rewritten
+         * by post-link editors). Their lookups use the bounded uncached
+         * readers; immutability is a cache prerequisite, not a PLT ABI. */
         if (obj->pltgot_vaddr == 0 ||
-            !symbol_lookup_metadata_declared_immutable(obj) ||
             !u64_add_checked(obj->pltgot_vaddr, sizeof(uint64_t),
                              &header_start) ||
             relocation_destination_overlaps_tls_template(

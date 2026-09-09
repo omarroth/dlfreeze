@@ -34,6 +34,7 @@ static _Atomic int quiescent_publications;
 static _Atomic int all_publications_quiescent;
 static _Atomic int first_fork_complete;
 static _Atomic int publication_overlap_observed;
+static int publication_overlap_enabled = 1;
 
 static void note_failure(unsigned int bit)
 {
@@ -91,7 +92,7 @@ static void note_quiescent_publication(void)
  * real loader publication without relying on scheduler timing. */
 void loader_stress_publication_hold(int plugin_id)
 {
-    if (plugin_id != 0)
+    if (plugin_id != 0 || !publication_overlap_enabled)
         return;
     atomic_store_explicit(
         &publication_constructor_waiting, 1, memory_order_release);
@@ -109,6 +110,8 @@ void loader_stress_publication_hold(int plugin_id)
  * callback returns. */
 static void overlap_atfork_prepare(void)
 {
+    if (!publication_overlap_enabled)
+        return;
     if (atomic_load_explicit(
             &publication_overlap_observed, memory_order_acquire))
         return;
@@ -245,6 +248,14 @@ static void *fork_worker(void *unused)
         int status = 0;
         pid_t child;
 
+        /* Older native loaders can acquire internal locks before invoking
+         * application atfork prepares. Their control run forks only after
+         * publication is quiescent; direct replay still requires overlap. */
+        if (pass == 0 && !publication_overlap_enabled &&
+            wait_for_flag(&all_publications_quiescent) != 0) {
+            note_failure(1U << 27);
+            break;
+        }
         if (pass == 1 &&
             (wait_for_value(&loaded_plugins, PLUGIN_COUNT) != 0 ||
              wait_for_value(&completed_readers, READER_THREADS) != 0)) {
@@ -310,12 +321,19 @@ static void *fork_worker(void *unused)
     return NULL;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     pthread_t loaders[LOADER_THREADS];
     pthread_t readers[READER_THREADS];
     pthread_t forker;
 
+    if (argc == 2 && strcmp(argv[1], "native") == 0) {
+        publication_overlap_enabled = 0;
+        atomic_store_explicit(&publication_overlap_observed, 1,
+                              memory_order_relaxed);
+    } else if (argc != 1) {
+        return 11;
+    }
     alarm(30);
     if (pthread_barrier_init(
             &start_barrier, NULL,

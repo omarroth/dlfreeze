@@ -201,6 +201,29 @@ static void build_branched_old_init_contract(void)
     image[INIT_SSP_CALL_OFF] = 0xc3;
 }
 
+static void build_backward_old_init_contract(void)
+{
+    uint8_t *ssp = image + INIT_SSP_OFF;
+    uint32_t multiplier = UINT32_C(1103515245);
+
+    build_init_contract();
+    memset(ssp, 0x90, 160);
+    memcpy(ssp, "\xf3\x0f\x1e\xfa\x53\x48\x85\xff\x74\x2e", 10);
+    memcpy(ssp + 10, "\x48\x8b\x1d\0\0\0\0", 7);
+    set_rip_disp32(ssp + 10, 7, (uintptr_t)(image + GUARD_GOT_OFF));
+    memcpy(ssp + 17, "\x48\x89\xfe\xba\x08\0\0\0\x48\x89\xdf", 11);
+    set_rel32(ssp + 28, (uintptr_t)(image + INIT_SSP_CALL_OFF));
+    memcpy(ssp + 33, "\x48\x8b\x03", 3);
+    memcpy(ssp + 36, "\x64\x48\x8b\x14\x25\0\0\0\0", 9);
+    memcpy(ssp + 45, "\x48\x89\x42\x28\x5b\xc3", 6);
+    memcpy(ssp + 56, "\x48\x8b\x15\0\0\0\0", 7);
+    set_rip_disp32(ssp + 56, 7, (uintptr_t)(image + GUARD_GOT_OFF));
+    memcpy(ssp + 63, "\x48\x69\xc2", 3);
+    memcpy(ssp + 66, &multiplier, sizeof(multiplier));
+    memcpy(ssp + 70, "\x48\x89\x02\xeb\xd9", 5);
+    image[INIT_SSP_CALL_OFF] = 0xc3;
+}
+
 static void build_frame_spill_init_contract(void)
 {
     uint8_t *ssp = image + INIT_SSP_OFF;
@@ -442,6 +465,31 @@ static int test_init_contract(void)
     image[INIT_SSP_OFF + 61] = 0xc3;
     if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
         return 0; /* common copy has two incompatible TCB fields */
+
+    build_backward_old_init_contract();
+    if (!decode_x86_64_musl_init_libc(&obj, &decoded, &canary) || canary != 40)
+        return 0;
+    /* Neither an interior jump nor disagreement between arm values proves
+     * the shared TCB store. */
+    image[INIT_SSP_OFF + 74]++;
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0;
+    build_backward_old_init_contract();
+    image[INIT_SSP_OFF + 35] = 0x0b;
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0;
+    build_backward_old_init_contract();
+    image[INIT_SSP_OFF + 66] ^= 1;
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0;
+    build_backward_old_init_contract();
+    image[INIT_SSP_OFF + 9]--;
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0;
+    build_backward_old_init_contract();
+    memset(image + INIT_SSP_OFF + 28, 0x90, 5);
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0; /* the entropy arm must actually initialize the guard */
 
     build_frame_spill_init_contract();
     if (!decode_x86_64_musl_init_libc(&obj, &decoded, &canary) ||
@@ -865,6 +913,62 @@ static int test_pthread_geometry(void)
     return 1;
 }
 
+/* A volatile TLS pointer is authoritative only across proven spill/reload
+ * paths. These mutations exercise both branch successors and stack aliases. */
+static int test_spilled_tls_argument(void)
+{
+    uint8_t *code = image + CREATE_OFF;
+    uint8_t saved[128];
+    struct x86_64_musl_clone_instruction instruction;
+
+    memset(code, 0x90, 128);
+    memcpy(code, "\x55\x48\x89\xe5\x48\x81\xec\x00\x01\0\0", 11);
+    set_rel32(code + 16, (uintptr_t)(image + COPY_TLS_OFF));
+    memcpy(code + 21, "\x49\x89\xc1", 3); /* copy result -> r9 */
+    memcpy(code + 24, "\x75\x06", 2); /* both paths converge at spill */
+    memcpy(code + 32, "\x4c\x89\x4d\xe0", 4);
+    set_rel32(code + 40, (uintptr_t)(image + INIT_OFF));
+    memcpy(code + 48, "\x4c\x8b\x4d\xe0", 4);
+    memcpy(code + 64, "\x41\x52", 2); /* outgoing CTID stack argument */
+    memcpy(code + 66, "\x4c\x89\x4d\xd0", 4);
+    set_rel32(code + 80, (uintptr_t)(image + CLONE_OFF));
+    memcpy(saved, code, sizeof(saved));
+    if (!x86_64_musl_spilled_tls_argument(&obj, code, 128, 16, 80) ||
+        !x86_64_musl_pushed_ctid_gap(code, 128, 66, 80, 1) ||
+        x86_64_musl_pushed_ctid_gap(code, 128, 66, 80, 0))
+        return 0;
+
+#define REJECT_POINTER_MUTATION(offset, bytes) do { \
+    memcpy(code, saved, sizeof(saved)); \
+    memcpy(code + (offset), (bytes), sizeof(bytes) - 1); \
+    if (x86_64_musl_spilled_tls_argument(&obj, code, 128, 16, 80)) \
+        return 0; \
+} while (0)
+    REJECT_POINTER_MUTATION(26, "\x45\x31\xc9"); /* fallthrough clobber */
+    REJECT_POINTER_MUTATION(26, "\xeb\xfe"); /* branch arm loops */
+    REJECT_POINTER_MUTATION(24, "\xeb\x7f"); /* escaping branch */
+    REJECT_POINTER_MUTATION(36, "\x48\x89\x45\xe4"); /* overlapping slot */
+    REJECT_POINTER_MUTATION(48, "\x4c\x8b\x4d\xd8"); /* wrong reload */
+    REJECT_POINTER_MUTATION(52, "\x45\x31\xc9"); /* volatile clobber */
+    REJECT_POINTER_MUTATION(52, "\xe8\0\0\0\0"); /* call after reload */
+    REJECT_POINTER_MUTATION(7, "\x08\0\0\0"); /* unallocated spill */
+#undef REJECT_POINTER_MUTATION
+    memcpy(code, saved, sizeof(saved));
+    memcpy(code + 70, "\x48\x89\xc4", 3); /* MOV RAX,RSP */
+    if (x86_64_musl_pushed_ctid_gap(code, 128, 66, 80, 1))
+        return 0;
+    memcpy(code, saved, sizeof(saved));
+    memcpy(code + 70, "\x48\x89\x04\x24", 4); /* overwrite CTID */
+    if (x86_64_musl_pushed_ctid_gap(code, 128, 66, 80, 1))
+        return 0;
+    if (!x86_64_musl_clone_instruction((const uint8_t *)"\x0f\x95\xc4", 3,
+            0, &instruction) || instruction.writes != 1u ||
+        !x86_64_musl_clone_instruction((const uint8_t *)"\xc6\xc7\0", 3,
+            0, &instruction) || instruction.writes != (1u << 3))
+        return 0;
+    return 1;
+}
+
 int main(void)
 {
     g_musl_layout = modern_layout();
@@ -887,6 +991,10 @@ int main(void)
     }
     if (!test_pthread_geometry()) {
         fprintf(stderr, "x86-64 musl pthread decoder gate failed\n");
+        return 1;
+    }
+    if (!test_spilled_tls_argument()) {
+        fprintf(stderr, "x86-64 musl spilled TLS argument decoder gate failed\n");
         return 1;
     }
     return 0;

@@ -34,7 +34,8 @@ BUILD_RECIPE_HASH := $(shell sha256sum Makefile 2>/dev/null | awk '{print $$1}')
 MUSL_CC := $(shell command -v musl-gcc 2>/dev/null || true)
 MUSL_CC_TRIPLE := $(shell if [ -n '$(MUSL_CC)' ]; then '$(MUSL_CC)' -dumpmachine 2>/dev/null; fi)
 MUSL_CC_ARCH := $(call triple_arch,$(MUSL_CC_TRIPLE))
-AUTO_STATIC_CC := $(if $(and $(MUSL_CC),$(filter $(BUILD_ARCH),$(MUSL_CC_ARCH))),$(MUSL_CC),$(CC))
+can_link_static = $(shell printf 'int main(void){return 0;}' | $(1) -static $(LDFLAGS) -x c - -x none -o /dev/null >/dev/null 2>&1 && printf yes)
+AUTO_STATIC_CC := $(if $(and $(MUSL_CC),$(filter $(BUILD_ARCH),$(MUSL_CC_ARCH)),$(call can_link_static,$(MUSL_CC))),$(MUSL_CC),$(CC))
 # An explicit STATIC_CC always wins.  Automatic musl selection is permitted
 # only when it targets the same ELF architecture as CC; silently mixing a host
 # musl-gcc into a cross build would produce an unusable tool/bootstrap pair.
@@ -67,7 +68,9 @@ PRELOAD_VARIANTS := $(PRELOAD) $(PRELOAD_STATIC)
 
 # Prefer musl-gcc for the small static tool and bootstrap when available.
 # Direct handoff is bootstrap-libc-neutral; a static system compiler is also
-# supported and covered by the bootstrap-independence regression.
+# supported and covered by the bootstrap-independence regression. Automatic
+# musl selection also requires a working static runtime: matching triples do
+# not guarantee that the compiler's implicit libraries are installed.
 TOOL_CC := $(STATIC_CC)
 
 .DEFAULT_GOAL := all
@@ -203,10 +206,10 @@ $(BOOTSTRAP): $(SRC)/bootstrap.c $(SRC)/loader.c $(SRC)/lazy_trampoline.S $(INC)
 PRELOAD_ARCH_CFLAGS := $(if $(filter aarch64,$(BUILD_ARCH)),$(call supported_cc_option,$(CC),-mno-outline-atomics),)
 PRELOAD_STATIC_ARCH_CFLAGS := $(if $(filter aarch64,$(STATIC_CC_ARCH)),$(call supported_cc_option,$(STATIC_CC),-mno-outline-atomics),)
 
-$(PRELOAD): $(SRC)/dlopen_preload.c $(INC)/dynamic_semantics.h $(BUILD_STAMP_FILE)
+$(PRELOAD): $(SRC)/dlopen_preload.c $(INC)/dynamic_semantics.h $(INC)/linux_syscalls.h $(BUILD_STAMP_FILE)
 	$(CC) $(CFLAGS) $(ERROR_CFLAGS) $(PRELOAD_ARCH_CFLAGS) -U_FORTIFY_SOURCE -shared -fPIC -Wl,-z,defs -o $@ $< -ldl $(LDFLAGS)
 
-$(PRELOAD_STATIC): $(SRC)/dlopen_preload.c $(INC)/dynamic_semantics.h $(BUILD_STAMP_FILE)
+$(PRELOAD_STATIC): $(SRC)/dlopen_preload.c $(INC)/dynamic_semantics.h $(INC)/linux_syscalls.h $(BUILD_STAMP_FILE)
 	$(STATIC_CC) $(CFLAGS) $(ERROR_CFLAGS) $(PRELOAD_STATIC_ARCH_CFLAGS) -U_FORTIFY_SOURCE -shared -fPIC -Wl,-z,defs -o $@ $< -ldl $(LDFLAGS)
 
 # ── test suite ─────────────────────────────────────────────────────

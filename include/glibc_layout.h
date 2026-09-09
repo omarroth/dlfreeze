@@ -1391,7 +1391,9 @@ dlfrz_glibc_x86_dlfcn_chain(
     struct dlfrz_glibc_dlfcn_consumer_evidence *evidence)
 {
     size_t completed = 0;
-    struct dlfrz_glibc_dlfcn_consumer_evidence result = {0};
+    struct dlfrz_glibc_dlfcn_consumer_evidence result;
+
+    memset(&result, 0, sizeof(result));
 
     for (size_t got_position = 0; got_position < code_size; got_position++) {
         struct dlfrz_glibc_x86_mov_load got_load;
@@ -1506,7 +1508,7 @@ dlfrz_glibc_x86_dlfcn_chain(
     if (completed != 1)
         return 0;
     if (evidence)
-        *evidence = result;
+        memcpy(evidence, &result, sizeof(result));
     return 1;
 }
 
@@ -1546,7 +1548,9 @@ dlfrz_glibc_aarch64_dlfcn_consumer(
 {
     size_t function_offset;
     size_t completed = 0;
-    struct dlfrz_glibc_dlfcn_consumer_evidence result = {0};
+    struct dlfrz_glibc_dlfcn_consumer_evidence result;
+
+    memset(&result, 0, sizeof(result));
 
     if (hook_offset < 0 || (hook_offset & 7) != 0 ||
         symbol->st_value % sizeof(uint32_t) != 0 ||
@@ -1698,7 +1702,7 @@ dlfrz_glibc_aarch64_dlfcn_consumer(
     if (completed != 1)
         return 0;
     if (evidence)
-        *evidence = result;
+        memcpy(evidence, &result, sizeof(result));
     return 1;
 }
 
@@ -3123,7 +3127,7 @@ dlfrz_glibc_dlfcn_hook_consumer_valid(
             result.slot_load_file_offsets))
         return 0;
     if (evidence)
-        *evidence = result;
+        memcpy(evidence, &result, sizeof(result));
     return 1;
 }
 
