@@ -131,6 +131,16 @@ static int immutable_binding_cache_gate(void)
             &g_all_objs[0], 1, g_all_objs, 2) ||
         g_relocation_ifunc_cache_hits != 1)
         return 0;
+    g_relocation_definition_cache_queries = 0;
+    if (relocation_symbol_is_ifunc(
+            &g_all_objs[0], 1, g_all_objs, 2) ||
+        g_relocation_definition_cache_queries != 1)
+        return 0;
+    g_relocation_definition_cache_queries = 0;
+    relocation_definition_cache_ifunc_store(
+        &g_all_objs[0], 1, g_all_objs, 2, 0);
+    if (g_relocation_definition_cache_queries != 1)
+        return 0;
     return 1;
 }
 

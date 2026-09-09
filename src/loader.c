@@ -1400,17 +1400,17 @@ static char *ldr_strrchr(const char *string, int value)
 /* r_offset is a byte address, not a C alignment promise.  Linkers can emit
  * scalar relocations into packed fields, so every relocation word access
  * must remain defined even when the destination is not uint64_t-aligned. */
+typedef uint64_t relocation_unaligned_u64
+    __attribute__((__aligned__(1), __may_alias__));
+
 static uint64_t relocation_load_u64(const void *address)
 {
-    uint64_t value;
-
-    ldr_memcpy(&value, address, sizeof(value));
-    return value;
+    return *(const volatile relocation_unaligned_u64 *)address;
 }
 
 static void relocation_store_u64(void *address, uint64_t value)
 {
-    ldr_memcpy(address, &value, sizeof(value));
+    *(volatile relocation_unaligned_u64 *)address = value;
 }
 
 static void relocation_store_u64_pair(void *address,
@@ -6900,9 +6900,8 @@ static int loaded_relr_read(const struct loaded_obj *obj, size_t index,
 {
     if (!obj || !obj->relr || !relocation_out || index >= obj->relr_count)
         return 0;
-    memcpy(relocation_out,
-           (const uint8_t *)obj->relr + index * sizeof(*relocation_out),
-           sizeof(*relocation_out));
+    *relocation_out = relocation_load_u64(
+        (const uint8_t *)obj->relr + index * sizeof(*relocation_out));
     return 1;
 }
 
@@ -20429,6 +20428,7 @@ static size_t g_version_key_admission_visits;
 static size_t g_versym_value_reads;
 static size_t g_dladdr_gnu_chain_visits;
 static size_t g_relocation_definition_cache_hits;
+static size_t g_relocation_definition_cache_queries;
 static size_t g_relocation_definition_cache_stores;
 static size_t g_relocation_definition_cache_growth_attempts;
 static int g_relocation_definition_cache_force_allocation_failure;
@@ -29908,6 +29908,9 @@ relocation_definition_cache_entry(
     uint16_t requester_index, uint32_t symbol_index,
     uint16_t object_count, int skip_requester, int create)
 {
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+    g_relocation_definition_cache_queries++;
+#endif
     struct relocation_definition_cache_table *table =
         g_relocation_definition_table;
     uint32_t index = relocation_definition_cache_hash(
@@ -30021,10 +30024,14 @@ static int relocation_definition_cache_scope_immutable(
     return immutable;
 }
 
-static int relocation_definition_cache_lookup(
+/* IFUNC classification immediately consumes the same admitted entry. Return
+ * that borrowed entry with the definition instead of hashing the key twice.
+ * Callers must not retain it across callbacks or loader-scope changes. */
+static int relocation_definition_cache_lookup_with_entry(
     struct loaded_obj *requester, uint32_t symbol_index,
     struct loaded_obj *objs, int nobj, int skip_requester,
-    struct loaded_obj **owner_out, const Elf64_Sym **symbol_out)
+    struct loaded_obj **owner_out, const Elf64_Sym **symbol_out,
+    struct relocation_definition_cache_ent **entry_out)
 {
     struct relocation_definition_cache_ent *entry;
     const Elf64_Sym *reference;
@@ -30059,10 +30066,22 @@ static int relocation_definition_cache_lookup(
         return 0;
     *owner_out = &objs[entry->definition_owner_index];
     *symbol_out = definition;
+    if (entry_out)
+        *entry_out = entry;
 #ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
     g_relocation_definition_cache_hits++;
 #endif
     return 1;
+}
+
+static int relocation_definition_cache_lookup(
+    struct loaded_obj *requester, uint32_t symbol_index,
+    struct loaded_obj *objs, int nobj, int skip_requester,
+    struct loaded_obj **owner_out, const Elf64_Sym **symbol_out)
+{
+    return relocation_definition_cache_lookup_with_entry(
+        requester, symbol_index, objs, nobj, skip_requester,
+        owner_out, symbol_out, NULL);
 }
 
 static void relocation_definition_cache_store(
@@ -30143,20 +30162,15 @@ static int relocation_definition_cache_ifunc_lookup(
     struct relocation_definition_cache_ent *entry;
     struct loaded_obj *owner;
     const Elf64_Sym *definition;
-    int requester_index;
 
     if (!is_ifunc_out ||
-        !relocation_definition_cache_lookup(
+        !relocation_definition_cache_lookup_with_entry(
             requester, symbol_index, objs, nobj, 0,
-            &owner, &definition) ||
-        !dl_object_table_index(requester, nobj, &requester_index) ||
-        requester_index < 0 || requester_index > UINT16_MAX)
+            &owner, &definition, &entry))
         return 0;
     (void)owner;
     (void)definition;
-    entry = relocation_definition_cache_entry(
-        (uint16_t)requester_index, symbol_index, (uint16_t)nobj, 0, 0);
-    if (!entry || !entry->ifunc_classification_valid)
+    if (!entry->ifunc_classification_valid)
         return 0;
     *is_ifunc_out = entry->is_ifunc != 0;
 #ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
@@ -30172,22 +30186,15 @@ static void relocation_definition_cache_ifunc_store(
     struct relocation_definition_cache_ent *entry;
     struct loaded_obj *owner;
     const Elf64_Sym *definition;
-    int requester_index;
 
     /* A normal definition-cache entry proves both metadata immutability and
      * the absence of GNU-unique selection. */
-    if (!relocation_definition_cache_lookup(
+    if (!relocation_definition_cache_lookup_with_entry(
             requester, symbol_index, objs, nobj, 0,
-            &owner, &definition) ||
-        !dl_object_table_index(requester, nobj, &requester_index) ||
-        requester_index < 0 || requester_index > UINT16_MAX)
+            &owner, &definition, &entry))
         return;
     (void)owner;
     (void)definition;
-    entry = relocation_definition_cache_entry(
-        (uint16_t)requester_index, symbol_index, (uint16_t)nobj, 0, 0);
-    if (!entry)
-        return;
     entry->is_ifunc = is_ifunc ? 1 : 0;
     entry->ifunc_classification_valid = 1;
 }
@@ -34514,17 +34521,27 @@ static int walk_relr(struct loaded_obj *obj, int apply)
         } else {
             uint64_t bitmap = entry >> 1;
 
-            if (!have_where)
+            if (!have_where ||
+                where_offset > UINT64_MAX - 63 * sizeof(uint64_t))
                 goto out;
-            for (unsigned int j = 0; bitmap; j++, bitmap >>= 1) {
+            /* Most bitmap destinations belong to one writable PT_LOAD.
+             * Admit their complete enclosing span once; a span crossing a
+             * hole or a segment boundary retains the exact per-word path.
+             * Empty bitmaps still advance the cursor without a query. */
+            if (!apply && bitmap != 0 &&
+                relr_writable_load_index_contains(
+                    &writable_index, where_offset,
+                    (64U - (unsigned int)__builtin_clzll(bitmap)) *
+                        sizeof(uint64_t))) {
+                where_offset += 63 * sizeof(uint64_t);
+                continue;
+            }
+            while (bitmap != 0) {
+                unsigned int j = (unsigned int)__builtin_ctzll(bitmap);
                 uint64_t offset;
                 void *where;
 
-                if (!(bitmap & 1))
-                    continue;
-                if (where_offset > UINT64_MAX -
-                                   (uint64_t)j * sizeof(uint64_t))
-                    goto out;
+                bitmap &= bitmap - 1;
                 offset = where_offset + (uint64_t)j * sizeof(uint64_t);
                 if (apply) {
                     where = (void *)(uintptr_t)(base + offset);
@@ -34535,8 +34552,6 @@ static int walk_relr(struct loaded_obj *obj, int apply)
                     goto out;
                 }
             }
-            if (where_offset > UINT64_MAX - 63 * sizeof(uint64_t))
-                goto out;
             where_offset += 63 * sizeof(uint64_t);
         }
     }
@@ -37630,7 +37645,16 @@ static int target_x86_cpu_probe_poll(int fd, short events,
  * merely to make the compatibility path available. */
 static int target_x86_cpu_probe_sigchld_clone_safe(void)
 {
-    struct sigaction action;
+    /* Linux x86-64 rt_sigaction layout, not either bootstrap libc's public
+     * struct sigaction. Keep the rejecting sentinel in the kernel's actual
+     * output buffer: a libc wrapper may use an uninitialized private buffer
+     * and copy it over our sentinel after a handled, unexecuted syscall. */
+    struct {
+        uintptr_t handler;
+        unsigned long flags;
+        uintptr_t restorer;
+        uint64_t mask;
+    } action;
     uint64_t kernel_mask = UINT64_MAX;
     const uint64_t sigchld_bit =
         UINT64_C(1) << (unsigned int)(SIGCHLD - 1);
@@ -37639,21 +37663,25 @@ static int target_x86_cpu_probe_sigchld_clone_safe(void)
                    "SIGCHLD must fit Linux's kernel signal word");
     _Static_assert(sizeof(kernel_mask) == TARGET_X86_KERNEL_SIGSET_SIZE,
                    "Linux x86-64 kernel signal-mask ABI");
+    _Static_assert(sizeof(action) == 4 * sizeof(uint64_t) &&
+                   offsetof(__typeof__(action), mask) == 3 * sizeof(uint64_t),
+                   "Linux x86-64 kernel sigaction ABI");
 
     /* A SECCOMP_RET_TRAP handler can resume an unexecuted syscall with an
      * apparent zero result.  Seed every field consumed below with a rejecting
      * value, so only kernel-written query output can authorize the retry. */
     ldr_memset(&action, 0, sizeof(action));
-    action.sa_handler = SIG_IGN;
-    action.sa_flags = SA_NOCLDWAIT;
+    action.handler = (uintptr_t)SIG_IGN;
+    action.flags = SA_NOCLDWAIT;
     if (g_target_tls_active ||
-        guarded_sigaction(SIGCHLD, NULL, &action) < 0 ||
-        action.sa_handler != SIG_DFL ||
-        (action.sa_flags & SA_NOCLDWAIT) != 0)
+        arch_raw_syscall4(SYS_rt_sigaction, SIGCHLD, 0, (long)&action,
+                          TARGET_X86_KERNEL_SIGSET_SIZE) != 0 ||
+        action.handler != (uintptr_t)SIG_DFL ||
+        (action.flags & SA_NOCLDWAIT) != 0)
         return 0;
     if (arch_raw_syscall4(
             SYS_rt_sigprocmask, SIG_SETMASK, 0, (long)&kernel_mask,
-            TARGET_X86_KERNEL_SIGSET_SIZE) < 0)
+            TARGET_X86_KERNEL_SIGSET_SIZE) != 0)
         return 0;
     return (kernel_mask & sigchld_bit) == 0;
 }

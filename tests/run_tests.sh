@@ -27200,6 +27200,7 @@ test_direct_runtime_parser_bounds() {
     pass "runtime immutable relocation bindings are requester/symbol cached"
     pass "runtime relocation binding cache preserves mutable and GNU-unique fallback"
     pass "runtime relocation binding cache is epoch-load bounded"
+    pass "runtime IFUNC classification reuses one admitted binding-cache probe"
     pass "runtime relocation cache grows without losing definitions or IFUNC classification"
     pass "runtime relocation cache allocation failure and epoch wrap preserve semantics"
     pass "runtime relocation cache growth preserves outstanding entries and nested scope changes"
@@ -27222,6 +27223,8 @@ test_direct_runtime_parser_bounds() {
     pass "runtime RELR replay requires complete relocation admission"
     pass "runtime RELR replay preserves immutable writable-table authority"
     pass "runtime RELR replay avoids repeated PT_LOAD destination scans"
+    pass "runtime RELR bitmap spans retain exact hole and boundary admission"
+    pass "runtime relocation words preserve unaligned exact-bounds access"
 
     if ! gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -O3 -Iinclude \
             -ffunction-sections -fdata-sections -fno-stack-protector \

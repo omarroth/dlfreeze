@@ -640,7 +640,7 @@ static int gate_writable_authority_and_fast_replay(void)
     g_relr_writable_index_queries = 0;
     if (validate_object_relocations(&obj) < 0 ||
         obj.relr_replay_state != LOADED_RELR_ADMITTED ||
-        g_relr_writable_index_queries != 4 ||
+        g_relr_writable_index_queries != 3 ||
         g_loaded_obj_vaddr_pointer_calls != 0) {
         dl_release_runtime_mapping(&obj);
         return 0;
@@ -719,6 +719,127 @@ static int gate_readonly_authority_fast_replay(void)
     return 1;
 }
 
+static int gate_bitmap_span_admission(void)
+{
+    _Alignas(8) uint8_t image[2048] = {0};
+    Elf64_Phdr phdr[2];
+    Elf64_Relr entries[2];
+    struct loaded_obj obj;
+
+    for (unsigned int variant = 0; variant < 5; variant++) {
+        size_t expected_queries = 2;
+        int valid = 1;
+
+        gate_object_init(&obj, image, sizeof(image), phdr, 2);
+        entries[0] = 128;
+        entries[1] = variant == 1 ? (UINT64_C(1) << 63) | 1
+                                  : UINT64_MAX;
+        if (variant >= 2) {
+            /* A sparse bitmap can span an unmapped hole without naming a
+             * byte in it. The enclosing-span miss must fall back to words. */
+            phdr[0].p_filesz = phdr[0].p_memsz = 144;
+            phdr[1].p_type = PT_LOAD;
+            phdr[1].p_flags = PF_R | PF_W;
+            phdr[1].p_vaddr = 256;
+            phdr[1].p_filesz = phdr[1].p_memsz = 1024;
+            entries[1] = (UINT64_C(1) << 16) | 3;
+            expected_queries = 4;
+            if (variant == 3) {
+                entries[1] |= UINT64_C(1) << 2; /* The first hole word. */
+                valid = 0;
+            } else if (variant == 4) {
+                /* Adjacent owners are not one enclosing PT_LOAD either. */
+                phdr[0].p_filesz = phdr[0].p_memsz = 256;
+            }
+        }
+        memset(image, 0, sizeof(image));
+        if (publish_loaded_relocation_authority(
+                &obj, NULL, 0, NULL, 0, entries, 2) < 0)
+            return 0;
+        g_relr_writable_index_queries = 0;
+        if ((validate_object_relocations(&obj) == 0) != valid ||
+            g_relr_writable_index_queries != expected_queries) {
+            dl_release_runtime_mapping(&obj);
+            return 0;
+        }
+        if (valid) {
+            size_t queries = g_relr_writable_index_queries;
+            uint64_t bitmap = entries[1] >> 1;
+
+            if (walk_relr(&obj, 1) < 0 ||
+                g_relr_writable_index_queries != queries ||
+                relocation_load_u64(image + 128) != (uintptr_t)image) {
+                dl_release_runtime_mapping(&obj);
+                return 0;
+            }
+            for (unsigned int bit = 0; bit < 63; bit++) {
+                uint64_t expected = bitmap & (UINT64_C(1) << bit)
+                    ? (uintptr_t)image : 0;
+
+                if (relocation_load_u64(image + 136 + bit * 8) != expected) {
+                    dl_release_runtime_mapping(&obj);
+                    return 0;
+                }
+            }
+        } else if (walk_relr(&obj, 1) == 0 ||
+                   relocation_load_u64(image + 128) != 0) {
+            dl_release_runtime_mapping(&obj);
+            return 0;
+        }
+        dl_release_runtime_mapping(&obj);
+    }
+    return 1;
+}
+
+static int gate_relocation_word_guard_pages(void)
+{
+    long page = sysconf(_SC_PAGESIZE);
+    uint8_t *mapping;
+    uint8_t *bytes;
+    static const uint64_t values[] = {
+        0, UINT64_MAX, UINT64_C(0x1020304050607080),
+        UINT64_C(0x8877665544332211)
+    };
+    int valid = 1;
+
+    if (page < 64 || (uintmax_t)page > SIZE_MAX / 3U)
+        return 0;
+    mapping = mmap(NULL, (size_t)page * 3, PROT_NONE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapping == MAP_FAILED)
+        return 0;
+    bytes = mapping + page;
+    if (mprotect(bytes, (size_t)page, PROT_READ | PROT_WRITE) < 0) {
+        munmap(mapping, (size_t)page * 3);
+        return 0;
+    }
+    for (size_t alignment = 0; alignment < 16; alignment++) {
+        for (unsigned int end = 0; end < 2; end++) {
+            size_t offset = end ? (size_t)page - 16 - alignment : alignment;
+
+            for (size_t v = 0; v < sizeof(values) / sizeof(values[0]); v++) {
+                const uint64_t pair[2] = {values[v], ~values[v]};
+                const uint8_t *expected = (const uint8_t *)pair;
+
+                memset(bytes, 0xa5, (size_t)page);
+                relocation_store_u64_pair(bytes + offset, pair[0], pair[1]);
+                if (relocation_load_u64(bytes + offset) != pair[0] ||
+                    relocation_load_u64(bytes + offset + 8) != pair[1])
+                    valid = 0;
+                for (size_t i = 0; i < (size_t)page; i++) {
+                    uint8_t byte = i >= offset && i - offset < 16
+                        ? expected[i - offset] : 0xa5;
+
+                    if (bytes[i] != byte)
+                        valid = 0;
+                }
+            }
+        }
+    }
+    munmap(mapping, (size_t)page * 3);
+    return valid;
+}
+
 int main(void)
 {
     if (!gate_replay_requires_complete_admission())
@@ -749,5 +870,9 @@ int main(void)
         return 13;
     if (!gate_readonly_authority_fast_replay())
         return 14;
+    if (!gate_bitmap_span_admission())
+        return 15;
+    if (!gate_relocation_word_guard_pages())
+        return 16;
     return 0;
 }
