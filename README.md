@@ -141,6 +141,13 @@ BENCH_CASES=python-imports make bench
 BENCH_CASES=python-numpy make bench
 ```
 
+Direct loading grows its relocation-definition cache on demand for large
+dependency graphs, up to 524,288 cached requester/symbol bindings. Small
+programs keep the initial fixed-size table; total cache storage is bounded to
+less than 48 MiB even at maximum growth. Allocation failure falls back to
+normal symbol lookup; cache growth does not change symbol-version, scope,
+IFUNC, or writable-metadata semantics.
+
 ## Disclaimer
 
 The majority of code for this project was written by LLMs. Although I've read through the code to make sure there's nothing obviously stupid, do not use this project in a production or security-sensitive environment without vetting it yourself.

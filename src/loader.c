@@ -20314,12 +20314,19 @@ struct sym_cache_ent {
  * separate key.  Entries are epoch-scoped so a recursive dlopen publication
  * invalidates later resolver lookups before they can reuse an old scope. */
 #define RELOCATION_DEFINITION_CACHE_SIZE 16384U
+#define RELOCATION_DEFINITION_CACHE_LIMIT 1048576U
 #define RELOCATION_DEFINITION_CACHE_MAX_ENTRIES \
     (RELOCATION_DEFINITION_CACHE_SIZE / 2U)
 
 _Static_assert((RELOCATION_DEFINITION_CACHE_SIZE &
                 (RELOCATION_DEFINITION_CACHE_SIZE - 1)) == 0,
                "relocation definition cache must be a power of two");
+_Static_assert(RELOCATION_DEFINITION_CACHE_LIMIT >=
+                   RELOCATION_DEFINITION_CACHE_SIZE &&
+               (RELOCATION_DEFINITION_CACHE_LIMIT &
+                (RELOCATION_DEFINITION_CACHE_LIMIT - 1U)) == 0 &&
+               RELOCATION_DEFINITION_CACHE_LIMIT <= UINT32_MAX / 2U,
+               "relocation cache growth must be bounded and power-of-two");
 
 struct relocation_definition_cache_ent {
     uint32_t epoch;
@@ -20354,7 +20361,20 @@ struct relocation_scope_immutability_ent {
 
 static struct sym_cache_ent g_sym_cache[RESOLVE_CACHE_SIZE];
 static struct relocation_definition_cache_ent
-    g_relocation_definition_cache[RELOCATION_DEFINITION_CACHE_SIZE];
+    g_relocation_definition_cache_initial[RELOCATION_DEFINITION_CACHE_SIZE];
+struct relocation_definition_cache_table {
+    struct relocation_definition_cache_ent *entries;
+    uint32_t size;
+};
+static struct relocation_definition_cache_table
+    g_relocation_definition_cache_initial_table = {
+        g_relocation_definition_cache_initial, RELOCATION_DEFINITION_CACHE_SIZE
+    };
+static struct relocation_definition_cache_table *g_relocation_definition_table =
+    &g_relocation_definition_cache_initial_table;
+#define g_relocation_definition_cache (g_relocation_definition_table->entries)
+#define g_relocation_definition_cache_size (g_relocation_definition_table->size)
+static int g_relocation_definition_cache_growth_failed;
 static struct relocation_scope_immutability_ent
     g_relocation_scope_immutability[MAX_TOTAL_OBJS];
 static uint32_t g_relocation_definition_cache_entries;
@@ -20370,6 +20390,9 @@ static size_t g_versym_value_reads;
 static size_t g_dladdr_gnu_chain_visits;
 static size_t g_relocation_definition_cache_hits;
 static size_t g_relocation_definition_cache_stores;
+static size_t g_relocation_definition_cache_growth_attempts;
+static int g_relocation_definition_cache_force_allocation_failure;
+static void (*g_relocation_definition_cache_growth_hook)(void);
 static size_t g_relocation_definition_scope_scans;
 static size_t g_relocation_ifunc_cache_hits;
 static size_t g_relocation_validation_calls;
@@ -20392,10 +20415,12 @@ static void clear_resolution_caches(void)
 {
     g_cache_epoch++;
     g_relocation_definition_cache_entries = 0;
+    g_relocation_definition_cache_growth_failed = 0;
     if (g_cache_epoch == 0) {
         memset(g_sym_cache, 0, sizeof(g_sym_cache));
         memset(g_relocation_definition_cache, 0,
-               sizeof(g_relocation_definition_cache));
+               (size_t)g_relocation_definition_cache_size *
+                   sizeof(*g_relocation_definition_cache));
         memset(g_relocation_scope_immutability, 0,
                sizeof(g_relocation_scope_immutability));
         g_cache_epoch = 1;
@@ -29729,30 +29754,136 @@ static uint32_t relocation_definition_cache_hash(
     return (uint32_t)value;
 }
 
+/* Large graphs can exceed the initial table with unique requester/symbol
+ * pairs before relocation replay begins. Grow only on demand, preserving
+ * both definition and IFUNC classification records for the current epoch.
+ * This is an optional accelerator: allocation failure or the memory bound
+ * retains the old table and falls back to ordinary lookup for new keys. */
+static int grow_relocation_definition_cache(void)
+{
+    struct relocation_definition_cache_table *old_table =
+        g_relocation_definition_table;
+    struct relocation_definition_cache_table *new_table;
+    struct relocation_definition_cache_ent *old =
+        old_table->entries;
+    struct relocation_definition_cache_ent *replacement;
+    uint32_t old_size = old_table->size;
+    uint32_t epoch = g_cache_epoch;
+    uint32_t copied = 0;
+    uint32_t new_size;
+    size_t bytes;
+    long allocation;
+    uint64_t all_signals = UINT64_MAX, old_signals = 0;
+
+    if (old_size >= RELOCATION_DEFINITION_CACHE_LIMIT ||
+        g_relocation_definition_cache_growth_failed)
+        return 0;
+    new_size = old_size * 2U;
+    if (__builtin_mul_overflow((size_t)new_size, sizeof(*replacement),
+                               &bytes) ||
+        __builtin_add_overflow(bytes, sizeof(*new_table), &bytes))
+        return 0;
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+    g_relocation_definition_cache_growth_attempts++;
+    allocation = g_relocation_definition_cache_force_allocation_failure
+        ? -ENOMEM :
+#else
+    allocation =
+#endif
+        arch_raw_syscall6(SYS_mmap, 0, (long)bytes, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (raw_syscall_failed(allocation)) {
+        /* Do not retry mmap for every remaining symbol in this epoch. */
+        if (old_table == g_relocation_definition_table && epoch == g_cache_epoch)
+            g_relocation_definition_cache_growth_failed = 1;
+        return 0;
+    }
+    new_table = (void *)(uintptr_t)allocation;
+    replacement = (void *)(new_table + 1);
+    new_table->entries = replacement;
+    new_table->size = new_size;
+    for (uint32_t i = 0; i < old_size; i++) {
+        const struct relocation_definition_cache_ent *entry = &old[i];
+        uint32_t index;
+
+        if (entry->epoch != epoch)
+            continue;
+        index = relocation_definition_cache_hash(
+            entry->requester_index, entry->reference_symbol_index,
+            entry->object_count, entry->skip_requester) & (new_size - 1U);
+        while (replacement[index].epoch == epoch)
+            index = (index + 1U) & (new_size - 1U);
+        replacement[index] = *entry;
+        copied++;
+    }
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+    if (g_relocation_definition_cache_growth_hook)
+        g_relocation_definition_cache_growth_hook();
+#endif
+    /* Make the final scope check and publication indivisible with respect
+     * to signal-driven reentry. The loader lock serializes other threads. */
+    if (arch_raw_syscall4(SYS_rt_sigprocmask, SIG_BLOCK,
+                          (long)&all_signals, (long)&old_signals,
+                          sizeof(old_signals)) < 0) {
+        (void)arch_raw_syscall2(SYS_munmap, (long)new_table, (long)bytes);
+        return 0;
+    }
+    if (old_table != g_relocation_definition_table || epoch != g_cache_epoch) {
+        /* A nested signal/loader callback changed the scope while we built
+         * the candidate. Retry against that state, never revive this one. */
+        (void)arch_raw_syscall2(SYS_munmap, (long)new_table, (long)bytes);
+        if (arch_raw_syscall4(SYS_rt_sigprocmask, SIG_SETMASK,
+                              (long)&old_signals, 0, sizeof(old_signals)) < 0)
+            loader_exit(127);
+        return 1;
+    }
+    g_relocation_definition_cache_entries = copied;
+    g_relocation_definition_table = new_table;
+    if (arch_raw_syscall4(SYS_rt_sigprocmask, SIG_SETMASK,
+                          (long)&old_signals, 0, sizeof(old_signals)) < 0)
+        loader_exit(127);
+    /* Publish size and storage together. Retain superseded tables because
+     * an interrupted lookup may still own an entry pointer. Geometric growth
+     * bounds all retained storage to less than twice the maximum table size.
+     * Raw maintenance syscalls leave target errno unchanged. */
+    return 1;
+}
+
 static struct relocation_definition_cache_ent *
 relocation_definition_cache_entry(
     uint16_t requester_index, uint32_t symbol_index,
     uint16_t object_count, int skip_requester, int create)
 {
+    struct relocation_definition_cache_table *table =
+        g_relocation_definition_table;
     uint32_t index = relocation_definition_cache_hash(
         requester_index, symbol_index, object_count, skip_requester) &
-        (RELOCATION_DEFINITION_CACHE_SIZE - 1);
+        (table->size - 1U);
 
     for (uint32_t probe = 0;
-         probe < RELOCATION_DEFINITION_CACHE_SIZE; probe++) {
+         probe < table->size; probe++) {
         struct relocation_definition_cache_ent *entry =
-            &g_relocation_definition_cache[index];
+            &table->entries[index];
 
         if (entry->epoch != g_cache_epoch) {
             if (!create)
                 return NULL;
+            if (table != g_relocation_definition_table)
+                return relocation_definition_cache_entry(
+                    requester_index, symbol_index, object_count,
+                    skip_requester, create);
             /* Keep at least half of every epoch's table empty.  Besides
              * bounding first-touch cost, this guarantees that a miss never
              * degenerates into a full-table walk; capacity exhaustion is an
              * optimization miss, not a load failure. */
             if (g_relocation_definition_cache_entries >=
-                RELOCATION_DEFINITION_CACHE_MAX_ENTRIES)
-                return NULL;
+                table->size / 2U) {
+                if (!grow_relocation_definition_cache())
+                    return NULL;
+                return relocation_definition_cache_entry(
+                    requester_index, symbol_index, object_count,
+                    skip_requester, create);
+            }
             memset(entry, 0, sizeof(*entry));
             entry->epoch = g_cache_epoch;
             entry->requester_index = requester_index;
@@ -29767,7 +29898,7 @@ relocation_definition_cache_entry(
             entry->object_count == object_count &&
             entry->skip_requester == (skip_requester ? 1 : 0))
             return entry;
-        index = (index + 1) & (RELOCATION_DEFINITION_CACHE_SIZE - 1);
+        index = (index + 1U) & (table->size - 1U);
     }
     return NULL;
 }

@@ -444,16 +444,136 @@ static int cache_load_bound_gate(void)
             return 0;
     }
     if (g_relocation_definition_cache_entries !=
-            RELOCATION_DEFINITION_CACHE_MAX_ENTRIES ||
-        relocation_definition_cache_entry(
+            RELOCATION_DEFINITION_CACHE_MAX_ENTRIES)
+        return 0;
+    g_relocation_definition_cache_force_allocation_failure = 1;
+    g_relocation_definition_cache_growth_attempts = 0;
+    set_loader_errno(E2BIG);
+    if (relocation_definition_cache_entry(
             0, RELOCATION_DEFINITION_CACHE_MAX_ENTRIES, 2, 0, 1) != NULL ||
         relocation_definition_cache_entry(0, 0, 2, 0, 0) == NULL)
         return 0;
+    for (uint32_t i = 1; i <= 100; i++)
+        if (relocation_definition_cache_entry(
+                0, RELOCATION_DEFINITION_CACHE_MAX_ENTRIES + i,
+                2, 0, 1) != NULL)
+            return 0;
+    if (g_relocation_definition_cache_growth_attempts != 1 ||
+        loader_errno_value() != E2BIG ||
+        g_relocation_definition_cache_size != RELOCATION_DEFINITION_CACHE_SIZE)
+        return 0;
+    g_relocation_definition_cache_force_allocation_failure = 0;
 
     clear_resolution_caches();
     return g_relocation_definition_cache_entries == 0 &&
         relocation_definition_cache_entry(0, 0, 2, 0, 1) != NULL &&
         g_relocation_definition_cache_entries == 1;
+}
+
+static int cache_growth_gate(void)
+{
+    const uint32_t count = RELOCATION_DEFINITION_CACHE_SIZE + 17U;
+    struct relocation_definition_cache_ent *retired_entry = NULL;
+
+    initialize_symbol_scope();
+    g_relocation_definition_cache_growth_attempts = 0;
+    set_loader_errno(E2BIG);
+    for (uint32_t i = 0; i < count; i++) {
+        struct relocation_definition_cache_ent *entry =
+            relocation_definition_cache_entry(i % 2U, i, 2, i % 2U, 1);
+
+        if (!entry)
+            return 0;
+        entry->definition_owner_index = 1U - i % 2U;
+        entry->definition_symbol_index = i + 1U;
+        entry->found = 1;
+        entry->ifunc_classification_valid = 1;
+        entry->is_ifunc = i % 2U;
+        if (i == RELOCATION_DEFINITION_CACHE_MAX_ENTRIES)
+            retired_entry = entry;
+    }
+    if (g_relocation_definition_cache_growth_attempts != 2 ||
+        loader_errno_value() != E2BIG ||
+        g_relocation_definition_cache_size != 4U * RELOCATION_DEFINITION_CACHE_SIZE ||
+        g_relocation_definition_cache_entries != count)
+        return 0;
+    /* Retain an entry from the first dynamic table across the next growth,
+     * not merely from the static initial table (which is never unmapped). */
+    if (!retired_entry || retired_entry->definition_symbol_index !=
+            RELOCATION_DEFINITION_CACHE_MAX_ENTRIES + 1U ||
+        retired_entry == relocation_definition_cache_entry(
+            0, RELOCATION_DEFINITION_CACHE_MAX_ENTRIES, 2, 0, 0))
+        return 0;
+    retired_entry->definition_symbol_index = UINT32_MAX;
+    for (uint32_t i = 0; i < count; i++) {
+        const struct relocation_definition_cache_ent *entry =
+            relocation_definition_cache_entry(i % 2U, i, 2, i % 2U, 0);
+
+        if (!entry || entry->definition_owner_index != 1U - i % 2U ||
+            entry->definition_symbol_index != i + 1U || !entry->found ||
+            !entry->ifunc_classification_valid || entry->is_ifunc != i % 2U)
+            return 0;
+    }
+    clear_resolution_caches();
+    if (g_relocation_definition_cache_entries != 0 ||
+        relocation_definition_cache_entry(0, 0, 2, 0, 0) != NULL ||
+        !relocation_definition_cache_entry(0, 0, 2, 0, 1))
+        return 0;
+    /* Epoch wrap must clear the entire grown mapping, not pointer-sized or
+     * initial-table-sized storage. Stale definitions must never revive. */
+    g_cache_epoch = UINT32_MAX;
+    clear_resolution_caches();
+    for (uint32_t i = 0; i < g_relocation_definition_cache_size; i++)
+        if (g_relocation_definition_cache[i].epoch != 0)
+            return 0;
+    struct relocation_definition_cache_table *saved_table =
+        g_relocation_definition_table;
+    struct relocation_definition_cache_table ceiling_table = {
+        saved_table->entries, RELOCATION_DEFINITION_CACHE_LIMIT
+    };
+    g_relocation_definition_table = &ceiling_table;
+    int grew = grow_relocation_definition_cache();
+    g_relocation_definition_table = saved_table;
+    return !grew && g_cache_epoch == 1 &&
+        g_relocation_definition_cache_growth_attempts == 2;
+}
+
+static void cache_growth_clear_hook(void)
+{
+    g_relocation_definition_cache_growth_hook = NULL;
+    clear_resolution_caches();
+    (void)relocation_definition_cache_entry(1, 7, 2, 0, 1);
+}
+
+static void cache_growth_nested_hook(void)
+{
+    g_relocation_definition_cache_growth_hook = NULL;
+    (void)grow_relocation_definition_cache();
+}
+
+static int cache_growth_reentry_gate(void)
+{
+    initialize_symbol_scope();
+    struct relocation_definition_cache_table *saved_table =
+        g_relocation_definition_table;
+    if (!relocation_definition_cache_entry(0, 3, 2, 0, 1))
+        return 0;
+    g_relocation_definition_cache_growth_hook = cache_growth_clear_hook;
+    if (!grow_relocation_definition_cache() ||
+        g_relocation_definition_table != saved_table ||
+        g_relocation_definition_cache_entries != 1 ||
+        relocation_definition_cache_entry(0, 3, 2, 0, 0) ||
+        !relocation_definition_cache_entry(1, 7, 2, 0, 0))
+        return 0;
+    g_relocation_definition_cache_growth_hook = cache_growth_nested_hook;
+    if (!grow_relocation_definition_cache() ||
+        g_relocation_definition_table == saved_table ||
+        g_relocation_definition_cache_size != saved_table->size * 2U ||
+        g_relocation_definition_cache_entries != 1 ||
+        !relocation_definition_cache_entry(1, 7, 2, 0, 0))
+        return 0;
+    clear_resolution_caches();
+    return 1;
 }
 
 static int cache_collision_gate(void)
@@ -1321,6 +1441,10 @@ int main(void)
         return 6;
     if (!cache_collision_gate())
         return 7;
+    if (!cache_growth_gate())
+        return 15;
+    if (!cache_growth_reentry_gate())
+        return 16;
     if (!scope_immutability_key_gate())
         return 8;
     if (!relocation_phase_validation_gate())
