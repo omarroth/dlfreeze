@@ -6,13 +6,28 @@
 
 static int stable_file_truncation_gate(void)
 {
-    char path[] = "/tmp/dlfreeze-packer-stable.XXXXXX";
+    char path[PATH_MAX];
     unsigned char expected[8192];
     struct packer_stable_file_image image = {0};
     struct stat before;
+    const char *temporary_directory = getenv("TMPDIR");
+    size_t temporary_directory_length;
     size_t done = 0;
     int fd = -1;
     int result = 0;
+    int path_length;
+
+    if (!temporary_directory || temporary_directory[0] != '/')
+        temporary_directory = "/tmp";
+    temporary_directory_length = strlen(temporary_directory);
+    path_length = snprintf(
+        path, sizeof(path), "%s%sdlfreeze-packer-stable.XXXXXX",
+        temporary_directory,
+        temporary_directory_length != 0 &&
+                temporary_directory[temporary_directory_length - 1] == '/'
+            ? "" : "/");
+    if (path_length < 0 || (size_t)path_length >= sizeof(path))
+        goto out;
 
     for (size_t i = 0; i < sizeof(expected); i++)
         expected[i] = (unsigned char)(i * 131U + 17U);
@@ -55,6 +70,184 @@ out:
     return result;
 }
 
+static uint32_t alias_gate_append_string(
+    char *table, size_t capacity, size_t *cursor, const char *value)
+{
+    size_t length = strlen(value) + 1;
+    uint32_t offset;
+
+    if (!table || !cursor || !value || *cursor == 0 ||
+        *cursor > capacity || *cursor > UINT32_MAX ||
+        length > capacity - *cursor)
+        return 0;
+    offset = (uint32_t)*cursor;
+    memcpy(table + *cursor, value, length);
+    *cursor += length;
+    return offset;
+}
+
+static int manifest_alias_collision_gate(void)
+{
+    struct dlfrz_entry entries[2];
+    char strings[512] = {0};
+    size_t cursor = 1;
+    const char *conflict = NULL;
+    uint32_t request_source;
+    uint32_t exact_identity;
+    uint32_t bare_identity;
+    uint32_t bare_source;
+    uint32_t node;
+    uint32_t child;
+    uint32_t repeated_child;
+    uint32_t lexical_neighbor;
+    uint32_t root;
+
+    request_source = alias_gate_append_string(
+        strings, sizeof(strings), &cursor, "/captured/request.so");
+    exact_identity = alias_gate_append_string(
+        strings, sizeof(strings), &cursor, "/scope/libcollision.so");
+    bare_identity = alias_gate_append_string(
+        strings, sizeof(strings), &cursor, "libcollision.so");
+    bare_source = alias_gate_append_string(
+        strings, sizeof(strings), &cursor, "/captured/libcollision.so");
+    node = alias_gate_append_string(
+        strings, sizeof(strings), &cursor, "/captured/node");
+    child = alias_gate_append_string(
+        strings, sizeof(strings), &cursor, "/captured/node/child.so");
+    repeated_child = alias_gate_append_string(
+        strings, sizeof(strings), &cursor, "/captured/node//child.so");
+    lexical_neighbor = alias_gate_append_string(
+        strings, sizeof(strings), &cursor,
+        "/captured/nodeish/child.so");
+    root = alias_gate_append_string(
+        strings, sizeof(strings), &cursor, "/");
+    if (!request_source || !exact_identity || !bare_identity ||
+        !bare_source || !node || !child || !repeated_child ||
+        !lexical_neighbor || !root)
+        return 0;
+
+    memset(entries, 0, sizeof(entries));
+    entries[0].flags = DLFRZ_FLAG_SHLIB | DLFRZ_FLAG_DLOPEN;
+    entries[0].name_offset = request_source;
+    entries[0].dlopen_request_offset = exact_identity;
+    entries[0].data_offset = UINT64_C(0x1000);
+    entries[0].data_size = UINT64_C(0x800);
+    entries[1].flags = DLFRZ_FLAG_SHLIB | DLFRZ_FLAG_DLOPEN |
+                       DLFRZ_FLAG_NEEDED_PATHFUL;
+    entries[1].name_offset = exact_identity;
+    entries[1].data_offset = UINT64_C(0x3000);
+    entries[1].data_size = UINT64_C(0x800);
+    errno = 0;
+    if (packed_manifest_aliases_are_consistent(
+            entries, 2, strings, &conflict) == 0 ||
+        errno != EEXIST || !conflict ||
+        strcmp(conflict, strings + exact_identity) != 0)
+        return 0;
+    entries[1].data_offset = entries[0].data_offset;
+    if (packed_manifest_aliases_are_consistent(
+            entries, 2, strings, &conflict) < 0)
+        return 0;
+
+    /* DATA shadows frozen ELFs in open/stat.  A negative, virtual, or
+     * directory record therefore cannot reuse an ELF path identity. */
+    memset(&entries[1], 0, sizeof(entries[1]));
+    entries[1].flags = DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_NEGATIVE;
+    entries[1].name_offset = exact_identity;
+    errno = 0;
+    if (packed_manifest_aliases_are_consistent(
+            entries, 2, strings, &conflict) == 0 ||
+        errno != EEXIST || !conflict ||
+        strcmp(conflict, strings + exact_identity) != 0)
+        return 0;
+
+    /* A derived child requires every captured component ancestor to be a
+     * directory.  Cover both DATA->ELF and ELF->DATA directionality, while
+     * retaining ordinary lexical prefixes as distinct names. */
+    memset(entries, 0, sizeof(entries));
+    entries[0].flags = DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_NEGATIVE;
+    entries[0].name_offset = node;
+    entries[1].flags = DLFRZ_FLAG_SHLIB | DLFRZ_FLAG_NEEDED_PATHFUL;
+    entries[1].name_offset = child;
+    entries[1].data_offset = UINT64_C(0x9000);
+    entries[1].data_size = UINT64_C(0x800);
+    if (packed_manifest_aliases_are_consistent(
+            entries, 2, strings, &conflict) == 0 ||
+        !conflict || strcmp(conflict, strings + node) != 0)
+        return 0;
+
+    /* Progressive misses do not materialize the child or derive its parent
+     * as a directory, so a negative ancestor and negative descendant are a
+     * coherent lexical snapshot. */
+    entries[1].flags = DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_NEGATIVE;
+    entries[1].data_offset = 0;
+    entries[1].data_size = 0;
+    if (packed_manifest_aliases_are_consistent(
+            entries, 2, strings, &conflict) < 0)
+        return 0;
+
+    entries[1].flags = DLFRZ_FLAG_SHLIB | DLFRZ_FLAG_NEEDED_PATHFUL;
+    entries[1].data_offset = UINT64_C(0x9000);
+    entries[1].data_size = UINT64_C(0x800);
+    entries[0].flags = DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_DIRECTORY;
+    if (packed_manifest_aliases_are_consistent(
+            entries, 2, strings, &conflict) < 0)
+        return 0;
+
+    entries[0].flags = DLFRZ_FLAG_SHLIB | DLFRZ_FLAG_NEEDED_PATHFUL;
+    entries[0].data_offset = UINT64_C(0xb000);
+    entries[0].data_size = UINT64_C(0x800);
+    entries[1].flags = DLFRZ_FLAG_DATA;
+    entries[1].data_offset = UINT64_C(0xd000);
+    entries[1].data_size = UINT64_C(0x800);
+    if (packed_manifest_aliases_are_consistent(
+            entries, 2, strings, &conflict) == 0)
+        return 0;
+    entries[1].name_offset = lexical_neighbor;
+    if (packed_manifest_aliases_are_consistent(
+            entries, 2, strings, &conflict) < 0)
+        return 0;
+    entries[1].name_offset = repeated_child;
+    if (packed_manifest_aliases_are_consistent(
+            entries, 2, strings, &conflict) == 0)
+        return 0;
+
+    entries[0].flags = DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_NEGATIVE;
+    entries[0].name_offset = root;
+    entries[0].data_offset = 0;
+    entries[0].data_size = 0;
+    entries[1].flags = DLFRZ_FLAG_SHLIB | DLFRZ_FLAG_NEEDED_PATHFUL;
+    entries[1].name_offset = child;
+    if (packed_manifest_aliases_are_consistent(
+            entries, 2, strings, &conflict) == 0)
+        return 0;
+    entries[0].flags = DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_DIRECTORY;
+    if (packed_manifest_aliases_are_consistent(
+            entries, 2, strings, &conflict) < 0)
+        return 0;
+
+    /* Bare dependency identities compare by basename, exactly as the
+     * runtime's DT_NEEDED lookup does. */
+    memset(entries, 0, sizeof(entries));
+    entries[0].flags = DLFRZ_FLAG_SHLIB | DLFRZ_FLAG_DLOPEN;
+    entries[0].name_offset = request_source;
+    entries[0].dlopen_request_offset = bare_identity;
+    entries[0].data_offset = UINT64_C(0x5000);
+    entries[0].data_size = UINT64_C(0x800);
+    entries[1].flags = DLFRZ_FLAG_SHLIB | DLFRZ_FLAG_DLOPEN;
+    entries[1].name_offset = bare_source;
+    entries[1].data_offset = UINT64_C(0x7000);
+    entries[1].data_size = UINT64_C(0x800);
+    errno = 0;
+    if (packed_manifest_aliases_are_consistent(
+            entries, 2, strings, &conflict) == 0 ||
+        errno != EEXIST || !conflict ||
+        strcmp(conflict, strings + bare_identity) != 0)
+        return 0;
+    entries[1].data_offset = entries[0].data_offset;
+    return packed_manifest_aliases_are_consistent(
+               entries, 2, strings, &conflict) == 0;
+}
+
 int main(void)
 {
     enum { ALIAS_COUNT = 65535 };
@@ -81,7 +274,8 @@ int main(void)
      * as referenced so a -Werror build remains a faithful compile gate. */
     (void)&packer_phdr_write;
 
-    if (!stable_file_truncation_gate() || !libs ||
+    if (!stable_file_truncation_gate() ||
+        !manifest_alias_collision_gate() || !libs ||
         !entries || !metas || !source_aliases || !startup_aliases)
         goto out;
 

@@ -41,6 +41,7 @@
     X(DLFRZ_GLIBC_AARCH64_RTLD_672_4520, EM_AARCH64, 672, 4520)              \
     X(DLFRZ_GLIBC_AARCH64_2_35,      EM_AARCH64,  688, 4504)                 \
     X(DLFRZ_GLIBC_AARCH64_2_43,      EM_AARCH64,  400, 2272)                 \
+    X(DLFRZ_GLIBC_AARCH64_2_44,      EM_AARCH64,  400, 2288)                 \
     X(DLFRZ_GLIBC_AARCH64_2_40_LEGACY, EM_AARCH64, 704, 4504)                \
     X(DLFRZ_GLIBC_AARCH64_2_41,      EM_AARCH64,  704, 3040)                 \
     X(DLFRZ_GLIBC_X86_RTLD_896_4336, EM_X86_64,   896, 4336)                 \
@@ -142,6 +143,7 @@ dlfrz_glibc_glro_reloc_profile(
             EM_AARCH64, 584, 592, 608, 616, 624, 632 };
         break;
     case DLFRZ_GLIBC_AARCH64_2_43:
+    case DLFRZ_GLIBC_AARCH64_2_44:
         value = (struct dlfrz_glibc_glro_reloc_profile){
             EM_AARCH64, 288, 296, 312, 320, 328, 336 };
         break;
@@ -2031,12 +2033,21 @@ dlfrz_glibc_x86_dlfcn_member_matches(
 }
 
 /* Scan one x86-64 code region once for all four hidden dlfcn-hook
- * consumers.  The expensive part of this validation is finding the
- * relocation-rooted GOT/hook chain in a stripped executable PT_LOAD.  Once
- * such a chain is found, collect all four members while scanning its bounded
- * (96-byte) dispatch window once.  Keep a separate match count per slot so
- * this has exactly the same fail-closed uniqueness contract as four calls to
- * dlfrz_glibc_x86_dlfcn_member_matches(). */
+ * consumers.  Every currently admitted hook offset is a positive value
+ * above INT8_MAX and therefore uses a disp32; its low byte is a much rarer
+ * immutable anchor than the tens of thousands of ordinary REX.W/MOV
+ * instructions in a libc text segment.  Enumerate exact hook-load candidates
+ * from that byte, then search only the preceding 1024-byte chain window for
+ * the relocation-rooted GOT load.  Checking the decoded displacement
+ * position prevents one byte from reporting the same instruction twice
+ * through the SIB and non-SIB shapes.  The generic helper retains the
+ * original forward validator for a possible future disp8 profile.
+ *
+ * Reversing the traversal does not change the evidence relation: every
+ * accepted GOT/hook pair still passes the same decoders, address proof,
+ * branch proof and bounded dispatch scan.  Keep a separate match count per
+ * slot so this has exactly the same fail-closed uniqueness contract as four
+ * calls to dlfrz_glibc_x86_dlfcn_member_matches(). */
 static inline int
 dlfrz_glibc_x86_dlfcn_internal_matches(
     const unsigned char *code, size_t code_size, uint64_t code_vaddr,
@@ -2046,8 +2057,9 @@ dlfrz_glibc_x86_dlfcn_internal_matches(
     size_t slot_positions[DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U])
 {
     const size_t internal_count = DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U;
-    size_t got_position;
-    size_t got_search = 0;
+    size_t displacement_search = 0;
+    unsigned char encoded_hook_offset[sizeof(int32_t)];
+    unsigned char displacement_low;
 
     if (!matches || !hook_positions || !slot_positions)
         return 0;
@@ -2056,60 +2068,105 @@ dlfrz_glibc_x86_dlfcn_internal_matches(
         hook_positions[i] = 0;
         slot_positions[i] = 0;
     }
+    if (!code)
+        return 1;
+    if (hook_offset >= INT8_MIN && hook_offset <= INT8_MAX) {
+        for (size_t internal = 0; internal < internal_count; internal++)
+            matches[internal] = dlfrz_glibc_x86_dlfcn_member_matches(
+                code, code_size, code_vaddr, glro_got_vaddr,
+                hook_offset, (unsigned int)(9U + internal), 1024U,
+                &hook_positions[internal], &slot_positions[internal]);
+        return 1;
+    }
+    if (hook_offset < INT32_MIN || hook_offset > INT32_MAX)
+        return 1;
+    for (size_t byte = 0; byte < sizeof(encoded_hook_offset); byte++)
+        encoded_hook_offset[byte] =
+            (unsigned char)((uint32_t)hook_offset >> (byte * 8U));
+    displacement_low = encoded_hook_offset[0];
 
-    while (dlfrz_glibc_x86_next_mov_load_candidate(
-               code, code_size, code_size, got_search, &got_position)) {
-        struct dlfrz_glibc_x86_mov_load got_load;
-        uint64_t next_vaddr;
-        uint64_t target_vaddr;
-        size_t hook_end;
-        size_t hook_position;
-        size_t hook_search;
+    while (displacement_search < code_size) {
+        const unsigned char *displacement =
+            (const unsigned char *)memchr(
+                code + displacement_search, displacement_low,
+                code_size - displacement_search);
+        size_t displacement_position;
+        size_t candidate_positions[2];
+        size_t candidate_count = 0;
 
-        got_search = got_position + 1;
-
-        if (!dlfrz_glibc_x86_mov_load(
-                code + got_position, code_size - got_position, &got_load) ||
-            !got_load.rip_relative ||
-            code_vaddr > UINT64_MAX - got_position ||
-            code_vaddr + got_position > UINT64_MAX - got_load.length)
+        if (!displacement)
+            break;
+        displacement_position = (size_t)(displacement - code);
+        displacement_search = displacement_position + 1U;
+        if (sizeof(encoded_hook_offset) >
+                code_size - displacement_position ||
+            memcmp(displacement, encoded_hook_offset,
+                   sizeof(encoded_hook_offset)) != 0)
             continue;
-        next_vaddr = code_vaddr + got_position + got_load.length;
-        if (!dlfrz_glibc_add_signed_u64(
-                next_vaddr, got_load.displacement, &target_vaddr) ||
-            target_vaddr != glro_got_vaddr)
-            continue;
-        hook_end = code_size;
-        if (hook_end - got_position > 1024U)
-            hook_end = got_position + 1024U;
-        hook_search = got_position + got_load.length;
-        while (dlfrz_glibc_x86_next_mov_load_candidate(
-                   code, code_size, hook_end, hook_search,
-                   &hook_position)) {
+        /* A plain base load places its disp32 three bytes after the REX;
+         * the admitted no-index SIB form places it four bytes after. */
+        if (displacement_position >= 4U)
+            candidate_positions[candidate_count++] =
+                displacement_position - 4U;
+        if (displacement_position >= 3U)
+            candidate_positions[candidate_count++] =
+                displacement_position - 3U;
+
+        for (size_t candidate = 0; candidate < candidate_count;
+             candidate++) {
+            size_t hook_position = candidate_positions[candidate];
             struct dlfrz_glibc_x86_mov_load hook_load;
-
-            hook_search = hook_position + 1;
+            size_t dispatches[DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U];
+            size_t dispatch_positions[
+                DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U];
+            size_t got_search;
 
             if (!dlfrz_glibc_x86_mov_load(
                     code + hook_position, code_size - hook_position,
                     &hook_load) || hook_load.rip_relative ||
-                hook_load.base != got_load.destination ||
-                hook_load.displacement != hook_offset)
+                hook_load.displacement != hook_offset ||
+                hook_load.length < sizeof(int32_t) ||
+                hook_position + hook_load.length - sizeof(int32_t) !=
+                    displacement_position)
                 continue;
-            if (hook_position > got_position + 48U &&
-                !dlfrz_glibc_x86_dlfcn_branch_targets(
-                    code, code_size, code_vaddr,
-                    got_position + got_load.length, hook_position))
-                continue;
-            {
-                size_t dispatches[DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U];
-                size_t dispatch_positions[
-                    DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U];
+            dlfrz_glibc_x86_dlfcn_internal_slot_dispatches(
+                code, code_size, hook_position + hook_load.length,
+                hook_load.destination, dispatches, dispatch_positions);
 
-                dlfrz_glibc_x86_dlfcn_internal_slot_dispatches(
-                    code, code_size, hook_position + hook_load.length,
-                    hook_load.destination, dispatches,
-                    dispatch_positions);
+            /* GOT_POSITION must satisfy HOOK_POSITION < GOT_POSITION +
+             * 1024, exactly matching the forward scanner's half-open chain
+             * window. */
+            got_search = hook_position >= 1024U
+                ? hook_position - 1023U : 0;
+            for (;;) {
+                struct dlfrz_glibc_x86_mov_load got_load;
+                uint64_t next_vaddr;
+                uint64_t target_vaddr;
+                size_t got_position;
+
+                if (!dlfrz_glibc_x86_next_mov_load_candidate(
+                        code, code_size, hook_position, got_search,
+                        &got_position))
+                    break;
+                got_search = got_position + 1U;
+                if (!dlfrz_glibc_x86_mov_load(
+                        code + got_position, code_size - got_position,
+                        &got_load) || !got_load.rip_relative ||
+                    got_load.destination != hook_load.base ||
+                    got_position + got_load.length > hook_position ||
+                    code_vaddr > UINT64_MAX - got_position ||
+                    code_vaddr + got_position >
+                        UINT64_MAX - got_load.length)
+                    continue;
+                next_vaddr = code_vaddr + got_position + got_load.length;
+                if (!dlfrz_glibc_add_signed_u64(
+                        next_vaddr, got_load.displacement, &target_vaddr) ||
+                    target_vaddr != glro_got_vaddr ||
+                    (hook_position - got_position > 48U &&
+                     !dlfrz_glibc_x86_dlfcn_branch_targets(
+                         code, code_size, code_vaddr,
+                         got_position + got_load.length, hook_position)))
+                    continue;
                 for (size_t internal = 0; internal < internal_count;
                      internal++) {
                     if (dispatches[internal] != 1)
@@ -2450,7 +2507,10 @@ dlfrz_glibc_aarch64_dlfcn_member_matches(
     return completed;
 }
 
-/* AArch64 counterpart of the one-pass hidden-member scan above. */
+/* AArch64 counterpart of the hidden-member scan above.  The hook offset is
+ * an exact immediate in one LDR, so enumerate those rare loads first and
+ * prove each possible ADRP/LDR root only inside its preceding bounded chain
+ * window. */
 static inline int
 dlfrz_glibc_aarch64_dlfcn_internal_matches(
     const unsigned char *code, size_t code_size, uint64_t code_vaddr,
@@ -2472,50 +2532,61 @@ dlfrz_glibc_aarch64_dlfcn_internal_matches(
      * contain an AArch64 witness, but another well-formed PT_LOAD may. */
     if ((code_vaddr & 3U) != 0)
         return 1;
+    if (!code || hook_offset < 0 ||
+        (hook_offset & 7) != 0 || hook_offset > 4095 * 8)
+        return 1;
 
-    for (size_t got_position = 0;
-         got_position + sizeof(uint32_t) <= code_size;
-         got_position += sizeof(uint32_t)) {
-        size_t got_load_position = 0;
-        unsigned int glro_register = 0;
-        size_t hook_end;
+    for (size_t hook_position = 0;
+         hook_position + sizeof(uint32_t) <= code_size;
+         hook_position += sizeof(uint32_t)) {
+        uint32_t hook_load =
+            dlfrz_glibc_read_u32(code + hook_position);
+        unsigned int hook_register;
+        size_t dispatches[DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U];
+        size_t dispatch_positions[
+            DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U];
+        size_t root_start;
 
-        if (!dlfrz_glibc_aarch64_dlfcn_glro_load(
-                code, code_size, code_vaddr, got_position,
-                glro_got_vaddr, &got_load_position, &glro_register))
+        if ((hook_load & UINT32_C(0xffc00000)) !=
+                UINT32_C(0xf9400000) ||
+            ((uint64_t)((hook_load >> 10) & UINT32_C(0xfff)) *
+             UINT64_C(8)) != (uint64_t)hook_offset)
             continue;
-        hook_end = code_size;
-        if (hook_end - got_load_position > 1024U)
-            hook_end = got_load_position + 1024U;
-        for (size_t hook_position =
-                 got_load_position + sizeof(uint32_t);
-             hook_position + sizeof(uint32_t) <= hook_end;
-             hook_position += sizeof(uint32_t)) {
-            uint32_t hook_load =
-                dlfrz_glibc_read_u32(code + hook_position);
-            unsigned int hook_register;
+        hook_register = hook_load & 31U;
+        dlfrz_glibc_aarch64_dlfcn_internal_slot_dispatches(
+            code, code_size, hook_position + sizeof(uint32_t),
+            hook_register, dispatches, dispatch_positions);
 
-            if ((hook_load & UINT32_C(0xffc00000)) !=
-                    UINT32_C(0xf9400000) ||
+        /* The GOT LDR may be at most 28 bytes after its ADRP, and the hook
+         * LDR's end must fit in the GOT load's 1024-byte chain window.  A
+         * 1056-byte reverse envelope is therefore conservative; the exact
+         * forward inequalities below decide admission. */
+        root_start = hook_position > 1056U
+            ? (hook_position - 1056U) & ~(size_t)3U : 0;
+        for (size_t got_position = root_start;
+             got_position + sizeof(uint32_t) <= hook_position;
+             got_position += sizeof(uint32_t)) {
+            size_t got_load_position = 0;
+            unsigned int glro_register = 0;
+            size_t hook_end;
+
+            if (!dlfrz_glibc_aarch64_dlfcn_glro_load(
+                    code, code_size, code_vaddr, got_position,
+                    glro_got_vaddr, &got_load_position, &glro_register) ||
                 ((hook_load >> 5) & 31U) != glro_register ||
-                ((uint64_t)((hook_load >> 10) & UINT32_C(0xfff)) *
-                 UINT64_C(8)) != (uint64_t)hook_offset)
+                got_load_position + sizeof(uint32_t) > hook_position)
                 continue;
-            if (hook_position > got_load_position + 48U &&
-                !dlfrz_glibc_aarch64_dlfcn_branch_targets(
-                    code, code_size, code_vaddr,
-                    got_load_position + sizeof(uint32_t), hook_position))
+            hook_end = code_size;
+            if (hook_end - got_load_position > 1024U)
+                hook_end = got_load_position + 1024U;
+            if (hook_position + sizeof(uint32_t) > hook_end ||
+                (hook_position - got_load_position > 48U &&
+                 !dlfrz_glibc_aarch64_dlfcn_branch_targets(
+                     code, code_size, code_vaddr,
+                     got_load_position + sizeof(uint32_t),
+                     hook_position)))
                 continue;
-            hook_register = hook_load & 31U;
             {
-                size_t dispatches[DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U];
-                size_t dispatch_positions[
-                    DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U];
-
-                dlfrz_glibc_aarch64_dlfcn_internal_slot_dispatches(
-                    code, code_size,
-                    hook_position + sizeof(uint32_t), hook_register,
-                    dispatches, dispatch_positions);
                 for (size_t internal = 0; internal < internal_count;
                      internal++) {
                     if (dispatches[internal] != 1)
@@ -3474,6 +3545,7 @@ dlfrz_glibc_x86_cpu_layout_profile(
     case DLFRZ_GLIBC_AARCH64_RTLD_672_4520:
     case DLFRZ_GLIBC_AARCH64_2_35:
     case DLFRZ_GLIBC_AARCH64_2_43:
+    case DLFRZ_GLIBC_AARCH64_2_44:
     case DLFRZ_GLIBC_AARCH64_2_40_LEGACY:
     case DLFRZ_GLIBC_AARCH64_2_41:
     case DLFRZ_GLIBC_LAYOUT_UNKNOWN:
@@ -5069,7 +5141,7 @@ dlfrz_glibc_x86_getauxval_contract_valid(
     struct dlfrz_elf64_dyn_view view;
     Elf64_Sym function;
     const unsigned char *code;
-    uint64_t glro_got_vaddr;
+    uint64_t glro_got_vaddr = 0;
     uint64_t load_next;
     uint64_t load_target;
     size_t function_offset;
@@ -6005,34 +6077,45 @@ dlfrz_glibc_glro_relocations_valid(
  * interpreter/libc images inspected during bootstrap, while the final
  * memcmp remains authoritative. */
 static inline const unsigned char *
+dlfrz_glibc_find_literal_from_byte(const unsigned char *bytes, size_t size,
+                                   size_t start, const char *literal,
+                                   size_t literal_size,
+                                   size_t search_byte)
+{
+    size_t candidate_limit;
+    size_t search;
+
+    if (!bytes || !literal || literal_size == 0 || start > size ||
+        literal_size > size - start || search_byte >= literal_size)
+        return NULL;
+    candidate_limit = size - literal_size;
+    search = start + search_byte;
+    while (search <= candidate_limit + search_byte) {
+        const unsigned char *matched =
+            (const unsigned char *)memchr(
+                bytes + search, (unsigned char)literal[search_byte],
+                candidate_limit + search_byte - search + 1U);
+        size_t matched_offset;
+        size_t candidate;
+
+        if (!matched)
+            return NULL;
+        matched_offset = (size_t)(matched - bytes);
+        candidate = matched_offset - search_byte;
+        if (memcmp(bytes + candidate, literal, literal_size) == 0)
+            return bytes + candidate;
+        search = matched_offset + 1U;
+    }
+    return NULL;
+}
+
+static inline const unsigned char *
 dlfrz_glibc_find_literal(const unsigned char *bytes, size_t size,
                          size_t start, const char *literal,
                          size_t literal_size)
 {
-    const unsigned char *cursor;
-    size_t remaining;
-
-    if (!bytes || !literal || literal_size == 0 || start > size ||
-        literal_size > size - start)
-        return NULL;
-    cursor = bytes + start;
-    remaining = size - start;
-    while (remaining >= literal_size) {
-        const unsigned char *candidate =
-            (const unsigned char *)memchr(
-                cursor, (unsigned char)literal[0],
-                remaining - literal_size + 1);
-        size_t offset;
-
-        if (!candidate)
-            return NULL;
-        if (memcmp(candidate, literal, literal_size) == 0)
-            return candidate;
-        offset = (size_t)(candidate - bytes) + 1;
-        cursor = bytes + offset;
-        remaining = size - offset;
-    }
-    return NULL;
+    return dlfrz_glibc_find_literal_from_byte(
+        bytes, size, start, literal, literal_size, 0);
 }
 
 struct dlfrz_glibc_release_profile_state {
@@ -6071,8 +6154,8 @@ dlfrz_glibc_release_profile_accumulate(
          (!want_stable || state->stable_invalid)))
         return;
     while (want_stable || want_development) {
-        const unsigned char *match = dlfrz_glibc_find_literal(
-            bytes, size, search, anchor, sizeof(anchor) - 1);
+        const unsigned char *match = dlfrz_glibc_find_literal_from_byte(
+            bytes, size, search, anchor, sizeof(anchor) - 1, 8U);
         size_t i;
         size_t after;
 
@@ -6277,40 +6360,73 @@ dlfrz_glibc_config_path_match_accumulate(
 }
 
 /* Walk one immutable file range once, recognizing both configured glibc
- * paths from complete absolute C strings.  NUL-delimited iteration avoids a
- * byte-by-byte retry at every non-candidate position.  Literal matching is
- * deliberately reset at each PT_LOAD boundary, so disjoint ranges cannot
- * synthesize a pathname. */
+ * paths from complete absolute C strings.  Both identities contain the
+ * exact "/ld.so." suffix anchor.  Searching that uncommon literal avoids a
+ * memchr restart at every NUL byte in code, relocation data and segment
+ * padding.  Only after the complete suffix and its terminating NUL match do
+ * we walk backward to the preceding string boundary; those accepted walks
+ * are disjoint unless the input contains another suffix anchor in the same
+ * string, so total work remains bounded by the input plus its candidates.
+ * Literal matching is deliberately reset at each PT_LOAD boundary, so
+ * disjoint ranges cannot synthesize a pathname. */
 static inline void
 dlfrz_glibc_config_paths_accumulate(
     const unsigned char *bytes, size_t size,
     struct dlfrz_glibc_config_path_match *cache,
     struct dlfrz_glibc_config_path_match *preload)
 {
-    size_t offset = 0;
+    static const char anchor[] = "/ld.so.";
+    const size_t anchor_size = sizeof(anchor) - 1U;
+    const size_t cache_suffix_size =
+        sizeof(DLFRZ_GLIBC_CACHE_SUFFIX) - 1U;
+    const size_t preload_suffix_size =
+        sizeof(DLFRZ_GLIBC_PRELOAD_SUFFIX) - 1U;
+    size_t search = 0;
 
-    while (offset < size) {
-        const unsigned char *terminator =
-            (const unsigned char *)memchr(
-                bytes + offset, '\0', size - offset);
+    if (!bytes)
+        return;
+    while (search < size) {
+        const unsigned char *suffix = dlfrz_glibc_find_literal(
+            bytes, size, search, anchor, anchor_size);
+        const unsigned char *candidate;
+        size_t suffix_position;
         size_t candidate_size;
+        size_t matched_suffix_size = 0;
 
-        if (!terminator)
+        if (!suffix)
             break;
-        candidate_size = (size_t)(terminator - (bytes + offset));
-        if (candidate_size != 0 && bytes[offset] == '/') {
-            if (cache)
-                dlfrz_glibc_config_path_match_accumulate(
-                    cache, bytes + offset, candidate_size,
-                    DLFRZ_GLIBC_CACHE_SUFFIX,
-                    sizeof(DLFRZ_GLIBC_CACHE_SUFFIX) - 1);
-            if (preload)
-                dlfrz_glibc_config_path_match_accumulate(
-                    preload, bytes + offset, candidate_size,
-                    DLFRZ_GLIBC_PRELOAD_SUFFIX,
-                    sizeof(DLFRZ_GLIBC_PRELOAD_SUFFIX) - 1);
+        suffix_position = (size_t)(suffix - bytes);
+        search = suffix_position + 1U;
+        if (cache && cache_suffix_size < size - suffix_position &&
+            memcmp(suffix, DLFRZ_GLIBC_CACHE_SUFFIX,
+                   cache_suffix_size) == 0 &&
+            suffix[cache_suffix_size] == '\0') {
+            matched_suffix_size = cache_suffix_size;
+        } else if (preload &&
+                   preload_suffix_size < size - suffix_position &&
+                   memcmp(suffix, DLFRZ_GLIBC_PRELOAD_SUFFIX,
+                          preload_suffix_size) == 0 &&
+                   suffix[preload_suffix_size] == '\0') {
+            matched_suffix_size = preload_suffix_size;
         }
-        offset += candidate_size + 1;
+        if (matched_suffix_size == 0)
+            continue;
+
+        candidate = suffix;
+        while (candidate != bytes && candidate[-1] != '\0')
+            candidate--;
+        if (*candidate != '/')
+            continue;
+        candidate_size = (size_t)(suffix - candidate) +
+                         matched_suffix_size;
+        if (matched_suffix_size == cache_suffix_size)
+            dlfrz_glibc_config_path_match_accumulate(
+                cache, candidate, candidate_size,
+                DLFRZ_GLIBC_CACHE_SUFFIX, cache_suffix_size);
+        else
+            dlfrz_glibc_config_path_match_accumulate(
+                preload, candidate, candidate_size,
+                DLFRZ_GLIBC_PRELOAD_SUFFIX, preload_suffix_size);
     }
 }
 
@@ -6533,6 +6649,8 @@ dlfrz_glibc_layout_release_is_supported(enum dlfrz_glibc_layout_id layout,
         return minor >= 36 && minor <= 39;
     case DLFRZ_GLIBC_AARCH64_2_43:
         return minor == 43;
+    case DLFRZ_GLIBC_AARCH64_2_44:
+        return minor == 44;
     case DLFRZ_GLIBC_AARCH64_2_40_LEGACY:
         return minor == 40;
     case DLFRZ_GLIBC_AARCH64_2_41:
@@ -6610,6 +6728,8 @@ dlfrz_glibc_dlfcn_hook_offset(enum dlfrz_glibc_layout_id layout, int minor)
         return minor == 35 ? 680 : -1;
     case DLFRZ_GLIBC_AARCH64_2_41:
         return minor == 41 ? 680 : -1;
+    case DLFRZ_GLIBC_AARCH64_2_44:
+        return minor == 44 ? 376 : -1;
     case DLFRZ_GLIBC_X86_2_17:
     case DLFRZ_GLIBC_X86_2_29:
     case DLFRZ_GLIBC_X86_RTLD_544_4000:
@@ -6649,6 +6769,8 @@ dlfrz_glibc_find_object_offset(enum dlfrz_glibc_layout_id layout, int minor)
         return minor == 35 ? 664 : -1;
     case DLFRZ_GLIBC_AARCH64_2_41:
         return minor == 41 ? 672 : -1;
+    case DLFRZ_GLIBC_AARCH64_2_44:
+        return minor == 44 ? 360 : -1;
     case DLFRZ_GLIBC_X86_2_17:
     case DLFRZ_GLIBC_X86_2_29:
     case DLFRZ_GLIBC_X86_RTLD_544_4000:
@@ -6674,6 +6796,7 @@ dlfrz_glibc_direct_thread_layout_is_supported(
     switch (layout) {
     case DLFRZ_GLIBC_AARCH64_2_35:
     case DLFRZ_GLIBC_AARCH64_2_41:
+    case DLFRZ_GLIBC_AARCH64_2_44:
     case DLFRZ_GLIBC_X86_RTLD_896_4336:
     case DLFRZ_GLIBC_X86_2_34:
     case DLFRZ_GLIBC_X86_2_37_OR_2_40_LEGACY:

@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <elf.h>
+#include <fcntl.h>
 #include <link.h>
 #include <pthread.h>
 #include <stddef.h>
@@ -380,9 +381,12 @@ int main(int argc, char **argv)
     void *zero_sized_symbol;
     void *wide_symbol;
     void *short_symbol;
+    void *loader_api_symbol;
+    Dl_info loader_api_info;
+    struct link_map *loader_interior_map = NULL;
     struct iterate_reentrant_state iterate_reentrant;
 
-    if (argc != 4)
+    if (argc != 4 && argc != 5)
         return fail(2);
     strict_mode = strcmp(argv[2], "strict") == 0;
     target_has_glibc_api =
@@ -494,8 +498,24 @@ int main(int argc, char **argv)
         !info.dli_fname || !info.dli_fname[0] ||
         info.dli_fbase == NULL)
         return fail(68);
+    loader_api_symbol = dlsym(RTLD_DEFAULT, "dlopen");
+    memset(&loader_api_info, 0, sizeof(loader_api_info));
+    if (!loader_api_symbol ||
+        dladdr(loader_api_symbol, &loader_api_info) != 1 ||
+        !loader_api_info.dli_fname || !loader_api_info.dli_fname[0] ||
+        !loader_api_info.dli_fbase || !loader_api_info.dli_sname ||
+        strcmp(loader_api_info.dli_sname, "dlopen") != 0 ||
+        loader_api_info.dli_saddr != loader_api_symbol)
+        return fail(82);
+    memset(&info, 0, sizeof(info));
+    if (dladdr((void *)((uintptr_t)loader_api_symbol + 1), &info) != 1 ||
+        !info.dli_fname || !info.dli_fname[0] || !info.dli_fbase ||
+        (strict_mode &&
+         (strcmp(info.dli_fname, loader_api_info.dli_fname) == 0 ||
+          info.dli_sname != NULL || info.dli_saddr != NULL)))
+        return fail(87);
     for (struct link_map *cursor = main_map; cursor; cursor = cursor->l_next) {
-        if (++map_count > 512)
+        if (++map_count > 1024)
             return fail(47);
         if (cursor->l_prev != previous)
             return fail(48);
@@ -605,6 +625,8 @@ int main(int argc, char **argv)
     if (strict_mode && target_has_glibc_api && !dladdr1_call)
         return fail(53);
     if (dladdr1_call) {
+        struct link_map *loader_api_map;
+
         memset(&info, 0, sizeof(info));
         extra = NULL;
         if (dladdr1_call(symbol, &info, &extra,
@@ -618,6 +640,44 @@ int main(int argc, char **argv)
             !extra ||
             ELF64_ST_TYPE(((const Elf64_Sym *)extra)->st_info) != STT_FUNC)
             return fail(54);
+        memset(&info, 0, sizeof(info));
+        extra = NULL;
+        if (dladdr1_call(loader_api_symbol, &info, &extra,
+                         TEST_RTLD_DL_LINKMAP) != 1 ||
+            !extra || !info.dli_fname || !info.dli_sname ||
+            strcmp(info.dli_sname, "dlopen") != 0 ||
+            info.dli_saddr != loader_api_symbol)
+            return fail(83);
+        loader_api_map = (struct link_map *)extra;
+        if (!loader_api_map->l_name ||
+            strcmp(loader_api_map->l_name, info.dli_fname) != 0)
+            return fail(83);
+        memset(&info, 0, sizeof(info));
+        extra = NULL;
+        if (dladdr1_call(
+                (void *)((uintptr_t)loader_api_symbol + 1),
+                &info, &extra, TEST_RTLD_DL_LINKMAP) != 1 ||
+            !extra || !info.dli_fname || !info.dli_fname[0])
+            return fail(88);
+        loader_interior_map = (struct link_map *)extra;
+        if (!loader_interior_map->l_name ||
+            strcmp(loader_interior_map->l_name, info.dli_fname) != 0 ||
+            (strict_mode && loader_interior_map == loader_api_map))
+            return fail(88);
+        memset(&info, 0, sizeof(info));
+        extra = NULL;
+        if (dladdr1_call(loader_api_symbol, &info, &extra,
+                         TEST_RTLD_DL_SYMENT) != 1 ||
+            !extra ||
+            (ELF64_ST_TYPE(((const Elf64_Sym *)extra)->st_info) != STT_FUNC &&
+             ELF64_ST_TYPE(((const Elf64_Sym *)extra)->st_info) !=
+                 STT_GNU_IFUNC) ||
+            (strict_mode &&
+             (((const Elf64_Sym *)extra)->st_shndx != SHN_ABS ||
+              ((const Elf64_Sym *)extra)->st_value !=
+                  (Elf64_Addr)(uintptr_t)loader_api_symbol ||
+              ((const Elf64_Sym *)extra)->st_size != 0)))
+            return fail(84);
     }
     {
         find_object_fn find_object = NULL;
@@ -629,6 +689,7 @@ int main(int argc, char **argv)
             return fail(69);
         if (symbol) {
             struct iterate_address_state puts_object;
+            struct iterate_address_state loader_object;
             void *puts_address = dlsym(RTLD_DEFAULT, "puts");
 
             memcpy(&find_object, &symbol, sizeof(find_object));
@@ -640,6 +701,22 @@ int main(int argc, char **argv)
                 (uintptr_t)value < expected_map_start ||
                 (uintptr_t)value >= expected_map_end)
                 return fail(56);
+            memset(&found, 0xa5, sizeof(found));
+            if (find_object(
+                    (void *)((uintptr_t)loader_api_symbol + 1),
+                    &found) != 0 || !loader_interior_map ||
+                found.link_map != loader_interior_map ||
+                !found.eh_frame ||
+                (uintptr_t)loader_api_symbol + 1 <
+                    (uintptr_t)found.map_start ||
+                (uintptr_t)loader_api_symbol + 1 >=
+                    (uintptr_t)found.map_end)
+                return fail(89);
+            memset(&loader_object, 0, sizeof(loader_object));
+            loader_object.address = (uintptr_t)loader_api_symbol + 1;
+            if (dl_iterate_phdr(inspect_address_object, &loader_object) != 0 ||
+                loader_object.matches != 1 || loader_object.invalid)
+                return fail(90);
             if (!puts_address)
                 return fail(70);
             memset(&puts_object, 0, sizeof(puts_object));
@@ -685,6 +762,24 @@ int main(int argc, char **argv)
         (void)dlerror();
         if (dlinfo(handle, 0, &extra) != -1 || dlerror() == NULL)
             return fail(58);
+    }
+
+    if (argc == 5) {
+        unsigned char byte;
+        Dl_info open_info;
+        void *open_symbol = dlsym(RTLD_DEFAULT, "open");
+        int fd = open(argv[4], O_RDONLY | O_CLOEXEC);
+
+        if (fd < 0 || read(fd, &byte, sizeof(byte)) != 1 ||
+            close(fd) != 0)
+            return fail(85);
+        memset(&open_info, 0, sizeof(open_info));
+        if (!open_symbol || dladdr(open_symbol, &open_info) != 1 ||
+            !open_info.dli_fname || !open_info.dli_fname[0] ||
+            !open_info.dli_fbase || !open_info.dli_sname ||
+            !open_info.dli_sname[0] || open_info.dli_saddr != open_symbol)
+            return fail(86);
+        printf("loader-vfs-alias:%s\n", open_info.dli_sname);
     }
 
     puts("loader-introspection-ok");

@@ -5,6 +5,13 @@ set -euo pipefail
 
 BUILD="${1:-build}"
 DLFREEZE="$BUILD/dlfreeze"
+MANIFEST_ENTRY_SIZE=$(awk \
+    '$2 == "DLFRZ_MANIFEST_ENTRY_SIZE" { value = $3; sub(/U$/, "", value); print value; exit }' \
+    include/common.h)
+if [[ ! "$MANIFEST_ENTRY_SIZE" =~ ^[0-9]+$ ]]; then
+    echo "cannot determine frozen manifest entry size" >&2
+    exit 1
+fi
 
 mkdir -p "$BUILD"
 
@@ -20,9 +27,9 @@ TEST_TIMEOUT_KILL_AFTER="${TEST_TIMEOUT_KILL_AFTER:-5}"
 TEST_CC_RETRIES="${TEST_CC_RETRIES:-2}"
 TEST_REAL_GCC="${TEST_REAL_GCC:-$(command -v gcc || true)}"
 
-# A -d regression must exercise the in-process loader itself.  Individual
-# fallback tests explicitly unset this variable when they need the wrapper.
-export DLFREEZE_NO_FORK="${DLFREEZE_NO_FORK:-1}"
+# Keep the public in-process default deterministic.  Tests of the optional
+# speculative supervisor opt in explicitly at the individual invocation.
+unset DLFREEZE_NO_FORK DLFREEZE_SUPERVISED_FALLBACK
 
 gcc() {
     local attempt=0 tmp rc
@@ -332,9 +339,10 @@ test_loader_fileback_gate() {
     if gcc -std=c11 -O2 -g -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
             -fno-stack-protector -ffunction-sections -fdata-sections \
             -Wl,--gc-sections -o "$helper" \
-            tests/loader_fileback_gate.c -ldl -pthread &&
+            tests/loader_fileback_gate.c src/lazy_trampoline.S \
+            -ldl -pthread &&
        run_with_timeout_seconds 12 "$helper"; then
-        pass "loader startup compare skip and fdless lazy copy fallback"
+        pass "loader startup fileback, lazy copy, and private VFS publication"
     else
         fail "loader file-backed segment authority gate" \
             "compile failed, provenance/copy fallback differed, or fd remained open"
@@ -361,6 +369,9 @@ test_packer_alias_gate() {
 test_packer_elf_alignment_gate() {
     echo "--- packer ELF alignment and transaction gate ---"
     local helper="$BUILD/packer_elf_alignment_gate"
+    local root="$BUILD/packer-bootstrap-machine"
+    local tool="$root/dlfreeze" bootstrap="$root/dlfreeze-bootstrap"
+    local output="$root/foreign-bootstrap.frozen" log="$root/freeze.log"
 
     if gcc -std=c11 -O2 -g -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
             -ffunction-sections -fdata-sections -Wl,--gc-sections \
@@ -372,6 +383,34 @@ test_packer_elf_alignment_gate() {
             "compile failed, malformed bounds were admitted, or mutation leaked"
     fi
     rm -f "$helper"
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    if ! cp "$DLFREEZE" "$tool" ||
+       ! cp "$BUILD/dlfreeze-bootstrap" "$bootstrap" ||
+       ! elf64_set_foreign_machine "$bootstrap"; then
+        fail "packer bootstrap target architecture" \
+            "cannot construct a foreign-machine bootstrap sibling"
+        rm -rf "$root"
+        return
+    fi
+    printf '%s' 'preexisting-output' >"$output"
+    if run_freeze "$tool" -d -o "$output" -- /bin/true \
+            >"$log" 2>&1; then
+        fail "packer bootstrap target architecture" \
+            "foreign-machine bootstrap was published"
+    elif [ "$(cat "$output")" = 'preexisting-output' ] &&
+         grep -Fq 'copied ELF input is incompatible:' "$log" &&
+         ! find "$root" -maxdepth 1 -type f \
+             \( -name '.dlfreeze-pack.*' -o \
+                -name '.dlfreeze-backup.*' \) -print -quit |
+             grep -q .; then
+        pass "packer bootstrap matches target architecture before publication"
+    else
+        fail "packer bootstrap target architecture" \
+            "output changed, diagnostic missing, or private names leaked"
+    fi
+    rm -rf "$root"
 }
 
 test_packer_prelink_relocation_gate() {
@@ -382,12 +421,83 @@ test_packer_prelink_relocation_gate() {
             -ffunction-sections -fdata-sections -Wl,--gc-sections \
             -o "$helper" tests/packer_prelink_relocation_gate.c &&
        run_with_timeout_seconds 8 "$helper"; then
-        pass "packer prelink control authority and deferred symbolic fixups"
+        pass "packer prelink authority, lazy admission, and deferred fixups"
     else
         fail "packer prelink relocation authority gate" \
             "compile failed, mutable metadata was admitted, or ownership leaked"
     fi
     rm -f "$helper"
+}
+
+test_packer_publish_fallback_gate() {
+    echo "--- packer portable publication fallback gate ---"
+    local runtime_root helper
+
+    runtime_root=$(mktemp -d /dev/shm/dlfreeze-publish-gate.XXXXXX) || {
+        fail "packer portable publication fallback gate" \
+            "cannot create isolated /dev/shm test directory"
+        return
+    }
+    helper="$runtime_root/packer_publish_gate"
+    if TMPDIR="$runtime_root" \
+       gcc -std=c11 -O2 -g -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
+            -ffunction-sections -fdata-sections -Wl,--gc-sections \
+            -o "$helper" tests/packer_publish_gate.c &&
+       TMPDIR="$runtime_root" run_with_timeout_seconds 8 "$helper"; then
+        pass "packer old-kernel atomic publication and rollback"
+    else
+        fail "packer portable publication fallback gate" \
+            "compile failed, a race overwrote output, or rollback leaked state"
+    fi
+    rm -f "$helper"
+    rmdir "$runtime_root" 2>/dev/null || true
+}
+
+test_packer_transaction_identity_handoff_gate() {
+    echo "--- packer transaction identity handoff gate ---"
+    local runtime_root helper stage leaf ok=1
+
+    runtime_root=$(mktemp -d /dev/shm/dlfreeze-identity-gate.XXXXXX) || {
+        fail "packer transaction identity handoff gate" \
+            "cannot create isolated /dev/shm test directory"
+        return
+    }
+    helper="$runtime_root/packer_transaction_identity_gate"
+    if ! TMPDIR="$runtime_root" \
+         gcc -std=c11 -O2 -g -Wall -Wextra -Werror -D_GNU_SOURCE \
+            -DDLFREEZE_PACKER_TRANSACTION_GATE -Iinclude \
+            -o "$helper" tests/packer_transaction_identity_gate.c \
+            src/packer.c src/dep_resolver.c src/elf_parser.c; then
+        ok=0
+    else
+        for stage in 1 2 3 4 0; do
+            if [ "$stage" -eq 0 ]; then
+                leaf="success.frozen"
+            else
+                leaf="failure-$stage.frozen"
+            fi
+            if ! TMPDIR="$runtime_root" run_freeze "$helper" \
+                    /bin/true "$BUILD/dlfreeze-bootstrap" \
+                    "$runtime_root/$leaf" "$stage" \
+                    >"$runtime_root/stage-$stage.out" \
+                    2>"$runtime_root/stage-$stage.err"; then
+                cat "$runtime_root/stage-$stage.out" >&2 || true
+                cat "$runtime_root/stage-$stage.err" >&2 || true
+                ok=0
+                break
+            fi
+        done
+    fi
+    if [ "$ok" -eq 1 ] &&
+       run_with_timeout env DLFREEZE_NO_FORK=1 \
+           "$runtime_root/success.frozen"; then
+        ((DIRECT_ARTIFACTS++)) || true
+        pass "packer replacement identity handoff and failure cleanup"
+    else
+        fail "packer transaction identity handoff gate" \
+            "fresh pack failed, adopted a stale inode, or left transaction debris"
+    fi
+    rm -rf "$runtime_root"
 }
 
 test_glibc_gnu_hash_shift_gate() {
@@ -537,23 +647,29 @@ C
 }
 
 # A successful `dlfreeze -d` may still intentionally produce an extraction-
-# mode image when the embedded runtime is unsupported.  DLFREEZE_NO_FORK only
-# disables fallback after direct metadata has been found, so it cannot make
-# such an image a strict direct-load test.  Captured DATA instead fails
-# admission when the runtime is unsupported; report that as an unsupported
-# test target.  Keep the packer log and raw footer checks together so direct
-# regressions cannot silently pass via extraction.
+# mode image when the embedded runtime is unsupported.  Runtime policy cannot
+# make such an image a strict direct-load test because it has no direct
+# metadata. Captured DATA instead fails admission when the runtime is
+# unsupported; report that as an unsupported test target. Keep the packer log
+# and raw footer checks together so direct regressions cannot silently pass via
+# extraction.
 DIRECT_FREEZE_REASON=""
 DIRECT_META_OFF=""
-freeze_require_direct_with() {
-    local freezer="$1" label="$2" log="$3" output="$4"
+freeze_require_direct_invocation_with() {
+    local freezer="$1" mode_option="$2" label="$3" log="$4" output="$5"
     local runtime_warning size footer_magic meta_off payload_end
     local direct_confirmed=0
-    shift 4
+    local -a mode_arguments=()
+    shift 5
+
+    if [ -n "$mode_option" ]; then
+        mode_arguments+=("$mode_option")
+    fi
 
     DIRECT_FREEZE_REASON=""
     DIRECT_META_OFF=""
-    if ! run_freeze "$freezer" -d -o "$output" "$@" >"$log" 2>&1; then
+    if ! run_freeze "$freezer" "${mode_arguments[@]}" -o "$output" \
+            "$@" >"$log" 2>&1; then
         runtime_warning=$(grep -Em1 \
             '^dlfreeze: (captured files require a supported direct-load runtime|pathful traced dlopen entries require a supported direct-load mode|pathful DT_NEEDED entries require a supported direct-load mode|.* requires native loader semantics, but this manifest requires direct-load semantics)$' \
             "$log" || true)
@@ -573,6 +689,13 @@ freeze_require_direct_with() {
         '^[[:space:]]*mode[[:space:]]*:[[:space:]]*direct-load \(in-process loader\)[[:space:]]*$' \
         "$log"; then
         direct_confirmed=1
+    fi
+    runtime_warning=$(grep -Em1 \
+        'pre-linked[[:space:]]*:[[:space:]]*no \(unsupported direct contract; using extraction\)' \
+        "$log" || true)
+    if [ -n "$runtime_warning" ]; then
+        DIRECT_FREEZE_REASON="startup graph requires native loader semantics"
+        return 77
     fi
     runtime_warning=$(grep -Em1 \
         'direct-load is unavailable for runtime .*creating an extraction-mode binary' \
@@ -622,8 +745,24 @@ freeze_require_direct_with() {
     return 0
 }
 
+freeze_require_direct_with() {
+    local freezer="$1"
+    shift
+    freeze_require_direct_invocation_with "$freezer" -d "$@"
+}
+
 freeze_require_direct() {
     freeze_require_direct_with "$DLFREEZE" "$@"
+}
+
+freeze_require_default_direct_with() {
+    local freezer="$1"
+    shift
+    freeze_require_direct_invocation_with "$freezer" "" "$@"
+}
+
+freeze_require_default_direct() {
+    freeze_require_default_direct_with "$DLFREEZE" "$@"
 }
 
 # ===================================================================
@@ -643,6 +782,11 @@ freeze_and_compare() {
     local expect actual rc_e=0 rc_a=0
     capture_output expect "$binary" "$@" || rc_e=$?
     capture_output actual "$output" "$@" || rc_a=$?
+    # A late dlopen which was not exercised while packing is intentionally
+    # permitted to fall back to the host filesystem.  Its dlfreeze-owned
+    # diagnostic is not target output; focused fallback tests below validate
+    # the warning itself and the loaded object's behavior separately.
+    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
 
     if [ "$expect" = "$actual" ] && [ "$rc_e" = "$rc_a" ]; then
         pass "$label"
@@ -687,6 +831,945 @@ C
         diff -u <(echo "$expect") <(echo "$actual") | head -20 || true
     fi
     rm -f "$src" "$bin" "$out"
+}
+
+# The public default prefers direct loading whenever the structurally
+# identified target runtime is admitted.  Extraction remains an explicit,
+# testable escape hatch; contradictory policy switches must never depend on
+# option order.
+test_default_direct_policy() {
+    echo "--- default direct-load policy ---"
+    local root="$BUILD/default_direct_policy"
+    local src="$root/main.c" bin="$root/main"
+    local direct_out="$root/default.frozen" direct_log="$root/default.log"
+    local extract_out="$root/extract.frozen" extract_log="$root/extract.log"
+    local conflict_out="$root/conflict.frozen" conflict_log="$root/conflict.log"
+    local actual="" size meta_off rc=0 freeze_rc=0
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    cat > "$src" <<'C'
+#include <stdio.h>
+int main(void) { puts("default-direct-ok"); return 0; }
+C
+    if ! gcc -o "$bin" "$src"; then
+        fail "default direct-load policy" "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+
+    freeze_require_default_direct "default direct-load policy" \
+        "$direct_log" "$direct_out" -- "$bin" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "default direct-load policy" "$DIRECT_FREEZE_REASON"
+    elif [ "$freeze_rc" -eq 0 ]; then
+        capture_output actual env -u DLFREEZE_NO_FORK \
+            -u DLFREEZE_SUPERVISED_FALLBACK "$direct_out" || rc=$?
+        if [ "$rc" -eq 0 ] && [ "$actual" = "default-direct-ok" ]; then
+            pass "default direct-load policy"
+        else
+            fail "default direct-load policy execution" \
+                "exit=$rc output=$actual"
+        fi
+    fi
+
+    actual=""
+    rc=0
+    if ! run_freeze "$DLFREEZE" -v -x -o "$extract_out" -- "$bin" \
+            >"$extract_log" 2>&1; then
+        fail "forced extraction policy" "dlfreeze failed"
+    else
+        size=$(stat -c %s "$extract_out" 2>/dev/null || true)
+        meta_off=""
+        if [[ "$size" =~ ^[0-9]+$ ]] && [ "$size" -ge 64 ]; then
+            meta_off=$(od -An -tu8 -j $((size - 24)) -N8 "$extract_out" \
+                2>/dev/null | tr -d '[:space:]')
+        fi
+        capture_output actual "$extract_out" || rc=$?
+        if [ "$meta_off" = 0 ] && [ "$rc" -eq 0 ] &&
+           [ "$actual" = "default-direct-ok" ] &&
+           ! grep -Eq \
+               '^[[:space:]]*mode[[:space:]]*:[[:space:]]*direct-load' \
+               "$extract_log"; then
+            pass "forced extraction policy"
+        else
+            fail "forced extraction policy" \
+                "meta=$meta_off exit=$rc output=$actual"
+        fi
+    fi
+
+    if run_freeze "$DLFREEZE" -d -x -o "$conflict_out" -- "$bin" \
+            >"$conflict_log" 2>&1; then
+        fail "conflicting runtime policy options" \
+            "dlfreeze accepted -d together with -x"
+    elif [ -e "$conflict_out" ]; then
+        fail "conflicting runtime policy options" \
+            "rejected invocation left an artifact"
+    elif grep -Fq \
+            'dlfreeze: -d and -x select incompatible runtime modes' \
+            "$conflict_log"; then
+        pass "conflicting runtime policy options"
+    else
+        fail "conflicting runtime policy options" \
+            "invocation failed for an unrelated reason"
+    fi
+
+    rm -rf "$root"
+}
+
+# Helper discovery should not turn procfs into a pack-time dependency.  The
+# running executable's AT_EXECFN/argv[0] spellings provide a conventional,
+# canonicalized fallback when /proc/self/exe is unavailable in a container or
+# chroot.  Exercise the real static tool rather than a duplicated path parser.
+test_packer_helper_discovery_without_proc() {
+    echo "--- packer helper discovery without procfs ---"
+    local root="$BUILD/helper_discovery_without_proc"
+    local src="$root/main.c" bin="$root/main" out="$root/main.frozen"
+    local log="$root/pack.log" freezer actual="" rc=0
+
+    if ! command -v bwrap >/dev/null 2>&1; then
+        skip "packer helper discovery without procfs" \
+            "bubblewrap is unavailable"
+        return
+    fi
+    if ! bwrap --ro-bind / / --bind /tmp /tmp --tmpfs /proc \
+            --dev-bind /dev /dev -- /bin/true >/dev/null 2>&1; then
+        skip "packer helper discovery without procfs" \
+            "unprivileged mount namespaces are unavailable"
+        return
+    fi
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    cat > "$src" <<'C'
+#include <stdio.h>
+int main(void) { puts("no-proc-helper-ok"); return 0; }
+C
+    if ! gcc -o "$bin" "$src"; then
+        fail "packer helper discovery without procfs" \
+            "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+    freezer=$(readlink -f "$DLFREEZE")
+    bin=$(readlink -f "$bin")
+    out=$(readlink -m "$out")
+    if ! bwrap --ro-bind / / --bind /tmp /tmp --tmpfs /proc \
+            --dev-bind /dev /dev -- "$freezer" -x -o "$out" -- "$bin" \
+            >"$log" 2>&1; then
+        fail "packer helper discovery without procfs" \
+            "packing failed"
+        tail -n 40 "$log" || true
+        rm -rf "$root"
+        return
+    fi
+    capture_output actual "$out" || rc=$?
+    if [ "$rc" -eq 0 ] && [ "$actual" = "no-proc-helper-ok" ]; then
+        pass "packer helper discovery without procfs"
+    else
+        fail "packer helper discovery without procfs" \
+            "exit=$rc output=$actual"
+    fi
+    rm -rf "$root"
+}
+
+# A valid ELF executable need not contain PT_DYNAMIC.  Such a target has no
+# userspace loader to reproduce, so preserve it as a one-entry extraction
+# artifact and let the kernel execute the embedded bytes.  The compatibility
+# path must not perturb loader environment variables when no loader exists.
+test_static_executable_extraction() {
+    echo "--- fully static executable extraction ---"
+    local root="$BUILD/static_executable_extraction"
+    local src="$root/main.c" bin="$root/main" out="$root/main.frozen"
+    local log="$root/freeze.log" dynamic="$root/dynamic"
+    local pie="$root/static-pie" pie_out="$root/static-pie.frozen"
+    local pie_log="$root/static-pie.log"
+    local trace_out="$root/traced.frozen" trace_log="$root/trace.log"
+    local invalid="$root/no-interp-needed" invalid_out="$root/invalid.frozen"
+    local invalid_log="$root/invalid.log"
+    local size meta_off entry_count phoff phentsz phnum ptype
+    local native="" actual="" native_rc=0 rc=0 interp_index="" i
+    local elf_reader="${READELF:-}"
+
+    if [ -z "$elf_reader" ]; then
+        elf_reader=$(command -v readelf 2>/dev/null ||
+                     command -v llvm-readelf 2>/dev/null || true)
+    fi
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    cat > "$src" <<'C'
+#include <stdio.h>
+#include <stdlib.h>
+int main(int argc, char **argv)
+{
+    const char *library_path = getenv("LD_LIBRARY_PATH");
+    printf("static:%s:%s\n", argc > 1 ? argv[1] : "missing",
+           library_path ? library_path : "(unset)");
+    return argc > 2 ? atoi(argv[2]) : 0;
+}
+C
+    if ! gcc -Wall -Wextra -Werror -O2 -static -fno-pie -no-pie \
+            -o "$bin" "$src" >/dev/null 2>&1; then
+        skip "fully static executable extraction" \
+            "compiler cannot link a conventional static executable"
+        rm -rf "$root"
+        return
+    fi
+    if [ -z "$elf_reader" ]; then
+        skip "fully static executable extraction" \
+            "readelf or llvm-readelf is unavailable"
+        rm -rf "$root"
+        return
+    fi
+    if LC_ALL=C "$elf_reader" -lW "$bin" 2>/dev/null |
+            grep -Eq '^[[:space:]]*DYNAMIC[[:space:]]'; then
+        skip "fully static executable extraction" \
+            "toolchain did not produce a PT_DYNAMIC-free executable"
+        rm -rf "$root"
+        return
+    fi
+
+    capture_output native env LD_LIBRARY_PATH=caller-value \
+        "$bin" payload 23 || native_rc=$?
+    if [ "$native_rc" -ne 23 ] ||
+       [ "$native" != "static:payload:caller-value" ]; then
+        fail "fully static executable native control" \
+            "exit=$native_rc output=$native"
+        rm -rf "$root"
+        return
+    fi
+    if ! run_freeze "$DLFREEZE" -v -o "$out" -- "$bin" \
+            >"$log" 2>&1; then
+        fail "fully static executable extraction" "dlfreeze failed"
+        tail -n 40 "$log" || true
+        rm -rf "$root"
+        return
+    fi
+
+    size=$(stat -c %s "$out" 2>/dev/null || true)
+    if [[ "$size" =~ ^[0-9]+$ ]] && [ "$size" -ge 64 ]; then
+        entry_count=$(od -An -tu4 -j $((size - 52)) -N4 "$out" \
+            2>/dev/null | tr -d '[:space:]')
+        meta_off=$(od -An -tu8 -j $((size - 24)) -N8 "$out" \
+            2>/dev/null | tr -d '[:space:]')
+    else
+        entry_count=""
+        meta_off=""
+    fi
+    if run_freeze "$DLFREEZE" -t -o "$trace_out" -- "$bin" \
+            >"$trace_log" 2>&1; then
+        fail "fully static trace refusal" \
+            "dlfreeze accepted a preload trace for a static target"
+    elif [ -e "$trace_out" ]; then
+        fail "fully static trace refusal" \
+            "rejected trace left an artifact"
+    elif grep -Fq -- \
+            '-t has no ABI-compatible preload helper' "$trace_log"; then
+        pass "fully static trace refusal"
+    else
+        fail "fully static trace refusal" \
+            "trace failed for an unrelated reason"
+        tail -n 40 "$trace_log" || true
+    fi
+    rm -f "$bin"
+    capture_output actual env -u DLFREEZE_NO_FORK \
+        LD_LIBRARY_PATH=caller-value "$out" payload 23 || rc=$?
+    if [ "$entry_count" = 1 ] && [ "$meta_off" = 0 ] &&
+       [ "$rc" -eq "$native_rc" ] && [ "$actual" = "$native" ] &&
+       grep -Fq \
+           'direct-load is unavailable for runtime (none); creating an extraction-mode binary' \
+           "$log"; then
+        pass "fully static executable extraction"
+    else
+        fail "fully static executable extraction" \
+            "entries=$entry_count meta=$meta_off exit=$rc output=$actual"
+    fi
+
+    # Static PIE carries PT_DYNAMIC for self-relocation but still has neither
+    # PT_INTERP nor DT_NEEDED.  Exercise that distinct parser branch when the
+    # compiler supports it.
+    actual=""
+    rc=0
+    if ! gcc -Wall -Wextra -Werror -O2 -static-pie \
+            -o "$pie" "$src" >/dev/null 2>&1; then
+        skip "static PIE extraction" "compiler does not support -static-pie"
+    elif LC_ALL=C "$elf_reader" -lW "$pie" 2>/dev/null |
+            grep -Eq 'Requesting program interpreter:' ||
+         LC_ALL=C "$elf_reader" -dW "$pie" 2>/dev/null |
+            grep -Eq '\(NEEDED\)'; then
+        skip "static PIE extraction" \
+            "toolchain did not produce a self-contained static PIE"
+    elif ! run_freeze "$DLFREEZE" -v -o "$pie_out" -- "$pie" \
+            >"$pie_log" 2>&1; then
+        fail "static PIE extraction" "dlfreeze failed"
+        tail -n 40 "$pie_log" || true
+    else
+        size=$(stat -c %s "$pie_out" 2>/dev/null || true)
+        meta_off=""
+        if [[ "$size" =~ ^[0-9]+$ ]] && [ "$size" -ge 64 ]; then
+            meta_off=$(od -An -tu8 -j $((size - 24)) -N8 "$pie_out" \
+                2>/dev/null | tr -d '[:space:]')
+        fi
+        rm -f "$pie"
+        capture_output actual env -u DLFREEZE_NO_FORK -u LD_LIBRARY_PATH \
+            "$pie_out" pie 0 || rc=$?
+        if [ "$meta_off" = 0 ] && [ "$rc" -eq 0 ] &&
+           [ "$actual" = "static:pie:(unset)" ]; then
+            actual=""
+            capture_output actual env -u DLFREEZE_NO_FORK \
+                LD_LIBRARY_PATH=caller-value "$pie_out" pie 0 || rc=$?
+        fi
+        if [ "$meta_off" = 0 ] && [ "$rc" -eq 0 ] &&
+           [ "$actual" = "static:pie:caller-value" ]; then
+            pass "static PIE extraction"
+        else
+            fail "static PIE extraction" \
+                "meta=$meta_off exit=$rc output=$actual"
+        fi
+    fi
+
+    # DT_NEEDED is meaningful only through a particular interpreter's search
+    # contract.  Removing PT_INTERP from an ordinary dynamic executable must
+    # therefore fail closed instead of resolving its libraries with host
+    # guesses.
+    if ! gcc -Wall -Wextra -Werror -O2 -o "$dynamic" "$src"; then
+        fail "interpreter-less DT_NEEDED rejection" \
+            "dynamic fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+    cp "$dynamic" "$invalid"
+    phoff=$(od -An -tu8 -j 32 -N8 "$invalid" | tr -d '[:space:]')
+    phentsz=$(od -An -tu2 -j 54 -N2 "$invalid" | tr -d '[:space:]')
+    phnum=$(od -An -tu2 -j 56 -N2 "$invalid" | tr -d '[:space:]')
+    if [[ "$phoff" =~ ^[0-9]+$ ]] && [[ "$phentsz" =~ ^[0-9]+$ ]] &&
+       [[ "$phnum" =~ ^[0-9]+$ ]]; then
+        for ((i = 0; i < phnum; i++)); do
+            ptype=$(od -An -tu4 -j $((phoff + i * phentsz)) -N4 \
+                "$invalid" | tr -d '[:space:]')
+            if [ "$ptype" = 3 ]; then
+                interp_index=$i
+                break
+            fi
+        done
+    fi
+    if [ -z "$interp_index" ]; then
+        fail "interpreter-less DT_NEEDED rejection" \
+            "fixture has no PT_INTERP"
+    elif ! dd if=/dev/zero of="$invalid" bs=1 \
+            seek=$((phoff + interp_index * phentsz)) count=4 \
+            conv=notrunc status=none; then
+        fail "interpreter-less DT_NEEDED rejection" \
+            "cannot remove PT_INTERP"
+    elif run_freeze "$DLFREEZE" -o "$invalid_out" -- "$invalid" \
+            >"$invalid_log" 2>&1; then
+        fail "interpreter-less DT_NEEDED rejection" \
+            "dlfreeze accepted an unknown loader contract"
+    elif [ -e "$invalid_out" ]; then
+        fail "interpreter-less DT_NEEDED rejection" \
+            "rejected input left an artifact"
+    elif grep -Fq \
+            'target has DT_NEEDED entries but no ELF interpreter' \
+            "$invalid_log"; then
+        pass "interpreter-less DT_NEEDED rejection"
+    else
+        fail "interpreter-less DT_NEEDED rejection" \
+            "input failed for an unrelated reason"
+        tail -n 40 "$invalid_log" || true
+    fi
+
+    rm -rf "$root"
+}
+
+# An ELF interpreter has no standardized `interpreter program` command-line
+# ABI.  A structurally unknown loader can still run a dependency-free target
+# without any search-policy guesses, but only through the kernel's ordinary
+# PT_INTERP startup and only while the original bytes remain installed.
+test_unknown_interpreter_kernel_extraction() {
+    echo "--- dependency-free unknown interpreter extraction ---"
+    local root="$BUILD/unknown_interpreter_extraction"
+    local interp_src="$root/interp.S" main_src="$root/main.S"
+    local dependency_src="$root/dependency.S"
+    local interp="$root/custom-interp" main="$root/main"
+    local dependency="$root/libunknown-needed.so"
+    local main_needed="$root/main-needed"
+    local interp_needed="$root/custom-interp-needed"
+    local interp_needed_main="$root/interp-needed-main"
+    local out="$root/main.frozen" log="$root/freeze.log"
+    local needed_out="$root/needed.frozen" needed_log="$root/needed.log"
+    local interp_needed_out="$root/interp-needed.frozen"
+    local interp_needed_log="$root/interp-needed.log"
+    local elf_reader="${READELF:-}"
+    local native="" actual="" native_rc=0 rc=0
+    local size entry_count meta_off manifest_off interp_flags
+    local expected_interp_flags=$((0x8000 | 0x02))
+
+    case "$(uname -m)" in
+        x86_64|aarch64) ;;
+        *)
+            skip "dependency-free unknown interpreter extraction" \
+                "fixture supports x86_64 and AArch64"
+            return
+            ;;
+    esac
+    if [ -z "$elf_reader" ]; then
+        elf_reader=$(command -v readelf 2>/dev/null ||
+                     command -v llvm-readelf 2>/dev/null || true)
+    fi
+    if [ -z "$elf_reader" ]; then
+        skip "dependency-free unknown interpreter extraction" \
+            "readelf or llvm-readelf is unavailable"
+        return
+    fi
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    root=$(cd "$root" && pwd -P)
+    interp_src="$root/interp.S"
+    main_src="$root/main.S"
+    dependency_src="$root/dependency.S"
+    interp="$root/custom-interp"
+    main="$root/main"
+    dependency="$root/libunknown-needed.so"
+    main_needed="$root/main-needed"
+    interp_needed="$root/custom-interp-needed"
+    interp_needed_main="$root/interp-needed-main"
+    out="$root/main.frozen"
+    log="$root/freeze.log"
+    needed_out="$root/needed.frozen"
+    needed_log="$root/needed.log"
+    interp_needed_out="$root/interp-needed.frozen"
+    interp_needed_log="$root/interp-needed.log"
+
+    cat > "$interp_src" <<'ASM'
+#if defined(__x86_64__)
+.global _start
+.section .text
+_start:
+    mov (%rsp), %rcx
+    lea 16(%rsp,%rcx,8), %r8
+    mov (%r8), %r9
+1:  mov (%r8), %rax
+    add $8, %r8
+    test %rax, %rax
+    jne 1b
+2:  mov (%r8), %rax
+    mov 8(%r8), %rdx
+    add $16, %r8
+    test %rax, %rax
+    je 4f
+    cmp $7, %rax
+    jne 2b
+    test %rdx, %rdx
+    je 4f
+    lea kernel_msg(%rip), %rsi
+    mov $7, %edx
+    jmp 5f
+4:  lea launcher_msg(%rip), %rsi
+    mov $9, %edx
+5:  mov $1, %eax
+    mov $1, %edi
+    syscall
+    mov %r9, %rsi
+    mov $28, %edx
+    mov $1, %eax
+    mov $1, %edi
+    syscall
+    lea newline(%rip), %rsi
+    mov $1, %edx
+    mov $1, %eax
+    mov $1, %edi
+    syscall
+    mov $60, %eax
+    xor %edi, %edi
+    syscall
+#elif defined(__aarch64__)
+.global _start
+.section .text
+_start:
+    ldr x2, [sp]
+    add x3, sp, #16
+    add x3, x3, x2, lsl #3
+    ldr x6, [x3]
+1:  ldr x4, [x3], #8
+    cbnz x4, 1b
+2:  ldp x4, x5, [x3], #16
+    cbz x4, 4f
+    cmp x4, #7
+    b.ne 2b
+    cbz x5, 4f
+    adr x1, kernel_msg
+    mov x2, #7
+    b 5f
+4:  adr x1, launcher_msg
+    mov x2, #9
+5:  mov x8, #64
+    mov x0, #1
+    svc #0
+    mov x1, x6
+    mov x2, #28
+    mov x8, #64
+    mov x0, #1
+    svc #0
+    adr x1, newline
+    mov x2, #1
+    mov x8, #64
+    mov x0, #1
+    svc #0
+    mov x8, #93
+    mov x0, #0
+    svc #0
+#else
+#error unsupported fixture architecture
+#endif
+.section .rodata
+kernel_msg: .ascii "kernel:"
+launcher_msg: .ascii "launcher:"
+newline: .ascii "\n"
+ASM
+    cat > "$main_src" <<'ASM'
+#if defined(__x86_64__)
+.global _start
+.section .text
+_start:
+    mov $60, %eax
+    mov $42, %edi
+    syscall
+#elif defined(__aarch64__)
+.global _start
+.section .text
+_start:
+    mov x8, #93
+    mov x0, #42
+    svc #0
+#else
+#error unsupported fixture architecture
+#endif
+ASM
+    cat > "$dependency_src" <<'ASM'
+.global unknown_dependency_marker
+.section .text
+unknown_dependency_marker:
+    ret
+ASM
+
+    if ! gcc -nostdlib -shared -Wl,-e,_start \
+            -Wl,-soname,custom-interp.so -o "$interp" "$interp_src" ||
+       ! gcc -nostdlib -pie -Wl,-e,_start \
+            -Wl,--dynamic-linker="$interp" -o "$main" "$main_src" ||
+       LC_ALL=C "$elf_reader" -dW "$main" 2>/dev/null |
+            grep -Eq '\(NEEDED\)' ||
+       LC_ALL=C "$elf_reader" -dW "$interp" 2>/dev/null |
+            grep -Eq '\(NEEDED\)'; then
+        fail "dependency-free unknown interpreter extraction" \
+            "could not construct an empty-closure ELF fixture"
+        rm -rf "$root"
+        return
+    fi
+
+    capture_output native env -i LD_LIBRARY_PATH=caller-value \
+        "$main" || native_rc=$?
+    if [ "$native_rc" -ne 0 ] ||
+       [ "$native" != "kernel:LD_LIBRARY_PATH=caller-value" ]; then
+        fail "dependency-free unknown interpreter native control" \
+            "exit=$native_rc output=$native"
+        rm -rf "$root"
+        return
+    fi
+    if ! run_freeze "$DLFREEZE" -v -x -o "$out" -- "$main" \
+            >"$log" 2>&1; then
+        fail "dependency-free unknown interpreter extraction" \
+            "dlfreeze failed"
+        tail -n 40 "$log" || true
+        rm -rf "$root"
+        return
+    fi
+
+    size=$(stat -c %s "$out" 2>/dev/null || true)
+    entry_count=""; meta_off=""; manifest_off=""; interp_flags=""
+    if [[ "$size" =~ ^[0-9]+$ ]] && [ "$size" -ge 64 ]; then
+        entry_count=$(od -An -tu4 -j $((size - 52)) -N4 "$out" \
+            2>/dev/null | tr -d '[:space:]')
+        manifest_off=$(od -An -tu8 -j $((size - 48)) -N8 "$out" \
+            2>/dev/null | tr -d '[:space:]')
+        meta_off=$(od -An -tu8 -j $((size - 24)) -N8 "$out" \
+            2>/dev/null | tr -d '[:space:]')
+    fi
+    if [[ "$manifest_off" =~ ^[0-9]+$ ]]; then
+        interp_flags=$(od -An -tu4 \
+            -j $((manifest_off + MANIFEST_ENTRY_SIZE + 16)) -N4 "$out" \
+            2>/dev/null | tr -d '[:space:]')
+    fi
+    actual=""; rc=0
+    capture_output actual env -i LD_LIBRARY_PATH=caller-value \
+        "$out" || rc=$?
+    if [ "$entry_count" = 2 ] && [ "$meta_off" = 0 ] &&
+       [ "$interp_flags" = "$expected_interp_flags" ] && [ "$rc" -eq 0 ] &&
+       [ "$actual" = "$native" ]; then
+        pass "dependency-free unknown interpreter kernel extraction"
+    else
+        fail "dependency-free unknown interpreter extraction" \
+            "entries=$entry_count meta=$meta_off flags=$interp_flags exit=$rc output=$actual"
+    fi
+
+    if ! cp -p "$interp" "$interp.saved" ||
+       ! printf '\0' >> "$interp"; then
+        fail "unknown interpreter byte-identity refusal" \
+            "could not replace the original interpreter revision"
+        rm -f "$interp"
+        mv "$interp.saved" "$interp" 2>/dev/null || true
+    else
+        actual=""; rc=0
+        capture_output actual env -i LD_LIBRARY_PATH=caller-value \
+            "$out" || rc=$?
+        rm -f "$interp"
+        mv "$interp.saved" "$interp"
+        if [ "$rc" -eq 127 ] &&
+           [[ "$actual" == *"bundled launcher ABI is unknown"* ]] &&
+           [[ "$actual" != *"launcher:"* ]]; then
+            pass "unknown interpreter byte-identity refusal"
+        else
+            fail "unknown interpreter byte-identity refusal" \
+                "exit=$rc output=$actual"
+        fi
+    fi
+
+    # Once the literal PT_INTERP pathname is gone, the embedded copy must not
+    # be treated as a command-line launcher.  The fixture deliberately emits
+    # a distinct marker when entered through that non-standard convention.
+    if ! mv "$interp" "$interp.saved"; then
+        fail "unknown interpreter bundled-launcher refusal" \
+            "could not hide the original interpreter"
+    else
+        actual=""; rc=0
+        capture_output actual env -i LD_LIBRARY_PATH=caller-value \
+            "$out" || rc=$?
+        mv "$interp.saved" "$interp"
+        if [ "$rc" -eq 127 ] &&
+           [[ "$actual" == *"bundled launcher ABI is unknown"* ]] &&
+           [[ "$actual" != *"launcher:"* ]]; then
+            pass "unknown interpreter bundled-launcher refusal"
+        else
+            fail "unknown interpreter bundled-launcher refusal" \
+                "exit=$rc output=$actual"
+        fi
+    fi
+
+    # Either side of the startup contract having a DT_NEEDED edge would
+    # require the unknown interpreter's search policy, so both cases remain
+    # fatal before an artifact is published.
+    if ! gcc -nostdlib -shared -Wl,-soname,libunknown-needed.so \
+            -o "$dependency" "$dependency_src" ||
+       ! gcc -nostdlib -pie -Wl,-e,_start \
+            -Wl,--dynamic-linker="$interp" -Wl,--no-as-needed \
+            -o "$main_needed" "$main_src" "$dependency"; then
+        fail "unknown interpreter dependency refusal" \
+            "could not construct main dependency fixture"
+    elif run_freeze "$DLFREEZE" -x -o "$needed_out" -- "$main_needed" \
+            >"$needed_log" 2>&1; then
+        fail "unknown interpreter main dependency refusal" \
+            "dlfreeze accepted an unknown search ABI"
+    elif [ -e "$needed_out" ] ||
+         ! grep -Fq 'unsupported target dynamic-linker search ABI' \
+             "$needed_log"; then
+        fail "unknown interpreter main dependency refusal" \
+            "input failed for an unrelated reason"
+    else
+        pass "unknown interpreter main dependency refusal"
+    fi
+
+    if ! gcc -nostdlib -shared -Wl,-e,_start \
+            -Wl,-soname,custom-interp-needed.so -Wl,--no-as-needed \
+            -o "$interp_needed" "$interp_src" "$dependency" ||
+       ! gcc -nostdlib -pie -Wl,-e,_start \
+            -Wl,--dynamic-linker="$interp_needed" \
+            -o "$interp_needed_main" "$main_src"; then
+        fail "unknown interpreter dependency refusal" \
+            "could not construct interpreter dependency fixture"
+    elif run_freeze "$DLFREEZE" -x -o "$interp_needed_out" -- \
+            "$interp_needed_main" >"$interp_needed_log" 2>&1; then
+        fail "unknown interpreter self-dependency refusal" \
+            "dlfreeze omitted the interpreter dependency"
+    elif [ -e "$interp_needed_out" ] ||
+         ! grep -Fq 'unsupported target dynamic-linker search ABI' \
+             "$interp_needed_log"; then
+        fail "unknown interpreter self-dependency refusal" \
+            "input failed for an unrelated reason"
+    else
+        pass "unknown interpreter self-dependency refusal"
+    fi
+
+    rm -rf "$root"
+}
+
+# A fallback-capable artifact may explicitly treat a supervised direct attempt
+# as an optimization.  Denying the handoff-only pipe must then select the same
+# extraction path which an explicit -x artifact can still execute under the
+# identical syscall filter.
+test_default_direct_pipe2_seccomp_fallback() {
+    echo "--- optional direct supervisor seccomp fallback ---"
+    local root="$BUILD/default_direct_pipe2_fallback"
+    local target_src="$root/target.c" launcher_src="$root/launcher.c"
+    local target="$root/target" launcher="$root/launcher"
+    local direct_out="$root/default.frozen" direct_log="$root/default.log"
+    local extract_out="$root/extract.frozen" extract_log="$root/extract.log"
+    local actual="" rc=0 freeze_rc=0
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    cat > "$target_src" <<'C'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main(void)
+{
+    const char *library_path = getenv("LD_LIBRARY_PATH");
+
+    if (!library_path || !strstr(library_path, "/dlfreeze."))
+        return 91;
+    puts("supervisor-extraction-fallback-ok");
+    return 0;
+}
+C
+    cat > "$launcher_src" <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <stddef.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+int main(int argc, char **argv)
+{
+#if defined(__NR_pipe2)
+    struct sock_filter filter[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K,
+                 SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_fprog program = {
+        .len = (unsigned short)(sizeof(filter) / sizeof(filter[0])),
+        .filter = filter,
+    };
+    int descriptors[2];
+    char *child_argv[2];
+    if (argc != 2)
+        return 76;
+    filter[1].k = __NR_pipe2;
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 ||
+        prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program) < 0)
+        return 77;
+    errno = 0;
+    if (syscall(__NR_pipe2, descriptors, O_CLOEXEC) != -1 ||
+        errno != EPERM) {
+        if (errno == 0) {
+            close(descriptors[0]);
+            close(descriptors[1]);
+        }
+        return 78;
+    }
+    child_argv[0] = argv[1];
+    child_argv[1] = NULL;
+    execv(argv[1], child_argv);
+    return 79;
+#else
+    (void)argc;
+    (void)argv;
+    return 77;
+#endif
+}
+C
+
+    if ! gcc -Wall -Wextra -Werror -o "$target" "$target_src" ||
+       ! gcc -Wall -Wextra -Werror -o "$launcher" "$launcher_src"; then
+        fail "optional direct handoff pipe fallback" "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+
+    freeze_require_default_direct "optional direct handoff pipe fallback" \
+        "$direct_log" "$direct_out" -- "$target" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "optional direct handoff pipe fallback" "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+    if ! run_freeze "$DLFREEZE" -x -o "$extract_out" -- "$target" \
+            >"$extract_log" 2>&1; then
+        fail "denied pipe2 extraction control" "forced extraction pack failed"
+        rm -rf "$root"
+        return
+    fi
+
+    capture_output actual env -u DLFREEZE_NO_FORK -u LD_LIBRARY_PATH \
+        "$launcher" "$extract_out" || rc=$?
+    if [ "$rc" -eq 77 ]; then
+        skip "optional direct handoff pipe fallback" \
+            "seccomp filter installation is unavailable"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$rc" -eq 0 ] &&
+       [ "$actual" = "supervisor-extraction-fallback-ok" ]; then
+        pass "forced extraction survives denied pipe2"
+    else
+        fail "denied pipe2 extraction control" \
+            "exit=$rc output=$actual"
+        rm -rf "$root"
+        return
+    fi
+
+    actual=""
+    rc=0
+    capture_output actual env -u DLFREEZE_NO_FORK -u LD_LIBRARY_PATH \
+        DLFREEZE_SUPERVISED_FALLBACK=1 \
+        "$launcher" "$direct_out" || rc=$?
+    if [ "$rc" -eq 0 ] &&
+       [ "$actual" = "supervisor-extraction-fallback-ok" ]; then
+        pass "optional direct pipe2 failure uses extraction"
+    else
+        fail "optional direct pipe2 fallback" \
+            "exit=$rc output=$actual"
+    fi
+    rm -rf "$root"
+}
+
+# A supervisor child must restore the caller's signal mask before either
+# direct handoff or extraction exec.  A syscall policy can distinguish the
+# initial SIG_BLOCK from that SIG_SETMASK operation; never start the target
+# with the entire forwarding set accidentally left blocked.
+test_supervisor_child_mask_restore_failure() {
+    echo "--- supervisor child signal-mask restore failure ---"
+    local root="$BUILD/supervisor_mask_restore"
+    local target_src="$root/target.c" launcher_src="$root/launcher.c"
+    local target="$root/target" launcher="$root/launcher"
+    local direct_out="$root/default.frozen" direct_log="$root/default.log"
+    local extract_out="$root/extract.frozen" extract_log="$root/extract.log"
+    local artifact label actual rc freeze_rc=0
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    cat > "$target_src" <<'C'
+#include <stdio.h>
+
+int main(void)
+{
+    puts("mask-restore-target-ran");
+    return 0;
+}
+C
+    cat > "$launcher_src" <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <signal.h>
+#include <stddef.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+int main(int argc, char **argv)
+{
+#if defined(__NR_rt_sigprocmask)
+    struct sock_filter filter[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                 __NR_rt_sigprocmask, 0, 3),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, args[0])),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SIG_SETMASK, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K,
+                 SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_fprog program = {
+        .len = (unsigned short)(sizeof(filter) / sizeof(filter[0])),
+        .filter = filter,
+    };
+    char *child_argv[2];
+
+    if (argc != 2)
+        return 76;
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 ||
+        prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program) < 0)
+        return 77;
+    child_argv[0] = argv[1];
+    child_argv[1] = NULL;
+    execv(argv[1], child_argv);
+    return 79;
+#else
+    (void)argc;
+    (void)argv;
+    return 77;
+#endif
+}
+C
+
+    if ! gcc -Wall -Wextra -Werror -o "$target" "$target_src" ||
+       ! gcc -Wall -Wextra -Werror -o "$launcher" "$launcher_src"; then
+        fail "supervisor child signal-mask restore" "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+    freeze_require_default_direct "supervisor child signal-mask restore" \
+        "$direct_log" "$direct_out" -- "$target" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "supervisor child signal-mask restore" "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+    if ! run_freeze "$DLFREEZE" -x -o "$extract_out" -- "$target" \
+            >"$extract_log" 2>&1; then
+        fail "supervisor child signal-mask restore" \
+            "forced extraction pack failed"
+        rm -rf "$root"
+        return
+    fi
+
+    for artifact in "$extract_out" "$direct_out"; do
+        if [ "$artifact" = "$extract_out" ]; then
+            label="extraction"
+        else
+            label="supervised direct"
+        fi
+        actual=""
+        rc=0
+        capture_output actual env -u DLFREEZE_NO_FORK \
+            DLFREEZE_SUPERVISED_FALLBACK=1 \
+            "$launcher" "$artifact" || rc=$?
+        if [ "$rc" -eq 77 ]; then
+            skip "supervisor child signal-mask restore" \
+                "seccomp filter installation is unavailable"
+            rm -rf "$root"
+            return
+        fi
+        if [ "$rc" -eq 127 ] &&
+           [[ "$actual" != *"mask-restore-target-ran"* ]]; then
+            pass "$label rejects failed child signal-mask restore"
+        else
+            fail "$label child signal-mask restore" \
+                "exit=$rc output=$actual"
+        fi
+    done
+    rm -rf "$root"
 }
 
 # Repeatable options are limited by argv/resources, not an unrelated parser
@@ -959,6 +2042,7 @@ test_glibc_tunable_defaults_direct() {
     cat > "$src" <<'C'
 #include <errno.h>
 #include <stdint.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -1744,6 +2828,199 @@ test_musl_target_contract_direct() {
     rm -f "$bin" "$out" "$log"
 }
 
+# musl raises its process-wide default pthread stack from the largest
+# PT_GNU_STACK p_memsz in the initial object graph.  The GNU property is only
+# a link-time correlation witness, and objects first loaded by dlopen do not
+# participate in this startup maximum.
+test_musl_default_stack_direct() {
+    echo "--- musl startup PT_GNU_STACK replay ---"
+    local root="$BUILD/musl_default_stack"
+    local main_src=tests/musl_default_stack.c
+    local mutator="$root/elf_property_to_note"
+    local base="$root/base" base_out="$root/base.frozen"
+    local needed="$root/libdlfreeze_stack_needed.so"
+    local needed_main="$root/needed-main"
+    local needed_out="$root/needed-main.frozen"
+    local capped="$root/capped" capped_out="$root/capped.frozen"
+    local mutant="$root/property-note-main"
+    local mutant_out="$root/property-note-main.frozen"
+    local late="$root/libdlfreeze_stack_late.so"
+    local late_out="$root/late-main.frozen"
+    local interposer="$root/libdlfreeze_stack_interposer.so"
+    local interposed_main="$root/interposed-main"
+    local interposed_out="$root/interposed-main.frozen"
+    local dynamic
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    if ! command -v musl-gcc >/dev/null 2>&1; then
+        skip "musl startup PT_GNU_STACK replay" "musl-gcc not installed"
+        rm -rf "$root"
+        return
+    fi
+    if ! command -v readelf >/dev/null 2>&1; then
+        skip "musl startup PT_GNU_STACK replay" "readelf not installed"
+        rm -rf "$root"
+        return
+    fi
+    if ! "$TEST_REAL_GCC" -std=c11 -O2 -Wall -Wextra -Werror \
+            -o "$mutator" tests/elf_property_to_note.c; then
+        fail "musl startup PT_GNU_STACK replay" \
+            "ELF property mutator compile failed"
+        rm -rf "$root"
+        return
+    fi
+
+    cat > "$root/stack-provider.c" <<'C'
+int dlfreeze_stack_startup_dependency(void) { return 73; }
+int dlfreeze_stack_touch(void) { return 73; }
+C
+    cat > "$root/stack-interposer.c" <<'C'
+#define _GNU_SOURCE 1
+#include <errno.h>
+#include <pthread.h>
+#include <stddef.h>
+int dlfreeze_stack_startup_dependency(void) { return 73; }
+int pthread_attr_setstacksize(pthread_attr_t *attr, size_t size) {
+    (void)attr;
+    (void)size;
+    return EINVAL;
+}
+int pthread_setattr_default_np(const pthread_attr_t *attr) {
+    (void)attr;
+    return EINVAL;
+}
+C
+
+    if ! musl-gcc -std=c11 -O2 -Wall -Wextra -Werror -pthread \
+            -Wl,-z,stack-size=2097152 -o "$base" "$main_src" -ldl ||
+       ! musl-gcc -std=c11 -O2 -Wall -Wextra -Werror -shared -fPIC \
+            -Wl,-soname,libdlfreeze_stack_needed.so \
+            -Wl,-z,stack-size=4194304 -o "$needed" \
+            "$root/stack-provider.c" ||
+       ! musl-gcc -std=c11 -O2 -Wall -Wextra -Werror -pthread \
+            -DDLFREEZE_STACK_STARTUP_DEP \
+            -Wl,-z,stack-size=2097152 -Wl,-rpath,'$ORIGIN' \
+            -L"$root" -o "$needed_main" "$main_src" \
+            -ldlfreeze_stack_needed -ldl ||
+       ! musl-gcc -std=c11 -O2 -Wall -Wextra -Werror -pthread \
+            -Wl,-z,stack-size=67108864 -o "$capped" "$main_src" -ldl ||
+       ! musl-gcc -std=c11 -O2 -Wall -Wextra -Werror -shared -fPIC \
+            -Wl,-soname,libdlfreeze_stack_late.so \
+            -Wl,-z,stack-size=4194304 -o "$late" \
+            "$root/stack-provider.c" ||
+       ! musl-gcc -std=c11 -O2 -Wall -Wextra -Werror -shared -fPIC \
+            -Wl,-soname,libdlfreeze_stack_interposer.so \
+            -o "$interposer" "$root/stack-interposer.c" ||
+       ! musl-gcc -std=c11 -O2 -Wall -Wextra -Werror -pthread \
+            -DDLFREEZE_STACK_STARTUP_DEP \
+            -Wl,-z,stack-size=2097152 -Wl,-rpath,'$ORIGIN' \
+            -L"$root" -o "$interposed_main" "$main_src" \
+            -ldlfreeze_stack_interposer -ldl; then
+        fail "musl startup PT_GNU_STACK replay" "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+    if ! file "$base" | grep 'interpreter .*ld-musl' >/dev/null; then
+        skip "musl startup PT_GNU_STACK replay" \
+            "musl-gcc did not produce a dynamic musl executable"
+        rm -rf "$root"
+        return
+    fi
+    dynamic=$(LC_ALL=C readelf -lW "$base" 2>/dev/null || true)
+    if ! grep -E 'GNU_STACK.*0x200000[[:space:]]+RW' \
+            <<<"$dynamic" >/dev/null; then
+        skip "musl startup PT_GNU_STACK replay" \
+            "linker did not preserve a 2 MiB non-executable PT_GNU_STACK"
+        rm -rf "$root"
+        return
+    fi
+
+    _musl_stack_compare_case() {
+        local label="$1" bin="$2" out="$3" mode="$4"
+        local expected_default="$5"
+        local log="$out.log" expect="" actual=""
+        local native_rc=0 direct_rc=0 freeze_rc=0
+        shift 5
+
+        capture_output expect env -u LD_LIBRARY_PATH "$bin" "$@" ||
+            native_rc=$?
+        if [ "$native_rc" -ne 0 ]; then
+            fail "$label native control" "exit=$native_rc output=$expect"
+            return 1
+        fi
+        if { [ "$mode" = trace ] &&
+             [[ "$expect" != "before=$expected_default/"* ]]; } ||
+           { [ "$mode" != trace ] &&
+             [[ "$expect" != "default=$expected_default worker="* ]]; }; then
+            fail "$label native control" \
+                "startup default was not $expected_default: $expect"
+            return 1
+        fi
+        if [ "$mode" = trace ]; then
+            freeze_require_direct "$label" "$log" "$out" \
+                -t -- "$bin" "$@" || freeze_rc=$?
+        else
+            freeze_require_direct "$label" "$log" "$out" \
+                -- "$bin" "$@" || freeze_rc=$?
+        fi
+        if [ "$freeze_rc" -eq 77 ]; then
+            skip "$label" "$DIRECT_FREEZE_REASON"
+            return 77
+        fi
+        if [ "$freeze_rc" -ne 0 ]; then
+            return 1
+        fi
+        capture_output actual env -u LD_LIBRARY_PATH \
+            DLFREEZE_NO_FORK=1 "$out" "$@" || direct_rc=$?
+        actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+        if [ "$direct_rc" -eq "$native_rc" ] &&
+           [ "$actual" = "$expect" ]; then
+            pass "$label"
+            return 0
+        fi
+        fail "$label" \
+            "native=$native_rc/$expect strict-direct=$direct_rc/$actual"
+        return 1
+    }
+
+    _musl_stack_compare_case \
+        "musl 2 MiB startup default and worker stack" \
+        "$base" "$base_out" plain 2097152 || true
+    _musl_stack_compare_case \
+        "musl larger startup dependency stack wins" \
+        "$needed_main" "$needed_out" plain 4194304 || true
+    _musl_stack_compare_case \
+        "musl startup stack request respects native cap" \
+        "$capped" "$capped_out" plain 8388608 || true
+
+    if cp "$base" "$mutant" &&
+       LC_ALL=C readelf -nW "$mutant" 2>/dev/null |
+           grep -E 'stack size:[[:space:]]*0x200000' >/dev/null &&
+       "$mutator" "$mutant" &&
+       ! LC_ALL=C readelf -lW "$mutant" 2>/dev/null |
+           grep -q GNU_PROPERTY &&
+       LC_ALL=C readelf -lW "$mutant" 2>/dev/null |
+           grep -E 'GNU_STACK.*0x200000[[:space:]]+RW' >/dev/null; then
+        _musl_stack_compare_case \
+            "musl PT_GNU_STACK is independent of GNU property" \
+            "$mutant" "$mutant_out" plain 2097152 || true
+    else
+        skip "musl PT_GNU_STACK is independent of GNU property" \
+            "linker did not emit one mutable GNU property segment"
+    fi
+
+    _musl_stack_compare_case \
+        "musl late dlopen stack does not change startup default" \
+        "$base" "$late_out" trace 2097152 "$late" || true
+    _musl_stack_compare_case \
+        "musl default-stack replay binds the exact libc provider" \
+        "$interposed_main" "$interposed_out" plain 2097152 || true
+
+    unset -f _musl_stack_compare_case
+    rm -rf "$root"
+}
+
 # ===================================================================
 # Runtime-family classification follows validated interpreter contents, not
 # the installed PT_INTERP basename.  The layout-gate tests below separately
@@ -2257,7 +3534,10 @@ test_failed_loader_trace_records() {
 # ===================================================================
 # The direct loader must not import bootstrap memory/string/syscall helpers.
 # This object-level gate catches both explicit calls and calls synthesized by
-# compiler lowering (for example, a struct copy becoming memcpy at -O2).
+# compiler lowering (for example, a struct copy becoming memcpy at -O3).  It
+# also keeps strict aliasing enabled at the optimized loader boundary: typed
+# mapped pointers must not be populated through incompatible pointer-to-pointer
+# casts.
 # ===================================================================
 test_loader_post_tls_import_gate() {
     echo "--- direct loader post-TLS import gate ---"
@@ -2269,15 +3549,20 @@ test_loader_post_tls_import_gate() {
        [ "$(command -v musl-gcc)" != "$(command -v "$TEST_REAL_GCC")" ]; then
         compilers+=(musl-gcc)
     fi
+    if command -v clang >/dev/null 2>&1 &&
+       [ "$(command -v clang)" != "$(command -v "$TEST_REAL_GCC")" ]; then
+        compilers+=(clang)
+    fi
     if ! command -v nm >/dev/null 2>&1; then
         skip "direct loader bootstrap-neutral imports" "nm not installed"
         return
     fi
 
     for cc in "${compilers[@]}"; do
-        label="direct loader bootstrap-neutral imports ($cc)"
+        label="direct loader bootstrap-neutral strict-alias compile ($cc)"
         object="$BUILD/loader-post-tls-$(basename "$cc").o"
-        if ! "$cc" -Wall -Wextra -Werror -O2 -D_GNU_SOURCE -Iinclude \
+        if ! "$cc" -Wall -Wextra -Werror -Wstrict-aliasing=2 \
+                -O3 -fstrict-aliasing -D_GNU_SOURCE -Iinclude \
                 -fno-stack-protector -ffunction-sections -fdata-sections \
                 -c src/loader.c -o "$object"; then
             fail "$label" "loader object compile failed"
@@ -2293,6 +3578,490 @@ test_loader_post_tls_import_gate() {
         fi
         rm -f "$object"
     done
+}
+
+# The packer parses file-backed ELF records through generic allocation and
+# mapping helpers.  Keep optimized strict aliasing enabled so typed views are
+# never populated by writing through an incompatible pointer-to-pointer type.
+test_packer_strict_alias_gate() {
+    echo "--- packer strict-alias compile gate ---"
+
+    local -a compilers=("$TEST_REAL_GCC")
+    local cc object label strict_warning version
+
+    if command -v musl-gcc >/dev/null 2>&1 &&
+       [ "$(command -v musl-gcc)" != "$(command -v "$TEST_REAL_GCC")" ]; then
+        compilers+=(musl-gcc)
+    fi
+    if command -v clang >/dev/null 2>&1 &&
+       [ "$(command -v clang)" != "$(command -v "$TEST_REAL_GCC")" ]; then
+        compilers+=(clang)
+    fi
+
+    for cc in "${compilers[@]}"; do
+        label="packer strict-alias compile ($cc)"
+        object="$BUILD/packer-strict-alias-$(basename "$cc").o"
+        strict_warning=-Wstrict-aliasing=2
+        version=$("$cc" --version 2>/dev/null || true)
+        if grep -qi clang <<<"$version"; then
+            strict_warning=-Wstrict-aliasing
+        fi
+        if "$cc" -std=c11 -Wall -Wextra -Werror "$strict_warning" \
+                -O3 -fstrict-aliasing -D_GNU_SOURCE -Iinclude \
+                -c src/packer.c -o "$object"; then
+            pass "$label"
+        else
+            fail "$label" "packer object compile failed"
+        fi
+        rm -f "$object"
+    done
+}
+
+# ===================================================================
+# Bootstrap startup must not inherit an x86 shadow-stack requirement from a
+# hardening compiler wrapper.  Prefix injection proves the Makefile's explicit
+# opt-out wins; suffix injection proves the final-ELF property gate catches a
+# wrapper which deliberately overrides that opt-out.
+# ===================================================================
+test_bootstrap_cet_isolation() {
+    echo "--- bootstrap CET isolation ---"
+
+    local suppress_label="bootstrap compiler CET suppression"
+    local reject_label="bootstrap post-link SHSTK rejection"
+    local root="$BUILD/bootstrap_cet_isolation"
+    local probe_src="$root/probe.c" probe="$root/probe"
+    local wrapper="$root/static-cc"
+    local safe_build="$root/suppressed" safe_log="$root/suppressed.log"
+    local reject_build="$root/rejected" reject_log="$root/rejected.log"
+    local target notes reject_rc=0
+
+    if [ -z "$TEST_REAL_GCC" ] || ! command -v make >/dev/null 2>&1 ||
+       ! command -v readelf >/dev/null 2>&1; then
+        skip "$suppress_label" "gcc, make, or readelf is unavailable"
+        skip "$reject_label" "gcc, make, or readelf is unavailable"
+        return
+    fi
+    target=$("$TEST_REAL_GCC" -dumpmachine 2>/dev/null || true)
+    case "${target%%-*}" in
+        x86_64|amd64) ;;
+        *)
+            skip "$suppress_label" "compiler target is not x86-64"
+            skip "$reject_label" "compiler target is not x86-64"
+            return
+            ;;
+    esac
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    cat > "$probe_src" <<'C'
+int main(void) { return 0; }
+C
+    if ! "$TEST_REAL_GCC" -static -fcf-protection=full \
+            -o "$probe" "$probe_src" >/dev/null 2>&1; then
+        skip "$suppress_label" "static CET probe cannot be linked"
+        skip "$reject_label" "static CET probe cannot be linked"
+        rm -rf "$root"
+        return
+    fi
+    if ! notes=$(LC_ALL=C readelf -nW "$probe" 2>&1); then
+        skip "$suppress_label" "static CET probe cannot be inspected"
+        skip "$reject_label" "static CET probe cannot be inspected"
+        rm -rf "$root"
+        return
+    fi
+    if ! grep -Eq 'x86 feature:.*SHSTK' <<<"$notes"; then
+        skip "$suppress_label" \
+            "static toolchain does not propagate -fcf-protection=full to SHSTK"
+        skip "$reject_label" \
+            "static toolchain does not propagate -fcf-protection=full to SHSTK"
+        rm -rf "$root"
+        return
+    fi
+
+    cat > "$wrapper" <<'SH'
+#!/bin/sh
+: "${DLFREEZE_CET_REAL_CC:?}"
+# This property-only regression need not repeat the primary build's expensive
+# loader optimization; the trailing -O0 keeps its two isolated links focused.
+if [ "${DLFREEZE_CET_INJECT_AFTER:-0}" = 1 ]; then
+    exec "$DLFREEZE_CET_REAL_CC" "$@" -O0 -fcf-protection=full
+fi
+exec "$DLFREEZE_CET_REAL_CC" -fcf-protection=full "$@" -O0
+SH
+    chmod +x "$wrapper"
+
+    if ! env DLFREEZE_CET_REAL_CC="$TEST_REAL_GCC" \
+            make --no-print-directory -f Makefile \
+                BUILD="$safe_build" CC="$TEST_REAL_GCC" \
+                STATIC_CC="$wrapper" \
+                "$safe_build/dlfreeze-bootstrap" >"$safe_log" 2>&1; then
+        fail "$suppress_label" "isolated bootstrap build failed"
+        tail -n 40 "$safe_log" || true
+    elif ! grep -Fq -- '-fcf-protection=none' "$safe_log"; then
+        fail "$suppress_label" "bootstrap compile omitted the CET opt-out"
+    elif ! notes=$(LC_ALL=C readelf -nW \
+            "$safe_build/dlfreeze-bootstrap" 2>&1); then
+        fail "$suppress_label" "cannot inspect isolated bootstrap"
+    elif grep -Eq 'x86 feature:.*SHSTK' <<<"$notes"; then
+        fail "$suppress_label" "isolated bootstrap still advertises SHSTK"
+    else
+        pass "$suppress_label"
+    fi
+
+    env DLFREEZE_CET_REAL_CC="$TEST_REAL_GCC" \
+        DLFREEZE_CET_INJECT_AFTER=1 \
+        make --no-print-directory -f Makefile \
+            BUILD="$reject_build" CC="$TEST_REAL_GCC" \
+            STATIC_CC="$wrapper" \
+            "$reject_build/dlfreeze-bootstrap" >"$reject_log" 2>&1 ||
+        reject_rc=$?
+    if [ "$reject_rc" -eq 0 ]; then
+        fail "$reject_label" "SHSTK-bearing bootstrap was accepted"
+    elif [ -e "$reject_build/dlfreeze-bootstrap" ]; then
+        fail "$reject_label" "rejected bootstrap was not removed"
+    elif ! grep -Fq \
+            'final ELF must not advertise GNU_PROPERTY_X86_FEATURE_1_SHSTK' \
+            "$reject_log"; then
+        fail "$reject_label" "build failed before the GNU-property gate"
+        tail -n 40 "$reject_log" || true
+    else
+        pass "$reject_label"
+    fi
+
+    rm -rf "$root"
+}
+
+# ===================================================================
+# Keep the temporary x86 bootstrap runnable on the architectural baseline.
+# A prefixing wrapper models a distro compiler default and proves that the
+# Makefile's explicit -march follows it.  A synthetic ISA_1_NEEDED note then
+# proves the final-ELF gate rejects requirements from startup objects or a
+# suffixing compiler wrapper.  ISA_1_USED is deliberately not rejected: the
+# loader contains CPUID-gated XSAVE instructions whose truthful USED note is
+# not an execution requirement.
+# ===================================================================
+test_bootstrap_x86_isa_isolation() {
+    echo "--- bootstrap x86 ISA isolation ---"
+
+    local baseline_label="bootstrap compiler x86-64 baseline"
+    local reject_label="bootstrap post-link x86 ISA requirement rejection"
+    local root="$BUILD/bootstrap_x86_isa_isolation"
+    local mini_src="$root/src" bootstrap_cc wrapper note_src note_obj
+    local safe_build="$root/baseline" safe_log="$root/baseline.log"
+    local reject_build="$root/rejected" reject_log="$root/rejected.log"
+    local target notes reject_rc=0
+
+    if ! command -v make >/dev/null 2>&1 ||
+       ! command -v readelf >/dev/null 2>&1; then
+        skip "$baseline_label" "make or readelf is unavailable"
+        skip "$reject_label" "make or readelf is unavailable"
+        return
+    fi
+    bootstrap_cc=$(command -v musl-gcc || true)
+    if [ -z "$bootstrap_cc" ]; then
+        bootstrap_cc="$TEST_REAL_GCC"
+    fi
+    if [ -z "$bootstrap_cc" ]; then
+        skip "$baseline_label" "no static-capable C compiler is available"
+        skip "$reject_label" "no static-capable C compiler is available"
+        return
+    fi
+    target=$("$bootstrap_cc" -dumpmachine 2>/dev/null || true)
+    case "${target%%-*}" in
+        x86_64|amd64) ;;
+        *)
+            skip "$baseline_label" "static compiler target is not x86-64"
+            skip "$reject_label" "static compiler target is not x86-64"
+            return
+            ;;
+    esac
+
+    rm -rf "$root"
+    mkdir -p "$mini_src"
+    cat > "$mini_src/bootstrap.c" <<'C'
+int main(void) { return 0; }
+C
+    cat > "$mini_src/loader.c" <<'C'
+/* The property gate does not require the production loader body. */
+C
+    note_src="$root/isa-needed.S"
+    note_obj="$root/isa-needed.o"
+    cat > "$note_src" <<'ASM'
+.section .note.gnu.property,"a",@note
+.p2align 3
+.long 4
+.long 16
+.long 5
+.asciz "GNU"
+.p2align 3
+.long 0xc0008002
+.long 4
+.long 4
+.long 0
+.section .note.GNU-stack,"",@progbits
+ASM
+    if ! "$bootstrap_cc" -c -x assembler-with-cpp \
+            "$note_src" -o "$note_obj" >/dev/null 2>&1 ||
+       ! notes=$(LC_ALL=C readelf -nW "$note_obj" 2>&1) ||
+       ! grep -Eqi 'x86 ISA needed:.*x86-64-v3' <<<"$notes"; then
+        fail "$reject_label" "cannot synthesize the ISA_1_NEEDED fixture"
+        rm -rf "$root"
+        return
+    fi
+
+    wrapper="$root/static-cc"
+    cat > "$wrapper" <<'SH'
+#!/bin/sh
+: "${DLFREEZE_ISA_REAL_CC:?}"
+for argument do
+    case "$argument" in
+        -c|-E|-S|-dumpmachine|--version)
+            exec "$DLFREEZE_ISA_REAL_CC" "$@"
+            ;;
+    esac
+done
+if [ "${DLFREEZE_ISA_INJECT_AFTER:-0}" = 1 ]; then
+    : "${DLFREEZE_ISA_NOTE:?}"
+    exec "$DLFREEZE_ISA_REAL_CC" "$@" "$DLFREEZE_ISA_NOTE"
+fi
+# The Makefile's later -march=x86-64 must override this distro-style prefix.
+exec "$DLFREEZE_ISA_REAL_CC" -march=x86-64-v3 "$@"
+SH
+    chmod +x "$wrapper"
+
+    if ! env DLFREEZE_ISA_REAL_CC="$bootstrap_cc" \
+            make --no-print-directory -f Makefile \
+                BUILD="$safe_build" SRC="$mini_src" \
+                CC="$bootstrap_cc" STATIC_CC="$wrapper" \
+                "$safe_build/dlfreeze-bootstrap" >"$safe_log" 2>&1; then
+        fail "$baseline_label" "isolated baseline build failed"
+        tail -n 40 "$safe_log" || true
+    elif ! grep -Fq -- '-march=x86-64' "$safe_log"; then
+        fail "$baseline_label" "bootstrap compile omitted the ISA baseline"
+    else
+        pass "$baseline_label"
+    fi
+
+    env DLFREEZE_ISA_REAL_CC="$bootstrap_cc" \
+        DLFREEZE_ISA_INJECT_AFTER=1 DLFREEZE_ISA_NOTE="$note_obj" \
+        make --no-print-directory -f Makefile \
+            BUILD="$reject_build" SRC="$mini_src" \
+            CC="$bootstrap_cc" STATIC_CC="$wrapper" \
+            "$reject_build/dlfreeze-bootstrap" >"$reject_log" 2>&1 ||
+        reject_rc=$?
+    if [ "$reject_rc" -eq 0 ]; then
+        fail "$reject_label" "ISA-requiring bootstrap was accepted"
+    elif [ -e "$reject_build/dlfreeze-bootstrap" ]; then
+        fail "$reject_label" "rejected bootstrap was not removed"
+    elif ! grep -Fq \
+            'final ELF must not require an x86-64 ISA level above baseline' \
+            "$reject_log"; then
+        fail "$reject_label" "build failed before the GNU-property gate"
+        tail -n 40 "$reject_log" || true
+    else
+        pass "$reject_label"
+    fi
+
+    rm -rf "$root"
+}
+
+# ===================================================================
+# Keep AArch64 BTI/GCS policy out of the temporary bootstrap.  As above, a
+# prefixing wrapper proves the explicit compiler opt-out wins, while forced
+# final properties prove the post-link check fails closed.  TLSDESC resolvers
+# are indirect-call targets, so inspect their first instruction independently
+# of the bootstrap-wide property suppression.
+# ===================================================================
+test_bootstrap_aarch64_branch_isolation() {
+    echo "--- bootstrap AArch64 branch isolation ---"
+
+    local suppress_label="bootstrap compiler AArch64 branch suppression"
+    local bti_reject_label="bootstrap post-link AArch64 BTI rejection"
+    local gcs_reject_label="bootstrap post-link AArch64 GCS rejection"
+    local pads_label="AArch64 TLSDESC BTI landing pads"
+    local root="$BUILD/bootstrap_aarch64_branch_isolation"
+    local probe_src="$root/probe.c" probe_obj="$root/probe.o"
+    local bti_probe="$root/bti-probe" gcs_probe="$root/gcs-probe"
+    local wrapper="$root/static-cc"
+    local safe_build="$root/suppressed" safe_log="$root/suppressed.log"
+    local reject_build reject_log property reject_label reject_rc
+    local pad_obj="$root/loader.o" objdump_tool symbol first bad_pad=""
+    local target notes standard_supported=0 force_bti=0 force_gcs=0
+    local -a pad_branch_flags=()
+
+    if [ -z "$TEST_REAL_GCC" ] || ! command -v make >/dev/null 2>&1 ||
+       ! command -v readelf >/dev/null 2>&1; then
+        skip "$suppress_label" "gcc, make, or readelf is unavailable"
+        skip "$bti_reject_label" "gcc, make, or readelf is unavailable"
+        skip "$gcs_reject_label" "gcc, make, or readelf is unavailable"
+        skip "$pads_label" "gcc, make, or readelf is unavailable"
+        return
+    fi
+    target=$("$TEST_REAL_GCC" -dumpmachine 2>/dev/null || true)
+    case "${target%%-*}" in
+        aarch64|arm64) ;;
+        *)
+            skip "$suppress_label" "compiler target is not AArch64"
+            skip "$bti_reject_label" "compiler target is not AArch64"
+            skip "$gcs_reject_label" "compiler target is not AArch64"
+            skip "$pads_label" "compiler target is not AArch64"
+            return
+            ;;
+    esac
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    cat > "$probe_src" <<'C'
+int main(void) { return 0; }
+C
+    if "$TEST_REAL_GCC" -Werror -mbranch-protection=standard -c \
+            -o "$probe_obj" "$probe_src" >/dev/null 2>&1; then
+        standard_supported=1
+    fi
+    if "$TEST_REAL_GCC" -Werror -mbranch-protection=none -c \
+            -o "$probe_obj" "$probe_src" >/dev/null 2>&1; then
+        # Ensure compiler-generated landing pads cannot make the hand-written
+        # TLSDESC entry-point check pass accidentally.
+        pad_branch_flags=(-mbranch-protection=none)
+    fi
+
+    objdump_tool=$("$TEST_REAL_GCC" -print-prog-name=objdump 2>/dev/null || true)
+    if [ -z "$objdump_tool" ] || ! command -v "$objdump_tool" >/dev/null 2>&1; then
+        objdump_tool="${target}-objdump"
+    fi
+    if ! command -v "$objdump_tool" >/dev/null 2>&1; then
+        objdump_tool=objdump
+    fi
+    if ! command -v "$objdump_tool" >/dev/null 2>&1; then
+        skip "$pads_label" "target objdump is unavailable"
+    elif ! "$TEST_REAL_GCC" -Wall -Wextra -Werror -O0 -D_GNU_SOURCE \
+            "${pad_branch_flags[@]}" -Iinclude -fno-stack-protector \
+            -ffunction-sections \
+            -fdata-sections -c src/loader.c -o "$pad_obj"; then
+        fail "$pads_label" "loader object compile failed"
+    else
+        for symbol in \
+            dlfreeze_aarch64_tlsdesc_static \
+            dlfreeze_aarch64_tlsdesc_undefweak \
+            dlfreeze_aarch64_tlsdesc_dynamic; do
+            first=$(LC_ALL=C "$objdump_tool" -d --disassemble="$symbol" \
+                    "$pad_obj" 2>/dev/null | awk -v symbol="$symbol" '
+                index($0, "<" symbol ">:") { found = 1; next }
+                found && !printed && /^[[:space:]]*[[:xdigit:]]+:/ {
+                    print
+                    printed = 1
+                }
+            ')
+            if ! grep -Eqi ':[[:space:]]+d503245f([[:space:]]|$)' \
+                    <<<"$first"; then
+                bad_pad="${bad_pad}${bad_pad:+, }${symbol}: ${first:-missing}"
+            fi
+        done
+        if [ -n "$bad_pad" ]; then
+            fail "$pads_label" "$bad_pad"
+        else
+            pass "$pads_label"
+        fi
+    fi
+
+    if [ "$standard_supported" -eq 0 ]; then
+        skip "$suppress_label" "compiler lacks -mbranch-protection=standard"
+        skip "$bti_reject_label" "compiler lacks -mbranch-protection=standard"
+        skip "$gcs_reject_label" "compiler lacks -mbranch-protection=standard"
+        rm -rf "$root"
+        return
+    fi
+
+    cat > "$wrapper" <<'SH'
+#!/bin/sh
+: "${DLFREEZE_AARCH64_REAL_CC:?}"
+# Property-only links do not need the primary bootstrap's optimization cost.
+if [ "${DLFREEZE_AARCH64_INJECT_AFTER:-0}" = 1 ]; then
+    set -- "$@" -O0 -mbranch-protection=standard
+    case "${DLFREEZE_AARCH64_FORCE_PROPERTY:-}" in
+        bti) set -- "$@" -Wl,-z,force-bti ;;
+        gcs) set -- "$@" -Wl,-z,gcs=always ;;
+    esac
+    exec "$DLFREEZE_AARCH64_REAL_CC" "$@"
+fi
+exec "$DLFREEZE_AARCH64_REAL_CC" -mbranch-protection=standard "$@" -O0
+SH
+    chmod +x "$wrapper"
+
+    if ! env DLFREEZE_AARCH64_REAL_CC="$TEST_REAL_GCC" \
+            make --no-print-directory -f Makefile \
+                BUILD="$safe_build" CC="$TEST_REAL_GCC" \
+                STATIC_CC="$wrapper" \
+                "$safe_build/dlfreeze-bootstrap" >"$safe_log" 2>&1; then
+        fail "$suppress_label" "isolated bootstrap build failed"
+        tail -n 40 "$safe_log" || true
+    elif ! grep -Fq -- '-mbranch-protection=none' "$safe_log"; then
+        fail "$suppress_label" "bootstrap compile omitted the branch opt-out"
+    elif ! notes=$(LC_ALL=C readelf -nW \
+            "$safe_build/dlfreeze-bootstrap" 2>&1); then
+        fail "$suppress_label" "cannot inspect isolated bootstrap"
+    elif grep -Eqi 'aarch64 feature:.*(BTI|GCS)' <<<"$notes"; then
+        fail "$suppress_label" "isolated bootstrap still advertises BTI/GCS"
+    else
+        pass "$suppress_label"
+    fi
+
+    if "$TEST_REAL_GCC" -static -mbranch-protection=standard \
+            -Wl,-z,force-bti -o "$bti_probe" "$probe_src" \
+            >/dev/null 2>&1 &&
+       notes=$(LC_ALL=C readelf -nW "$bti_probe" 2>/dev/null) &&
+       grep -Eqi 'aarch64 feature:.*BTI' <<<"$notes"; then
+        force_bti=1
+    fi
+    if "$TEST_REAL_GCC" -static -mbranch-protection=standard \
+            -Wl,-z,gcs=always -o "$gcs_probe" "$probe_src" \
+            >/dev/null 2>&1 &&
+       notes=$(LC_ALL=C readelf -nW "$gcs_probe" 2>/dev/null) &&
+       grep -Eqi 'aarch64 feature:.*GCS' <<<"$notes"; then
+        force_gcs=1
+    fi
+
+    for property in bti gcs; do
+        if [ "$property" = bti ]; then
+            reject_label="$bti_reject_label"
+            if [ "$force_bti" -eq 0 ]; then
+                skip "$reject_label" "linker cannot synthesize a readable BTI property"
+                continue
+            fi
+        else
+            reject_label="$gcs_reject_label"
+            if [ "$force_gcs" -eq 0 ]; then
+                skip "$reject_label" "linker/readelf cannot expose a GCS property"
+                continue
+            fi
+        fi
+
+        reject_build="$root/rejected-$property"
+        reject_log="$root/rejected-$property.log"
+        reject_rc=0
+        env DLFREEZE_AARCH64_REAL_CC="$TEST_REAL_GCC" \
+            DLFREEZE_AARCH64_INJECT_AFTER=1 \
+            DLFREEZE_AARCH64_FORCE_PROPERTY="$property" \
+            make --no-print-directory -f Makefile \
+                BUILD="$reject_build" CC="$TEST_REAL_GCC" \
+                STATIC_CC="$wrapper" \
+                "$reject_build/dlfreeze-bootstrap" >"$reject_log" 2>&1 ||
+            reject_rc=$?
+        if [ "$reject_rc" -eq 0 ]; then
+            fail "$reject_label" "property-bearing bootstrap was accepted"
+        elif [ -e "$reject_build/dlfreeze-bootstrap" ]; then
+            fail "$reject_label" "rejected bootstrap was not removed"
+        elif ! grep -Fq \
+                'final ELF must not advertise GNU_PROPERTY_AARCH64_FEATURE_1_BTI or GNU_PROPERTY_AARCH64_FEATURE_1_GCS' \
+                "$reject_log"; then
+            fail "$reject_label" "build failed before the GNU-property gate"
+            tail -n 40 "$reject_log" || true
+        else
+            pass "$reject_label"
+        fi
+    done
+
+    rm -rf "$root"
 }
 
 # ===================================================================
@@ -2405,12 +4174,13 @@ int main(int argc, char **argv) {
 C
     printf x > "$data"
 
-    if ! "$TEST_REAL_GCC" -Wall -Wextra -Werror -O2 -D_GNU_SOURCE \
-            -Iinclude -fno-stack-protector -ffunction-sections \
-            -fdata-sections -static -Wl,--gc-sections \
-            -Wl,-Ttext-segment=0x40000000 \
-            -o "$root/dlfreeze-bootstrap" src/bootstrap.c src/loader.c \
-            >"$bootstrap_log" 2>&1; then
+    # Exercise the production bootstrap recipe itself so this alternate-libc
+    # probe cannot drift from its architecture, placement, or unwind
+    # contract as supported compiler/linker combinations evolve.
+    if ! make --no-print-directory -f Makefile \
+            BUILD="$root" CC="$TEST_REAL_GCC" \
+            STATIC_CC="$TEST_REAL_GCC" WERROR=1 \
+            "$root/dlfreeze-bootstrap" >"$bootstrap_log" 2>&1; then
         skip "$label" "static glibc bootstrap is unavailable"
         rm -rf "$root"
         return
@@ -2565,6 +4335,87 @@ C
     fi
 
     rm -f "$src" "$bin" "$out" "$log"
+}
+
+# ===================================================================
+# Test 1g1: glibc recognizes the kernel-backed initial pthread
+# ===================================================================
+test_glibc_initial_thread_scheduler_direct() {
+    echo "--- glibc initial-thread scheduler identity ---"
+    local root="$BUILD/glibc_initial_thread_scheduler"
+    local src="$root/main.c" bin="$root/main"
+    local out="$root/main.frozen" log="$root/main.log"
+    local expect actual rc_e=0 rc=0 freeze_rc=0
+    local label="glibc initial-thread scheduler identity"
+
+    if ! compiler_targets_glibc; then
+        skip "$label" "test compiler does not target glibc"
+        return
+    fi
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    cat > "$src" <<'C'
+#define _GNU_SOURCE
+#include <pthread.h>
+#include <sched.h>
+#include <stdio.h>
+
+int main(void)
+{
+    struct sched_param parameters = {0};
+    int policy = 0;
+    int error = pthread_getschedparam(
+        pthread_self(), &policy, &parameters);
+
+    if (error != 0) {
+        fprintf(stderr, "pthread_getschedparam failed: %d\n", error);
+        return 1;
+    }
+    puts("initial-thread-scheduler-ok");
+    return 0;
+}
+C
+
+    # Keep this gate about the initial-thread ABI.  Some startup-file builds
+    # contribute an unrelated unresolved weak lazy PLT slot; eager binding
+    # gives the direct loader the same startup lookup result without testing
+    # its intentional native-lazy fallback policy here.
+    if ! gcc -std=c11 -Wall -Wextra -Werror -O2 -pthread -Wl,-z,now \
+            -o "$bin" "$src"; then
+        fail "$label" "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+    capture_output expect "$bin" || rc_e=$?
+    if [ "$rc_e" -ne 0 ] ||
+       [ "$expect" != "initial-thread-scheduler-ok" ]; then
+        fail "$label native control" "exit=$rc_e output=$expect"
+        rm -rf "$root"
+        return
+    fi
+
+    freeze_require_direct "$label" "$log" "$out" "$bin" ||
+        freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "$label" "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+
+    capture_output actual env DLFREEZE_NO_FORK=1 "$out" || rc=$?
+    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+    if [ "$rc" -eq "$rc_e" ] && [ "$actual" = "$expect" ]; then
+        pass "$label"
+    else
+        fail "$label" \
+            "native=$rc_e:$expect direct=$rc:$actual"
+    fi
+    rm -rf "$root"
 }
 
 # ===================================================================
@@ -3123,7 +4974,8 @@ test_glibc_private_exception_direct() {
     if ! gcc -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
             -fno-stack-protector \
             -ffunction-sections -fdata-sections -Wl,--gc-sections \
-            -o "$helper" tests/glibc_exception_gate.c -ldl -pthread; then
+            -o "$helper" tests/glibc_exception_gate.c \
+            src/lazy_trampoline.S -ldl -pthread; then
         fail "glibc private exception fail-closed contract" \
             "helper compile failed"
         rm -f "$helper"
@@ -3653,23 +5505,24 @@ C
     fi
     printf 'resource-ok\n' > "$resource"
 
-    if run_freeze "$DLFREEZE" -t -f "$root_abs/*" \
+    if run_freeze "$DLFREEZE" -x -t -f "$root_abs/*" \
             -o "$no_direct_out" -- "$bin" "$resource" \
             >"$no_direct_log" 2>&1; then
         fail "captured files require direct mode" \
-            "packer accepted captured DATA without -d"
+            "packer accepted captured DATA with forced extraction"
     elif [ -e "$no_direct_out" ]; then
         fail "captured files require direct mode" \
             "rejected pack left an output artifact"
-    elif grep -Fq 'captured files require direct-load mode (-d)' \
+    elif grep -Fq \
+            'captured files are incompatible with forced extraction mode (-x)' \
             "$no_direct_log"; then
-        pass "captured files require direct mode"
+        pass "captured files reject forced extraction"
     else
         fail "captured files require direct mode" \
             "packer failed for an unrelated reason"
     fi
 
-    freeze_require_direct "captured-file direct artifact" "$log" "$out" \
+    freeze_require_default_direct "captured-file direct artifact" "$log" "$out" \
         -t -f "$root_abs/*" -- "$bin" "$resource" || freeze_rc=$?
     if [ "$freeze_rc" -eq 77 ]; then
         skip "captured-file direct artifact" "$DIRECT_FREEZE_REASON"
@@ -3713,10 +5566,11 @@ C
 
     # DATA makes this artifact structurally direct-only.  With no extraction
     # fallback to preserve, direct startup must retain the PID assigned by the
-    # caller instead of inserting an otherwise observable supervisor process.
+    # caller even when the generic supervisor opt-in is present.
     pid_marker="$root/frozen.pid"
     rm -f "$pid_marker"
-    env -u DLFREEZE_NO_FORK "$out" "$resource" "$sibling" \
+    env -u DLFREEZE_NO_FORK DLFREEZE_SUPERVISED_FALLBACK=1 \
+        "$out" "$resource" "$sibling" \
         "$pid_marker" >/dev/null 2>&1 &
     frozen_pid=$!
     wait "$frozen_pid" || frozen_rc=$?
@@ -3917,8 +5771,10 @@ C
             saw_prelinked=1
         fi
         if [ "$freeze_rc" -eq 0 ] &&
-           grep -Fq 'dlfreeze: pre-linker failed' "$log" &&
-           grep -Eq 'pre-linked[[:space:]]*:[[:space:]]*no' "$log" &&
+           grep -Fq 'dlfreeze: pre-linker resource/address miss' "$log" &&
+           grep -Eq \
+               'pre-linked[[:space:]]*:[[:space:]]*no \(resource/address miss; using runtime relocation\)' \
+               "$log" &&
            grep -Eq \
                'mode[[:space:]]*:[[:space:]]*direct-load \(in-process loader\)' \
                "$log"; then
@@ -4009,8 +5865,10 @@ C
     freeze_rc=$?
     set -e
     if [ "$freeze_rc" -ne 0 ] ||
-       ! grep -Fq 'dlfreeze: pre-linker failed' "$clean_log" ||
-       ! grep -Eq 'pre-linked[[:space:]]*:[[:space:]]*no' "$clean_log" ||
+       ! grep -Fq 'dlfreeze: pre-linker resource/address miss' "$clean_log" ||
+       ! grep -Eq \
+           'pre-linked[[:space:]]*:[[:space:]]*no \(resource/address miss; using runtime relocation\)' \
+           "$clean_log" ||
        ! grep -Eq \
            'mode[[:space:]]*:[[:space:]]*direct-load \(in-process loader\)' \
            "$clean_log"; then
@@ -4023,7 +5881,8 @@ C
     fi
 
     actual=""; rc=0
-    capture_output actual env -u DLFREEZE_NO_FORK LD_AUDIT= \
+    capture_output actual env -u DLFREEZE_NO_FORK \
+        DLFREEZE_SUPERVISED_FALLBACK=1 LD_AUDIT= \
         LD_PRELOAD="$preload_so" "$clean_out" \
         "$captured.host" "$host_dir" || rc=$?
     # Recoverable failures in the supervised direct child are deliberately
@@ -4039,7 +5898,8 @@ C
     fi
 
     actual=""; rc=0
-    capture_output actual env -u DLFREEZE_NO_FORK LD_PRELOAD= \
+    capture_output actual env -u DLFREEZE_NO_FORK \
+        DLFREEZE_SUPERVISED_FALLBACK=1 LD_PRELOAD= \
         LD_AUDIT="$preload_so" "$clean_out" \
         "$captured.host" "$host_dir" || rc=$?
     # The strict/direct-only case above proves that a nonempty LD_AUDIT is
@@ -4199,7 +6059,7 @@ C
     if [[ "$count" =~ ^[0-9]+$ && "$manifest" =~ ^[0-9]+$ ]]; then
         for ((i = 0; i < count; i++)); do
             entry_flags=$(od -An -tu4 \
-                -j $((manifest + i * 32 + 16)) -N4 "$out" |
+                -j $((manifest + i * MANIFEST_ENTRY_SIZE + 16)) -N4 "$out" |
                 tr -d '[:space:]')
             if [[ "$entry_flags" =~ ^[0-9]+$ ]] &&
                [ $((entry_flags & 0x4000)) -ne 0 ]; then
@@ -4215,7 +6075,7 @@ C
         cp "$out" "$bad_manifest"
         printf '\001\000\000\000\000\000\000\000' |
             dd of="$bad_manifest" bs=1 \
-                seek=$((manifest + special_index * 32)) \
+                seek=$((manifest + special_index * MANIFEST_ENTRY_SIZE)) \
                 conv=notrunc status=none
         actual=""; rc=0
         capture_output actual "$bad_manifest" "$root" || rc=$?
@@ -4369,13 +6229,15 @@ test_vfs_dir_handle_registry() {
 
     rm -rf "$root"
     rm -f "$out" "$log"
-    mkdir -p "$data/other"
+    mkdir -p "$data/other" "$data/another"
     root=$(realpath "$root")
     data="$root/data"
     bin="$root/program"
     printf '1\n' >"$data/first.txt"
     printf '2\n' >"$data/second.txt"
     printf '3\n' >"$data/other/third.txt"
+    printf '4\n' >"$data/another/fourth.txt"
+    printf 'x\n' >"$root/reuse.txt"
 
     if ! gcc -Wall -Wextra -Werror -pthread \
             -o "$bin" tests/vfs_dir_registry.c; then
@@ -4384,7 +6246,8 @@ test_vfs_dir_handle_registry() {
         rm -f "$out" "$log"
         return
     fi
-    capture_output actual "$bin" "$data" "$data/second.txt" "$root" || rc=$?
+    capture_output actual "$bin" "$data" "$data/second.txt" "$root" \
+        trace || rc=$?
     if [ "$rc" -ne 0 ] || [ "$actual" != "$expected" ]; then
         fail "native DIR handle registry control" \
             "exit=$rc output=$actual"
@@ -4394,7 +6257,8 @@ test_vfs_dir_handle_registry() {
     fi
 
     freeze_require_direct "VFS DIR handle registry" "$log" "$out" \
-        -t -f "$data/*" -- "$bin" "$data" "$data/second.txt" "$root" ||
+        -t -f "$data/*" -- "$bin" "$data" "$data/second.txt" "$root" \
+        trace ||
         freeze_rc=$?
     if [ "$freeze_rc" -eq 77 ]; then
         skip "VFS DIR handle registry" "$DIRECT_FREEZE_REASON"
@@ -4409,9 +6273,14 @@ test_vfs_dir_handle_registry() {
     fi
 
     rm -rf "$data"
+    mkdir -p "$data"
+    printf 'host replacement\n' >"$data/first.txt"
+    printf 'negative host sentinel\n' >"$data/proc"
+    printf 'uncaptured host sentinel\n' >"$data/host-only"
+    ln -s /dev/null "$data/host-link"
     actual=""; rc=0
     capture_output actual env DLFREEZE_NO_FORK=1 \
-        "$out" "$data" "$data/second.txt" "$root" || rc=$?
+        "$out" "$data" "$data/second.txt" "$root" frozen || rc=$?
     actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
     if [ "$rc" -eq 0 ] && [ "$actual" = "$expected" ]; then
         pass "VFS DIR handle registry"
@@ -4500,46 +6369,126 @@ C
 
     if grep -Eq '^[[:space:]]*pre-linked[[:space:]]*:[[:space:]]*yes' \
             "$pack_log"; then
-        # Prelinked bytes are now extraction-safe, so a clean artifact keeps
-        # the same pre-handoff fallback supervisor as an ordinary relocatable
-        # artifact.  The default launcher PID and target PID must therefore
-        # be distinct; the explicit strict/no-fork path still preserves the
-        # exact process identity.
+        # The ordinary direct path replaces the bootstrap in the same
+        # process.  The fallback supervisor is an explicit opt-in because it
+        # necessarily changes application-visible process identity.
         rm -f "$marker"
         rc=0
-        env -u DLFREEZE_NO_FORK "$out" "$marker" pid \
+        env -u DLFREEZE_NO_FORK -u DLFREEZE_SUPERVISED_FALLBACK \
+            "$out" "$marker" pid \
+            >/dev/null 2>&1 &
+        frozen_pid=$!
+        wait "$frozen_pid" || rc=$?
+        target_pid=$(cat "$marker" 2>/dev/null || true)
+        if [ "$rc" -eq 0 ] && [ "$target_pid" = "$frozen_pid" ]; then
+            pass "prelinked default direct process identity"
+        else
+            fail "prelinked default direct process identity" \
+                "launcher_pid=$frozen_pid target_pid=$target_pid exit=$rc"
+        fi
+
+        rm -f "$marker"
+        rc=0
+        env -u DLFREEZE_NO_FORK DLFREEZE_SUPERVISED_FALLBACK=1 \
+            "$out" "$marker" pid \
             >/dev/null 2>&1 &
         frozen_pid=$!
         wait "$frozen_pid" || rc=$?
         target_pid=$(cat "$marker" 2>/dev/null || true)
         if [ "$rc" -eq 0 ] && [ -n "$target_pid" ] &&
            [ "$target_pid" != "$frozen_pid" ]; then
-            pass "prelinked clean artifact remains supervised"
+            pass "prelinked opt-in supervisor process identity"
         else
-            fail "prelinked clean artifact supervisor" \
-                "launcher_pid=$frozen_pid target_pid=$target_pid exit=$rc"
-        fi
-
-        rm -f "$marker"
-        rc=0
-        env DLFREEZE_NO_FORK=1 "$out" "$marker" pid \
-            >/dev/null 2>&1 &
-        frozen_pid=$!
-        wait "$frozen_pid" || rc=$?
-        target_pid=$(cat "$marker" 2>/dev/null || true)
-        if [ "$rc" -eq 0 ] && [ "$target_pid" = "$frozen_pid" ]; then
-            pass "prelinked strict direct process identity"
-        else
-            fail "prelinked strict direct process identity" \
+            fail "prelinked opt-in supervisor process identity" \
                 "launcher_pid=$frozen_pid target_pid=$target_pid exit=$rc"
         fi
     else
-        skip "prelinked clean artifact remains supervised" \
+        skip "prelinked default direct process identity" \
             "fixture used runtime relocation"
-        skip "prelinked strict direct process identity" \
+        skip "prelinked opt-in supervisor process identity" \
             "fixture used runtime relocation"
     fi
     rm -f "$src" "$bin" "$out" "$marker" "$pack_log"
+}
+
+# POSIX record locks are process-associated: exec preserves them, while fork
+# does not transfer ownership to the child.  The default direct path must
+# therefore enter the target in the caller-assigned process.  Also exercise
+# the deliberately different semantics of the explicit supervisor opt-in so
+# this policy cannot silently flip again.
+test_direct_inherited_posix_lock() {
+    echo "--- direct inherited POSIX record lock ---"
+    local root="$BUILD/direct_inherited_posix_lock"
+    local bin="$root/program" out="$root/program.frozen"
+    local lock_file="$root/record.lock" log="$root/program.log"
+    local actual="" rc=0 freeze_rc=0
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    if ! gcc -Wall -Wextra -Werror -O2 -o "$bin" \
+            tests/inherited_posix_lock.c; then
+        fail "inherited POSIX lock" "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+
+    capture_output actual env -u DLFREEZE_NO_FORK \
+        -u DLFREEZE_SUPERVISED_FALLBACK \
+        "$bin" --launch "$bin" "$lock_file" in-process || rc=$?
+    if [ "$rc" -eq 77 ]; then
+        skip "inherited POSIX lock" \
+            "filesystem does not provide POSIX record locks"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$rc" -ne 0 ] ||
+       [ "$actual" != "inherited-posix-lock-in-process-ok" ]; then
+        fail "native inherited POSIX lock control" \
+            "exit=$rc output=$actual"
+        rm -rf "$root"
+        return
+    fi
+    pass "native inherited POSIX lock control"
+
+    freeze_require_default_direct "inherited POSIX lock" "$log" "$out" \
+        -- "$bin" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "default direct inherited POSIX lock" "$DIRECT_FREEZE_REASON"
+        skip "opt-in supervisor POSIX lock ownership" \
+            "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+
+    actual=""; rc=0
+    capture_output actual env -u DLFREEZE_NO_FORK \
+        -u DLFREEZE_SUPERVISED_FALLBACK \
+        "$bin" --launch "$out" "$lock_file" in-process || rc=$?
+    if [ "$rc" -eq 0 ] &&
+       [ "$actual" = "inherited-posix-lock-in-process-ok" ]; then
+        pass "default direct inherited POSIX lock"
+    else
+        fail "default direct inherited POSIX lock" \
+            "exit=$rc output=$actual"
+    fi
+
+    actual=""; rc=0
+    capture_output actual env -u DLFREEZE_NO_FORK \
+        DLFREEZE_SUPERVISED_FALLBACK=1 \
+        "$bin" --launch "$out" "$lock_file" supervised || rc=$?
+    if [ "$rc" -eq 0 ] &&
+       [ "$actual" = "inherited-posix-lock-supervised-ok" ]; then
+        pass "opt-in supervisor POSIX lock ownership"
+    else
+        fail "opt-in supervisor POSIX lock ownership" \
+            "exit=$rc output=$actual"
+    fi
+
+    rm -rf "$root"
 }
 
 # ===================================================================
@@ -4616,7 +6565,7 @@ int main(int argc, char **argv) {
 C
     if ! gcc -Wall -Wextra -Werror -o "$bin" "$src" ||
        ! gcc -Wall -Wextra -Werror -o "$timer_bin" "$timer_src" ||
-       ! run_freeze "$DLFREEZE" -o "$out" -- "$bin" >"$log" 2>&1; then
+       ! run_freeze "$DLFREEZE" -x -o "$out" -- "$bin" >"$log" 2>&1; then
         fail "fallback supervisor signal forwarding" \
             "could not build extraction fixture"
         rm -f "$src" "$bin" "$timer_src" "$timer_bin" \
@@ -4860,7 +6809,7 @@ C
         return
     fi
 
-    if ! run_freeze "$DLFREEZE" -o "$extracted" "$target" \
+    if ! run_freeze "$DLFREEZE" -x -o "$extracted" "$target" \
             >"$extracted_log" 2>&1; then
         fail "extraction supervisor inherited SIGCHLD" "freeze failed"
     else
@@ -4881,6 +6830,7 @@ C
     elif [ "$freeze_rc" -eq 0 ]; then
         rc=0
         run_with_timeout env -u DLFREEZE_NO_FORK \
+            DLFREEZE_SUPERVISED_FALLBACK=1 \
             "$launcher" "$direct" || rc=$?
         if [ "$rc" -eq 37 ]; then
             pass "direct startup preserves inherited SIGCHLD"
@@ -4903,9 +6853,11 @@ C
 
 # ===================================================================
 # Test 2c1a: a sandbox may deny the contained CPU probe's signal-zero clone,
-# its atomic result write, or its __WCLONE reap.  Clean artifacts may fall
-# back only when containment is intact; strict direct mode must never retry
-# the target initializer in-process.
+# its atomic result write, or its class-specific reap.  Linux syscall
+# emulators may instead reject clone(0) with EINVAL; retrying with SIGCHLD is
+# safe only under an inherited default, waitable, unblocked disposition.
+# Clean artifacts may fall back only when containment is intact; strict
+# direct mode must never retry the target initializer in-process.
 # ===================================================================
 test_direct_cpu_probe_seccomp_fallback() {
     echo "--- contained CPU probe seccomp fallback ---"
@@ -4917,8 +6869,32 @@ test_direct_cpu_probe_seccomp_fallback() {
     local log="$BUILD/cpu_probe_seccomp.log"
     local clean_out="$BUILD/cpu_probe_seccomp.clean.frozen"
     local clean_log="$BUILD/cpu_probe_seccomp.clean.log"
+    local signal_root="$BUILD/cpu_probe_sigchld_bootstrap"
+    local signal_src="$signal_root/sigchld_state.c"
+    local signal_obj="$signal_root/sigchld_state.o"
+    local signal_build="$signal_root/build"
+    local signal_tool="$signal_root/tool"
+    local signal_out="$signal_root/cpu_probe_sigchld.frozen"
+    local signal_log="$signal_root/cpu_probe_sigchld.log"
+    local signal_build_log="$signal_root/bootstrap.log"
+    local signal_report="$signal_root/state.report"
     local fallback_out="" actual="" rc=0 freeze_rc=0 clean_rc=0
-    local prelinked=0 clean=0 limit
+    local signal_freeze_rc=0 mode state_label report_state
+    local prelinked=0 clean=0 signal_ready=0 limit bootstrap_cc retry_label
+    local -a retry_labels=(
+        "contained CPU probe EINVAL SIGCHLD retry"
+        "contained CPU probe SIGCHLD wait class"
+        "contained CPU probe SIGCHLD reap containment refusal"
+        "contained CPU probe SIGCHLD fallback clone refusal"
+        "contained CPU probe SIGCHLD action-query refusal"
+        "contained CPU probe SIGCHLD mask-query refusal"
+        "contained CPU probe trapped action-query refusal"
+        "contained CPU probe trapped mask-query refusal"
+        "contained CPU probe ignored SIGCHLD refusal"
+        "contained CPU probe blocked SIGCHLD refusal"
+        "contained CPU probe custom SIGCHLD refusal"
+        "contained CPU probe SA_NOCLDWAIT refusal"
+    )
 
     if [ "$(uname -m)" != x86_64 ]; then
         skip "contained CPU probe seccomp fallback" "requires x86-64"
@@ -4935,6 +6911,9 @@ test_direct_cpu_probe_seccomp_fallback() {
             "requires x86-64"
         skip "terminal loader exit survives marker denial" "requires x86-64"
         skip "application exit 126 survives handoff" "requires x86-64"
+        for retry_label in "${retry_labels[@]}"; do
+            skip "$retry_label" "requires x86-64"
+        done
         return
     fi
     if ! getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
@@ -4958,19 +6937,38 @@ test_direct_cpu_probe_seccomp_fallback() {
             "requires glibc x86 CPU-feature initialization"
         skip "application exit 126 survives handoff" \
             "requires glibc x86 CPU-feature initialization"
+        for retry_label in "${retry_labels[@]}"; do
+            skip "$retry_label" \
+                "requires glibc x86 CPU-feature initialization"
+        done
         return
     fi
     cat > "$target_src" <<'C'
 #include <stdlib.h>
 #include <stdio.h>
+#include <signal.h>
 
 static volatile unsigned char large_bss[64U * 1024U * 1024U];
 
 int main(void) {
+    struct sigaction action;
+    sigset_t blocked;
+    sigset_t pending;
+
     large_bss[0] = 1;
     large_bss[sizeof(large_bss) - 1] = 2;
     if (getenv("DLFREEZE_TEST_EXIT_126"))
         return 126;
+    if (getenv("DLFREEZE_TEST_EXPECT_SIGCHLD_DEFAULT")) {
+        if (sigaction(SIGCHLD, NULL, &action) != 0 ||
+            sigprocmask(SIG_SETMASK, NULL, &blocked) != 0 ||
+            sigpending(&pending) != 0 ||
+            action.sa_handler != SIG_DFL ||
+            (action.sa_flags & SA_NOCLDWAIT) != 0 ||
+            sigismember(&blocked, SIGCHLD) != 0 ||
+            sigismember(&pending, SIGCHLD) != 0)
+            return 83;
+    }
     puts("cpu-probe-seccomp-target-ran");
     return large_bss[0] + large_bss[sizeof(large_bss) - 1] - 3;
 }
@@ -4979,6 +6977,7 @@ C
 #include <errno.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
+#include <signal.h>
 #include <stddef.h>
 #include <string.h>
 #include <sys/prctl.h>
@@ -5000,6 +6999,145 @@ int main(int argc, char **argv)
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1),
         BPF_STMT(BPF_RET | BPF_K,
                  SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_filter clone_einval[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_clone, 0, 3),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, args[0])),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K,
+                 SECCOMP_RET_ERRNO | (EINVAL & SECCOMP_RET_DATA)),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_filter clone_einval_fallback_eperm[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_clone, 0, 4),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, args[0])),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K,
+                 SECCOMP_RET_ERRNO | (EINVAL & SECCOMP_RET_DATA)),
+        BPF_STMT(BPF_RET | BPF_K,
+                 SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_filter clone_einval_deny_clone_wait[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_clone, 0, 3),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, args[0])),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K,
+                 SECCOMP_RET_ERRNO | (EINVAL & SECCOMP_RET_DATA)),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_wait4, 0, 3),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, args[2])),
+        BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, 0x80000000U, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K,
+                 SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_filter clone_einval_deny_normal_wait[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_clone, 0, 3),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, args[0])),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K,
+                 SECCOMP_RET_ERRNO | (EINVAL & SECCOMP_RET_DATA)),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_wait4, 0, 3),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, args[2])),
+        BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, 0x80000000U, 1, 0),
+        BPF_STMT(BPF_RET | BPF_K,
+                 SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_filter clone_einval_deny_sigchld_action_query[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_clone, 0, 3),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, args[0])),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K,
+                 SECCOMP_RET_ERRNO | (EINVAL & SECCOMP_RET_DATA)),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_rt_sigaction, 0, 3),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, args[0])),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SIGCHLD, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K,
+                 SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_filter clone_einval_deny_mask_query[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_clone, 0, 3),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, args[0])),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K,
+                 SECCOMP_RET_ERRNO | (EINVAL & SECCOMP_RET_DATA)),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_rt_sigprocmask, 0, 3),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, args[1])),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K,
+                 SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_filter clone_einval_trap_sigchld_action_query[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_clone, 0, 3),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, args[0])),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K,
+                 SECCOMP_RET_ERRNO | (EINVAL & SECCOMP_RET_DATA)),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_rt_sigaction, 0, 5),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, args[0])),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SIGCHLD, 0, 3),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, args[1])),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_filter clone_einval_trap_mask_query[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_clone, 0, 3),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, args[0])),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K,
+                 SECCOMP_RET_ERRNO | (EINVAL & SECCOMP_RET_DATA)),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_rt_sigprocmask, 0, 3),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, args[1])),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
     };
     struct sock_filter deny_result_write[] = {
@@ -5060,6 +7198,45 @@ int main(int argc, char **argv)
         program.len = (unsigned short)(sizeof(deny_clone) /
                                        sizeof(deny_clone[0]));
         program.filter = deny_clone;
+    } else if (strcmp(argv[1], "clone-einval") == 0) {
+        program.len = (unsigned short)(sizeof(clone_einval) /
+                                       sizeof(clone_einval[0]));
+        program.filter = clone_einval;
+    } else if (strcmp(argv[1], "clone-einval-fallback-eperm") == 0) {
+        program.len = (unsigned short)(
+            sizeof(clone_einval_fallback_eperm) /
+            sizeof(clone_einval_fallback_eperm[0]));
+        program.filter = clone_einval_fallback_eperm;
+    } else if (strcmp(argv[1], "clone-einval-clone-wait") == 0) {
+        program.len = (unsigned short)(
+            sizeof(clone_einval_deny_clone_wait) /
+            sizeof(clone_einval_deny_clone_wait[0]));
+        program.filter = clone_einval_deny_clone_wait;
+    } else if (strcmp(argv[1], "clone-einval-normal-wait") == 0) {
+        program.len = (unsigned short)(
+            sizeof(clone_einval_deny_normal_wait) /
+            sizeof(clone_einval_deny_normal_wait[0]));
+        program.filter = clone_einval_deny_normal_wait;
+    } else if (strcmp(argv[1], "clone-einval-action-query") == 0) {
+        program.len = (unsigned short)(
+            sizeof(clone_einval_deny_sigchld_action_query) /
+            sizeof(clone_einval_deny_sigchld_action_query[0]));
+        program.filter = clone_einval_deny_sigchld_action_query;
+    } else if (strcmp(argv[1], "clone-einval-mask-query") == 0) {
+        program.len = (unsigned short)(
+            sizeof(clone_einval_deny_mask_query) /
+            sizeof(clone_einval_deny_mask_query[0]));
+        program.filter = clone_einval_deny_mask_query;
+    } else if (strcmp(argv[1], "clone-einval-action-query-trap") == 0) {
+        program.len = (unsigned short)(
+            sizeof(clone_einval_trap_sigchld_action_query) /
+            sizeof(clone_einval_trap_sigchld_action_query[0]));
+        program.filter = clone_einval_trap_sigchld_action_query;
+    } else if (strcmp(argv[1], "clone-einval-mask-query-trap") == 0) {
+        program.len = (unsigned short)(
+            sizeof(clone_einval_trap_mask_query) /
+            sizeof(clone_einval_trap_mask_query[0]));
+        program.filter = clone_einval_trap_mask_query;
     } else if (strcmp(argv[1], "write") == 0) {
         program.len = (unsigned short)(sizeof(deny_result_write) /
                                        sizeof(deny_result_write[0]));
@@ -5092,11 +7269,183 @@ int main(int argc, char **argv)
     return 78;
 }
 C
+    rm -rf "$signal_root"
+    mkdir -p "$signal_root" "$signal_tool"
+    cat > "$signal_src" <<'C'
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <signal.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ucontext.h>
+#include <unistd.h>
+
+enum sigchld_test_mode {
+    SIGCHLD_TEST_NONE,
+    SIGCHLD_TEST_IGNORED,
+    SIGCHLD_TEST_BLOCKED,
+    SIGCHLD_TEST_CUSTOM,
+    SIGCHLD_TEST_NOCLDWAIT
+};
+
+static enum sigchld_test_mode test_mode;
+static const char *test_report_path;
+static volatile sig_atomic_t test_handler_calls;
+static volatile sig_atomic_t test_sigsys_calls;
+static int test_sigsys_resume;
+
+static void test_sigchld_handler(int signal_number)
+{
+    (void)signal_number;
+    test_handler_calls++;
+}
+
+static void test_sigsys_handler(int signal_number, siginfo_t *info,
+                                void *context)
+{
+    (void)info;
+#if defined(__x86_64__) && defined(REG_RAX)
+    if (signal_number != SIGSYS || !context)
+        _exit(100);
+    ((ucontext_t *)context)->uc_mcontext.gregs[REG_RAX] = 0;
+    test_sigsys_calls++;
+#else
+    (void)signal_number;
+    (void)context;
+    _exit(100);
+#endif
+}
+
+static void test_sigchld_report(void)
+{
+    static const char good[] = "sigchld-state-ok\n";
+    static const char trapped[] = "sigsys-resume-ok\n";
+    static const char bad[] = "sigchld-state-bad\n";
+    struct sigaction action;
+    sigset_t blocked;
+    sigset_t pending;
+    const char *message = good;
+    size_t length = sizeof(good) - 1;
+    int fd;
+    int is_blocked;
+    int is_pending;
+
+    if (!test_report_path)
+        return;
+    if (test_sigsys_resume) {
+        if (test_sigsys_calls == 1) {
+            message = trapped;
+            length = sizeof(trapped) - 1;
+        } else {
+            message = bad;
+            length = sizeof(bad) - 1;
+        }
+        goto write_report;
+    }
+    if (test_mode == SIGCHLD_TEST_NONE)
+        return;
+    if (sigaction(SIGCHLD, NULL, &action) != 0 ||
+        sigprocmask(SIG_SETMASK, NULL, &blocked) != 0 ||
+        sigpending(&pending) != 0) {
+        message = bad;
+        length = sizeof(bad) - 1;
+        goto write_report;
+    }
+    is_blocked = sigismember(&blocked, SIGCHLD);
+    is_pending = sigismember(&pending, SIGCHLD);
+    if (is_blocked < 0 || is_pending < 0)
+        message = bad;
+    else if (test_mode == SIGCHLD_TEST_IGNORED &&
+             (action.sa_handler != SIG_IGN || is_blocked || is_pending))
+        message = bad;
+    else if (test_mode == SIGCHLD_TEST_BLOCKED &&
+             (action.sa_handler != SIG_DFL ||
+              (action.sa_flags & SA_NOCLDWAIT) != 0 ||
+              !is_blocked || !is_pending))
+        message = bad;
+    else if (test_mode == SIGCHLD_TEST_CUSTOM &&
+             (action.sa_handler != test_sigchld_handler ||
+              is_blocked || is_pending || test_handler_calls != 0))
+        message = bad;
+    else if (test_mode == SIGCHLD_TEST_NOCLDWAIT &&
+             (action.sa_handler != SIG_DFL ||
+              (action.sa_flags & SA_NOCLDWAIT) == 0 ||
+              is_blocked || is_pending))
+        message = bad;
+    if (message == bad)
+        length = sizeof(bad) - 1;
+
+write_report:
+    fd = open(test_report_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd >= 0) {
+        (void)write(fd, message, length);
+        (void)close(fd);
+    }
+}
+
+static void test_sigchld_configure(void) __attribute__((constructor));
+static void test_sigchld_configure(void)
+{
+    struct sigaction action;
+    sigset_t one_signal;
+    const char *mode = getenv("DLFREEZE_TEST_CPU_SIGCHLD_MODE");
+    const char *sigsys_resume =
+        getenv("DLFREEZE_TEST_CPU_SIGSYS_RESUME");
+
+    test_report_path = getenv("DLFREEZE_TEST_CPU_SIGCHLD_REPORT");
+    if (sigsys_resume && strcmp(sigsys_resume, "1") == 0) {
+        memset(&action, 0, sizeof(action));
+        if (sigemptyset(&action.sa_mask) != 0)
+            _exit(101);
+        action.sa_sigaction = test_sigsys_handler;
+        action.sa_flags = SA_SIGINFO;
+        if (sigaction(SIGSYS, &action, NULL) != 0)
+            _exit(102);
+        test_sigsys_resume = 1;
+    }
+    if (!mode || !*mode) {
+        if (test_sigsys_resume && atexit(test_sigchld_report) != 0)
+            _exit(103);
+        return;
+    }
+    memset(&action, 0, sizeof(action));
+    if (sigemptyset(&action.sa_mask) != 0 ||
+        sigemptyset(&one_signal) != 0 ||
+        sigaddset(&one_signal, SIGCHLD) != 0)
+        _exit(95);
+    if (strcmp(mode, "ignored") == 0) {
+        test_mode = SIGCHLD_TEST_IGNORED;
+        action.sa_handler = SIG_IGN;
+    } else if (strcmp(mode, "blocked") == 0) {
+        test_mode = SIGCHLD_TEST_BLOCKED;
+        action.sa_handler = SIG_DFL;
+    } else if (strcmp(mode, "custom") == 0) {
+        test_mode = SIGCHLD_TEST_CUSTOM;
+        action.sa_handler = test_sigchld_handler;
+    } else if (strcmp(mode, "nocldwait") == 0) {
+        test_mode = SIGCHLD_TEST_NOCLDWAIT;
+        action.sa_handler = SIG_DFL;
+        action.sa_flags = SA_NOCLDWAIT;
+    } else {
+        _exit(96);
+    }
+    if (sigaction(SIGCHLD, &action, NULL) != 0)
+        _exit(97);
+    if (test_mode == SIGCHLD_TEST_BLOCKED) {
+        if (sigprocmask(SIG_BLOCK, &one_signal, NULL) != 0 ||
+            kill(getpid(), SIGCHLD) != 0)
+            _exit(98);
+    }
+    if (atexit(test_sigchld_report) != 0)
+        _exit(99);
+}
+C
     if ! gcc -Wall -Wextra -Werror -o "$target" "$target_src" ||
        ! gcc -Wall -Wextra -Werror -o "$launcher" "$launcher_src"; then
         fail "contained CPU probe seccomp fallback" "fixture compile failed"
         rm -f "$target_src" "$launcher_src" "$target" "$launcher" \
             "$out" "$log" "$clean_out" "$clean_log"
+        rm -rf "$signal_root"
         return
     fi
     freeze_require_direct "contained CPU probe seccomp" "$log" \
@@ -5121,6 +7470,9 @@ C
             "$DIRECT_FREEZE_REASON"
         skip "application exit 126 survives handoff" \
             "$DIRECT_FREEZE_REASON"
+        for retry_label in "${retry_labels[@]}"; do
+            skip "$retry_label" "$DIRECT_FREEZE_REASON"
+        done
     elif [ "$freeze_rc" -eq 0 ]; then
         if grep -Eq 'pre-linked[[:space:]]*:[[:space:]]*yes' "$log"; then
             prelinked=1
@@ -5143,8 +7495,11 @@ C
                 clean_rc=$?
                 set -e
                 if [ "$clean_rc" -eq 0 ] &&
-                   grep -Fq 'dlfreeze: pre-linker failed' "$clean_log" &&
-                   grep -Eq 'pre-linked[[:space:]]*:[[:space:]]*no' \
+                   grep -Fq \
+                       'dlfreeze: pre-linker resource/address miss' \
+                       "$clean_log" &&
+                   grep -Eq \
+                       'pre-linked[[:space:]]*:[[:space:]]*no \(resource/address miss; using runtime relocation\)' \
                        "$clean_log"; then
                     clean=1
                     fallback_out="$clean_out"
@@ -5175,6 +7530,9 @@ C
                 "seccomp filter unavailable"
             skip "application exit 126 survives handoff" \
                 "seccomp filter unavailable"
+            for retry_label in "${retry_labels[@]}"; do
+                skip "$retry_label" "seccomp filter unavailable"
+            done
         else
             if [ "$rc" -eq 127 ] &&
                [[ "$actual" == *"target x86 CPU probe is unavailable before target invocation"* ]] &&
@@ -5183,6 +7541,205 @@ C
             else
                 fail "contained CPU probe seccomp strict refusal" \
                     "exit=$rc output=$actual"
+            fi
+
+            actual=""; rc=0
+            capture_output actual env DLFREEZE_NO_FORK=1 \
+                DLFREEZE_TEST_EXPECT_SIGCHLD_DEFAULT=1 \
+                "$launcher" clone-einval "$out" || rc=$?
+            if [ "$rc" -eq 0 ] &&
+               [ "$actual" = "cpu-probe-seccomp-target-ran" ]; then
+                pass "contained CPU probe EINVAL SIGCHLD retry"
+            else
+                fail "contained CPU probe EINVAL SIGCHLD retry" \
+                    "exit=$rc output=$actual"
+            fi
+
+            # Refusing __WCLONE waits after the EINVAL retry must be harmless:
+            # a SIGCHLD clone belongs to the ordinary wait class.
+            actual=""; rc=0
+            capture_output actual env DLFREEZE_NO_FORK=1 \
+                DLFREEZE_TEST_EXPECT_SIGCHLD_DEFAULT=1 \
+                "$launcher" clone-einval-clone-wait "$out" || rc=$?
+            if [ "$rc" -eq 0 ] &&
+               [ "$actual" = "cpu-probe-seccomp-target-ran" ]; then
+                pass "contained CPU probe SIGCHLD wait class"
+            else
+                fail "contained CPU probe SIGCHLD wait class" \
+                    "exit=$rc output=$actual"
+            fi
+
+            # Conversely, refusing the ordinary wait class after a successful
+            # retry must retain the terminal containment-loss distinction.
+            actual=""; rc=0
+            capture_output actual env DLFREEZE_NO_FORK=1 \
+                "$launcher" clone-einval-normal-wait "$out" || rc=$?
+            if [ "$rc" -eq 127 ] &&
+               [[ "$actual" == *"target x86 CPU probe containment could not be re-established"* ]] &&
+               [[ "$actual" != *"cpu-probe-seccomp-target-ran"* ]]; then
+                pass "contained CPU probe SIGCHLD reap containment refusal"
+            else
+                fail "contained CPU probe SIGCHLD reap containment refusal" \
+                    "exit=$rc output=$actual"
+            fi
+
+            actual=""; rc=0
+            capture_output actual env DLFREEZE_NO_FORK=1 \
+                "$launcher" clone-einval-fallback-eperm "$out" || rc=$?
+            if [ "$rc" -eq 127 ] &&
+               [[ "$actual" == *"target x86 CPU probe is unavailable before target invocation"* ]] &&
+               [[ "$actual" != *"cpu-probe-seccomp-target-ran"* ]]; then
+                pass "contained CPU probe SIGCHLD fallback clone refusal"
+            else
+                fail "contained CPU probe SIGCHLD fallback clone refusal" \
+                    "exit=$rc output=$actual"
+            fi
+
+            actual=""; rc=0
+            capture_output actual env DLFREEZE_NO_FORK=1 \
+                "$launcher" clone-einval-action-query "$out" || rc=$?
+            if [ "$rc" -eq 127 ] &&
+               [[ "$actual" == *"target x86 CPU probe is unavailable before target invocation"* ]] &&
+               [[ "$actual" != *"cpu-probe-seccomp-target-ran"* ]]; then
+                pass "contained CPU probe SIGCHLD action-query refusal"
+            else
+                fail "contained CPU probe SIGCHLD action-query refusal" \
+                    "exit=$rc output=$actual"
+            fi
+
+            actual=""; rc=0
+            capture_output actual env DLFREEZE_NO_FORK=1 \
+                "$launcher" clone-einval-mask-query "$out" || rc=$?
+            if [ "$rc" -eq 127 ] &&
+               [[ "$actual" == *"target x86 CPU probe is unavailable before target invocation"* ]] &&
+               [[ "$actual" != *"cpu-probe-seccomp-target-ran"* ]]; then
+                pass "contained CPU probe SIGCHLD mask-query refusal"
+            else
+                fail "contained CPU probe SIGCHLD mask-query refusal" \
+                    "exit=$rc output=$actual"
+            fi
+
+            bootstrap_cc=$(command -v musl-gcc 2>/dev/null || true)
+            if [ -z "$bootstrap_cc" ]; then
+                bootstrap_cc="$TEST_REAL_GCC"
+            fi
+            if [ -n "$bootstrap_cc" ] &&
+               "$bootstrap_cc" -Wall -Wextra -Werror -O2 \
+                   -c "$signal_src" -o "$signal_obj" \
+                   >"$signal_build_log" 2>&1 &&
+               make --no-print-directory -f Makefile \
+                   BUILD="$signal_build" CC="$TEST_REAL_GCC" \
+                   STATIC_CC="$bootstrap_cc" WERROR=1 \
+                   LDFLAGS="$signal_obj" \
+                   "$signal_build/dlfreeze-bootstrap" \
+                   >>"$signal_build_log" 2>&1 &&
+               cp "$DLFREEZE" "$signal_tool/dlfreeze" &&
+               cp "$signal_build/dlfreeze-bootstrap" \
+                   "$signal_tool/dlfreeze-bootstrap"; then
+                signal_ready=1
+            else
+                for mode in ignored blocked custom nocldwait; do
+                    case "$mode" in
+                        ignored) state_label="contained CPU probe ignored SIGCHLD refusal" ;;
+                        blocked) state_label="contained CPU probe blocked SIGCHLD refusal" ;;
+                        custom) state_label="contained CPU probe custom SIGCHLD refusal" ;;
+                        nocldwait) state_label="contained CPU probe SA_NOCLDWAIT refusal" ;;
+                    esac
+                    fail "$state_label" "isolated bootstrap build failed"
+                done
+                fail "contained CPU probe trapped action-query refusal" \
+                    "isolated bootstrap build failed"
+                fail "contained CPU probe trapped mask-query refusal" \
+                    "isolated bootstrap build failed"
+                tail -n 40 "$signal_build_log" 2>/dev/null || true
+            fi
+            if [ "$signal_ready" -eq 1 ]; then
+                freeze_require_direct_with "$signal_tool/dlfreeze" \
+                    "contained CPU probe SIGCHLD state fixture" \
+                    "$signal_log" "$signal_out" "$target" ||
+                    signal_freeze_rc=$?
+                if [ "$signal_freeze_rc" -eq 77 ]; then
+                    for mode in ignored blocked custom nocldwait; do
+                        case "$mode" in
+                            ignored) state_label="contained CPU probe ignored SIGCHLD refusal" ;;
+                            blocked) state_label="contained CPU probe blocked SIGCHLD refusal" ;;
+                            custom) state_label="contained CPU probe custom SIGCHLD refusal" ;;
+                            nocldwait) state_label="contained CPU probe SA_NOCLDWAIT refusal" ;;
+                        esac
+                        skip "$state_label" "$DIRECT_FREEZE_REASON"
+                    done
+                    skip "contained CPU probe trapped action-query refusal" \
+                        "$DIRECT_FREEZE_REASON"
+                    skip "contained CPU probe trapped mask-query refusal" \
+                        "$DIRECT_FREEZE_REASON"
+                elif [ "$signal_freeze_rc" -eq 0 ]; then
+                    for mode in ignored blocked custom nocldwait; do
+                        case "$mode" in
+                            ignored) state_label="contained CPU probe ignored SIGCHLD refusal" ;;
+                            blocked) state_label="contained CPU probe blocked SIGCHLD refusal" ;;
+                            custom) state_label="contained CPU probe custom SIGCHLD refusal" ;;
+                            nocldwait) state_label="contained CPU probe SA_NOCLDWAIT refusal" ;;
+                        esac
+                        rm -f "$signal_report"
+                        actual=""; rc=0
+                        capture_output actual env DLFREEZE_NO_FORK=1 \
+                            DLFREEZE_TEST_CPU_SIGCHLD_MODE="$mode" \
+                            DLFREEZE_TEST_CPU_SIGCHLD_REPORT="$signal_report" \
+                            "$launcher" clone-einval "$signal_out" || rc=$?
+                        report_state=$(cat "$signal_report" 2>/dev/null || true)
+                        if [ "$rc" -eq 127 ] &&
+                           [[ "$actual" == *"target x86 CPU probe is unavailable before target invocation"* ]] &&
+                           [[ "$actual" != *"cpu-probe-seccomp-target-ran"* ]] &&
+                           [ "$report_state" = "sigchld-state-ok" ]; then
+                            pass "$state_label"
+                        else
+                            fail "$state_label" \
+                                "exit=$rc state=$report_state output=$actual"
+                        fi
+                    done
+                    for mode in action mask; do
+                        case "$mode" in
+                            action)
+                                state_label="contained CPU probe trapped action-query refusal"
+                                retry_label="clone-einval-action-query-trap"
+                                ;;
+                            mask)
+                                state_label="contained CPU probe trapped mask-query refusal"
+                                retry_label="clone-einval-mask-query-trap"
+                                ;;
+                        esac
+                        rm -f "$signal_report"
+                        actual=""; rc=0
+                        capture_output actual env DLFREEZE_NO_FORK=1 \
+                            DLFREEZE_TEST_CPU_SIGSYS_RESUME=1 \
+                            DLFREEZE_TEST_CPU_SIGCHLD_REPORT="$signal_report" \
+                            "$launcher" "$retry_label" "$signal_out" || rc=$?
+                        report_state=$(cat "$signal_report" 2>/dev/null || true)
+                        if [ "$rc" -eq 127 ] &&
+                           [[ "$actual" == *"target x86 CPU probe is unavailable before target invocation"* ]] &&
+                           [[ "$actual" != *"cpu-probe-seccomp-target-ran"* ]] &&
+                           [ "$report_state" = "sigsys-resume-ok" ]; then
+                            pass "$state_label"
+                        else
+                            fail "$state_label" \
+                                "exit=$rc state=$report_state output=$actual"
+                        fi
+                    done
+                else
+                    for mode in ignored blocked custom nocldwait; do
+                        case "$mode" in
+                            ignored) state_label="contained CPU probe ignored SIGCHLD refusal" ;;
+                            blocked) state_label="contained CPU probe blocked SIGCHLD refusal" ;;
+                            custom) state_label="contained CPU probe custom SIGCHLD refusal" ;;
+                            nocldwait) state_label="contained CPU probe SA_NOCLDWAIT refusal" ;;
+                        esac
+                        fail "$state_label" "state fixture freeze failed"
+                    done
+                    fail "contained CPU probe trapped action-query refusal" \
+                        "state fixture freeze failed"
+                    fail "contained CPU probe trapped mask-query refusal" \
+                        "state fixture freeze failed"
+                fi
             fi
             if [ "$clean" -ne 1 ]; then
                 skip "contained CPU probe seccomp fallback" \
@@ -5200,6 +7757,7 @@ C
             else
                 actual=""; rc=0
                 capture_output actual env -u DLFREEZE_NO_FORK \
+                    DLFREEZE_SUPERVISED_FALLBACK=1 \
                     "$launcher" fstatfs-kill "$fallback_out" || rc=$?
                 if [ "$rc" -eq 0 ] &&
                    [[ "$actual" == *"cpu-probe-seccomp-target-ran"* ]]; then
@@ -5211,6 +7769,7 @@ C
 
                 actual=""; rc=0
                 capture_output actual env -u DLFREEZE_NO_FORK \
+                    DLFREEZE_SUPERVISED_FALLBACK=1 \
                     "$launcher" fs-metadata-kill "$fallback_out" || rc=$?
                 if [ "$rc" -eq 76 ]; then
                     skip "fallback avoids optional filesystem metadata probes" \
@@ -5225,6 +7784,7 @@ C
 
                 actual=""; rc=0
                 capture_output actual env -u DLFREEZE_NO_FORK \
+                    DLFREEZE_SUPERVISED_FALLBACK=1 \
                     "$launcher" clone "$fallback_out" || rc=$?
                 # A pre-clone refusal is a recoverable failure in the
                 # supervised child, so it is intentionally silent before the
@@ -5240,6 +7800,7 @@ C
 
                 actual=""; rc=0
                 capture_output actual env -u DLFREEZE_NO_FORK \
+                    DLFREEZE_SUPERVISED_FALLBACK=1 \
                     "$launcher" write "$fallback_out" || rc=$?
                 if [ "$rc" -eq 127 ] &&
                    [[ "$actual" == *"target x86 CPU probe failed safely in its contained child"* ]] &&
@@ -5252,6 +7813,7 @@ C
 
                 actual=""; rc=0
                 capture_output actual env -u DLFREEZE_NO_FORK \
+                    DLFREEZE_SUPERVISED_FALLBACK=1 \
                     DLFREEZE_TEST_EXIT_126=1 "$fallback_out" || rc=$?
                 if [ "$rc" -eq 126 ]; then
                     pass "application exit 126 survives handoff"
@@ -5262,6 +7824,7 @@ C
 
                 actual=""; rc=0
                 capture_output actual env -u DLFREEZE_NO_FORK \
+                    DLFREEZE_SUPERVISED_FALLBACK=1 \
                     "$launcher" allwrite "$fallback_out" || rc=$?
                 if [ "$rc" -eq 127 ] &&
                    [[ "$actual" != *"cpu-probe-seccomp-target-ran"* ]]; then
@@ -5297,6 +7860,7 @@ C
 
             actual=""; rc=0
             capture_output actual env -u DLFREEZE_NO_FORK \
+                DLFREEZE_SUPERVISED_FALLBACK=1 \
                 "$launcher" wait4 "$out" || rc=$?
             if [ "$rc" -eq 127 ] &&
                [[ "$actual" == *"target x86 CPU probe containment could not be re-established"* ]] &&
@@ -5310,12 +7874,12 @@ C
     fi
     rm -f "$target_src" "$launcher_src" "$target" "$launcher" \
         "$out" "$log" "$clean_out" "$clean_log"
+    rm -rf "$signal_root"
 }
 
 # ===================================================================
-# Test 2c2: controlling-terminal I/O and job-control signals survive
-# both automatic direct-only selection and the explicit strict in-process
-# diagnostic path.
+# Test 2c2: controlling-terminal I/O and job-control signals survive both the
+# default in-process path and the explicitly requested fallback supervisor.
 # ===================================================================
 test_direct_pty_interaction() {
     echo "--- direct controlling-PTY interaction ---"
@@ -5356,23 +7920,26 @@ test_direct_pty_interaction() {
     freeze_require_direct "direct PTY interaction" "$pack_log" "$out" \
         "$helper" || freeze_rc=$?
     if [ "$freeze_rc" -eq 77 ]; then
-        skip "automatic direct PTY interaction" "$DIRECT_FREEZE_REASON"
-        skip "strict direct PTY interaction" "$DIRECT_FREEZE_REASON"
+        skip "default direct PTY interaction" "$DIRECT_FREEZE_REASON"
+        skip "supervised direct PTY interaction" "$DIRECT_FREEZE_REASON"
     elif [ "$freeze_rc" -eq 0 ]; then
         if "$helper" --run -- env -u DLFREEZE_NO_FORK \
+                -u DLFREEZE_SUPERVISED_FALLBACK \
                 "$out" --target >"$supervised_log" 2>&1; then
-            pass "automatic direct PTY interaction"
+            pass "default direct PTY interaction"
         else
-            fail "automatic direct PTY interaction" \
+            fail "default direct PTY interaction" \
                 "terminal protocol failed"
             tail -n 80 "$supervised_log" || true
         fi
 
-        if "$helper" --run -- env DLFREEZE_NO_FORK=1 \
+        if "$helper" --run -- env -u DLFREEZE_NO_FORK \
+                DLFREEZE_SUPERVISED_FALLBACK=1 \
                 "$out" --target >"$strict_log" 2>&1; then
-            pass "strict direct PTY interaction"
+            pass "supervised direct PTY interaction"
         else
-            fail "strict direct PTY interaction" "terminal protocol failed"
+            fail "supervised direct PTY interaction" \
+                "terminal protocol failed"
             tail -n 80 "$strict_log" || true
         fi
     fi
@@ -5380,7 +7947,8 @@ test_direct_pty_interaction() {
     # -f selects the combined file/dlopen tracer, whose child must retain
     # foreground-terminal ownership while it reads the protocol input.  The
     # deliberately unmatched glob keeps this a terminal test, not a VFS test.
-    if run_freeze env -u DLFREEZE_NO_FORK PTY_GATE_TIMEOUT_MS=60000 \
+    if run_freeze env -u DLFREEZE_NO_FORK \
+        -u DLFREEZE_SUPERVISED_FALLBACK PTY_GATE_TIMEOUT_MS=60000 \
         "$helper" --run -- "$DLFREEZE" -d -t \
             -f "$BUILD/.dlfreeze-pty-no-match/*" -o "$trace_out" -- \
             "$helper" --target >"$trace_log" 2>&1 &&
@@ -7940,7 +10508,7 @@ int main(void)
 }
 C
     if ! gcc -Wall -Wextra -Werror -O2 -o "$bin" "$src" ||
-       ! run_freeze "$DLFREEZE" -o "$out" -- "$bin" >"$log" 2>&1; then
+       ! run_freeze "$DLFREEZE" -x -o "$out" -- "$bin" >"$log" 2>&1; then
         fail "bootstrap TMPDIR selection" "fixture build or freeze failed"
         tail -n 40 "$log" 2>/dev/null || true
         rm -rf "$root"
@@ -8413,7 +10981,10 @@ SH
             "first executable script did not reach ELF admission"
     fi
 
-    default_out="$root/default-path.frozen"
+    # Some implementations in the system default path are multicall
+    # binaries which select their applet from basename(argv[0]).  Give the
+    # frozen caller the same basename execvp supplied for the native run.
+    default_out="$root/true"
     default_log="$root/default-path.log"
     if run_freeze env -u PATH "$dlfreeze_abs" -o "$default_out" true \
             >"$default_log" 2>&1 && "$default_out"; then
@@ -8469,10 +11040,10 @@ C
     printf 'outside-sentinel\n' > "$marker"
 
     if ! (cd "$child" &&
-          run_freeze "$dlfreeze_abs" -o "$dot_out" -- ./dot-relative-target \
+          run_freeze "$dlfreeze_abs" -x -o "$dot_out" -- ./dot-relative-target \
               >"$dot_log" 2>&1) ||
        ! (cd "$child" &&
-          run_freeze "$dlfreeze_abs" -o "$parent_out" -- "../$escape_name" \
+          run_freeze "$dlfreeze_abs" -x -o "$parent_out" -- "../$escape_name" \
               >"$parent_log" 2>&1); then
         fail "relative executable extraction identity" \
             "packing ./name or ../name failed"
@@ -8523,7 +11094,7 @@ test_exact_range_duplicate_extraction() {
 int main(void) { puts("exact-range-ok"); return 0; }
 C
     if ! gcc -o "$bin" "$src" ||
-       ! run_freeze "$DLFREEZE" -o "$base" -- "$bin" >"$log" 2>&1; then
+       ! run_freeze "$DLFREEZE" -x -o "$base" -- "$bin" >"$log" 2>&1; then
         fail "exact-range duplicate extraction" "fixture creation failed"
         rm -rf "$root"
         return
@@ -8553,7 +11124,8 @@ C
     fi
 
     for ((i = 0; i < count; i++)); do
-        flags=$(od -An -tu4 -j $((manifest + i * 32 + 16)) -N4 "$base" |
+        flags=$(od -An -tu4 \
+            -j $((manifest + i * MANIFEST_ENTRY_SIZE + 16)) -N4 "$base" |
             tr -d '[:space:]')
         if ((flags & 1)); then main_index=$i; fi
         if ((flags & 2)); then interp_index=$i; fi
@@ -8567,9 +11139,9 @@ C
         return
     fi
 
-    main_entry=$((manifest + main_index * 32))
-    interp_entry=$((manifest + interp_index * 32))
-    shlib_entry=$((manifest + shlib_index * 32))
+    main_entry=$((manifest + main_index * MANIFEST_ENTRY_SIZE))
+    interp_entry=$((manifest + interp_index * MANIFEST_ENTRY_SIZE))
+    shlib_entry=$((manifest + shlib_index * MANIFEST_ENTRY_SIZE))
     cp "$base" "$positive"
     cp "$base" "$negative"
 
@@ -8797,6 +11369,65 @@ test_direct_runtime_service_collisions() {
 # constructor which recursively dlopens another object and fork children
 # which must inherit a coherent loader/VFS snapshot.
 # ===================================================================
+test_direct_constructor_binding() {
+    echo "--- direct cold lazy binding during a constructor ---"
+    local root="$BUILD/direct-constructor-binding"
+    local root_abs bin lib out log native actual mode variant rc freeze_rc
+    local -a definitions trace_flags
+
+    mkdir -p "$root"
+    root_abs=$(realpath "$root")
+    bin="$root_abs/main"
+    if ! gcc -Wall -Wextra -Werror -O2 -pthread -rdynamic \
+            -Wl,-z,lazy -o "$bin" tests/direct_constructor_binding.c -ldl; then
+        fail "constructor binding fixture" "main compile failed"
+        return
+    fi
+    for variant in ordinary ifunc; do
+        if [ "$variant" = ifunc ] && ! compiler_supports_gnu_ifunc "$root_abs"; then
+            skip "constructor binding IFUNC" "native toolchain/runtime does not support IFUNC"
+            continue
+        fi
+        definitions=()
+        [ "$variant" != ifunc ] || definitions=(-DTEST_IFUNC)
+        lib="$root_abs/libconstructor_binding_$variant.so"
+        if ! gcc -Wall -Wextra -Werror -O2 -shared -fPIC \
+                -Wl,-z,lazy "${definitions[@]}" -o "$lib" \
+                tests/direct_constructor_binding_plugin.c; then
+            fail "constructor binding $variant" "plugin compile failed"
+            continue
+        fi
+        rc=0
+        capture_output native "$bin" "$lib" || rc=$?
+        if [ "$rc" -ne 0 ] || [ "$native" != constructor-binding-ok ]; then
+            fail "constructor binding $variant native control" "exit=$rc output=$native"
+            continue
+        fi
+        for mode in filesystem traced; do
+            trace_flags=()
+            [ "$mode" != traced ] || trace_flags=(-t)
+            out="$root_abs/$variant-$mode.frozen"
+            log="$root_abs/$variant-$mode.log"
+            freeze_rc=0
+            freeze_require_direct "constructor binding $variant $mode" \
+                "$log" "$out" "${trace_flags[@]}" "$bin" "$lib" || freeze_rc=$?
+            if [ "$freeze_rc" -eq 77 ]; then
+                skip "constructor binding $variant $mode" "$DIRECT_FREEZE_REASON"
+                continue
+            fi
+            [ "$freeze_rc" -eq 0 ] || continue
+            rc=0
+            capture_output actual "$out" "$lib" || rc=$?
+            actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+            if [ "$rc" -eq 0 ] && [ "$actual" = "$native" ]; then
+                pass "constructor binding $variant $mode"
+            else
+                fail "constructor binding $variant $mode" "exit=$rc output=$actual"
+            fi
+        done
+    done
+}
+
 test_direct_runtime_loader_concurrency() {
     echo "--- direct runtime loader concurrency ---"
     local root="$BUILD/direct-loader-concurrency"
@@ -8880,7 +11511,8 @@ test_direct_runtime_loader_concurrency() {
 test_direct_loader_introspection() {
     echo "--- direct loader public introspection ---"
     local root="$BUILD/direct-loader-introspection"
-    local root_abs lib late bin out log native actual rc=0 freeze_rc=0
+    local root_abs lib late bin out log data vfs_out vfs_log
+    local native actual vfs_native vfs_actual rc=0 freeze_rc=0
 
     rm -rf "$root"
     mkdir -p "$root"
@@ -8890,6 +11522,9 @@ test_direct_loader_introspection() {
     bin="$root_abs/main"
     out="$root_abs/main.frozen"
     log="$root_abs/freeze.log"
+    data="$root_abs/captured-byte"
+    vfs_out="$root_abs/main-vfs.frozen"
+    vfs_log="$root_abs/freeze-vfs.log"
 
     if ! gcc -Wall -Wextra -Werror -O2 -shared -fPIC \
             -Wl,-soname,libloader_introspection_plugin.so \
@@ -8932,6 +11567,160 @@ test_direct_loader_introspection() {
         fail "direct loader public introspection" \
             "exit=$rc output=$actual"
     fi
+
+    printf 'x' >"$data"
+    if ! capture_output vfs_native \
+            "$bin" "$lib" native "$late" "$data" ||
+       ! grep -Eq '^loader-vfs-alias:.+' <<<"$vfs_native" ||
+       ! grep -Fxq 'loader-introspection-ok' <<<"$vfs_native"; then
+        fail "direct loader VFS dladdr alias native control" \
+            "exit/output differs: $vfs_native"
+        rm -rf "$root"
+        return
+    fi
+    freeze_rc=0
+    freeze_require_direct "direct loader VFS dladdr alias" \
+        "$vfs_log" "$vfs_out" -t -f "$data" -- \
+        "$bin" "$lib" native "$late" "$data" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "direct loader VFS dladdr alias" "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+    rm -f "$data"
+    rc=0
+    capture_output vfs_actual \
+        "$vfs_out" "$lib" strict "$late" "$data" || rc=$?
+    vfs_actual=$(printf '%s\n' "$vfs_actual" | strip_dlfreeze_warnings)
+    if [ "$rc" -eq 0 ] && [ "$vfs_actual" = "$vfs_native" ]; then
+        pass "direct loader VFS dladdr alias"
+    else
+        fail "direct loader VFS dladdr alias" \
+            "exit=$rc native=$vfs_native frozen=$vfs_actual"
+    fi
+    rm -rf "$root"
+}
+
+# ===================================================================
+# A public loader callback executes above bootstrap frames.  Exceptions must
+# find those frames' CFI through the same ELF introspection surface as target
+# objects, and unwinding out of the callback must not strand the loader lock.
+# ===================================================================
+test_direct_loader_callback_unwind() {
+    echo "--- direct loader callback unwinding ---"
+    local root="$BUILD/direct-loader-callback-unwind"
+    local bin="$root/main" out="$root/main.frozen" log="$root/freeze.log"
+    local native="" actual="" rc=0 freeze_rc=0
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    if ! command -v g++ >/dev/null 2>&1; then
+        skip "direct loader callback unwinding" "g++ is unavailable"
+        rm -rf "$root"
+        return
+    fi
+    if ! g++ -Wall -Wextra -Werror -O2 -g -std=c++17 -pthread \
+            -o "$bin" tests/direct_loader_callback_unwind.cc -ldl; then
+        fail "direct loader callback unwinding" "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+    capture_output native "$bin" || rc=$?
+    if [ "$rc" -eq 77 ]; then
+        skip "direct loader callback unwinding" \
+            "native runtime cannot unwind an exception through its loader callback"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$rc" -ne 0 ] || [ "$native" != "caught:from callback" ]; then
+        fail "direct loader callback unwinding native control" \
+            "exit=$rc output=$native"
+        rm -rf "$root"
+        return
+    fi
+    freeze_require_direct "direct loader callback unwinding" \
+        "$log" "$out" "$bin" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "direct loader callback unwinding" "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+    capture_output actual "$out" || rc=$?
+    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+    if [ "$rc" -eq 0 ] && [ "$actual" = "$native" ]; then
+        pass "direct loader callback unwinding"
+    else
+        fail "direct loader callback unwinding" \
+            "exit=$rc native=$native frozen=$actual"
+    fi
+    rm -rf "$root"
+}
+
+# ===================================================================
+# The bootstrap is a startup loader object.  A late object activated from its
+# dl_iterate_phdr callback must follow it in both the iteration and public
+# link_map views; rebuilding the latter with a different insertion point
+# exposes contradictory namespace order to generic introspection clients.
+# ===================================================================
+test_direct_loader_callback_order() {
+    echo "--- direct loader callback publication order ---"
+    local root="$BUILD/direct-loader-callback-order"
+    local root_abs lib bin out log native="" actual=""
+    local rc=0 freeze_rc=0
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    root_abs=$(realpath "$root")
+    lib="$root_abs/libloader_callback_order_late.so"
+    bin="$root_abs/main"
+    out="$root_abs/main.frozen"
+    log="$root_abs/freeze.log"
+
+    if ! gcc -Wall -Wextra -Werror -O2 -shared -fPIC \
+            -Wl,-soname,libloader_callback_order_late.so \
+            -o "$lib" tests/direct_loader_callback_order_plugin.c ||
+       ! gcc -Wall -Wextra -Werror -O2 -o "$bin" \
+            tests/direct_loader_callback_order.c -ldl; then
+        fail "direct loader callback publication order" \
+            "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+    if ! capture_output native "$bin" "$lib" trace ||
+       [ "$native" != "loader-callback-order-trace" ]; then
+        fail "direct loader callback publication order native control" \
+            "exit/output differs: $native"
+        rm -rf "$root"
+        return
+    fi
+    freeze_require_direct "direct loader callback publication order" \
+        "$log" "$out" -t -- "$bin" "$lib" trace || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "direct loader callback publication order" \
+            "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+    capture_output actual "$out" "$lib" strict || rc=$?
+    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+    if [ "$rc" -eq 0 ] && [ "$actual" = "loader-callback-order-ok" ]; then
+        pass "direct loader callback publication order"
+    else
+        fail "direct loader callback publication order" \
+            "exit=$rc output=$actual"
+    fi
     rm -rf "$root"
 }
 
@@ -8944,8 +11733,9 @@ test_direct_loader_introspection() {
 test_external_program_headers_direct() {
     echo "--- external program-header tables ---"
     local root="$BUILD/external-program-headers"
-    local root_abs mutator gate lib sparse truncated bad bin main
-    local out runtime_out main_out log actual="" rc=0 freeze_rc=0
+    local root_abs mutator gate lib sparse truncated renamed renamed_to
+    local bad bin main out runtime_out main_out renamed_out log libc_banner
+    local actual="" rc=0 freeze_rc=0
 
     rm -rf "$root"
     mkdir -p "$root"
@@ -8955,11 +11745,14 @@ test_external_program_headers_direct() {
     lib="$root_abs/libexternal-phdr.so"
     sparse="$root_abs/libexternal-phdr-sparse.so"
     truncated="$root_abs/libexternal-phdr-truncated.so"
+    renamed="$root_abs/libexternal-phdr-renamed.so"
+    renamed_to="$root_abs/libexternal-phdr-renamed-after-load.so"
     bin="$root_abs/probe"
     main="$root_abs/main"
     out="$root_abs/probe.frozen"
     runtime_out="$root_abs/probe-runtime.frozen"
     main_out="$root_abs/main.frozen"
+    renamed_out="$root_abs/renamed.frozen"
     log="$root_abs/freeze.log"
 
     if ! gcc -Wall -Wextra -Werror -O2 -Iinclude -o "$mutator" \
@@ -9024,6 +11817,41 @@ test_external_program_headers_direct() {
         elif [ "$freeze_rc" -eq 77 ]; then
             skip "external main program headers" "$DIRECT_FREEZE_REASON"
         fi
+    fi
+
+    # A PHDR-less dl_iterate_phdr record cannot become pathname-only
+    # authority.  musl retains the pre-constructor dlpi_name even when the
+    # mapped inode is renamed.  The l_ld mapping remains independently
+    # provable at its new /proc/self/maps path, but the stale dlpi_name must
+    # not be accepted as evidence for that object.
+    libc_banner=$(ldd --version 2>&1 || true)
+    if grep -qi musl <<<"$libc_banner"; then
+        if gcc -Wall -Wextra -Werror -O2 -shared -fPIC -o "$renamed" \
+                tests/external_phdr_rename_plugin.c &&
+           "$mutator" --move "$renamed"; then
+            rm -f "$renamed_out" "$renamed_to"
+            if run_freeze env \
+                    DLFREEZE_EXTERNAL_PHDR_RENAME_FROM="$renamed" \
+                    DLFREEZE_EXTERNAL_PHDR_RENAME_TO="$renamed_to" \
+                    "$DLFREEZE" -d -t -o "$renamed_out" -- \
+                    "$bin" --load-only "$renamed" >"$log" 2>&1; then
+                fail "renamed external program headers" \
+                    "stale dlpi_name provenance was accepted"
+            elif grep -Fq \
+                    'loaded-dependency-map-does-not-match-source' "$log" &&
+                 [ ! -e "$renamed_out" ]; then
+                pass "renamed external program headers fail closed"
+            else
+                fail "renamed external program headers" \
+                    "precise trace failure or output cleanup missing"
+            fi
+        else
+            fail "renamed external program headers" \
+                "fixture compile/mutation failed"
+        fi
+    else
+        skip "renamed external program headers" \
+            "native dl_iterate_phdr publishes an in-image table"
     fi
 
     # Runtime filesystem loading exercises the 64-bit provenance field
@@ -9457,7 +12285,7 @@ C
         "$bin" || freeze_rc=$?
     if [ "$freeze_rc" -eq 77 ]; then
         skip "direct constructor signal (strict)" "$DIRECT_FREEZE_REASON"
-        skip "direct constructor signal (automatic)" "$DIRECT_FREEZE_REASON"
+        skip "direct constructor signal (supervised)" "$DIRECT_FREEZE_REASON"
         rm -f "$src" "$bin" "$out" "$log"
         return
     fi
@@ -9466,12 +12294,13 @@ C
         return
     fi
 
-    for mode in strict automatic; do
+    for mode in strict supervised; do
         actual=""; rc=0
         if [ "$mode" = strict ]; then
             capture_output actual env DLFREEZE_NO_FORK=1 "$out" || rc=$?
         else
-            capture_output actual env -u DLFREEZE_NO_FORK "$out" || rc=$?
+            capture_output actual env -u DLFREEZE_NO_FORK \
+                DLFREEZE_SUPERVISED_FALLBACK=1 "$out" || rc=$?
         fi
         if [ "$rc" -eq 139 ]; then
             pass "direct constructor signal ($mode)"
@@ -9480,6 +12309,129 @@ C
         fi
     done
     rm -f "$src" "$bin" "$out" "$log"
+}
+
+# ===================================================================
+# Test 2f1: debug crash handlers are optional and transactionally restored
+# ===================================================================
+test_direct_crash_handler_transaction() {
+    echo "--- direct debug crash-handler transaction ---"
+    local bin="$BUILD/direct_crash_handler_state"
+    local launcher="$BUILD/direct_crash_handler_launcher"
+    local out="$BUILD/direct_crash_handler_state.frozen"
+    local log="$BUILD/direct_crash_handler_state.log"
+    local actual="" rc=0 freeze_rc=0 seccomp_ready=1 ignored_ready=1
+
+    if ! gcc -O2 -Wall -Wextra -Werror \
+            -o "$bin" tests/direct_crash_handler_state.c ||
+       ! gcc -O2 -Wall -Wextra -Werror \
+            -o "$launcher" tests/direct_crash_handler_launcher.c; then
+        fail "direct debug crash-handler transaction" \
+            "fixture compile failed"
+        rm -f "$bin" "$launcher" "$out" "$log"
+        return
+    fi
+
+    capture_output actual "$launcher" none "$bin" ignored || rc=$?
+    if [ "$rc" -ne 0 ] || [ "$actual" != "crash-handler-restore-ok" ]; then
+        ignored_ready=0
+    fi
+
+    if [ "$ignored_ready" -eq 1 ]; then
+        actual=""; rc=0
+        capture_output actual "$launcher" deny-abrt "$bin" partial || rc=$?
+        if [ "$rc" -eq 77 ]; then
+            seccomp_ready=0
+        elif [ "$rc" -ne 0 ] ||
+             [ "$actual" != "crash-handler-rollback-ok" ]; then
+            fail "rt_sigaction errno native control" \
+                "exit=$rc output=$actual"
+            rm -f "$bin" "$launcher" "$out" "$log"
+            return
+        fi
+    fi
+    if [ "$seccomp_ready" -eq 1 ]; then
+        actual=""; rc=0
+        capture_output actual "$launcher" trap-all "$bin" plain || rc=$?
+        if [ "$rc" -eq 77 ]; then
+            seccomp_ready=0
+        elif [ "$rc" -ne 0 ] ||
+           [ "$actual" != "crash-handler-no-debug-ok" ]; then
+            fail "rt_sigaction trap native control" \
+                "exit=$rc output=$actual"
+            rm -f "$bin" "$launcher" "$out" "$log"
+            return
+        fi
+    fi
+
+    freeze_require_direct "direct debug crash-handler transaction" \
+        "$log" "$out" "$bin" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "direct inherited fatal SIG_IGN" "$DIRECT_FREEZE_REASON"
+        skip "direct rt_sigaction errno rollback" "$DIRECT_FREEZE_REASON"
+        skip "non-debug rt_sigaction trap avoidance" "$DIRECT_FREEZE_REASON"
+        rm -f "$bin" "$launcher" "$out" "$log"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -f "$bin" "$launcher" "$out" "$log"
+        return
+    fi
+
+    if [ "$ignored_ready" -eq 0 ]; then
+        skip "direct inherited fatal SIG_IGN" \
+            "native execution does not preserve ignored fatal signals"
+    else
+        actual=""; rc=0
+        capture_output actual env DLFREEZE_NO_FORK=1 \
+            "$launcher" none "$out" ignored || rc=$?
+        if [ "$rc" -eq 0 ] &&
+           [[ "$actual" == *"crash-handler-restore-ok"* ]] &&
+           [[ "$actual" != *"debug crash handlers unavailable"* ]]; then
+            pass "direct inherited fatal SIG_IGN"
+        else
+            fail "direct inherited fatal SIG_IGN" "exit=$rc output=$actual"
+        fi
+    fi
+
+    if [ "$ignored_ready" -eq 0 ]; then
+        skip "direct rt_sigaction errno rollback" \
+            "native execution does not preserve ignored fatal signals"
+    elif [ "$seccomp_ready" -eq 0 ]; then
+        skip "direct rt_sigaction errno rollback" \
+            "seccomp filter unavailable"
+    else
+        actual=""; rc=0
+        capture_output actual env DLFREEZE_NO_FORK=1 \
+            "$launcher" deny-abrt "$out" partial || rc=$?
+        if [ "$rc" -eq 0 ] &&
+           [[ "$actual" == *"debug crash handlers unavailable"* ]] &&
+           [[ "$actual" == *"crash-handler-rollback-ok"* ]]; then
+            pass "direct rt_sigaction errno rollback"
+        else
+            fail "direct rt_sigaction errno rollback" \
+                "exit=$rc output=$actual"
+        fi
+    fi
+
+    if [ "$seccomp_ready" -eq 0 ]; then
+        skip "non-debug rt_sigaction trap avoidance" \
+            "seccomp filter unavailable"
+    else
+        actual=""; rc=0
+        capture_output actual env DLFREEZE_NO_FORK=1 \
+            "$launcher" trap-all "$out" plain || rc=$?
+        actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+        if [ "$rc" -eq 0 ] &&
+           [ "$actual" = "crash-handler-no-debug-ok" ]; then
+            pass "non-debug rt_sigaction trap avoidance"
+        else
+            fail "non-debug rt_sigaction trap avoidance" \
+                "exit=$rc output=$actual"
+        fi
+    fi
+
+    rm -f "$bin" "$launcher" "$out" "$log"
 }
 
 # ===================================================================
@@ -9809,7 +12761,8 @@ C
             dd of="$prelinked" bs=1 seek="$meta_off" count=8 \
                 conv=notrunc status=none
         actual=""; rc=0
-        capture_output actual env -u DLFREEZE_NO_FORK "$prelinked" || rc=$?
+        capture_output actual env -u DLFREEZE_NO_FORK \
+            DLFREEZE_SUPERVISED_FALLBACK=1 "$prelinked" || rc=$?
         if [ "$rc" -eq 0 ] && [ "$actual" = "metadata-target-ran" ]; then
             pass "prelinked direct failure falls back safely"
         else
@@ -10372,6 +13325,59 @@ C
 # ===================================================================
 # Test 2j: over-aligned static TLS and malformed PT_TLS rejection
 # ===================================================================
+test_local_exec_tls_direct() {
+    echo "--- executable local-exec TLS layout ---"
+    local root="$BUILD/local-exec-tls"
+    local mode alignment label bin out log native actual rc freeze_rc
+    local -a mode_flags
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    for mode in pie exec; do
+        if [ "$mode" = pie ]; then
+            mode_flags=(-fPIE -pie)
+        else
+            mode_flags=(-fno-pie -no-pie)
+        fi
+        for alignment in 16 32; do
+            label="local-exec TLS $mode alignment $alignment"
+            bin="$root/$mode-$alignment"
+            out="$bin.frozen"
+            log="$bin.log"
+            if ! gcc -Wall -Wextra -Werror -O2 -pthread \
+                    "${mode_flags[@]}" -DTEST_TLS_ALIGNMENT="$alignment" \
+                    -o "$bin" tests/direct_local_exec_tls.c; then
+                fail "$label" "fixture compile failed"
+                continue
+            fi
+            rc=0; native=""
+            capture_output native "$bin" || rc=$?
+            if [ "$rc" -ne 0 ] || [ "$native" != "local-exec-tls-ok" ]; then
+                fail "$label native control" "exit=$rc output=$native"
+                continue
+            fi
+            freeze_rc=0
+            freeze_require_direct "$label" "$log" "$out" "$bin" ||
+                freeze_rc=$?
+            if [ "$freeze_rc" -eq 77 ]; then
+                skip "$label" "$DIRECT_FREEZE_REASON"
+                continue
+            fi
+            if [ "$freeze_rc" -ne 0 ]; then
+                continue
+            fi
+            rc=0; actual=""
+            capture_output actual "$out" || rc=$?
+            if [ "$rc" -eq 0 ] && [ "$actual" = "$native" ]; then
+                pass "$label"
+            else
+                fail "$label" "exit=$rc output=$actual"
+            fi
+        done
+    done
+    rm -rf "$root"
+}
+
 test_static_tls_alignment_direct() {
     echo "--- static TLS alignment direct-load ---"
     local src="$BUILD/static_tls_align.c" bin="$BUILD/static_tls_align"
@@ -11755,7 +14761,7 @@ C
 
         if grep -Fq "$slash_lib" <<<"$dynamic" &&
            [ "$rc" -eq 0 ] && [ "$actual" = 17 ]; then
-            if run_freeze "$DLFREEZE" -o "$slash_extract" -- "$slash_bin" \
+            if run_freeze "$DLFREEZE" -x -o "$slash_extract" -- "$slash_bin" \
                     >"$slash_pack_log" 2>&1; then
                 fail "pathful DT_NEEDED extraction refusal" \
                     "packer created an extraction-mode artifact"
@@ -12940,24 +15946,50 @@ C
 # Test 2i: captured-file tables grow beyond their former fixed limits
 # ===================================================================
 test_vfs_hash_complexity_gate() {
-    echo "--- keyed VFS hash and linear directory derivation gate ---"
+    echo "--- keyed VFS hash and immutable directory-child index gate ---"
     local gate="$BUILD/vfs_hash_complexity_gate"
     local rc=0
 
     if ! gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -Iinclude \
             -ffunction-sections -fdata-sections -fno-stack-protector \
             -Wl,--gc-sections -o "$gate" \
-            tests/vfs_hash_complexity_gate.c -ldl -pthread; then
+            tests/vfs_hash_complexity_gate.c src/lazy_trampoline.S \
+            -ldl -pthread; then
         fail "VFS adversarial complexity gate" "fixture compile failed"
         rm -f "$gate"
         return
     fi
     run_with_timeout_seconds 10 "$gate" || rc=$?
     if [ "$rc" -eq 0 ]; then
-        pass "keyed VFS hashing and linear immutable directory spans"
+        pass "keyed VFS hashing, unique directories, and bounded readdir"
     else
         fail "VFS adversarial complexity gate" \
             "exit=$rc (timeout or structural mismatch)"
+    fi
+    rm -f "$gate"
+}
+
+test_vfs_registry_fastpath_gate() {
+    echo "--- VFS empty-registry fast-path publication gate ---"
+    local gate="$BUILD/vfs_registry_fastpath_gate"
+    local rc=0
+
+    if ! gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -Iinclude \
+            -ffunction-sections -fdata-sections -fno-stack-protector \
+            -Wl,--gc-sections -o "$gate" \
+            tests/vfs_registry_fastpath_gate.c src/lazy_trampoline.S \
+            -ldl -pthread; then
+        fail "VFS registry fast path" "fixture compile failed"
+        rm -f "$gate"
+        return
+    fi
+    run_with_timeout_seconds 10 "$gate" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        pass "empty VFS registries bypass the runtime loader lock"
+        pass "VFS registry publication survives recursion, stdio, and fork"
+    else
+        fail "VFS registry fast path" \
+            "exit=$rc (publication, identity, or lock-count mismatch)"
     fi
     rm -f "$gate"
 }
@@ -12967,10 +15999,11 @@ test_startup_dependency_index_gate() {
     local gate="$BUILD/startup_dependency_index_gate"
     local rc=0
 
-    if ! gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -O2 -Iinclude \
+    if ! gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -O3 -Iinclude \
             -ffunction-sections -fdata-sections -fno-stack-protector \
             -Wl,--gc-sections -o "$gate" \
-            tests/startup_dependency_index_gate.c -ldl -pthread; then
+            tests/startup_dependency_index_gate.c src/lazy_trampoline.S \
+            -ldl -pthread; then
         fail "startup dependency identity index" "WERROR fixture compile failed"
         rm -f "$gate"
         return
@@ -13256,7 +16289,12 @@ C
         rm -f "$src" "$bin"
         return
     fi
-    if ! tree=$(mktemp -d "$BUILD/high-cardinality-tree.XXXXXX"); then
+    # This case exercises manifest cardinality and deep-path semantics, not
+    # the backing store of the build directory.  Keep its thousands of tiny
+    # files in the caller's scratch filesystem so overlay/network workspaces
+    # do not turn the fixed trace timeout into an I/O-speed assertion.
+    if ! tree=$(mktemp -d \
+            "${TMPDIR:-/tmp}/dlfreeze-high-cardinality.XXXXXX"); then
         fail "high-cardinality captured-file manifest" \
             "could not create unique fixture root"
         rm -f "$src" "$bin"
@@ -13310,7 +16348,9 @@ C
 # ===================================================================
 test_ls() {
     echo "--- ls ---"
-    local out="$BUILD/ls.frozen"
+    # Preserve the requested command basename for multicall implementations
+    # such as BusyBox, whose public dispatch contract is argv[0].
+    local out="$BUILD/ls"
 
     # Use /usr/bin — stable and no tmpdir contamination
     freeze_and_compare "ls /usr/bin" /bin/ls "$out" /usr/bin
@@ -13326,7 +16366,8 @@ test_ls() {
 # ===================================================================
 test_cat() {
     echo "--- cat ---"
-    local out="$BUILD/cat.frozen"
+    # Preserve the requested command basename for multicall implementations.
+    local out="$BUILD/cat"
     local testfile=/etc/hostname
     [ -f "$testfile" ] || testfile=/etc/os-release
 
@@ -13601,11 +16642,13 @@ int main(int argc, char **argv) {
         puts("startup-elf-vfs-ok:seccomp-unavailable");
         return 0;
     }
-    errno = 0;
-    fd = open(argv[1], O_RDONLY);
-    if (fd >= 0 || errno != EPERM)
+    fd = open(argv[1], O_RDONLY | O_CLOEXEC);
+    if (fd < 0 || (fcntl(fd, F_GETFL) & O_ACCMODE) != O_RDONLY ||
+        (fcntl(fd, F_GETFD) & FD_CLOEXEC) == 0 ||
+        read(fd, &data_byte, 1) != 1 || data_byte != 'd')
         return 18;
-    puts("startup-elf-vfs-ok:fail-closed");
+    close(fd);
+    puts("startup-elf-vfs-ok:seal-fallback");
     return 0;
 }
 C
@@ -13640,16 +16683,456 @@ C
     rm -f "$data"
     mv "${data}.bak" "$data"
     actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
-    if [ "$rc" -eq 0 ] && [ "$actual" = "startup-elf-vfs-ok:fail-closed" ]; then
+    if [ "$rc" -eq 0 ] &&
+       [ "$actual" = "startup-elf-vfs-ok:seal-fallback" ]; then
         pass "direct startup ELF VFS visibility"
-        pass "VFS sealing failure is fail-closed"
+        pass "VFS sealing denial uses exact backing fallback"
     elif [ "$rc" -eq 0 ] &&
          [ "$actual" = "startup-elf-vfs-ok:seccomp-unavailable" ]; then
         pass "direct startup ELF VFS visibility"
-        skip "VFS sealing failure is fail-closed" "seccomp unavailable"
+        skip "VFS sealing denial uses exact backing fallback" \
+            "seccomp unavailable"
     else
         fail "direct startup ELF VFS visibility" "exit=$rc output=$actual"
         tail -n 60 "$log" || true
+    fi
+    rm -rf "$root"
+}
+
+# A traced absolute DSO is also a virtual file identity.  This must work when
+# the trace selected no DATA entries at all; otherwise the VFS shims are not
+# installed and plugin scanners silently consult the host filesystem.
+test_direct_dlopen_only_vfs() {
+    echo "--- direct traced-ELF VFS without DATA ---"
+    local build_abs root plugin_dir saved_dir plugin plugin_real
+    local sibling sibling_target bin out log
+    local size footer manifest count flags actual
+    local freeze_rc=0 rc=0 data_entries=0
+
+    build_abs=$(cd "$BUILD" && pwd -P)
+    root="$build_abs/vfs_dlopen_only_root"
+    plugin_dir="$root/plugins"
+    saved_dir="$root/plugins.saved"
+    plugin="$plugin_dir/libdlfrz_vfs_only.so"
+    plugin_real="$plugin_dir/libdlfrz_vfs_real.so"
+    sibling="$plugin_dir/host-sibling.txt"
+    sibling_target="$plugin_dir/host-sibling-target.txt"
+    bin="$root/main"
+    out="$root/main.frozen"
+    log="$root/main.log"
+
+    rm -rf "$root"
+    mkdir -p "$plugin_dir"
+    printf '%s\n' trace-host > "$sibling"
+    if ! gcc -std=c11 -Wall -Wextra -Werror -O2 -shared -fPIC \
+            -Wl,-soname,libdlfrz_vfs_only.so -o "$plugin_real" \
+            tests/vfs_dlopen_only_plugin.c ||
+       ! ln -s "$(basename "$plugin_real")" "$plugin" ||
+       ! gcc -std=c11 -Wall -Wextra -Werror -O2 -o "$bin" \
+            tests/vfs_dlopen_only.c -ldl; then
+        fail "direct traced-ELF VFS without DATA" "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+    capture_output actual "$bin" "$plugin" "$plugin_dir" "$sibling" \
+        trace-host "$plugin_real" || rc=$?
+    if [ "$rc" -ne 0 ] || [ "$actual" != "dlopen-only-vfs-ok" ]; then
+        fail "direct traced-ELF VFS without DATA" \
+            "native fixture exit=$rc output=$actual"
+        rm -rf "$root"
+        return
+    fi
+
+    freeze_require_direct "direct traced-ELF VFS without DATA" "$log" \
+        "$out" -t -- "$bin" "$plugin" "$plugin_dir" "$sibling" \
+        trace-host "$plugin_real" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "direct traced-ELF VFS without DATA" "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+
+    size=$(stat -c %s "$out")
+    footer=$((size - 64))
+    count=$(od -An -tu4 -j $((footer + 12)) -N4 "$out" |
+        tr -d '[:space:]')
+    manifest=$(od -An -tu8 -j $((footer + 16)) -N8 "$out" |
+        tr -d '[:space:]')
+    if [[ ! "$count" =~ ^[0-9]+$ || ! "$manifest" =~ ^[0-9]+$ ]]; then
+        fail "direct traced-ELF VFS without DATA" \
+            "manifest coordinates are invalid"
+        rm -rf "$root"
+        return
+    fi
+    for ((i = 0; i < count; i++)); do
+        flags=$(od -An -tu4 \
+            -j $((manifest + i * MANIFEST_ENTRY_SIZE + 16)) -N4 "$out" |
+            tr -d '[:space:]')
+        if [[ "$flags" =~ ^[0-9]+$ ]] && [ $((flags & 0x40)) -ne 0 ]; then
+            data_entries=$((data_entries + 1))
+        fi
+    done
+    if [ "$data_entries" -ne 0 ]; then
+        fail "direct traced-ELF VFS without DATA" \
+            "fixture unexpectedly captured DATA entries"
+        rm -rf "$root"
+        return
+    fi
+
+    mv "$plugin_dir" "$saved_dir"
+    mkdir -p "$plugin_dir"
+    ln -s /etc/passwd "$plugin"
+    ln -s /etc/group "$plugin_real"
+    printf '%s\n' runtime-host > "$sibling_target"
+    ln -s "$(basename "$sibling_target")" "$sibling"
+    actual=""; rc=0
+    capture_output actual "$out" "$plugin" "$plugin_dir" "$sibling" \
+        runtime-host "$plugin_real" || rc=$?
+    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+    if [ "$rc" -eq 0 ] && [ "$actual" = "dlopen-only-vfs-ok" ]; then
+        pass "direct traced-ELF VFS without DATA"
+        pass "traced-ELF VFS merged directory view"
+        pass "traced-ELF VFS uncaptured sibling fallthrough"
+    else
+        fail "direct traced-ELF VFS without DATA" \
+            "exit=$rc output=$actual"
+        tail -n 60 "$log" || true
+    fi
+    rm -rf "$root"
+}
+
+# ===================================================================
+# Test 4bc: direct VFS has an exact non-memfd backing-file backend
+# ===================================================================
+test_vfs_backing_fallback() {
+    echo "--- direct VFS backing-file fallback ---"
+    local build_abs root bin data out log tmpdir=/dev/shm
+    local actual rc=0 freeze_rc=0
+
+    build_abs=$(cd "$BUILD" && pwd -P)
+    root="$build_abs/vfs_backing_fallback_root"
+    bin="$root/main"
+    data="$root/captured.dat"
+    out="$root/main.frozen"
+    log="$root/main.log"
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    if [ ! -d "$tmpdir" ] || [ ! -w "$tmpdir" ]; then
+        skip "direct VFS memfd_create ENOSYS fallback" \
+            "$tmpdir is unavailable"
+        skip "direct VFS proc reopen denial fallback" \
+            "$tmpdir is unavailable"
+        skip "direct VFS fallback descriptor and concurrency contract" \
+            "$tmpdir is unavailable"
+        skip "direct VFS executable fallback mapping" \
+            "$tmpdir is unavailable"
+        rm -rf "$root"
+        return
+    fi
+    printf '%s\n' 'captured-fallback-data' > "$data"
+    if ! gcc -std=c11 -Wall -Wextra -Werror -O2 -pthread \
+            -o "$bin" tests/vfs_backing_fallback.c; then
+        fail "direct VFS backing-file fallback" "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+
+    freeze_require_direct "direct VFS backing-file fallback" "$log" \
+        "$out" -t -f "$data" "$bin" "$data" "$bin" "$tmpdir" trace ||
+        freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "direct VFS backing-file fallback" "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+
+    mv "$data" "${data}.bak"
+    mv "$bin" "${bin}.bak"
+    capture_output actual env TMPDIR="$tmpdir" \
+        "$out" "$data" "$bin" "$tmpdir" frozen || rc=$?
+    mv "${bin}.bak" "$bin"
+    mv "${data}.bak" "$data"
+    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+    if [ "$rc" -eq 0 ] &&
+       [ "$actual" = "vfs-backing-fallback-ok:verified" ]; then
+        pass "direct VFS memfd_create ENOSYS fallback"
+        pass "direct VFS proc reopen denial fallback"
+        pass "direct VFS fallback descriptor and concurrency contract"
+        pass "direct VFS executable fallback mapping"
+        pass "direct VFS fallback leaves no temporary names"
+        pass "direct VFS fallback uses immutable initial TMPDIR"
+    elif [ "$rc" -eq 0 ] &&
+         [ "$actual" = "vfs-backing-fallback-ok:seccomp-unavailable" ]; then
+        skip "direct VFS memfd_create ENOSYS fallback" \
+            "seccomp unavailable"
+        skip "direct VFS proc reopen denial fallback" \
+            "seccomp unavailable"
+        skip "direct VFS fallback descriptor and concurrency contract" \
+            "seccomp unavailable"
+        skip "direct VFS executable fallback mapping" \
+            "seccomp unavailable"
+        skip "direct VFS fallback leaves no temporary names" \
+            "seccomp unavailable"
+        skip "direct VFS fallback uses immutable initial TMPDIR" \
+            "seccomp unavailable"
+    else
+        fail "direct VFS backing-file fallback" \
+            "exit=$rc output=$actual"
+        tail -n 60 "$log" || true
+    fi
+    rm -rf "$root"
+}
+
+# ===================================================================
+# Test 4bb: captured revision timestamps agree through stat and fstat
+# ===================================================================
+test_captured_file_timestamp_metadata() {
+    echo "--- captured-file timestamp and descriptor metadata ---"
+    local build_abs root src stamp_src mutate_src bin stamp mutator data
+    local out bad_nsec bad_kind log expected actual rc=0 freeze_rc=0
+
+    build_abs=$(cd "$BUILD" && pwd -P)
+    root="$build_abs/vfs_timestamp_root"
+    src="$root/main.c"
+    stamp_src="$root/stamp.c"
+    mutate_src="$root/mutate.c"
+    bin="$root/main"
+    stamp="$root/stamp"
+    mutator="$root/mutate"
+    data="$root/captured.dat"
+    out="$root/main.frozen"
+    bad_nsec="$root/bad-nsec.frozen"
+    bad_kind="$root/bad-kind.frozen"
+    log="$root/main.log"
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    cat > "$stamp_src" <<'C'
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <stdio.h>
+#include <sys/stat.h>
+#include <time.h>
+
+int main(int argc, char **argv) {
+    const struct timespec times[2] = {
+        { .tv_sec = 0, .tv_nsec = UTIME_OMIT },
+        { .tv_sec = 946782245, .tv_nsec = 123456789 },
+    };
+    struct stat status;
+
+    if (argc != 2 || utimensat(AT_FDCWD, argv[1], times, 0) < 0 ||
+        stat(argv[1], &status) < 0)
+        return 1;
+    printf("%lld %ld\n", (long long)status.st_mtim.tv_sec,
+           status.st_mtim.tv_nsec);
+    return 0;
+}
+C
+    cat > "$src" <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+static int same_metadata(const struct stat *left, const struct stat *right) {
+    return left->st_dev == right->st_dev &&
+           left->st_ino == right->st_ino &&
+           left->st_mode == right->st_mode &&
+           left->st_nlink == right->st_nlink &&
+           left->st_uid == right->st_uid &&
+           left->st_gid == right->st_gid &&
+           left->st_rdev == right->st_rdev &&
+           left->st_size == right->st_size &&
+           left->st_blksize == right->st_blksize &&
+           left->st_blocks == right->st_blocks &&
+           left->st_atim.tv_sec == right->st_atim.tv_sec &&
+           left->st_atim.tv_nsec == right->st_atim.tv_nsec &&
+           left->st_mtim.tv_sec == right->st_mtim.tv_sec &&
+           left->st_mtim.tv_nsec == right->st_mtim.tv_nsec &&
+           left->st_ctim.tv_sec == right->st_ctim.tv_sec &&
+           left->st_ctim.tv_nsec == right->st_ctim.tv_nsec;
+}
+
+static int descriptor_matches(int fd, const struct stat *path_status,
+                              int check_empty_path) {
+    struct stat status;
+
+    if (fstat(fd, &status) < 0 || !same_metadata(path_status, &status))
+        return 0;
+    return !check_empty_path ||
+           (fstatat(fd, "", &status, AT_EMPTY_PATH) == 0 &&
+            same_metadata(path_status, &status));
+}
+
+int main(int argc, char **argv) {
+    struct stat path_status;
+    struct stat replaced_status;
+    long long expected_sec;
+    long expected_nsec;
+    int frozen_check;
+    int copied;
+    int fd;
+    int host;
+
+    if (argc != 4 && argc != 5)
+        return 2;
+    frozen_check = argc == 5;
+    expected_sec = strtoll(argv[2], NULL, 10);
+    expected_nsec = strtol(argv[3], NULL, 10);
+    if (stat(argv[1], &path_status) < 0 ||
+        (long long)path_status.st_mtim.tv_sec != expected_sec ||
+        path_status.st_mtim.tv_nsec != expected_nsec)
+        return 3;
+    fd = open(argv[1], O_RDONLY | O_CLOEXEC);
+    if (fd < 0 || !descriptor_matches(fd, &path_status, frozen_check))
+        return 4;
+    if (dup2(fd, fd) != fd ||
+        !descriptor_matches(fd, &path_status, frozen_check))
+        return 5;
+    copied = fcntl(fd, F_DUPFD_CLOEXEC, 10);
+    if (copied < 0 ||
+        !descriptor_matches(copied, &path_status, frozen_check))
+        return 6;
+#ifdef O_PATH
+    {
+        int path_fd = open(argv[1], O_PATH | O_CLOEXEC);
+
+        if (path_fd < 0 ||
+            !descriptor_matches(path_fd, &path_status, frozen_check))
+            return 7;
+        close(path_fd);
+    }
+#endif
+    host = open("/dev/null", O_RDONLY);
+    if (host < 0 || dup2(host, copied) != copied ||
+        fstat(copied, &replaced_status) < 0 ||
+        !S_ISCHR(replaced_status.st_mode))
+        return 8;
+    close(host);
+    close(copied);
+    close(fd);
+    puts("captured-timestamp-ok");
+    return 0;
+}
+C
+    cat > "$mutate_src" <<'C'
+#include <stdint.h>
+#include <limits.h>
+#include <stdio.h>
+#include <string.h>
+#include "common.h"
+
+int main(int argc, char **argv) {
+    struct dlfrz_footer footer;
+    struct dlfrz_entry entry;
+    FILE *file;
+    long end;
+
+    if (argc != 3 || (file = fopen(argv[1], "r+b")) == NULL ||
+        fseek(file, 0, SEEK_END) != 0 || (end = ftell(file)) < 0 ||
+        end < (long)sizeof(footer) ||
+        fseek(file, end - (long)sizeof(footer), SEEK_SET) != 0 ||
+        fread(&footer, sizeof(footer), 1, file) != 1 ||
+        memcmp(footer.magic, DLFRZ_MAGIC, sizeof(footer.magic)) != 0 ||
+        footer.version != DLFRZ_VERSION)
+        return 1;
+    for (uint32_t i = 0; i < footer.num_entries; i++) {
+        uint64_t offset = footer.manifest_offset +
+            (uint64_t)i * sizeof(entry);
+
+        if (offset > (uint64_t)LONG_MAX ||
+            fseek(file, (long)offset, SEEK_SET) != 0 ||
+            fread(&entry, sizeof(entry), 1, file) != 1)
+            return 1;
+        if (strcmp(argv[2], "nsec") == 0 &&
+            (entry.flags & DLFRZ_FLAG_DATA) != 0 &&
+            (entry.flags & (DLFRZ_FLAG_DATA_VIRTUAL |
+                            DLFRZ_FLAG_DATA_NEGATIVE |
+                            DLFRZ_FLAG_DATA_DIRECTORY)) == 0) {
+            entry.captured_mtime_nsec = 1000000000U;
+        } else if (strcmp(argv[2], "kind") == 0 &&
+                   (entry.flags & DLFRZ_FLAG_DATA) == 0) {
+            entry.captured_mtime_sec = 1;
+        } else {
+            continue;
+        }
+        if (fseek(file, (long)offset, SEEK_SET) != 0 ||
+            fwrite(&entry, sizeof(entry), 1, file) != 1 ||
+            fclose(file) != 0)
+            return 1;
+        return 0;
+    }
+    fclose(file);
+    return 1;
+}
+C
+    printf '%s\n' 'captured timestamp bytes' > "$data"
+    if ! gcc -Wall -Wextra -Werror -O2 -o "$stamp" "$stamp_src" ||
+       ! gcc -Wall -Wextra -Werror -O2 -o "$bin" "$src" ||
+       ! gcc -Wall -Wextra -Werror -O2 -Iinclude \
+            -o "$mutator" "$mutate_src"; then
+        fail "captured-file timestamp metadata" "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+    expected=$("$stamp" "$data")
+
+    freeze_require_direct "captured-file timestamp metadata" "$log" "$out" \
+        -t -f "$data" -- "$bin" "$data" $expected || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "captured-file timestamp metadata" "$DIRECT_FREEZE_REASON"
+        skip "captured timestamp manifest validation" "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+
+    printf '%s\n' 'host replacement metadata' > "$data"
+    rc=0
+    capture_output actual "$out" "$data" $expected frozen || rc=$?
+    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+    if [ "$rc" -eq 0 ] && [ "$actual" = "captured-timestamp-ok" ]; then
+        pass "captured stat/fstat timestamps and descriptor propagation"
+    else
+        fail "captured-file timestamp metadata" \
+            "exit=$rc output=$actual"
+    fi
+
+    cp "$out" "$bad_nsec"
+    cp "$out" "$bad_kind"
+    "$mutator" "$bad_nsec" nsec
+    "$mutator" "$bad_kind" kind
+    local invalid=0
+    for out in "$bad_nsec" "$bad_kind"; do
+        rc=0
+        capture_output actual "$out" "$data" $expected frozen || rc=$?
+        if [ "$rc" -ne 127 ] ||
+           [[ "$actual" != *"invalid manifest"* ]] ||
+           [[ "$actual" == *"captured-timestamp-ok"* ]]; then
+            invalid=1
+        fi
+    done
+    if [ "$invalid" -eq 0 ]; then
+        pass "captured timestamp manifest validation"
+    else
+        fail "captured timestamp manifest validation" \
+            "noncanonical timestamp metadata was admitted"
     fi
     rm -rf "$root"
 }
@@ -13722,12 +17205,12 @@ test_vfs_faccessat_flag_routing() {
         case "$actual" in
             *,seccomp=verified)
                 pass "direct VFS faccessat syscall routing"
-                pass "direct VFS faccessat2 ENOSYS is fail-closed"
+                pass "direct VFS faccessat2 ENOSYS uses target libc"
                 ;;
             *,seccomp=unavailable)
                 skip "direct VFS faccessat syscall routing" \
                     "seccomp unavailable"
-                skip "direct VFS faccessat2 ENOSYS is fail-closed" \
+                skip "direct VFS faccessat2 ENOSYS uses target libc" \
                     "seccomp unavailable"
                 ;;
         esac
@@ -14039,6 +17522,125 @@ C
           "$pos_out" "$neg_out" "$log"
 }
 
+# ===================================================================
+# Test 4da: legacy glibc CRT startup retains one owner for main init
+# ===================================================================
+test_glibc_legacy_crt_init_direct() {
+    echo "--- glibc legacy CRT main-initializer ownership ---"
+    local root="$BUILD/glibc_legacy_crt_init"
+    local src="$root/main.c" start="$root/start.S"
+    local bin="$root/main" out="$root/main.frozen" log="$root/main.log"
+    local expect actual rc_e=0 rc=0 freeze_rc=0
+    local label="glibc legacy CRT main-initializer ownership"
+
+    if [ "$(uname -m)" != x86_64 ]; then
+        skip "$label" "fixture currently covers the x86-64 startup ABI"
+        return
+    fi
+    if ! compiler_targets_glibc; then
+        skip "$label" "test compiler does not target glibc"
+        return
+    fi
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    cat > "$src" <<'C'
+#include <stdio.h>
+
+typedef void (*array_init_fn)(void);
+extern array_init_fn __init_array_start[];
+extern array_init_fn __init_array_end[];
+
+static int constructor_count;
+
+__attribute__((constructor))
+static void counted_constructor(void)
+{
+    constructor_count++;
+}
+
+/* This is the contract used by the legacy x86-64 glibc CRT: _start passes
+ * a non-null init callback to __libc_start_main, and that callback owns the
+ * main executable's init array. */
+void legacy_main_init(int argc, char **argv, char **envp)
+{
+    array_init_fn *entry;
+
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    for (entry = __init_array_start; entry < __init_array_end; entry++)
+        (*entry)();
+}
+
+void legacy_main_fini(void)
+{
+}
+
+int main(void)
+{
+    printf("legacy-crt-constructor-count=%d\n", constructor_count);
+    return constructor_count == 1 ? 0 : 40 + constructor_count;
+}
+C
+    cat > "$start" <<'ASM'
+    .text
+    .globl _start
+    .type _start,@function
+_start:
+    xorl %ebp, %ebp
+    movq %rdx, %r9
+    popq %rsi
+    movq %rsp, %rdx
+    andq $-16, %rsp
+    pushq %rax
+    pushq %rsp
+    leaq legacy_main_fini(%rip), %r8
+    leaq legacy_main_init(%rip), %rcx
+    leaq main(%rip), %rdi
+    call *__libc_start_main@GOTPCREL(%rip)
+    hlt
+    .size _start, .-_start
+    .section .note.GNU-stack,"",@progbits
+ASM
+
+    if ! gcc -std=c11 -Wall -Wextra -Werror -O2 -fno-pie -no-pie \
+            -nostartfiles -Wl,-e,_start -o "$bin" "$src" "$start"; then
+        fail "$label" "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+    capture_output expect "$bin" || rc_e=$?
+    if [ "$rc_e" -ne 0 ] ||
+       [ "$expect" != "legacy-crt-constructor-count=1" ]; then
+        fail "$label native control" "exit=$rc_e output=$expect"
+        rm -rf "$root"
+        return
+    fi
+
+    freeze_require_direct "$label" "$log" "$out" "$bin" ||
+        freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "$label" "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+
+    capture_output actual env DLFREEZE_NO_FORK=1 "$out" || rc=$?
+    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+    if [ "$rc" -eq "$rc_e" ] && [ "$actual" = "$expect" ]; then
+        pass "$label"
+    else
+        fail "$label" \
+            "native=$rc_e:$expect direct=$rc:$actual"
+    fi
+    rm -rf "$root"
+}
+
 smoke_direct_program() {
     local label="$1" binary="$2" out="$BUILD/program-smoke.frozen"
     local log="$BUILD/program-smoke.log" freeze_rc=0
@@ -14079,15 +17681,24 @@ smoke_direct_program() {
 # ===================================================================
 test_program_smoke_matrix() {
     echo "--- representative program smoke matrix ---"
-    local bash_bin
+    local bash_bin printf_bin="" candidate
     bash_bin="$(command -v bash || true)"
-    if [ -n "$bash_bin" ]; then
+    for candidate in /usr/bin/printf /bin/printf; do
+        if [ -f "$candidate" ] && [ -x "$candidate" ]; then
+            printf_bin="$candidate"
+            break
+        fi
+    done
+    if [ -z "$bash_bin" ]; then
+        skip "bash fork/exec" "program not installed"
+    elif [ -z "$printf_bin" ]; then
+        skip "bash fork/exec" "external printf program not installed"
+    else
         freeze_and_compare "bash fork/exec" "$bash_bin" \
             "$BUILD/program-bash.frozen" -c \
-            'printf "parent\n"; /bin/printf "child\n"'
+            'printf "parent\n"; "$1" "child\n"' \
+            dlfreeze-test "$printf_bin"
         rm -f "$BUILD/program-bash.frozen"
-    else
-        skip "bash fork/exec" "program not installed"
     fi
     smoke_direct_program "bash arithmetic" "$bash_bin" \
         -c 'x=$((20 + 22)); printf "value=%s\n" "$x"'
@@ -14098,7 +17709,16 @@ test_program_smoke_matrix() {
     smoke_direct_program "sqlite query" "$(command -v sqlite3 || true)" \
         :memory: 'select hex(zeroblob(4)), 6 * 7;'
     smoke_direct_program "zig version" "$(command -v zig || true)" version
-
+    smoke_direct_program "Perl expression" "$(command -v perl || true)" \
+        -e 'print 6 * 7, "\n"'
+    smoke_direct_program "Node expression" "$(command -v node || true)" \
+        -p 'JSON.stringify({answer: 6 * 7})'
+    smoke_direct_program "curl feature query" "$(command -v curl || true)" \
+        --version
+    smoke_direct_program "CMake command mode" "$(command -v cmake || true)" \
+        -E echo dlfreeze-cmake-ok
+    smoke_direct_program "ffmpeg feature query" \
+        "$(command -v ffmpeg || true)" -version
 }
 
 # Exercise Zig as a compiler, not just as a single-process version probe.
@@ -14480,7 +18100,7 @@ C
     fi
 
     local rc=0
-    if run_freeze "$DLFREEZE" -t -o "$out" -- "$prog" "$lib" \
+    if run_freeze "$DLFREEZE" -x -t -o "$out" -- "$prog" "$lib" \
             >"$log" 2>&1; then
         rc=0
     else
@@ -14541,7 +18161,7 @@ C
     fi
 
     # Freeze WITHOUT tracing — libfallback.so will NOT be embedded
-    if ! run_freeze "$DLFREEZE" -v -o "$out" "$prog"; then
+    if ! run_freeze "$DLFREEZE" -v -x -o "$out" "$prog"; then
         fail "dlopen-fallback" "dlfreeze failed"; return
     fi
 
@@ -14712,10 +18332,10 @@ C
     if [[ "$count" =~ ^[0-9]+$ && "$manifest" =~ ^[0-9]+$ ]]; then
         for ((i = 0; i < count; i++)); do
             entry_flags=$(od -An -tu4 \
-                -j $((manifest + i * 32 + 16)) -N4 "$out" |
+                -j $((manifest + i * MANIFEST_ENTRY_SIZE + 16)) -N4 "$out" |
                 tr -d '[:space:]')
             entry_request=$(od -An -tu4 \
-                -j $((manifest + i * 32 + 24)) -N4 "$out" |
+                -j $((manifest + i * MANIFEST_ENTRY_SIZE + 24)) -N4 "$out" |
                 tr -d '[:space:]')
             if [[ "$entry_flags" =~ ^[0-9]+$ ]] &&
                [[ "$entry_request" =~ ^[0-9]+$ ]] &&
@@ -14732,7 +18352,7 @@ C
     else
         cp "$out" "$bad"
         dd if=/dev/zero of="$bad" bs=1 \
-            seek=$((manifest + dlopen_index * 32 + 24)) count=4 \
+            seek=$((manifest + dlopen_index * MANIFEST_ENTRY_SIZE + 24)) count=4 \
             conv=notrunc status=none
         local bad_actual="" bad_rc=0
         capture_output bad_actual "$bad" || bad_rc=$?
@@ -15505,7 +19125,8 @@ test_gnu_runtime_dynamic_token_gate() {
     if gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -Iinclude \
             -ffunction-sections -fdata-sections -fno-stack-protector \
             -Wl,--gc-sections -o "$gate" \
-            tests/gnu_runtime_token_gate.c -ldl -pthread &&
+            tests/gnu_runtime_token_gate.c src/lazy_trampoline.S \
+            -ldl -pthread &&
        "$gate"; then
         pass "GNU direct runtime dynamic-token grammar"
     else
@@ -19690,9 +23311,8 @@ C
 
 # Public dlopen mode bits must drive loader state rather than being ignored.
 # The direct loader preserves NOLOAD and LOCAL-to-GLOBAL visibility semantics.
-# musl deliberately binds both public modes eagerly; a GNU pure-LAZY request
-# for a new object must fail before activation because direct mode has no
-# native PLT resolver.
+# musl deliberately binds both public modes eagerly; GNU pure-LAZY requests
+# retain their PLT first-call contract through the direct loader's resolver.
 test_direct_dlopen_mode_contract() {
     echo "--- direct dlopen mode contract ---"
     local root="$BUILD/dlopen_mode_contract"
@@ -19795,19 +23415,10 @@ int main(int argc, char **argv) {
         !default_absent("mode_dependency_value"))
         return 6;
 
-    /* musl implements RTLD_LAZY eagerly.  GNU, however, promises genuine
-     * lazy PLT binding, so direct mode must reject a new pure-LAZY object
-     * without running its constructor or publishing either symbol. */
+    /* Both runtimes admit the public spelling.  GNU keeps PLT binding lazy;
+     * musl deliberately applies its native eager policy. */
     (void)dlerror();
     handle = dlopen(argv[2], RTLD_LAZY | RTLD_LOCAL);
-#if defined(__GLIBC__)
-    if (handle != NULL || dlerror() == NULL ||
-        access(argv[3], F_OK) == 0 || errno != ENOENT ||
-        !default_absent("mode_top_value") ||
-        !default_absent("mode_dependency_value"))
-        return 7;
-    handle = dlopen(argv[2], RTLD_NOW | RTLD_LOCAL);
-#endif
     top_value = handle ? (value_fn)dlsym(handle, "mode_top_value") : NULL;
     dependency_value = handle
         ? (value_fn)dlsym(handle, "mode_dependency_value") : NULL;
@@ -19890,19 +23501,450 @@ C
     rm -rf "$root"
 }
 
+# Build a test-only bootstrap with two one-shot commit hooks.  A fault before
+# private DTV preparation must roll back like an ordinary failed dlopen; a
+# fault after DTV publication is terminal because returning would expose
+# target state which cannot be reconstructed safely.
+test_direct_transaction_atomicity_gate() {
+    echo "--- direct dlopen transaction atomicity gate ---"
+    local root="$BUILD/direct_transaction_atomicity_gate"
+    local gate_build="$root/tool"
+    local gate_tool="$gate_build/dlfreeze"
+    local lib_src="$root/library.c" lib="$root/libdlfrz_tx_gate.so"
+    local prog_src="$root/main.c" prog="$root/main"
+    local out="$root/main.frozen" log="$root/freeze.log"
+    local build_log="$root/build.log" actual="" rc=0 freeze_rc=0
+    local signal_stage signal_ok=1
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    cat >"$lib_src" <<'C'
+__thread int dlfrz_tx_gate_tls = 31;
+int dlfrz_tx_gate_target = 40;
+__thread int *dlfrz_tx_gate_pointer = &dlfrz_tx_gate_target;
+int dlfrz_tx_gate_constructor_count;
+int dlfrz_tx_gate_export = 73;
+
+__attribute__((constructor))
+static void dlfrz_tx_gate_constructor(void)
+{
+    dlfrz_tx_gate_constructor_count++;
+}
+
+int dlfrz_tx_gate_value(void)
+{
+    return dlfrz_tx_gate_tls + dlfrz_tx_gate_constructor_count;
+}
+
+int dlfrz_tx_gate_template_value(void)
+{
+    return *dlfrz_tx_gate_pointer;
+}
+C
+    cat >"$prog_src" <<'C'
+#include <dlfcn.h>
+#include <setjmp.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static sigjmp_buf dlfrz_tx_signal_escape;
+static volatile sig_atomic_t dlfrz_tx_signal_seen;
+
+static void dlfrz_tx_signal_handler(int signal_number)
+{
+    (void)signal_number;
+    dlfrz_tx_signal_seen = 1;
+    siglongjmp(dlfrz_tx_signal_escape, 1);
+}
+
+int main(int argc, char **argv)
+{
+    const char *stage = getenv("DLFREEZE_TRANSACTION_TEST_STAGE");
+    const char *signal_stage =
+        getenv("DLFREEZE_TRANSACTION_SIGNAL_STAGE");
+    void *first;
+    void *second;
+    int (*value)(void);
+    int (*template_value)(void);
+
+    if (argc != 2 || (!stage && !signal_stage))
+        return 2;
+
+    if (signal_stage) {
+        struct sigaction action;
+        sigset_t unblocked;
+
+        memset(&action, 0, sizeof(action));
+        action.sa_handler = dlfrz_tx_signal_handler;
+        sigemptyset(&action.sa_mask);
+        if (sigaction(SIGUSR1, &action, NULL) != 0) return 10;
+        sigemptyset(&unblocked);
+        sigaddset(&unblocked, SIGUSR1);
+        if (sigprocmask(SIG_UNBLOCK, &unblocked, NULL) != 0) return 11;
+        if (sigsetjmp(dlfrz_tx_signal_escape, 1) == 0) {
+            (void)dlopen(argv[1], RTLD_NOW | RTLD_GLOBAL);
+            return 12;
+        }
+        if (!dlfrz_tx_signal_seen) return 13;
+
+        /* RTLD_NOLOAD is rejected while a private transaction is active and
+         * succeeds only after the object scope has become publicly visible.
+         * Executing both exports additionally proves DTV publication and
+         * final executable protections survived the signal boundary. */
+        second = dlopen(
+            argv[1], RTLD_NOW | RTLD_GLOBAL | RTLD_NOLOAD);
+        if (!second) return 14;
+        value = (int (*)(void))dlsym(second, "dlfrz_tx_gate_value");
+        template_value = (int (*)(void))dlsym(
+            second, "dlfrz_tx_gate_template_value");
+        if (!value || !template_value || value() != 31 ||
+            template_value() != 40 ||
+            dlsym(RTLD_DEFAULT, "dlfrz_tx_gate_export") == NULL)
+            return 15;
+        puts("signal-after-complete-commit-ok");
+        return 0;
+    }
+
+    first = dlopen(argv[1], RTLD_NOW | RTLD_GLOBAL);
+    if (strcmp(stage, "before_tls_prepare") == 0) {
+        if (first || !dlerror())
+            return 3;
+        (void)dlerror();
+        if (dlsym(RTLD_DEFAULT, "dlfrz_tx_gate_export") != NULL)
+            return 4;
+        (void)dlerror();
+        second = dlopen(argv[1], RTLD_NOW | RTLD_GLOBAL);
+        if (!second) {
+            fprintf(stderr, "retry: %s\n", dlerror());
+            return 5;
+        }
+        value = (int (*)(void))dlsym(second, "dlfrz_tx_gate_value");
+        template_value = (int (*)(void))dlsym(
+            second, "dlfrz_tx_gate_template_value");
+        if (!value || !template_value || value() != 32 ||
+            template_value() != 40 ||
+            dlsym(RTLD_DEFAULT, "dlfrz_tx_gate_export") == NULL)
+            return 6;
+        puts("recoverable-rollback-and-retry-ok");
+        return 0;
+    }
+
+    /* Reaching this branch means a post-publication loader fault incorrectly
+     * returned as a recoverable dlopen failure. */
+    if (!first)
+        puts("invalid-recoverable-return");
+    return 90;
+}
+C
+    if ! gcc -shared -fPIC -Wl,-z,now \
+            -Wl,-soname,libdlfrz_tx_gate.so -o "$lib" "$lib_src" ||
+       ! gcc -o "$prog" "$prog_src" -ldl; then
+        fail "direct dlopen transaction atomicity" \
+            "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+    if ! readelf -Wr "$lib" 2>/dev/null |
+            grep -q 'dlfrz_tx_gate_target'; then
+        fail "direct dlopen transaction atomicity" \
+            "fixture has no relocation in its TLS initializer"
+        rm -rf "$root"
+        return
+    fi
+    if ! "${MAKE:-make}" --no-print-directory -j2 \
+            BUILD="$gate_build" WERROR=1 \
+            BOOTSTRAP_CPPFLAGS=-DDLFREEZE_TRANSACTION_ATOMICITY_GATE \
+            >"$build_log" 2>&1; then
+        fail "direct dlopen transaction atomicity" \
+            "test-only bootstrap build failed"
+        tail -n 80 "$build_log" || true
+        rm -rf "$root"
+        return
+    fi
+    freeze_require_direct_with "$gate_tool" \
+        "direct dlopen transaction atomicity" "$log" "$out" \
+        "$prog" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "direct dlopen transaction atomicity" "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+
+    capture_output actual env \
+        DLFREEZE_TRANSACTION_TEST_STAGE=before_tls_prepare \
+        "$out" "$lib" || rc=$?
+    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+    if [ "$rc" -eq 0 ] &&
+       [ "$actual" = "recoverable-rollback-and-retry-ok" ]; then
+        pass "pre-publication TLS/global failure rolls back and retries"
+    else
+        fail "direct dlopen recoverable transaction rollback" \
+            "exit=$rc output=$actual"
+    fi
+
+    actual=""; rc=0
+    capture_output actual env \
+        DLFREEZE_TRANSACTION_TEST_STAGE=after_irreversible_boundary \
+        "$out" "$lib" || rc=$?
+    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+    if [ "$rc" -eq 127 ] &&
+       [[ "$actual" == *"irreversible target-state change"* ]] &&
+       [[ "$actual" != *"invalid-recoverable-return"* ]]; then
+        pass "post-publication transaction failure is terminal"
+    else
+        fail "direct dlopen irreversible transaction boundary" \
+            "exit=$rc output=$actual"
+    fi
+
+    for signal_stage in after_tls_publish after_dormant_writes \
+                        after_ifunc after_mprotect; do
+        actual=""; rc=0
+        capture_output actual env \
+            DLFREEZE_TRANSACTION_SIGNAL_STAGE="$signal_stage" \
+            "$out" "$lib" || rc=$?
+        actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+        if [ "$rc" -ne 0 ] ||
+           [ "$actual" != "signal-after-complete-commit-ok" ]; then
+            fail "direct dlopen signal-safe commit boundary" \
+                "stage=$signal_stage exit=$rc output=$actual"
+            signal_ok=0
+            break
+        fi
+    done
+    if [ "$signal_ok" -eq 1 ]; then
+        pass "signals cannot escape a partial dlopen commit"
+    fi
+    rm -rf "$root"
+}
+
+# A thread may have a DTV slot for an older module still unallocated when it
+# loads a TLS-bearing IFUNC DSO.  The transaction must publish its prepared
+# replacement DTV before the resolver first-touches either TLS module, and a
+# resolver's RTLD_DEFAULT lookup must use the not-yet-visible root scope.
+test_direct_transaction_ifunc_tls_callback() {
+    echo "--- direct transaction IFUNC/TLS callback scope ---"
+    local root="$BUILD/direct_transaction_ifunc_tls_callback"
+    local old_src="$root/old.c" old="$root/libdlfrz_old_tls.so"
+    local new_src="$root/new.c" new="$root/libdlfrz_new_ifunc_tls.so"
+    local prog_src="$root/main.c" prog="$root/main"
+    local out="$root/main.frozen" log="$root/freeze.log"
+    local expect="" actual="" rc=0 native_rc=0 freeze_rc=0
+
+    if ! compiler_targets_glibc; then
+        skip "direct transaction IFUNC/TLS callback scope" \
+            "test compiler does not target glibc"
+        return
+    fi
+    rm -rf "$root"
+    mkdir -p "$root"
+    if ! compiler_supports_gnu_ifunc "$root"; then
+        skip "direct transaction IFUNC/TLS callback scope" \
+            "toolchain/runtime does not support GNU IFUNC"
+        rm -rf "$root"
+        return
+    fi
+    cat >"$old_src" <<'C'
+__thread int dlfrz_old_tls;
+int dlfrz_old_touch(void) { return ++dlfrz_old_tls; }
+int dlfrz_old_read(void) { return dlfrz_old_tls; }
+C
+    cat >"$new_src" <<'C'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <link.h>
+#include <stdint.h>
+
+__thread int dlfrz_new_tls = 23;
+static int (*dlfrz_resolved_old_touch)(void);
+
+static void *dlfrz_selected_resolver(void);
+
+static int dlfrz_resolver_object_visible(
+    struct dl_phdr_info *info, size_t size, void *opaque)
+{
+    uintptr_t address = (uintptr_t)(void *)&dlfrz_selected_resolver;
+    int *seen = (int *)opaque;
+
+    (void)size;
+    for (ElfW(Half) i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr) *phdr = &info->dlpi_phdr[i];
+        uintptr_t start;
+        uintptr_t end;
+
+        if (phdr->p_type != PT_LOAD || phdr->p_memsz == 0)
+            continue;
+        start = (uintptr_t)info->dlpi_addr + phdr->p_vaddr;
+        if (phdr->p_memsz > UINTPTR_MAX - start)
+            continue;
+        end = start + phdr->p_memsz;
+        if (address >= start && address < end) {
+            *seen = 1;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int dlfrz_selected_good(void)
+{
+    return dlfrz_new_tls + dlfrz_resolved_old_touch();
+}
+
+static int dlfrz_selected_bad(void) { return -1000; }
+
+static void *dlfrz_selected_resolver(void)
+{
+    int (*touch)(void) = (int (*)(void))dlsym(
+        RTLD_DEFAULT, "dlfrz_old_touch");
+    Dl_info object_info;
+    int iterate_seen = 0;
+    int old_value;
+
+    if (!touch ||
+        !dladdr((void *)&dlfrz_selected_resolver, &object_info) ||
+        !object_info.dli_fbase ||
+        dl_iterate_phdr(
+            dlfrz_resolver_object_visible, &iterate_seen) != 1 ||
+        !iterate_seen)
+        return (void *)dlfrz_selected_bad;
+    old_value = touch();
+    dlfrz_new_tls++;
+    dlfrz_resolved_old_touch = touch;
+    return old_value == 1 && dlfrz_new_tls == 24
+        ? (void *)dlfrz_selected_good : (void *)dlfrz_selected_bad;
+}
+
+int dlfrz_selected(void)
+    __attribute__((ifunc("dlfrz_selected_resolver")));
+int dlfrz_new_read(void) { return dlfrz_new_tls; }
+C
+    if ! gcc -shared -fPIC -Wl,-z,now \
+            -Wl,-soname,libdlfrz_old_tls.so -o "$old" "$old_src" ||
+       ! gcc -shared -fPIC -Wl,-z,now \
+            -Wl,-soname,libdlfrz_new_ifunc_tls.so \
+            -Wl,--no-as-needed -L"$root" -ldlfrz_old_tls \
+            -Wl,--as-needed -Wl,-rpath,'$ORIGIN' -ldl \
+            -o "$new" "$new_src"; then
+        fail "direct transaction IFUNC/TLS callback scope" \
+            "shared-library fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+    cat >"$prog_src" <<C
+#include <dlfcn.h>
+#include <pthread.h>
+#include <stdio.h>
+
+static void *worker(void *unused)
+{
+    void *handle;
+    int (*selected)(void);
+    int (*old_read)(void);
+    int (*new_read)(void);
+    int value;
+    (void)unused;
+
+    handle = dlopen("$(realpath "$new")", RTLD_NOW | RTLD_LOCAL);
+    if (!handle) {
+        fprintf(stderr, "new dlopen: %s\n", dlerror());
+        return (void *)1L;
+    }
+    selected = (int (*)(void))dlsym(handle, "dlfrz_selected");
+    old_read = (int (*)(void))dlsym(handle, "dlfrz_old_read");
+    new_read = (int (*)(void))dlsym(handle, "dlfrz_new_read");
+    if (!selected || !old_read || !new_read)
+        return (void *)2L;
+    value = selected();
+    printf("ifunc-tls-callback=%d old=%d new=%d\n",
+           value, old_read(), new_read());
+    return value == 26 && old_read() == 2 && new_read() == 24
+        ? NULL : (void *)3L;
+}
+
+int main(void)
+{
+    void *old_handle = dlopen(
+        "$(realpath "$old")", RTLD_NOW | RTLD_LOCAL);
+    int (*old_touch)(void);
+    pthread_t thread;
+    void *result = NULL;
+
+    if (!old_handle)
+        return 4;
+    old_touch = (int (*)(void))dlsym(old_handle, "dlfrz_old_touch");
+    if (!old_touch || old_touch() != 1)
+        return 5;
+    if (pthread_create(&thread, NULL, worker, NULL) != 0 ||
+        pthread_join(thread, &result) != 0 || result)
+        return 6;
+    printf("main=%d\n", old_touch() - 1);
+    return 0;
+}
+C
+    if ! gcc -o "$prog" "$prog_src" -ldl -lpthread; then
+        fail "direct transaction IFUNC/TLS callback scope" \
+            "program fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+    if ! readelf -Ws "$new" 2>/dev/null |
+            grep -Eq '[[:space:]]IFUNC[[:space:]].*dlfrz_selected$' ||
+       ! readelf -Wl "$new" 2>/dev/null |
+            grep -q 'TLS'; then
+        fail "direct transaction IFUNC/TLS callback scope" \
+            "fixture lacks IFUNC or PT_TLS"
+        rm -rf "$root"
+        return
+    fi
+    capture_output expect "$prog" || native_rc=$?
+    if [ "$native_rc" -ne 0 ]; then
+        fail "direct transaction IFUNC/TLS callback native control" \
+            "exit=$native_rc output=$expect"
+        rm -rf "$root"
+        return
+    fi
+    freeze_require_direct "direct transaction IFUNC/TLS callback scope" \
+        "$log" "$out" "$prog" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "direct transaction IFUNC/TLS callback scope" \
+            "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+    capture_output actual "$out" || rc=$?
+    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+    if [ "$rc" -eq 0 ] && [ "$actual" = "$expect" ]; then
+        pass "transaction DTV publication and resolver callback scope"
+    else
+        fail "direct transaction IFUNC/TLS callback scope" \
+            "exit=$rc expected=$expect actual=$actual"
+    fi
+    rm -rf "$root"
+}
+
 # GNU RTLD_LAZY permits an object with an unresolved, uncalled PLT target to
-# load successfully.  Direct mode has no native PLT resolver, so an untraced
-# late load must reject before constructors run, while a traced load must make
-# the whole artifact use the native loader through extraction mode.
+# load successfully.  Exercise both filesystem and traced-dormant direct
+# loading, then prove that a later NOW request validates the complete lazy
+# closure before returning and that NOW wins the loader's combined-bit policy.
 test_gnu_traced_lazy_binding_fallback() {
-    echo "--- GNU traced RTLD_LAZY native-binding fallback ---"
+    echo "--- GNU direct runtime RTLD_LAZY binding ---"
     local root="$BUILD/gnu_lazy_binding"
     local lib_src="$root/library.c" lib="$root/libdlfreeze_lazy_gap.so"
     local prog_src="$root/main.c" prog="$root/main"
     local direct_out="$root/main.direct.frozen"
     local direct_log="$root/main.direct.log"
-    local fallback_out="$root/main.extraction.frozen"
-    local fallback_log="$root/main.extraction.log"
+    local fallback_out="$root/main.traced.frozen"
+    local fallback_log="$root/main.traced.log"
     local missing_out="$root/main.missing.extraction.frozen"
     local missing_log="$root/main.missing.extraction.log"
     local marker="$root/constructor.marker"
@@ -19912,12 +23954,12 @@ test_gnu_traced_lazy_binding_fallback() {
     local rc=0 freeze_rc=0 missing_rc=0
 
     if ! compiler_targets_glibc; then
-        skip "GNU traced RTLD_LAZY native-binding fallback" \
+        skip "GNU direct runtime RTLD_LAZY binding" \
             "test compiler does not target glibc"
         return
     fi
     if ! command -v readelf >/dev/null 2>&1; then
-        skip "GNU traced RTLD_LAZY native-binding fallback" \
+        skip "GNU direct runtime RTLD_LAZY binding" \
             "readelf not installed"
         return
     fi
@@ -19960,7 +24002,7 @@ typedef int (*value_fn)(void);
 
 int main(int argc, char **argv) {
     const char *error;
-    void *handle;
+    void *handle, *promoted;
     value_fn value;
 
     if (argc == 1)
@@ -19981,35 +24023,47 @@ int main(int argc, char **argv) {
     if (argc != 4 || setenv("DLFREEZE_LAZY_MARKER", argv[3], 1) != 0)
         return 2;
 
-    (void)dlerror();
-    handle = dlopen(argv[2], RTLD_LAZY | RTLD_LOCAL);
-    if (strcmp(argv[1], "reject") == 0) {
-        if (handle != NULL) {
-            (void)dlclose(handle);
-            return 3;
-        }
+    if (strcmp(argv[1], "both") == 0) {
+        (void)dlerror();
+        handle = dlopen(argv[2], RTLD_LAZY | RTLD_NOW | RTLD_LOCAL);
         error = dlerror();
-        if (!error || !strstr(error, "requires native lazy binding"))
-            return 4;
-        if (access(argv[3], F_OK) == 0 || errno != ENOENT)
-            return 5;
-        puts("lazy-rejected-before-constructor");
-        return 0;
+        if (handle != NULL || !error || access(argv[3], F_OK) == 0 ||
+            errno != ENOENT)
+            return 3;
+        (void)dlerror();
+        handle = dlopen(argv[2], RTLD_LAZY | RTLD_LOCAL);
+    } else {
+        (void)dlerror();
+        handle = dlopen(argv[2], RTLD_LAZY | RTLD_LOCAL);
     }
-    if (strcmp(argv[1], "open") != 0)
-        return 6;
+    if (strcmp(argv[1], "open") != 0 &&
+        strcmp(argv[1], "promote") != 0 &&
+        strcmp(argv[1], "both") != 0)
+        return 4;
     if (!handle) {
         fprintf(stderr, "dlopen: %s\n", dlerror());
-        return 7;
+        return 5;
     }
     (void)dlerror();
     value = (value_fn)dlsym(handle, "dlfreeze_lazy_present");
     error = dlerror();
     if (!value || error || value() != 73)
-        return 8;
+        return 6;
+    if (strcmp(argv[1], "promote") == 0) {
+        (void)dlerror();
+        promoted = dlopen(argv[2], RTLD_NOW | RTLD_LOCAL);
+        error = dlerror();
+        if (promoted != NULL || !error || value() != 73)
+            return 7;
+    }
     if (dlclose(handle) != 0)
-        return 9;
-    puts("lazy-value=73");
+        return 8;
+    if (strcmp(argv[1], "promote") == 0)
+        puts("lazy-now-rejected=73");
+    else if (strcmp(argv[1], "both") == 0)
+        puts("lazy-now-precedence=73");
+    else
+        puts("lazy-value=73");
     return 0;
 }
 C
@@ -20058,44 +24112,53 @@ C
     pass "native GNU failed optional RTLD_LAZY control"
 
     rm -f "$marker"
-    freeze_require_direct "GNU untraced RTLD_LAZY rejection" \
+    freeze_require_direct "GNU untraced RTLD_LAZY direct load" \
         "$direct_log" "$direct_out" "$prog" || freeze_rc=$?
     if [ "$freeze_rc" -eq 77 ]; then
-        skip "GNU untraced RTLD_LAZY rejection" "$DIRECT_FREEZE_REASON"
+        skip "GNU untraced RTLD_LAZY direct load" "$DIRECT_FREEZE_REASON"
     elif [ "$freeze_rc" -eq 0 ]; then
         actual=""; rc=0
         capture_output actual env -u LD_BIND_NOW -u LD_BIND_NOT \
-            DLFREEZE_NO_FORK=1 "$direct_out" reject "$name" "$marker" ||
+            DLFREEZE_NO_FORK=1 "$direct_out" promote "$lib" "$marker" ||
+            rc=$?
+        actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+        if [ "$rc" -eq 0 ] && [ "$actual" = "lazy-now-rejected=73" ] &&
+           [ -f "$marker" ]; then
+            pass "GNU direct filesystem RTLD_LAZY and later NOW validation"
+        else
+            fail "GNU untraced RTLD_LAZY direct load" \
+                "exit=$rc output=$actual"
+        fi
+        rm -f "$marker"
+        actual=""; rc=0
+        capture_output actual env -u LD_BIND_NOW -u LD_BIND_NOT \
+            DLFREEZE_NO_FORK=1 "$direct_out" both "$lib" "$marker" ||
             rc=$?
         actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
         if [ "$rc" -eq 0 ] &&
-           [ "$actual" = "lazy-rejected-before-constructor" ] &&
-           [ ! -e "$marker" ]; then
-            pass "GNU direct rejects untraced new RTLD_LAZY before mutation"
+           [ "$actual" = "lazy-now-precedence=73" ] &&
+           [ -f "$marker" ]; then
+            pass "GNU direct NOW takes precedence over combined binding bits"
         else
-            fail "GNU untraced RTLD_LAZY rejection" \
+            fail "GNU direct RTLD_NOW precedence" \
                 "exit=$rc output=$actual"
         fi
     fi
 
     rm -f "$marker"
-    if ! run_freeze env -u LD_BIND_NOW -u LD_BIND_NOT \
-            LD_LIBRARY_PATH="$root" \
-            "$DLFREEZE" -d -t -o "$fallback_out" -- \
-            "$prog" open "$name" "$marker" >"$fallback_log" 2>&1; then
-        fail "GNU traced RTLD_LAZY extraction fallback" \
-            "dlfreeze failed"
-        tail -n 80 "$fallback_log" || true
+    freeze_rc=0
+    freeze_require_direct "GNU traced RTLD_LAZY direct load" \
+        "$fallback_log" "$fallback_out" -t -- \
+        "$prog" open "$lib" "$marker" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "GNU traced RTLD_LAZY direct load" "$DIRECT_FREEZE_REASON"
         rm -rf "$root"
         return
     fi
-    if [ ! -x "$fallback_out" ] || [ ! -f "$marker" ] ||
-       ! grep -Eq \
-            'traced RTLD_LAZY.*creating an extraction-mode binary' \
-            "$fallback_log"; then
-        fail "GNU traced RTLD_LAZY extraction fallback" \
-            "packer did not select and explain extraction mode"
-        tail -n 80 "$fallback_log" || true
+    if [ "$freeze_rc" -ne 0 ] || [ ! -f "$marker" ]; then
+        fail "GNU traced RTLD_LAZY direct load" \
+            "trace did not complete its lazy load"
+        tail -n 80 "$fallback_log" 2>/dev/null || true
         rm -rf "$root"
         return
     fi
@@ -20121,18 +24184,33 @@ C
         return
     fi
 
-    # Neither original ELF may contribute to the successful replay.
+    # Neither original ELF may contribute to the successful direct replay.
     rm -f "$marker" "$lib" "$prog"
     actual=""; rc=0
     capture_output actual env -u DLFREEZE_NO_FORK -u LD_LIBRARY_PATH \
         -u LD_BIND_NOW -u LD_BIND_NOT "$fallback_out" \
-        open "$name" "$marker" || rc=$?
+        promote "$lib" "$marker" || rc=$?
     actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
-    if [ "$rc" -eq 0 ] && [ "$actual" = "lazy-value=73" ] &&
+    if [ "$rc" -eq 0 ] && [ "$actual" = "lazy-now-rejected=73" ] &&
        [ -f "$marker" ]; then
-        pass "GNU traced RTLD_LAZY falls back to native extraction"
+        pass "GNU traced dormant RTLD_LAZY and later NOW validation"
     else
-        fail "GNU traced RTLD_LAZY extraction replay" \
+        fail "GNU traced RTLD_LAZY direct replay" \
+            "exit=$rc output=$actual"
+        tail -n 80 "$fallback_log" || true
+    fi
+
+    rm -f "$marker"
+    actual=""; rc=0
+    capture_output actual env -u DLFREEZE_NO_FORK -u LD_LIBRARY_PATH \
+        -u LD_BIND_NOW -u LD_BIND_NOT "$fallback_out" \
+        both "$lib" "$marker" || rc=$?
+    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+    if [ "$rc" -eq 0 ] && [ "$actual" = "lazy-now-precedence=73" ] &&
+       [ -f "$marker" ]; then
+        pass "GNU dormant NOW failure leaves later LAZY activation usable"
+    else
+        fail "GNU dormant RTLD_NOW precedence and retry" \
             "exit=$rc output=$actual"
         tail -n 80 "$fallback_log" || true
     fi
@@ -20152,11 +24230,1656 @@ C
     rm -rf "$root"
 }
 
+# A GNU IFUNC reached only through a runtime-loaded object's lazy PLT must be
+# resolved on its first call, exactly once.  RTLD_NOW must instead resolve it
+# before constructors, both for a fresh dormant activation and when promoting
+# an already-visible object which was first opened RTLD_LAZY.
+test_gnu_runtime_lazy_ifunc_direct() {
+    echo "--- GNU direct runtime lazy-PLT IFUNC timing ---"
+    local root="$BUILD/gnu_runtime_lazy_ifunc_direct"
+    local lib_src="$root/library.c" lib="$root/libdlfrz_runtime_lazy_ifunc.so"
+    local prog_src="$root/main.c" prog="$root/main"
+    local direct_out="$root/main.direct.frozen" direct_log="$root/main.direct.log"
+    local traced_out="$root/main.traced.frozen" traced_log="$root/main.traced.log"
+    local relocations symbols dynamic actual="" expected=""
+    local rc=0 freeze_rc=0
+    local label="GNU direct runtime lazy IFUNC timing and once-state"
+
+    if ! compiler_targets_glibc; then
+        skip "$label" "test compiler does not target glibc"
+        return
+    fi
+    if ! command -v readelf >/dev/null 2>&1; then
+        skip "$label" "readelf not installed"
+        return
+    fi
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    if ! compiler_supports_gnu_ifunc "$root"; then
+        skip "$label" "toolchain/runtime does not support GNU IFUNC"
+        rm -rf "$root"
+        return
+    fi
+
+    cat >"$lib_src" <<'C'
+static volatile int resolver_calls;
+static int constructor_observed = -1;
+
+static int runtime_lazy_impl(void) { return 73; }
+static void *runtime_lazy_resolver(void) {
+    resolver_calls++;
+    return (void *)runtime_lazy_impl;
+}
+
+int dlfrz_runtime_lazy_ifunc(void)
+    __attribute__((ifunc("runtime_lazy_resolver")));
+
+__attribute__((constructor)) static void runtime_lazy_constructor(void) {
+    constructor_observed = resolver_calls;
+}
+
+int dlfrz_runtime_lazy_call(void) {
+    return dlfrz_runtime_lazy_ifunc();
+}
+int dlfrz_runtime_lazy_resolver_calls(void) {
+    return resolver_calls;
+}
+int dlfrz_runtime_lazy_constructor_observed(void) {
+    return constructor_observed;
+}
+C
+    cat >"$prog_src" <<'C'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdio.h>
+#include <string.h>
+
+typedef int (*value_fn)(void);
+
+int main(int argc, char **argv) {
+    void *handle, *promoted = NULL;
+    value_fn call, calls, constructor_value;
+    const char *error;
+    int flags, constructor_seen, before, after_promotion = -1;
+    int first, after_first, second, after_second;
+
+    if (argc != 3)
+        return 2;
+    if (strcmp(argv[1], "lazy") == 0 ||
+        strcmp(argv[1], "promote") == 0)
+        flags = RTLD_LAZY | RTLD_LOCAL;
+    else if (strcmp(argv[1], "now") == 0)
+        flags = RTLD_NOW | RTLD_LOCAL;
+    else
+        return 3;
+
+    (void)dlerror();
+    handle = dlopen(argv[2], flags);
+    if (!handle) {
+        fprintf(stderr, "dlopen: %s\n", dlerror());
+        return 4;
+    }
+    (void)dlerror();
+    call = (value_fn)dlsym(handle, "dlfrz_runtime_lazy_call");
+    calls = (value_fn)dlsym(handle, "dlfrz_runtime_lazy_resolver_calls");
+    constructor_value = (value_fn)dlsym(
+        handle, "dlfrz_runtime_lazy_constructor_observed");
+    error = dlerror();
+    if (!call || !calls || !constructor_value || error)
+        return 5;
+
+    constructor_seen = constructor_value();
+    before = calls();
+    if (strcmp(argv[1], "promote") == 0) {
+        (void)dlerror();
+        promoted = dlopen(argv[2], RTLD_NOW | RTLD_LOCAL);
+        if (!promoted || dlerror())
+            return 6;
+        after_promotion = calls();
+    }
+    first = call();
+    after_first = calls();
+    second = call();
+    after_second = calls();
+
+    if (strcmp(argv[1], "promote") == 0) {
+        printf("runtime-lazy-ifunc-promote=%d,%d,%d,%d,%d,%d,%d\n",
+               constructor_seen, before, after_promotion, first,
+               after_first, second, after_second);
+        if (constructor_seen != 0 || before != 0 || after_promotion != 1)
+            return 7;
+    } else {
+        printf("runtime-lazy-ifunc-%s=%d,%d,%d,%d,%d,%d\n",
+               argv[1], constructor_seen, before, first,
+               after_first, second, after_second);
+        if ((strcmp(argv[1], "lazy") == 0 &&
+             (constructor_seen != 0 || before != 0)) ||
+            (strcmp(argv[1], "now") == 0 &&
+             (constructor_seen != 1 || before != 1)))
+            return 8;
+    }
+    if (first != 73 || after_first != 1 ||
+        second != 73 || after_second != 1)
+        return 9;
+    if (promoted && dlclose(promoted) != 0)
+        return 10;
+    return dlclose(handle) == 0 ? 0 : 11;
+}
+C
+
+    if ! gcc -shared -fPIC -nostartfiles -Wl,-z,lazy \
+            -Wl,-soname,libdlfrz_runtime_lazy_ifunc.so \
+            -o "$lib" "$lib_src" ||
+       ! gcc -Wl,-z,now -o "$prog" "$prog_src" -ldl; then
+        fail "$label" "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+    relocations=$(LC_ALL=C readelf -Wr "$lib" 2>/dev/null || true)
+    symbols=$(LC_ALL=C readelf -Ws "$lib" 2>/dev/null || true)
+    dynamic=$(LC_ALL=C readelf -d "$lib" 2>/dev/null || true)
+    if ! grep -E \
+            'JUMP_SLOT[^[:cntrl:]]*dlfrz_runtime_lazy_ifunc' \
+            <<<"$relocations" >/dev/null ||
+       ! grep -E \
+            'IFUNC[[:space:]]+GLOBAL[[:space:]]+DEFAULT[^[:cntrl:]]*dlfrz_runtime_lazy_ifunc' \
+            <<<"$symbols" >/dev/null ||
+       grep -Eq '\(BIND_NOW\)|FLAGS[^[:cntrl:]]*NOW' <<<"$dynamic"; then
+        skip "$label" "linker did not retain a lazy IFUNC JUMP_SLOT"
+        rm -rf "$root"
+        return
+    fi
+
+    capture_output actual env -u LD_BIND_NOW -u LD_BIND_NOT \
+        "$prog" lazy "$lib" || rc=$?
+    if [ "$rc" -ne 0 ] ||
+       [ "$actual" != "runtime-lazy-ifunc-lazy=0,0,73,1,73,1" ]; then
+        fail "$label native control" "exit=$rc output=$actual"
+        rm -rf "$root"
+        return
+    fi
+
+    freeze_require_direct "$label filesystem" "$direct_log" \
+        "$direct_out" -- "$prog" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "$label" "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+    for mode in lazy now promote; do
+        case "$mode" in
+            lazy) expected="runtime-lazy-ifunc-lazy=0,0,73,1,73,1" ;;
+            now) expected="runtime-lazy-ifunc-now=1,1,73,1,73,1" ;;
+            promote) expected="runtime-lazy-ifunc-promote=0,0,1,73,1,73,1" ;;
+        esac
+        actual=""; rc=0
+        capture_output actual env -u LD_BIND_NOW -u LD_BIND_NOT \
+            DLFREEZE_NO_FORK=1 "$direct_out" "$mode" "$lib" || rc=$?
+        actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+        if [ "$rc" -eq 0 ] && [ "$actual" = "$expected" ]; then
+            pass "$label filesystem $mode"
+        else
+            fail "$label filesystem $mode" "exit=$rc output=$actual"
+        fi
+    done
+
+    freeze_rc=0
+    freeze_require_direct "$label traced dormant" "$traced_log" \
+        "$traced_out" -t -- "$prog" lazy "$lib" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "$label traced dormant" "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+    rm -f "$prog" "$lib"
+    for mode in lazy now promote; do
+        case "$mode" in
+            lazy) expected="runtime-lazy-ifunc-lazy=0,0,73,1,73,1" ;;
+            now) expected="runtime-lazy-ifunc-now=1,1,73,1,73,1" ;;
+            promote) expected="runtime-lazy-ifunc-promote=0,0,1,73,1,73,1" ;;
+        esac
+        actual=""; rc=0
+        capture_output actual env -u DLFREEZE_NO_FORK -u LD_LIBRARY_PATH \
+            -u LD_BIND_NOW -u LD_BIND_NOT "$traced_out" \
+            "$mode" "$lib" || rc=$?
+        actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+        if [ "$rc" -eq 0 ] && [ "$actual" = "$expected" ]; then
+            pass "$label dormant $mode"
+        else
+            fail "$label dormant $mode" "exit=$rc output=$actual"
+            tail -n 80 "$traced_log" 2>/dev/null || true
+        fi
+    done
+    rm -rf "$root"
+}
+
+# A direct GNU artifact must preserve the native first-call contract for all
+# startup lazy PLT slots.  Keep the requester DSO free of CRT-added imports so
+# the four intentional slots prove ordinary startup lookup, dormant strong and
+# weak imports, and lookup against a provider made global immediately before
+# the weak slot's first call.
+test_gnu_startup_lazy_plt_direct() {
+    echo "--- GNU direct startup lazy-PLT semantics ---"
+    local root="$BUILD/gnu_startup_lazy_plt_direct"
+    local consumer_src="$root/consumer.c"
+    local consumer="$root/libdlfrz_lazy_consumer.so"
+    local provider_src="$root/provider.c"
+    local provider="$root/libdlfrz_lazy_provider.so"
+    local prog_src="$root/main.c" prog="$root/main"
+    local out="$root/main.frozen" log="$root/main.log"
+    local expected="lazy-plt=17,41,41" actual=""
+    local relocations symbols main_symbols dynamic main_dynamic
+    local rc=0 freeze_rc=0
+    local label="GNU direct startup lazy-PLT semantics"
+
+    if ! compiler_targets_glibc; then
+        skip "$label" "test compiler does not target glibc"
+        return
+    fi
+    if ! command -v readelf >/dev/null 2>&1; then
+        skip "$label" "readelf not installed"
+        return
+    fi
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    cat >"$consumer_src" <<'C'
+extern int dlfrz_lazy_ordinary(void);
+extern int dlfrz_lazy_missing_strong(void);
+extern int dlfrz_lazy_missing_weak(void) __attribute__((weak));
+extern int dlfrz_lazy_late_weak(void) __attribute__((weak));
+
+int dlfrz_lazy_call_ordinary(void) {
+    return dlfrz_lazy_ordinary();
+}
+
+int dlfrz_lazy_strong_slot(void) {
+    return dlfrz_lazy_missing_strong();
+}
+
+int dlfrz_lazy_weak_slot(void) {
+    return dlfrz_lazy_missing_weak();
+}
+
+int dlfrz_lazy_call_late(void) {
+    return dlfrz_lazy_late_weak();
+}
+C
+    cat >"$provider_src" <<'C'
+int dlfrz_lazy_late_weak(void) { return 41; }
+C
+    cat >"$prog_src" <<'C'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdio.h>
+
+extern int dlfrz_lazy_call_ordinary(void);
+extern int dlfrz_lazy_call_late(void);
+
+int dlfrz_lazy_ordinary(void) { return 17; }
+
+int main(int argc, char **argv) {
+    int ordinary = dlfrz_lazy_call_ordinary();
+    void *handle;
+    int first;
+    int second;
+
+    if (argc != 2 || ordinary != 17)
+        return 2;
+    handle = dlopen(argv[1], RTLD_NOW | RTLD_GLOBAL);
+    if (!handle)
+        return 3;
+    first = dlfrz_lazy_call_late();
+    second = dlfrz_lazy_call_late();
+    printf("lazy-plt=%d,%d,%d\n", ordinary, first, second);
+    return first == 41 && second == 41 ? 0 : 4;
+}
+C
+
+    if ! gcc -shared -fPIC -nostartfiles -Wl,-z,lazy \
+            -Wl,-soname,libdlfrz_lazy_consumer.so \
+            -o "$consumer" "$consumer_src" ||
+       ! gcc -shared -fPIC -nostartfiles -Wl,-z,now \
+            -Wl,-soname,libdlfrz_lazy_provider.so \
+            -o "$provider" "$provider_src" ||
+       ! gcc -Wl,-z,now -Wl,-E -Wl,--allow-shlib-undefined \
+            -Wl,--no-as-needed -L"$root" -Wl,-rpath,'$ORIGIN' \
+            -o "$prog" "$prog_src" -ldlfrz_lazy_consumer -ldl; then
+        fail "$label" "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+
+    relocations=$(LC_ALL=C readelf -Wr "$consumer" 2>/dev/null || true)
+    symbols=$(LC_ALL=C readelf -Ws "$consumer" 2>/dev/null || true)
+    main_symbols=$(LC_ALL=C readelf -Ws "$prog" 2>/dev/null || true)
+    dynamic=$(LC_ALL=C readelf -d "$consumer" 2>/dev/null || true)
+    main_dynamic=$(LC_ALL=C readelf -d "$prog" 2>/dev/null || true)
+    if ! grep -E \
+            'JUMP_SLOT[^[:cntrl:]]*dlfrz_lazy_ordinary' \
+            <<<"$relocations" >/dev/null ||
+       ! grep -E \
+            'JUMP_SLOT[^[:cntrl:]]*dlfrz_lazy_missing_strong' \
+            <<<"$relocations" >/dev/null ||
+       ! grep -E \
+            'JUMP_SLOT[^[:cntrl:]]*dlfrz_lazy_missing_weak' \
+            <<<"$relocations" >/dev/null ||
+       ! grep -E \
+            'JUMP_SLOT[^[:cntrl:]]*dlfrz_lazy_late_weak' \
+            <<<"$relocations" >/dev/null ||
+       ! grep -E \
+            'GLOBAL[[:space:]]+DEFAULT[[:space:]]+UND[[:space:]]+dlfrz_lazy_missing_strong' \
+            <<<"$symbols" >/dev/null ||
+       ! grep -E \
+            'WEAK[[:space:]]+DEFAULT[[:space:]]+UND[[:space:]]+dlfrz_lazy_missing_weak' \
+            <<<"$symbols" >/dev/null ||
+       ! grep -E \
+            'WEAK[[:space:]]+DEFAULT[[:space:]]+UND[[:space:]]+dlfrz_lazy_late_weak' \
+            <<<"$symbols" >/dev/null ||
+       ! grep -E \
+            'FUNC[[:space:]]+GLOBAL[[:space:]]+DEFAULT[^[:cntrl:]]*dlfrz_lazy_ordinary' \
+            <<<"$main_symbols" >/dev/null ||
+       grep -Eq '\(BIND_NOW\)|FLAGS[^[:cntrl:]]*NOW' <<<"$dynamic" ||
+       ! grep -Eq '\(BIND_NOW\)|FLAGS[^[:cntrl:]]*NOW' \
+            <<<"$main_dynamic"; then
+        fail "$label" "linker did not retain the intended lazy slots"
+        rm -rf "$root"
+        return
+    fi
+
+    capture_output actual env -u LD_BIND_NOW -u LD_BIND_NOT \
+        "$prog" "$provider" || rc=$?
+    if [ "$rc" -ne 0 ] || [ "$actual" != "$expected" ]; then
+        fail "$label native control" "exit=$rc output=$actual"
+        rm -rf "$root"
+        return
+    fi
+
+    freeze_require_direct "$label" "$log" "$out" -t -- \
+        "$prog" "$provider" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "$label" "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+
+    rm -f "$prog" "$consumer" "$provider"
+    actual=""
+    rc=0
+    capture_output actual env -u LD_LIBRARY_PATH -u LD_BIND_NOW \
+        -u LD_BIND_NOT DLFREEZE_NO_FORK=1 \
+        "$out" "$provider" || rc=$?
+    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+    if [ "$rc" -eq 0 ] && [ "$actual" = "$expected" ]; then
+        pass "$label"
+    else
+        fail "$label" "exit=$rc output=$actual"
+        tail -n 80 "$log" 2>/dev/null || true
+    fi
+    rm -rf "$root"
+}
+
+# A self-call through a lazy IFUNC PLT must not run the resolver while the
+# object is mapped or relocated.  Two calls then prove both first-call
+# resolution and that the direct loader patches the slot instead of invoking
+# the resolver again.
+test_gnu_startup_lazy_ifunc_direct() {
+    echo "--- GNU direct startup lazy-PLT IFUNC timing ---"
+    local root="$BUILD/gnu_startup_lazy_ifunc_direct"
+    local lib_src="$root/library.c" lib="$root/libdlfrz_lazy_ifunc.so"
+    local prog_src="$root/main.c" prog="$root/main"
+    local out="$root/main.frozen" log="$root/main.log"
+    local expected="lazy-ifunc=0,73,1,73,1" actual=""
+    local relocations symbols dynamic main_dynamic rc=0 freeze_rc=0
+    local label="GNU direct startup lazy IFUNC deferral and cache"
+
+    if ! compiler_targets_glibc; then
+        skip "$label" "test compiler does not target glibc"
+        return
+    fi
+    if ! command -v readelf >/dev/null 2>&1; then
+        skip "$label" "readelf not installed"
+        return
+    fi
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    if ! compiler_supports_gnu_ifunc "$root"; then
+        skip "$label" "toolchain/runtime does not support GNU IFUNC"
+        rm -rf "$root"
+        return
+    fi
+
+    cat >"$lib_src" <<'C'
+static volatile int resolver_calls;
+
+static int dlfrz_lazy_ifunc_impl(void) { return 73; }
+static void *dlfrz_lazy_ifunc_resolver(void) {
+    resolver_calls++;
+    return (void *)dlfrz_lazy_ifunc_impl;
+}
+
+int dlfrz_lazy_self_ifunc(void)
+    __attribute__((ifunc("dlfrz_lazy_ifunc_resolver")));
+
+int dlfrz_lazy_ifunc_call(void) {
+    return dlfrz_lazy_self_ifunc();
+}
+
+int dlfrz_lazy_ifunc_resolver_calls(void) {
+    return resolver_calls;
+}
+C
+    cat >"$prog_src" <<'C'
+#include <stdio.h>
+
+extern int dlfrz_lazy_ifunc_call(void);
+extern int dlfrz_lazy_ifunc_resolver_calls(void);
+
+int main(void) {
+    int before = dlfrz_lazy_ifunc_resolver_calls();
+    int first = dlfrz_lazy_ifunc_call();
+    int after_first = dlfrz_lazy_ifunc_resolver_calls();
+    int second = dlfrz_lazy_ifunc_call();
+    int after_second = dlfrz_lazy_ifunc_resolver_calls();
+
+    printf("lazy-ifunc=%d,%d,%d,%d,%d\n",
+           before, first, after_first, second, after_second);
+    return before == 0 && first == 73 && after_first == 1 &&
+           second == 73 && after_second == 1 ? 0 : 2;
+}
+C
+
+    if ! gcc -shared -fPIC -nostartfiles -Wl,-z,lazy \
+            -Wl,-soname,libdlfrz_lazy_ifunc.so \
+            -o "$lib" "$lib_src" ||
+       ! gcc -Wl,-z,now -Wl,--no-as-needed -L"$root" \
+            -Wl,-rpath,'$ORIGIN' -o "$prog" "$prog_src" \
+            -ldlfrz_lazy_ifunc; then
+        fail "$label" "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+
+    relocations=$(LC_ALL=C readelf -Wr "$lib" 2>/dev/null || true)
+    symbols=$(LC_ALL=C readelf -Ws "$lib" 2>/dev/null || true)
+    dynamic=$(LC_ALL=C readelf -d "$lib" 2>/dev/null || true)
+    main_dynamic=$(LC_ALL=C readelf -d "$prog" 2>/dev/null || true)
+    if ! grep -E \
+            'JUMP_SLOT[^[:cntrl:]]*dlfrz_lazy_self_ifunc' \
+            <<<"$relocations" >/dev/null ||
+       ! grep -E \
+            'IFUNC[[:space:]]+GLOBAL[[:space:]]+DEFAULT[^[:cntrl:]]*dlfrz_lazy_self_ifunc' \
+            <<<"$symbols" >/dev/null ||
+       grep -Eq '\(BIND_NOW\)|FLAGS[^[:cntrl:]]*NOW' <<<"$dynamic" ||
+       ! grep -Eq '\(BIND_NOW\)|FLAGS[^[:cntrl:]]*NOW' \
+            <<<"$main_dynamic"; then
+        skip "$label" "linker did not retain a lazy self-IFUNC JUMP_SLOT"
+        rm -rf "$root"
+        return
+    fi
+
+    capture_output actual env -u LD_BIND_NOW -u LD_BIND_NOT "$prog" || rc=$?
+    if [ "$rc" -ne 0 ] || [ "$actual" != "$expected" ]; then
+        fail "$label native control" "exit=$rc output=$actual"
+        rm -rf "$root"
+        return
+    fi
+
+    freeze_require_direct "$label" "$log" "$out" -- "$prog" ||
+        freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "$label" "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+
+    rm -f "$prog" "$lib"
+    actual=""
+    rc=0
+    capture_output actual env -u LD_LIBRARY_PATH -u LD_BIND_NOW \
+        -u LD_BIND_NOT DLFREEZE_NO_FORK=1 "$out" || rc=$?
+    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+    if [ "$rc" -eq 0 ] && [ "$actual" = "$expected" ]; then
+        pass "$label"
+    else
+        fail "$label" "exit=$rc output=$actual"
+        tail -n 80 "$log" 2>/dev/null || true
+    fi
+    rm -rf "$root"
+}
+
+# Concurrent callers which have already entered PLT0 must share one canonical
+# IFUNC invocation.  The resolver gate keeps that invocation in flight long
+# enough for every worker to reach the same unresolved slot; the main thread
+# then releases it through an eagerly bound control function.
+test_gnu_startup_lazy_ifunc_concurrent_once() {
+    echo "--- GNU direct concurrent lazy-PLT IFUNC once-state ---"
+    local root="$BUILD/gnu_startup_lazy_ifunc_concurrent"
+    local lib_src="$root/library.c" lib="$root/libdlfrz_lazy_ifunc_concurrent.so"
+    local prog_src="$root/main.c" prog="$root/main"
+    local out="$root/main.frozen" log="$root/main.log"
+    local expected="lazy-ifunc-concurrent=1,1" actual=""
+    local relocations symbols dynamic main_dynamic rc=0 freeze_rc=0
+    local label="GNU direct concurrent lazy IFUNC resolves once"
+
+    if ! compiler_targets_glibc; then
+        skip "$label" "test compiler does not target glibc"
+        return
+    fi
+    if ! command -v readelf >/dev/null 2>&1; then
+        skip "$label" "readelf not installed"
+        return
+    fi
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    if ! compiler_supports_gnu_ifunc "$root"; then
+        skip "$label" "toolchain/runtime does not support GNU IFUNC"
+        rm -rf "$root"
+        return
+    fi
+
+    cat >"$lib_src" <<'C'
+static int resolver_calls;
+static int resolver_release;
+
+static int dlfrz_lazy_ifunc_concurrent_impl(void) { return 73; }
+static void *dlfrz_lazy_ifunc_concurrent_resolver(void) {
+    __atomic_fetch_add(&resolver_calls, 1, __ATOMIC_RELAXED);
+    while (!__atomic_load_n(&resolver_release, __ATOMIC_ACQUIRE))
+        __asm__ volatile("" ::: "memory");
+    return (void *)dlfrz_lazy_ifunc_concurrent_impl;
+}
+
+int dlfrz_lazy_ifunc_concurrent(void)
+    __attribute__((ifunc("dlfrz_lazy_ifunc_concurrent_resolver")));
+
+int dlfrz_lazy_ifunc_concurrent_call(void) {
+    return dlfrz_lazy_ifunc_concurrent();
+}
+
+void dlfrz_lazy_ifunc_concurrent_release(void) {
+    __atomic_store_n(&resolver_release, 1, __ATOMIC_RELEASE);
+}
+
+int dlfrz_lazy_ifunc_concurrent_calls(void) {
+    return __atomic_load_n(&resolver_calls, __ATOMIC_RELAXED);
+}
+C
+    cat >"$prog_src" <<'C'
+#define _GNU_SOURCE
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <unistd.h>
+
+enum { THREAD_COUNT = 32 };
+
+extern int dlfrz_lazy_ifunc_concurrent_call(void);
+extern void dlfrz_lazy_ifunc_concurrent_release(void);
+extern int dlfrz_lazy_ifunc_concurrent_calls(void);
+
+static pthread_barrier_t start_barrier;
+static int results[THREAD_COUNT];
+
+static void *worker(void *argument) {
+    size_t index = (size_t)(uintptr_t)argument;
+    int barrier_result = pthread_barrier_wait(&start_barrier);
+
+    if (barrier_result != 0 &&
+        barrier_result != PTHREAD_BARRIER_SERIAL_THREAD)
+        return (void *)1;
+    results[index] = dlfrz_lazy_ifunc_concurrent_call();
+    return NULL;
+}
+
+int main(void) {
+    pthread_t threads[THREAD_COUNT];
+    int good = 1;
+    int barrier_result;
+
+    if (pthread_barrier_init(&start_barrier, NULL, THREAD_COUNT + 1) != 0)
+        return 2;
+    for (size_t i = 0; i < THREAD_COUNT; i++)
+        if (pthread_create(&threads[i], NULL, worker,
+                           (void *)(uintptr_t)i) != 0)
+            return 3;
+    barrier_result = pthread_barrier_wait(&start_barrier);
+    if (barrier_result != 0 &&
+        barrier_result != PTHREAD_BARRIER_SERIAL_THREAD)
+        return 4;
+    usleep(100000);
+    dlfrz_lazy_ifunc_concurrent_release();
+    for (size_t i = 0; i < THREAD_COUNT; i++) {
+        void *result = NULL;
+
+        if (pthread_join(threads[i], &result) != 0 || result != NULL ||
+            results[i] != 73)
+            good = 0;
+    }
+    int calls = dlfrz_lazy_ifunc_concurrent_calls();
+
+    printf("lazy-ifunc-concurrent=%d,%d\n", good, calls);
+    return good && calls > 0 ? 0 : 5;
+}
+C
+
+    if ! gcc -shared -fPIC -nostartfiles -Wl,-z,lazy \
+            -Wl,-soname,libdlfrz_lazy_ifunc_concurrent.so \
+            -o "$lib" "$lib_src" ||
+       ! gcc -Wl,-z,now -Wl,--no-as-needed -L"$root" \
+            -Wl,-rpath,'$ORIGIN' -pthread -o "$prog" "$prog_src" \
+            -ldlfrz_lazy_ifunc_concurrent; then
+        fail "$label" "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+
+    relocations=$(LC_ALL=C readelf -Wr "$lib" 2>/dev/null || true)
+    symbols=$(LC_ALL=C readelf -Ws "$lib" 2>/dev/null || true)
+    dynamic=$(LC_ALL=C readelf -d "$lib" 2>/dev/null || true)
+    main_dynamic=$(LC_ALL=C readelf -d "$prog" 2>/dev/null || true)
+    if ! grep -E \
+            'JUMP_SLOT[^[:cntrl:]]*dlfrz_lazy_ifunc_concurrent' \
+            <<<"$relocations" >/dev/null ||
+       ! grep -E \
+            'IFUNC[[:space:]]+GLOBAL[[:space:]]+DEFAULT[^[:cntrl:]]*dlfrz_lazy_ifunc_concurrent' \
+            <<<"$symbols" >/dev/null ||
+       grep -Eq '\(BIND_NOW\)|FLAGS[^[:cntrl:]]*NOW' <<<"$dynamic" ||
+       ! grep -Eq '\(BIND_NOW\)|FLAGS[^[:cntrl:]]*NOW' \
+            <<<"$main_dynamic"; then
+        skip "$label" "linker did not retain a lazy self-IFUNC JUMP_SLOT"
+        rm -rf "$root"
+        return
+    fi
+
+    capture_output actual env -u LD_BIND_NOW -u LD_BIND_NOT "$prog" || rc=$?
+    if [ "$rc" -ne 0 ] ||
+       ! grep -Eq '^lazy-ifunc-concurrent=1,[1-9][0-9]*$' \
+            <<<"$actual"; then
+        fail "$label native control" "exit=$rc output=$actual"
+        rm -rf "$root"
+        return
+    fi
+
+    freeze_require_direct "$label" "$log" "$out" -- "$prog" ||
+        freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "$label" "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+
+    rm -f "$prog" "$lib"
+    actual=""
+    rc=0
+    capture_output actual env -u LD_LIBRARY_PATH -u LD_BIND_NOW \
+        -u LD_BIND_NOT DLFREEZE_NO_FORK=1 "$out" || rc=$?
+    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+    if [ "$rc" -eq 0 ] && [ "$actual" = "$expected" ]; then
+        pass "$label"
+    else
+        fail "$label" "exit=$rc output=$actual"
+        tail -n 80 "$log" 2>/dev/null || true
+    fi
+    rm -rf "$root"
+}
+
+# fork may run from an IFUNC because the loader does not hold its namespace
+# lock across target resolver code.  The forking resolver frame survives in
+# both processes: the child must migrate that exact ownership claim while
+# discarding waiters and claims belonging to threads which did not survive.
+test_gnu_startup_lazy_ifunc_fork_owner() {
+    echo "--- GNU direct lazy-PLT IFUNC fork ownership ---"
+    local root="$BUILD/gnu_startup_lazy_ifunc_fork"
+    local lib_src="$root/library.c" lib="$root/libdlfrz_lazy_ifunc_fork.so"
+    local prog_src="$root/main.c" prog="$root/main"
+    local out="$root/main.frozen" log="$root/main.log"
+    local expected="lazy-ifunc-fork=83,1,83,1,0" actual=""
+    local relocations symbols dynamic main_dynamic rc=0 freeze_rc=0
+    local label="GNU direct lazy IFUNC preserves owner across fork"
+
+    if ! compiler_targets_glibc; then
+        skip "$label" "test compiler does not target glibc"
+        return
+    fi
+    if ! command -v readelf >/dev/null 2>&1; then
+        skip "$label" "readelf not installed"
+        return
+    fi
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    if ! compiler_supports_gnu_ifunc "$root"; then
+        skip "$label" "toolchain/runtime does not support GNU IFUNC"
+        rm -rf "$root"
+        return
+    fi
+
+    cat >"$lib_src" <<'C'
+#include <sys/types.h>
+#include <unistd.h>
+
+static int resolver_calls;
+static pid_t resolver_fork_result = -2;
+
+static int dlfrz_lazy_ifunc_fork_impl(void) { return 83; }
+static void *dlfrz_lazy_ifunc_fork_resolver(void) {
+    __atomic_fetch_add(&resolver_calls, 1, __ATOMIC_RELAXED);
+    resolver_fork_result = fork();
+    return (void *)dlfrz_lazy_ifunc_fork_impl;
+}
+
+int dlfrz_lazy_ifunc_fork(void)
+    __attribute__((ifunc("dlfrz_lazy_ifunc_fork_resolver")));
+
+int dlfrz_lazy_ifunc_fork_call(void) {
+    return dlfrz_lazy_ifunc_fork();
+}
+
+int dlfrz_lazy_ifunc_fork_calls(void) {
+    return __atomic_load_n(&resolver_calls, __ATOMIC_RELAXED);
+}
+
+pid_t dlfrz_lazy_ifunc_fork_child(void) {
+    return resolver_fork_result;
+}
+C
+    cat >"$prog_src" <<'C'
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+extern int dlfrz_lazy_ifunc_fork_call(void);
+extern int dlfrz_lazy_ifunc_fork_calls(void);
+extern pid_t dlfrz_lazy_ifunc_fork_child(void);
+
+struct child_report {
+    int value;
+    int calls;
+};
+
+static int report_pipe[2];
+
+int main(void) {
+    pid_t original = getpid();
+    struct child_report report = { -1, -1 };
+    int status = -1;
+    int value;
+
+    if (pipe(report_pipe) != 0)
+        return 2;
+    value = dlfrz_lazy_ifunc_fork_call();
+    if (getpid() != original) {
+        struct child_report child = {
+            value, dlfrz_lazy_ifunc_fork_calls()
+        };
+        ssize_t written;
+
+        close(report_pipe[0]);
+        do {
+            written = write(report_pipe[1], &child, sizeof(child));
+        } while (written < 0 && errno == EINTR);
+        _exit(written == (ssize_t)sizeof(child) ? 0 : 3);
+    }
+    pid_t child = dlfrz_lazy_ifunc_fork_child();
+    ssize_t received;
+
+    close(report_pipe[1]);
+    do {
+        received = read(report_pipe[0], &report, sizeof(report));
+    } while (received < 0 && errno == EINTR);
+    if (child <= 0 || received != (ssize_t)sizeof(report) ||
+        waitpid(child, &status, 0) != child)
+        return 4;
+    status = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    printf("lazy-ifunc-fork=%d,%d,%d,%d,%d\n",
+           value, dlfrz_lazy_ifunc_fork_calls(),
+           report.value, report.calls, status);
+    return value == 83 && dlfrz_lazy_ifunc_fork_calls() == 1 &&
+           report.value == 83 && report.calls == 1 && status == 0 ? 0 : 5;
+}
+C
+
+    if ! gcc -shared -fPIC -nostartfiles -Wl,-z,lazy \
+            -Wl,-soname,libdlfrz_lazy_ifunc_fork.so \
+            -o "$lib" "$lib_src" ||
+       ! gcc -Wl,-z,now -Wl,--no-as-needed -L"$root" \
+            -Wl,-rpath,'$ORIGIN' -pthread -o "$prog" "$prog_src" \
+            -ldlfrz_lazy_ifunc_fork; then
+        fail "$label" "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+
+    relocations=$(LC_ALL=C readelf -Wr "$lib" 2>/dev/null || true)
+    symbols=$(LC_ALL=C readelf -Ws "$lib" 2>/dev/null || true)
+    dynamic=$(LC_ALL=C readelf -d "$lib" 2>/dev/null || true)
+    main_dynamic=$(LC_ALL=C readelf -d "$prog" 2>/dev/null || true)
+    if ! grep -E 'JUMP_SLOT[^[:cntrl:]]*dlfrz_lazy_ifunc_fork' \
+            <<<"$relocations" >/dev/null ||
+       ! grep -E \
+            'IFUNC[[:space:]]+GLOBAL[[:space:]]+DEFAULT[^[:cntrl:]]*dlfrz_lazy_ifunc_fork' \
+            <<<"$symbols" >/dev/null ||
+       grep -Eq '\(BIND_NOW\)|FLAGS[^[:cntrl:]]*NOW' <<<"$dynamic" ||
+       ! grep -Eq '\(BIND_NOW\)|FLAGS[^[:cntrl:]]*NOW' \
+            <<<"$main_dynamic"; then
+        skip "$label" "linker did not retain a lazy self-IFUNC JUMP_SLOT"
+        rm -rf "$root"
+        return
+    fi
+
+    capture_output actual env -u LD_BIND_NOW -u LD_BIND_NOT "$prog" || rc=$?
+    if [ "$rc" -ne 0 ] || [ "$actual" != "$expected" ]; then
+        fail "$label native control" "exit=$rc output=$actual"
+        rm -rf "$root"
+        return
+    fi
+
+    freeze_require_direct "$label" "$log" "$out" -- "$prog" ||
+        freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "$label" "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+
+    rm -f "$prog" "$lib"
+    actual=""
+    rc=0
+    capture_output actual env -u LD_LIBRARY_PATH -u LD_BIND_NOW \
+        -u LD_BIND_NOT DLFREEZE_NO_FORK=1 "$out" || rc=$?
+    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+    if [ "$rc" -eq 0 ] && [ "$actual" = "$expected" ]; then
+        pass "$label"
+    else
+        fail "$label" "exit=$rc output=$actual"
+        tail -n 80 "$log" 2>/dev/null || true
+    fi
+    rm -rf "$root"
+}
+
+# The two resolver words in a GNU lazy object's PLTGOT are public ABI state.
+# GOT[1] must retain the same link_map identity that dladdr1 publishes, even
+# though the direct loader uses a private loaded_obj for its own bookkeeping.
+test_gnu_startup_lazy_link_map_identity() {
+    echo "--- GNU lazy-PLT public link_map identity ---"
+    local root="$BUILD/gnu_startup_lazy_link_map"
+    local lib_src="$root/library.c" lib="$root/libdlfrz_lazy_link_map.so"
+    local prog_src="$root/main.c" prog="$root/main"
+    local out="$root/main.frozen" log="$root/main.log"
+    local expected="lazy-link-map=1,29" actual=""
+    local relocations dynamic rc=0 freeze_rc=0
+    local label="GNU lazy-PLT GOT[1] public link_map identity"
+
+    if ! compiler_targets_glibc; then
+        skip "$label" "test compiler does not target glibc"
+        return
+    fi
+    if ! command -v readelf >/dev/null 2>&1; then
+        skip "$label" "readelf not installed"
+        return
+    fi
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    cat >"$lib_src" <<'C'
+extern int dlfrz_lazy_link_map_target(void);
+
+int dlfrz_lazy_link_map_call(void) {
+    return dlfrz_lazy_link_map_target();
+}
+
+static void dlfrz_lazy_link_map_anchor(void) {
+}
+
+void *dlfrz_lazy_link_map_address(void) {
+    /* A hidden/local address cannot be canonicalized to the executable's PLT,
+     * so dladdr1 must report this DSO's own link_map. */
+    return (void *)dlfrz_lazy_link_map_anchor;
+}
+C
+    cat >"$prog_src" <<'C'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <elf.h>
+#include <link.h>
+#include <stdint.h>
+#include <stdio.h>
+
+extern int dlfrz_lazy_link_map_call(void);
+extern void *dlfrz_lazy_link_map_address(void);
+
+int dlfrz_lazy_link_map_target(void) { return 29; }
+
+static int got_link_map_matches(void *address) {
+    Dl_info info;
+    struct link_map *map = NULL;
+    void *extra = NULL;
+
+    if (!dladdr1(address, &info, &extra, RTLD_DL_LINKMAP) || !extra)
+        return 0;
+    map = (struct link_map *)extra;
+    if (!map->l_ld)
+        return 0;
+    for (size_t i = 0; i < 1024; i++) {
+        Dl_info got_info;
+        void *got_extra = NULL;
+        uintptr_t got_address;
+        void **got;
+
+        if (map->l_ld[i].d_tag == DT_NULL)
+            return 0;
+        if (map->l_ld[i].d_tag != DT_PLTGOT)
+            continue;
+        got_address = (uintptr_t)map->l_ld[i].d_un.d_ptr;
+        /* Native glibc publishes adjusted dynamic pointer tags, while the
+         * direct loader retains their ELF virtual addresses in public l_ld. */
+        if (!dladdr1((void *)got_address, &got_info, &got_extra,
+                     RTLD_DL_LINKMAP) || got_extra != (void *)map) {
+            if ((uintptr_t)map->l_addr > UINTPTR_MAX - got_address)
+                return 0;
+            got_address += (uintptr_t)map->l_addr;
+        }
+        got = (void **)got_address;
+        return got[1] == (void *)map;
+    }
+    return 0;
+}
+
+int main(void) {
+    int match = got_link_map_matches(dlfrz_lazy_link_map_address());
+    int value = dlfrz_lazy_link_map_call();
+
+    printf("lazy-link-map=%d,%d\n", match, value);
+    return match == 1 && value == 29 ? 0 : 2;
+}
+C
+
+    if ! gcc -shared -fPIC -nostartfiles -Wl,-z,lazy \
+            -Wl,-soname,libdlfrz_lazy_link_map.so \
+            -o "$lib" "$lib_src" ||
+       ! gcc -Wl,-z,now -Wl,-E -Wl,--no-as-needed -L"$root" \
+            -Wl,-rpath,'$ORIGIN' -o "$prog" "$prog_src" \
+            -ldlfrz_lazy_link_map -ldl; then
+        fail "$label" "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+    relocations=$(LC_ALL=C readelf -Wr "$lib" 2>/dev/null || true)
+    dynamic=$(LC_ALL=C readelf -d "$lib" 2>/dev/null || true)
+    if ! grep -E \
+            'JUMP_SLOT[^[:cntrl:]]*dlfrz_lazy_link_map_target' \
+            <<<"$relocations" >/dev/null ||
+       grep -Eq '\(BIND_NOW\)|FLAGS[^[:cntrl:]]*NOW' <<<"$dynamic"; then
+        fail "$label" "linker did not retain the intended lazy slot"
+        rm -rf "$root"
+        return
+    fi
+
+    capture_output actual env -u LD_BIND_NOW -u LD_BIND_NOT "$prog" || rc=$?
+    if [ "$rc" -ne 0 ] || [ "$actual" != "$expected" ]; then
+        fail "$label native control" "exit=$rc output=$actual"
+        rm -rf "$root"
+        return
+    fi
+
+    freeze_require_direct "$label" "$log" "$out" -- "$prog" ||
+        freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "$label" "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+
+    rm -f "$prog" "$lib"
+    actual=""
+    rc=0
+    capture_output actual env -u LD_LIBRARY_PATH -u LD_BIND_NOW \
+        -u LD_BIND_NOT DLFREEZE_NO_FORK=1 "$out" || rc=$?
+    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+    if [ "$rc" -eq 0 ] && [ "$actual" = "$expected" ]; then
+        pass "$label"
+    else
+        fail "$label" "exit=$rc output=$actual"
+        tail -n 80 "$log" 2>/dev/null || true
+    fi
+    rm -rf "$root"
+}
+
+# Force the executable's real entry point to use a lazy JUMP_SLOT for the
+# glibc startup handoff.  Native libc and the direct adapter must each leave
+# the main init array with exactly one owner on both supported architectures.
+test_gnu_startup_lazy_start_main_constructor_once() {
+    echo "--- GNU lazy __libc_start_main constructor ownership ---"
+    local root="$BUILD/gnu_startup_lazy_start_main"
+    local src="$root/main.c" start="$root/start.S" bin="$root/main"
+    local out="$root/main.frozen" log="$root/main.log"
+    local expected="lazy-start-main-constructor-count=1" actual=""
+    local relocations dynamic rc=0 freeze_rc=0
+    local label="GNU lazy __libc_start_main constructor exactly once"
+
+    if ! compiler_targets_glibc; then
+        skip "$label" "test compiler does not target glibc"
+        return
+    fi
+    if ! command -v readelf >/dev/null 2>&1; then
+        skip "$label" "readelf not installed"
+        return
+    fi
+    case "$(uname -m)" in
+        x86_64|aarch64) ;;
+        *)
+            skip "$label" "fixture covers the supported lazy-PLT ABIs"
+            return
+            ;;
+    esac
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    cat >"$src" <<'C'
+#include <stdio.h>
+
+static int constructor_count;
+
+__attribute__((constructor))
+static void counted_constructor(void) {
+    constructor_count++;
+}
+
+int main(void) {
+    printf("lazy-start-main-constructor-count=%d\n", constructor_count);
+    return constructor_count == 1 ? 0 : 40 + constructor_count;
+}
+C
+    if [ "$(uname -m)" = x86_64 ]; then
+        cat >"$start" <<'ASM'
+    .text
+    .globl _start
+    .type _start,@function
+_start:
+    xorl %ebp, %ebp
+    movq %rdx, %r9
+    popq %rsi
+    movq %rsp, %rdx
+    andq $-16, %rsp
+    pushq %rax
+    pushq %rsp
+    xorl %r8d, %r8d
+    xorl %ecx, %ecx
+    leaq main(%rip), %rdi
+    call __libc_start_main@PLT
+    hlt
+    .size _start, .-_start
+    .section .note.GNU-stack,"",@progbits
+ASM
+    else
+        cat >"$start" <<'ASM'
+    .text
+    .globl _start
+    .type _start,%function
+_start:
+    mov x29, xzr
+    mov x30, xzr
+    mov x5, x0
+    ldr x1, [sp]
+    add x2, sp, #8
+    mov x6, sp
+    adrp x0, main
+    add x0, x0, :lo12:main
+    mov x3, xzr
+    mov x4, xzr
+    bl __libc_start_main
+    brk #0
+    .size _start, .-_start
+    .section .note.GNU-stack,"",%progbits
+ASM
+    fi
+
+    if ! gcc -std=c11 -Wall -Wextra -Werror -O2 -fno-pie -no-pie \
+            -nostartfiles -Wl,-e,_start -Wl,-z,lazy \
+            -o "$bin" "$src" "$start"; then
+        fail "$label" "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+    relocations=$(LC_ALL=C readelf -Wr "$bin" 2>/dev/null || true)
+    dynamic=$(LC_ALL=C readelf -d "$bin" 2>/dev/null || true)
+    if ! grep -E 'JUMP_SLOT[^[:cntrl:]]*__libc_start_main' \
+            <<<"$relocations" >/dev/null ||
+       grep -Eq '\(BIND_NOW\)|FLAGS[^[:cntrl:]]*NOW' <<<"$dynamic"; then
+        skip "$label" "linker did not retain a lazy startup JUMP_SLOT"
+        rm -rf "$root"
+        return
+    fi
+
+    capture_output actual env -u LD_BIND_NOW -u LD_BIND_NOT "$bin" || rc=$?
+    if [ "$rc" -ne 0 ] || [ "$actual" != "$expected" ]; then
+        fail "$label native control" "exit=$rc output=$actual"
+        rm -rf "$root"
+        return
+    fi
+
+    freeze_require_direct "$label" "$log" "$out" -- "$bin" ||
+        freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "$label" "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+
+    rm -f "$bin"
+    actual=""
+    rc=0
+    capture_output actual env -u LD_BIND_NOW -u LD_BIND_NOT \
+        DLFREEZE_NO_FORK=1 "$out" || rc=$?
+    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+    if [ "$rc" -eq 0 ] && [ "$actual" = "$expected" ]; then
+        pass "$label"
+    else
+        fail "$label" "exit=$rc output=$actual"
+        tail -n 80 "$log" 2>/dev/null || true
+    fi
+    rm -rf "$root"
+}
+
+# Mutate a direct artifact so two JMPREL records own the same destination.
+# The frozen-image mutation bypasses pack-time validation and therefore proves
+# the runtime loader rejects the lazy/eager alias before entering target code.
+test_gnu_startup_lazy_layout_alias_rejection() {
+    echo "--- GNU lazy-PLT relocation-alias rejection ---"
+    local root="$BUILD/gnu_startup_lazy_alias"
+    local src="$root/main.c" bin="$root/main"
+    local out="$root/main.frozen" bad="$root/main.bad.frozen"
+    local log="$root/main.log" actual=""
+    local size footer manifest main phoff phentsz phnum
+    local dynamic_off="" dynamic_size="" jmprel_vaddr="" jmprel_size=""
+    local pltrel_type="" jmprel_file="" jump_slot_type=""
+    local first_record="" second_record=""
+    local p d i poff type value pvaddr pfilesz pend tag record_type
+    local rc=0 freeze_rc=0
+    local label="GNU lazy-PLT duplicate destination rejection"
+
+    if ! compiler_targets_glibc; then
+        skip "$label" "test compiler does not target glibc"
+        return
+    fi
+    if ! command -v readelf >/dev/null 2>&1; then
+        skip "$label" "readelf not installed"
+        return
+    fi
+    case "$(uname -m)" in
+        x86_64) jump_slot_type=7 ;;
+        aarch64) jump_slot_type=1026 ;;
+        *)
+            skip "$label" "fixture covers the supported lazy-PLT ABIs"
+            return
+            ;;
+    esac
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    cat >"$src" <<'C'
+#include <stdio.h>
+#include <unistd.h>
+
+int main(void) {
+    printf("gnu-lazy-alias-target-ran:%ld\n", (long)getpid());
+    return 0;
+}
+C
+    if ! gcc -O0 -fno-builtin -Wl,-z,lazy -o "$bin" "$src"; then
+        fail "$label" "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$(LC_ALL=C readelf -Wr "$bin" 2>/dev/null | \
+              grep -c 'JUMP_SLOT' || true)" -lt 2 ] ||
+       LC_ALL=C readelf -d "$bin" 2>/dev/null |
+           grep -Eq '\(BIND_NOW\)|FLAGS[^[:cntrl:]]*NOW'; then
+        skip "$label" "linker did not retain two lazy JUMP_SLOT records"
+        rm -rf "$root"
+        return
+    fi
+
+    freeze_require_direct "$label" "$log" "$out" -- "$bin" ||
+        freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "$label" "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+
+    size=$(stat -c %s "$out" 2>/dev/null || true)
+    if ! [[ "$size" =~ ^[0-9]+$ ]] || [ "$size" -lt 64 ]; then
+        fail "$label" "direct artifact has no complete footer"
+        rm -rf "$root"
+        return
+    fi
+    footer=$((size - 64))
+    manifest=$(od -An -tu8 -j $((footer + 16)) -N8 "$out" |
+        tr -d '[:space:]')
+    main=$(od -An -tu8 -j "$manifest" -N8 "$out" |
+        tr -d '[:space:]')
+    phoff=$(od -An -tu8 -j $((main + 32)) -N8 "$out" |
+        tr -d '[:space:]')
+    phentsz=$(od -An -tu2 -j $((main + 54)) -N2 "$out" |
+        tr -d '[:space:]')
+    phnum=$(od -An -tu2 -j $((main + 56)) -N2 "$out" |
+        tr -d '[:space:]')
+    if ! [[ "$manifest" =~ ^[0-9]+$ && "$main" =~ ^[0-9]+$ &&
+            "$phoff" =~ ^[0-9]+$ && "$phentsz" =~ ^[0-9]+$ &&
+            "$phnum" =~ ^[0-9]+$ ]] || [ "$phentsz" -lt 56 ]; then
+        fail "$label" "could not locate the embedded executable"
+        rm -rf "$root"
+        return
+    fi
+    for ((p = 0; p < phnum; p++)); do
+        poff=$((main + phoff + p * phentsz))
+        type=$(od -An -tu4 -j "$poff" -N4 "$out" | tr -d '[:space:]')
+        if [ "$type" = 2 ]; then
+            value=$(od -An -tu8 -j $((poff + 8)) -N8 "$out" |
+                tr -d '[:space:]')
+            dynamic_size=$(od -An -tu8 -j $((poff + 32)) -N8 "$out" |
+                tr -d '[:space:]')
+            dynamic_off=$((main + value))
+            break
+        fi
+    done
+    if [ -z "$dynamic_off" ] || [ -z "$dynamic_size" ]; then
+        fail "$label" "embedded PT_DYNAMIC was not found"
+        rm -rf "$root"
+        return
+    fi
+    for ((d = 0; d + 16 <= dynamic_size; d += 16)); do
+        tag=$(od -An -tu8 -j $((dynamic_off + d)) -N8 "$out" |
+            tr -d '[:space:]')
+        [ "$tag" = 0 ] && break
+        value=$(od -An -tu8 -j $((dynamic_off + d + 8)) -N8 "$out" |
+            tr -d '[:space:]')
+        case "$tag" in
+            2) jmprel_size=$value ;;
+            20) pltrel_type=$value ;;
+            23) jmprel_vaddr=$value ;;
+        esac
+    done
+    if ! [[ "$jmprel_vaddr" =~ ^[0-9]+$ &&
+            "$jmprel_size" =~ ^[0-9]+$ &&
+            "$pltrel_type" =~ ^[0-9]+$ ]] ||
+       [ "$pltrel_type" -ne 7 ] || [ "$jmprel_size" -lt 48 ] ||
+       [ $((jmprel_size % 24)) -ne 0 ]; then
+        fail "$label" "embedded DT_JMPREL metadata is not canonical RELA"
+        rm -rf "$root"
+        return
+    fi
+    for ((p = 0; p < phnum; p++)); do
+        poff=$((main + phoff + p * phentsz))
+        type=$(od -An -tu4 -j "$poff" -N4 "$out" | tr -d '[:space:]')
+        [ "$type" = 1 ] || continue
+        value=$(od -An -tu8 -j $((poff + 8)) -N8 "$out" |
+            tr -d '[:space:]')
+        pvaddr=$(od -An -tu8 -j $((poff + 16)) -N8 "$out" |
+            tr -d '[:space:]')
+        pfilesz=$(od -An -tu8 -j $((poff + 32)) -N8 "$out" |
+            tr -d '[:space:]')
+        pend=$((pvaddr + pfilesz))
+        if [ "$jmprel_vaddr" -ge "$pvaddr" ] &&
+           [ $((jmprel_vaddr + jmprel_size)) -le "$pend" ]; then
+            jmprel_file=$((main + value + jmprel_vaddr - pvaddr))
+            break
+        fi
+    done
+    if [ -z "$jmprel_file" ]; then
+        fail "$label" "embedded JMPREL file range was not found"
+        rm -rf "$root"
+        return
+    fi
+    for ((i = 0; i < jmprel_size / 24; i++)); do
+        poff=$((jmprel_file + i * 24))
+        record_type=$(od -An -tu4 -j $((poff + 8)) -N4 "$out" |
+            tr -d '[:space:]')
+        [ "$record_type" = "$jump_slot_type" ] || continue
+        if [ -z "$first_record" ]; then
+            first_record=$poff
+        else
+            second_record=$poff
+            break
+        fi
+    done
+    if [ -z "$first_record" ] || [ -z "$second_record" ] ||
+       ! cp "$out" "$bad" ||
+       ! dd if="$out" of="$bad" bs=1 skip="$first_record" \
+            seek="$second_record" count=8 conv=notrunc status=none; then
+        fail "$label" "could not create a duplicate-destination artifact"
+        rm -rf "$root"
+        return
+    fi
+
+    actual=""
+    rc=0
+    capture_output actual env DLFREEZE_NO_FORK=1 "$bad" || rc=$?
+    if [ "$rc" -eq 127 ] &&
+       [[ "$actual" == *"unsupported GNU lazy-PLT layout"* ]] &&
+       [[ "$actual" != *"gnu-lazy-alias-target-ran"* ]]; then
+        pass "$label"
+    else
+        fail "$label" "exit=$rc output=$actual"
+        tail -n 80 "$log" 2>/dev/null || true
+    fi
+    rm -rf "$root"
+}
+
+# glibc's AArch64 IFUNC ABI grows independently of the ordinary function PCS.
+# Capture the kernel auxv directly, compare it with libc's public getauxval,
+# and have a genuinely lazy resolver validate the exact ABI arguments that the
+# direct loader supplies for the embedded glibc release.
+test_aarch64_gnu_lazy_ifunc_argument_abi_direct() {
+    echo "--- AArch64 GNU lazy IFUNC argument ABI ---"
+    local root="$BUILD/aarch64_gnu_lazy_ifunc_abi"
+    local lib_src="$root/library.c" lib="$root/libdlfrz_aarch64_ifunc_abi.so"
+    local prog_src="$root/main.c" prog="$root/main"
+    local out="$root/main.frozen" log="$root/main.log"
+    local expected="aarch64-lazy-ifunc-abi=0,83,1,0,83,1" actual=""
+    local relocations dynamic main_dynamic rc=0 freeze_rc=0
+    local label="AArch64 GNU lazy IFUNC auxv and argument ABI"
+
+    if [ "$(uname -m)" != aarch64 ]; then
+        skip "$label" "requires AArch64"
+        return
+    fi
+    if ! compiler_targets_glibc; then
+        skip "$label" "test compiler does not target glibc"
+        return
+    fi
+    if ! command -v readelf >/dev/null 2>&1; then
+        skip "$label" "readelf not installed"
+        return
+    fi
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    if ! compiler_supports_gnu_ifunc "$root"; then
+        skip "$label" "toolchain/runtime does not support GNU IFUNC"
+        rm -rf "$root"
+        return
+    fi
+    cat >"$lib_src" <<'C'
+#include <features.h>
+#include <stdint.h>
+
+#define DLFRZ_IFUNC_ARG_HWCAP (UINT64_C(1) << 62)
+
+struct dlfrz_ifunc_args {
+    uint64_t size;
+    uint64_t hwcap;
+    uint64_t hwcap2;
+    uint64_t hwcap3;
+    uint64_t hwcap4;
+};
+
+static volatile uint64_t expected_hwcap;
+static volatile uint64_t expected_hwcap2;
+static volatile uint64_t expected_hwcap3;
+static volatile uint64_t expected_hwcap4;
+static volatile int expected_public_match;
+static volatile int expected_ready;
+static volatile int resolver_calls;
+static volatile int resolver_status = -1;
+
+typedef int (*dlfrz_ifunc_impl_fn)(void);
+
+void dlfrz_aarch64_ifunc_set_expected(uint64_t hwcap, uint64_t hwcap2,
+                                      uint64_t hwcap3, uint64_t hwcap4,
+                                      int public_match) {
+    expected_hwcap = hwcap;
+    expected_hwcap2 = hwcap2;
+    expected_hwcap3 = hwcap3;
+    expected_hwcap4 = hwcap4;
+    expected_public_match = public_match;
+    expected_ready = 1;
+}
+
+static int dlfrz_aarch64_ifunc_impl(void) {
+    return resolver_status == 0 ? 83 : -resolver_status;
+}
+
+#if __GLIBC_PREREQ(2, 30)
+static dlfrz_ifunc_impl_fn dlfrz_aarch64_ifunc_resolver(
+    uint64_t arg0, const struct dlfrz_ifunc_args *arg1) {
+    uint64_t expected_size = __GLIBC_PREREQ(2, 42) ? 40 : 24;
+    int bad = !expected_ready || !expected_public_match;
+
+    if (arg0 != (expected_hwcap | DLFRZ_IFUNC_ARG_HWCAP) || !arg1 ||
+        arg1->size != expected_size || arg1->hwcap != expected_hwcap ||
+        arg1->hwcap2 != expected_hwcap2)
+        bad = 1;
+#if __GLIBC_PREREQ(2, 42)
+    if (arg1 && (arg1->hwcap3 != expected_hwcap3 ||
+                 arg1->hwcap4 != expected_hwcap4))
+        bad = 1;
+#endif
+    resolver_status = bad;
+    resolver_calls++;
+    return dlfrz_aarch64_ifunc_impl;
+}
+#else
+static dlfrz_ifunc_impl_fn dlfrz_aarch64_ifunc_resolver(uint64_t arg0) {
+    int bad = !expected_ready || !expected_public_match ||
+        arg0 != expected_hwcap;
+
+    resolver_status = bad;
+    resolver_calls++;
+    return dlfrz_aarch64_ifunc_impl;
+}
+#endif
+
+int dlfrz_aarch64_lazy_ifunc(void)
+    __attribute__((ifunc("dlfrz_aarch64_ifunc_resolver")));
+
+int dlfrz_aarch64_lazy_ifunc_call(void) {
+    return dlfrz_aarch64_lazy_ifunc();
+}
+
+int dlfrz_aarch64_lazy_ifunc_calls(void) { return resolver_calls; }
+int dlfrz_aarch64_lazy_ifunc_status(void) { return resolver_status; }
+C
+    cat >"$prog_src" <<'C'
+#define _GNU_SOURCE
+#include <elf.h>
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <sys/auxv.h>
+
+#ifndef AT_HWCAP2
+#define AT_HWCAP2 26
+#endif
+#ifndef AT_HWCAP3
+#define AT_HWCAP3 29
+#endif
+#ifndef AT_HWCAP4
+#define AT_HWCAP4 30
+#endif
+
+extern char **environ;
+extern void dlfrz_aarch64_ifunc_set_expected(
+    uint64_t, uint64_t, uint64_t, uint64_t, int);
+extern int dlfrz_aarch64_lazy_ifunc_call(void);
+extern int dlfrz_aarch64_lazy_ifunc_calls(void);
+extern int dlfrz_aarch64_lazy_ifunc_status(void);
+
+static int raw_auxv(unsigned long type, uint64_t *value, int *present) {
+    char **cursor = environ;
+    Elf64_auxv_t *auxv;
+
+    *value = 0;
+    *present = 0;
+    while (*cursor)
+        cursor++;
+    auxv = (Elf64_auxv_t *)(cursor + 1);
+    for (size_t i = 0; i < 256; i++) {
+        if (auxv[i].a_type == AT_NULL)
+            return 1;
+        if (auxv[i].a_type == type) {
+            if (*present)
+                return 0;
+            *present = 1;
+            *value = auxv[i].a_un.a_val;
+        }
+    }
+    return 0;
+}
+
+static int public_auxv(unsigned long type, uint64_t *value, int *present) {
+    unsigned long result;
+
+    errno = 0;
+    result = getauxval(type);
+    *present = result != 0 || errno != ENOENT;
+    *value = result;
+    return errno == 0 || errno == ENOENT;
+}
+
+int main(void) {
+    const unsigned long types[4] = {
+        AT_HWCAP, AT_HWCAP2, AT_HWCAP3, AT_HWCAP4
+    };
+    uint64_t raw[4] = {0};
+    uint64_t public_value[4] = {0};
+    int raw_present[4] = {0};
+    int public_present[4] = {0};
+    int match = 1;
+    int before;
+    int first;
+    int after_first;
+    int status;
+    int second;
+    int after_second;
+
+    for (size_t i = 0; i < 4; i++) {
+        if (!raw_auxv(types[i], &raw[i], &raw_present[i]) ||
+            !public_auxv(types[i], &public_value[i], &public_present[i]) ||
+            raw_present[i] != public_present[i] ||
+            raw[i] != public_value[i])
+            match = 0;
+    }
+    dlfrz_aarch64_ifunc_set_expected(
+        raw[0], raw[1], raw[2], raw[3], match);
+    before = dlfrz_aarch64_lazy_ifunc_calls();
+    first = dlfrz_aarch64_lazy_ifunc_call();
+    after_first = dlfrz_aarch64_lazy_ifunc_calls();
+    status = dlfrz_aarch64_lazy_ifunc_status();
+    second = dlfrz_aarch64_lazy_ifunc_call();
+    after_second = dlfrz_aarch64_lazy_ifunc_calls();
+    printf("aarch64-lazy-ifunc-abi=%d,%d,%d,%d,%d,%d\n",
+           before, first, after_first, status, second, after_second);
+    return before == 0 && first == 83 && after_first == 1 && status == 0 &&
+           second == 83 && after_second == 1 ? 0 : 2;
+}
+C
+
+    if ! gcc -std=c11 -Wall -Wextra -Werror -shared -fPIC -nostartfiles \
+            -Wl,-z,lazy -Wl,-soname,libdlfrz_aarch64_ifunc_abi.so \
+            -o "$lib" "$lib_src" ||
+       ! gcc -std=c11 -Wall -Wextra -Werror -Wl,-z,now \
+            -Wl,--no-as-needed -L"$root" -Wl,-rpath,'$ORIGIN' \
+            -o "$prog" "$prog_src" -ldlfrz_aarch64_ifunc_abi; then
+        fail "$label" "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+    relocations=$(LC_ALL=C readelf -Wr "$lib" 2>/dev/null || true)
+    dynamic=$(LC_ALL=C readelf -d "$lib" 2>/dev/null || true)
+    main_dynamic=$(LC_ALL=C readelf -d "$prog" 2>/dev/null || true)
+    if ! grep -E 'JUMP_SLOT[^[:cntrl:]]*dlfrz_aarch64_lazy_ifunc' \
+            <<<"$relocations" >/dev/null ||
+       grep -Eq '\(BIND_NOW\)|FLAGS[^[:cntrl:]]*NOW' <<<"$dynamic" ||
+       ! grep -Eq '\(BIND_NOW\)|FLAGS[^[:cntrl:]]*NOW' \
+            <<<"$main_dynamic"; then
+        skip "$label" "linker did not retain a lazy IFUNC JUMP_SLOT"
+        rm -rf "$root"
+        return
+    fi
+
+    capture_output actual env -u LD_BIND_NOW -u LD_BIND_NOT "$prog" || rc=$?
+    if [ "$rc" -ne 0 ] || [ "$actual" != "$expected" ]; then
+        fail "$label native control" "exit=$rc output=$actual"
+        rm -rf "$root"
+        return
+    fi
+
+    freeze_require_direct "$label" "$log" "$out" -- "$prog" ||
+        freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "$label" "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+
+    rm -f "$prog" "$lib"
+    actual=""
+    rc=0
+    capture_output actual env -u LD_LIBRARY_PATH -u LD_BIND_NOW \
+        -u LD_BIND_NOT DLFREEZE_NO_FORK=1 "$out" || rc=$?
+    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+    if [ "$rc" -eq 0 ] && [ "$actual" = "$expected" ]; then
+        pass "$label"
+    else
+        fail "$label" "exit=$rc output=$actual"
+        tail -n 80 "$log" 2>/dev/null || true
+    fi
+    rm -rf "$root"
+}
+
 # GNU also leaves startup-object PLT slots lazy unless the object requests
 # BIND_NOW.  A strong undefined JUMP_SLOT is therefore legal when the program
-# never calls it.  The direct loader has no native PLT trampoline, so it must
-# detect this before target effects and let a supervised, extraction-capable
-# artifact retry through the embedded native loader.
+# never calls it.  Verify that the direct artifact retains the native stub
+# and does not reject or resolve that unused import during startup.
 test_gnu_startup_lazy_binding_fallback() {
     echo "--- GNU startup lazy-PLT native-binding fallback ---"
     local root="$BUILD/gnu_startup_lazy_binding"
@@ -20164,7 +25887,7 @@ test_gnu_startup_lazy_binding_fallback() {
     local prog_src="$root/main.c" prog="$root/main"
     local out="$root/main.frozen" log="$root/main.log"
     local expected="startup-lazy-present=37" actual=""
-    local relocations dynamic rc=0 freeze_rc=0
+    local relocations dynamic size meta_off rc=0
 
     if ! compiler_targets_glibc; then
         skip "GNU startup lazy-PLT fallback" \
@@ -20231,43 +25954,40 @@ C
     fi
     pass "native GNU startup unresolved lazy-PLT control"
 
-    freeze_require_direct "GNU startup lazy-PLT fallback" "$log" \
-        "$out" "$prog" || freeze_rc=$?
-    if [ "$freeze_rc" -eq 77 ]; then
-        skip "GNU startup lazy-PLT strict refusal" "$DIRECT_FREEZE_REASON"
-        skip "GNU startup lazy-PLT supervised fallback" \
-            "$DIRECT_FREEZE_REASON"
+    if ! run_freeze env -u LD_BIND_NOW -u LD_BIND_NOT \
+            "$DLFREEZE" -d -o "$out" -- "$prog" >"$log" 2>&1; then
+        fail "GNU startup lazy-PLT pack-time fallback" "dlfreeze failed"
+        tail -n 80 "$log" || true
         rm -rf "$root"
         return
     fi
-    if [ "$freeze_rc" -ne 0 ]; then
-        rm -rf "$root"
-        return
+    size=$(stat -c %s "$out" 2>/dev/null || true)
+    meta_off=""
+    if [[ "$size" =~ ^[0-9]+$ ]] && [ "$size" -ge 64 ]; then
+        meta_off=$(od -An -tu8 -j $((size - 24)) -N8 "$out" \
+            2>/dev/null | tr -d '[:space:]')
     fi
-
-    actual=""; rc=0
-    capture_output actual env -u LD_BIND_NOW -u LD_BIND_NOT \
-        DLFREEZE_NO_FORK=1 "$out" || rc=$?
-    if [ "$rc" -eq 127 ] &&
-       [[ "$actual" == *"native lazy PLT binding is required"* ]] &&
-       [[ "$actual" == *"dlfreeze_startup_lazy_missing"* ]] &&
-       [[ "$actual" != *"$expected"* ]]; then
-        pass "GNU startup lazy-PLT strict refusal"
+    if [[ "$meta_off" =~ ^[0-9]+$ ]] && [ "$meta_off" -ne 0 ] &&
+       grep -Eq 'pre-linked[[:space:]]*:[[:space:]]*yes' "$log"; then
+        pass "GNU startup lazy-PLT selects direct loading while packing"
     else
-        fail "GNU startup lazy-PLT strict refusal" \
-            "exit=$rc output=$actual"
+        fail "GNU startup lazy-PLT pack-time admission" \
+            "meta=$meta_off; direct pre-link was not reported"
+        tail -n 80 "$log" || true
+        rm -rf "$root"
+        return
     fi
 
-    # Prove that the fallback uses only the embedded executable, DSO, and
+    # Prove that extraction uses only the embedded executable, DSO, and
     # native interpreter rather than reopening either source ELF.
     rm -f "$prog" "$lib"
     actual=""; rc=0
     capture_output actual env -u DLFREEZE_NO_FORK -u LD_LIBRARY_PATH \
         -u LD_BIND_NOW -u LD_BIND_NOT "$out" || rc=$?
     if [ "$rc" -eq 0 ] && [ "$actual" = "$expected" ]; then
-        pass "GNU startup lazy-PLT supervised fallback"
+        pass "GNU startup lazy-PLT embedded direct replay"
     else
-        fail "GNU startup lazy-PLT supervised fallback" \
+        fail "GNU startup lazy-PLT direct replay" \
             "exit=$rc output=$actual"
         tail -n 80 "$log" || true
     fi
@@ -20286,7 +26006,7 @@ test_gnu_startup_weak_lazy_binding_fallback() {
     local prog_src="$root/main.c" prog="$root/main"
     local out="$root/main.frozen" log="$root/main.log"
     local expected="startup-weak-lazy-present=53" actual=""
-    local relocations symbols dynamic rc=0 freeze_rc=0
+    local relocations symbols dynamic size meta_off rc=0
 
     if ! compiler_targets_glibc; then
         skip "GNU startup weak lazy-PLT fallback" \
@@ -20356,46 +26076,254 @@ C
     fi
     pass "native GNU startup weak unresolved lazy-PLT control"
 
-    freeze_require_direct "GNU startup weak lazy-PLT fallback" "$log" \
-        "$out" "$prog" || freeze_rc=$?
-    if [ "$freeze_rc" -eq 77 ]; then
-        skip "GNU startup weak lazy-PLT strict refusal" \
-            "$DIRECT_FREEZE_REASON"
-        skip "GNU startup weak lazy-PLT supervised fallback" \
-            "$DIRECT_FREEZE_REASON"
+    if ! run_freeze env -u LD_BIND_NOW -u LD_BIND_NOT \
+            "$DLFREEZE" -d -o "$out" -- "$prog" >"$log" 2>&1; then
+        fail "GNU startup weak lazy-PLT pack-time fallback" \
+            "dlfreeze failed"
+        tail -n 80 "$log" || true
         rm -rf "$root"
         return
     fi
-    if [ "$freeze_rc" -ne 0 ]; then
-        rm -rf "$root"
-        return
+    size=$(stat -c %s "$out" 2>/dev/null || true)
+    meta_off=""
+    if [[ "$size" =~ ^[0-9]+$ ]] && [ "$size" -ge 64 ]; then
+        meta_off=$(od -An -tu8 -j $((size - 24)) -N8 "$out" \
+            2>/dev/null | tr -d '[:space:]')
     fi
-
-    actual=""; rc=0
-    capture_output actual env -u LD_BIND_NOW -u LD_BIND_NOT \
-        DLFREEZE_NO_FORK=1 "$out" || rc=$?
-    if [ "$rc" -eq 127 ] &&
-       [[ "$actual" == *"native lazy PLT binding is required"* ]] &&
-       [[ "$actual" == *"dlfreeze_startup_weak_lazy_missing"* ]] &&
-       [[ "$actual" != *"$expected"* ]]; then
-        pass "GNU startup weak lazy-PLT strict refusal"
+    if [[ "$meta_off" =~ ^[0-9]+$ ]] && [ "$meta_off" -ne 0 ] &&
+       grep -Eq 'pre-linked[[:space:]]*:[[:space:]]*yes' "$log"; then
+        pass "GNU startup weak lazy-PLT selects direct loading while packing"
     else
-        fail "GNU startup weak lazy-PLT strict refusal" \
-            "exit=$rc output=$actual"
+        fail "GNU startup weak lazy-PLT pack-time admission" \
+            "meta=$meta_off; direct pre-link was not reported"
+        tail -n 80 "$log" || true
+        rm -rf "$root"
+        return
     fi
 
-    # The supervised retry must use the embedded executable, DSO, and native
+    # The extraction replay must use the embedded executable, DSO, and native
     # interpreter after both source files have disappeared.
     rm -f "$prog" "$lib"
     actual=""; rc=0
     capture_output actual env -u DLFREEZE_NO_FORK -u LD_LIBRARY_PATH \
         -u LD_BIND_NOW -u LD_BIND_NOT "$out" || rc=$?
     if [ "$rc" -eq 0 ] && [ "$actual" = "$expected" ]; then
-        pass "GNU startup weak lazy-PLT supervised fallback"
+        pass "GNU startup weak lazy-PLT embedded direct replay"
     else
-        fail "GNU startup weak lazy-PLT supervised fallback" \
+        fail "GNU startup weak lazy-PLT direct replay" \
             "exit=$rc output=$actual"
         tail -n 80 "$log" || true
+    fi
+    rm -rf "$root"
+}
+
+# A defined IFUNC is not an ordinary resolved PLT import: glibc invokes its
+# resolver on the first lazy call.  An uncalled slot must remain unresolved
+# in direct mode, keeping target code behind the same first-call boundary.
+test_gnu_startup_lazy_ifunc_fallback() {
+    echo "--- GNU startup lazy-PLT IFUNC timing fallback ---"
+    local root="$BUILD/gnu_startup_lazy_ifunc"
+    local lib_src="$root/library.c" lib="$root/libstartup_lazy_ifunc.so"
+    local prog_src="$root/main.c" prog="$root/main"
+    local out="$root/main.frozen" log="$root/main.log"
+    local expected="lazy-ifunc-resolver-ran=0" actual=""
+    local relocations symbols dynamic size meta_off rc=0
+
+    if ! compiler_targets_glibc; then
+        skip "GNU startup lazy IFUNC fallback" \
+            "test compiler does not target glibc"
+        return
+    fi
+    if ! command -v readelf >/dev/null 2>&1; then
+        skip "GNU startup lazy IFUNC fallback" "readelf not installed"
+        return
+    fi
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    if ! compiler_supports_gnu_ifunc "$root"; then
+        skip "GNU startup lazy IFUNC fallback" \
+            "toolchain/runtime does not support GNU IFUNC"
+        rm -rf "$root"
+        return
+    fi
+    cat >"$lib_src" <<'C'
+static int resolver_ran;
+
+static int lazy_implementation(void) { return 71; }
+static void *lazy_resolver(void) {
+    resolver_ran = 1;
+    return (void *)lazy_implementation;
+}
+
+int dlfreeze_startup_lazy_ifunc(void)
+    __attribute__((ifunc("lazy_resolver")));
+
+int dlfreeze_startup_lazy_ifunc_uncalled(void) {
+    return dlfreeze_startup_lazy_ifunc();
+}
+
+int dlfreeze_startup_lazy_ifunc_resolver_ran(void) {
+    return resolver_ran;
+}
+C
+    cat >"$prog_src" <<'C'
+#include <stdio.h>
+
+extern int dlfreeze_startup_lazy_ifunc_resolver_ran(void);
+
+int main(void) {
+    int ran = dlfreeze_startup_lazy_ifunc_resolver_ran();
+    printf("lazy-ifunc-resolver-ran=%d\n", ran);
+    return ran != 0;
+}
+C
+
+    if ! gcc -shared -fPIC -nostartfiles -Wl,-z,lazy \
+            -Wl,-soname,libstartup_lazy_ifunc.so \
+            -o "$lib" "$lib_src" ||
+       ! gcc -Wl,-z,now -Wl,--no-as-needed -L"$root" \
+            -Wl,-rpath,'$ORIGIN' -o "$prog" "$prog_src" \
+            -lstartup_lazy_ifunc; then
+        fail "GNU startup lazy IFUNC fixture" "compile failed"
+        rm -rf "$root"
+        return
+    fi
+    relocations=$(LC_ALL=C readelf -Wr "$lib" 2>/dev/null || true)
+    symbols=$(LC_ALL=C readelf -Ws "$lib" 2>/dev/null || true)
+    dynamic=$(LC_ALL=C readelf -d "$lib" 2>/dev/null || true)
+    if ! grep -E \
+            'JUMP_SLOT[^[:cntrl:]]*dlfreeze_startup_lazy_ifunc' \
+            <<<"$relocations" >/dev/null ||
+       ! grep -E \
+            'IFUNC[[:space:]]+GLOBAL[[:space:]]+DEFAULT[^[:cntrl:]]*dlfreeze_startup_lazy_ifunc' \
+            <<<"$symbols" >/dev/null ||
+       grep -Eq '\(BIND_NOW\)|FLAGS[^[:cntrl:]]*NOW' <<<"$dynamic"; then
+        skip "GNU startup lazy IFUNC fallback" \
+            "linker did not retain a lazy IFUNC JUMP_SLOT"
+        rm -rf "$root"
+        return
+    fi
+
+    capture_output actual env -u LD_BIND_NOW -u LD_BIND_NOT "$prog" || rc=$?
+    if [ "$rc" -ne 0 ] || [ "$actual" != "$expected" ]; then
+        fail "native GNU startup lazy IFUNC timing control" \
+            "exit=$rc output=$actual"
+        rm -rf "$root"
+        return
+    fi
+    pass "native GNU startup defers an uncalled IFUNC resolver"
+
+    if ! run_freeze env -u LD_BIND_NOW -u LD_BIND_NOT \
+            "$DLFREEZE" -d -o "$out" -- "$prog" >"$log" 2>&1; then
+        fail "GNU startup lazy IFUNC pack-time fallback" "dlfreeze failed"
+        tail -n 80 "$log" || true
+        rm -rf "$root"
+        return
+    fi
+    size=$(stat -c %s "$out" 2>/dev/null || true)
+    meta_off=""
+    if [[ "$size" =~ ^[0-9]+$ ]] && [ "$size" -ge 64 ]; then
+        meta_off=$(od -An -tu8 -j $((size - 24)) -N8 "$out" \
+            2>/dev/null | tr -d '[:space:]')
+    fi
+    if [[ "$meta_off" =~ ^[0-9]+$ ]] && [ "$meta_off" -ne 0 ] &&
+       grep -Eq 'pre-linked[[:space:]]*:[[:space:]]*yes' "$log"; then
+        pass "GNU startup lazy IFUNC selects direct loading while packing"
+    else
+        fail "GNU startup lazy IFUNC pack-time admission" \
+            "meta=$meta_off; direct pre-link was not reported"
+        tail -n 80 "$log" || true
+        rm -rf "$root"
+        return
+    fi
+
+    rm -f "$prog" "$lib"
+    actual=""; rc=0
+    capture_output actual env -u LD_LIBRARY_PATH -u LD_BIND_NOW \
+        -u LD_BIND_NOT "$out" || rc=$?
+    if [ "$rc" -eq 0 ] && [ "$actual" = "$expected" ]; then
+        pass "GNU startup lazy IFUNC embedded direct replay preserves timing"
+    else
+        fail "GNU startup lazy IFUNC direct replay" \
+            "exit=$rc output=$actual"
+        tail -n 80 "$log" || true
+    fi
+    rm -rf "$root"
+}
+
+# The early GNU lazy-binding scan consumes the same untrusted dynamic symbol
+# and relocation records as the prelinker.  A malformed record must retain
+# the typed invalid-input outcome; it must never be mistaken for a valid
+# native-lazy contract and quietly published as an extraction artifact.
+test_gnu_lazy_admission_malformed_metadata() {
+    echo "--- GNU lazy-admission malformed metadata ---"
+    local root="$BUILD/gnu_lazy_admission_malformed"
+    local src="$root/main.c" bin="$root/main" bad="$root/main.bad"
+    local gate="$root/gate" out="$root/main.frozen" log="$root/main.log"
+    local gate_rc=0 freeze_rc=0
+
+    if ! compiler_targets_glibc; then
+        skip "GNU lazy-admission malformed metadata" \
+            "test compiler does not target glibc"
+        return
+    fi
+    if ! command -v readelf >/dev/null 2>&1; then
+        skip "GNU lazy-admission malformed metadata" \
+            "readelf not installed"
+        return
+    fi
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    cat >"$src" <<'C'
+#include <stdio.h>
+int main(void) {
+    puts("gnu-lazy-malformed-target-ran");
+    return 0;
+}
+C
+    if ! gcc -fPIE -pie -Wl,--hash-style=both -o "$bin" "$src" ||
+       ! gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -Iinclude \
+            -o "$gate" tests/elf_prelink_gate.c; then
+        fail "GNU lazy-admission malformed fixture" "compile failed"
+        rm -rf "$root"
+        return
+    fi
+    cp "$bin" "$bad"
+    set +e
+    "$gate" symbol-index "$bad"
+    gate_rc=$?
+    set -e
+    if [ "$gate_rc" -eq 77 ]; then
+        skip "GNU lazy-admission malformed metadata" \
+            "fixture lacks a symbolic relocation"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$gate_rc" -ne 0 ]; then
+        fail "GNU lazy-admission malformed fixture" \
+            "could not mutate symbol index"
+        rm -rf "$root"
+        return
+    fi
+
+    set +e
+    run_freeze "$DLFREEZE" -d -o "$out" -- "$bad" >"$log" 2>&1
+    freeze_rc=$?
+    set -e
+    if [ "$freeze_rc" -ne 0 ] &&
+       [ "$freeze_rc" -ne 124 ] && [ "$freeze_rc" -ne 137 ] &&
+       [ ! -e "$out" ] &&
+       grep -Fq 'dlfreeze: pre-linker rejected invalid ELF metadata' \
+            "$log" &&
+       ! grep -Fq 'unsupported direct contract; using extraction' "$log";
+    then
+        pass "GNU lazy admission preserves invalid-metadata outcome"
+    else
+        fail "GNU lazy-admission malformed metadata" \
+            "freeze=$freeze_rc output-exists=$([ -e "$out" ] && echo yes || echo no)"
+        tail -n 60 "$log" || true
     fi
     rm -rf "$root"
 }
@@ -20557,6 +26485,7 @@ test_direct_dlopen_embedded_static_tls() {
     echo "--- direct traced dlopen static-TLS promotion ---"
     local root="$BUILD/dlopen_embedded_static_tls"
     local dep="$root/libdlfrz_early_tls_dep.so"
+    local dep_b="$root/libdlfrz_early_tls_dep_b.so"
     local root_a="$root/libdlfrz_early_root_a.so"
     local root_b="$root/libdlfrz_early_root_b.so"
     local late="$root/libdlfrz_late_static_tls.so"
@@ -20581,7 +26510,9 @@ test_direct_dlopen_embedded_static_tls() {
     rm -rf "$root"
     mkdir -p "$root" "$late_external_dir"
     if ! gcc -shared -fPIC -Wl,-soname,libdlfrz_early_tls_dep.so \
-            -o "$dep" tests/direct_early_tls_dep.c; then
+            -o "$dep" tests/direct_early_tls_dep.c ||
+       ! gcc -shared -fPIC -Wl,-soname,libdlfrz_early_tls_dep_b.so \
+            -o "$dep_b" tests/direct_early_tls_dep.c; then
         fail "direct traced static-TLS promotion" \
             "dependency compile failed"
         rm -rf "$root"
@@ -20634,7 +26565,7 @@ test_direct_dlopen_embedded_static_tls() {
        ! gcc "${ifunc_cflags[@]}" -shared -fPIC -DROOT_EVENT="'B'" \
             -Wl,-soname,libdlfrz_early_root_b.so -Wl,-rpath,'$ORIGIN' \
             -L"$root" -o "$root_b" tests/direct_early_tls_root.c \
-            -ldlfrz_early_tls_dep ||
+            -ldlfrz_early_tls_dep_b ||
        ! gcc -shared -fPIC -Wl,-soname,libdlfrz_late_static_tls.so \
             -o "$late" tests/direct_late_static_tls.c; then
         fail "direct traced static-TLS promotion" "root compile failed"
@@ -20740,12 +26671,14 @@ test_direct_dlopen_embedded_static_tls() {
 
     if [ "$trace_promotion_supported" -eq 1 ]; then
         mv "$dep" "${dep}.bak"
+        mv "$dep_b" "${dep_b}.bak"
         mv "$root_a" "${root_a}.bak"
         mv "$root_b" "${root_b}.bak"
         mv "$external_owner" "${external_owner}.bak"
         mv "$external_requester" "${external_requester}.bak"
         capture_output actual "$out" || rc=$?
         mv "${dep}.bak" "$dep"
+        mv "${dep_b}.bak" "$dep_b"
         mv "${root_a}.bak" "$root_a"
         mv "${root_b}.bak" "$root_b"
         mv "${external_owner}.bak" "$external_owner"
@@ -20887,7 +26820,79 @@ test_direct_dlopen_startup_owned_ie() {
 }
 
 # ===================================================================
-# Test 9j: runtime dlopen consumes format-bounded PHDR/DYNAMIC tables
+# Test 9j: direct x86 CET state follows the exact target/kernel contract
+# ===================================================================
+test_direct_x86_cet_state() {
+    echo "--- direct x86 CET state and late-load policy ---"
+    local root="$BUILD/direct_x86_cet_state"
+    local legacy="$root/liblegacy.so"
+    local bin="$root/main" out="$root/main.frozen" log="$root/main.log"
+    local legacy_path expect="" actual="" rc_e=0 rc_a=0 freeze_rc=0
+    local label="direct x86 CET state and late-load policy"
+
+    if [ "$(uname -m)" != x86_64 ] ||
+       ! getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
+        skip "$label" "requires an x86-64 glibc target"
+        return
+    fi
+    if ! command -v readelf >/dev/null 2>&1; then
+        skip "$label" "readelf is unavailable"
+        return
+    fi
+    rm -rf "$root"
+    mkdir -p "$root"
+    if ! "$TEST_REAL_GCC" -std=c11 -Wall -Wextra -Werror \
+            -O2 -fPIC -shared -fcf-protection=none \
+            -Wl,--fatal-warnings -o "$legacy" \
+            tests/x86_cet_legacy_dso.c >/dev/null 2>&1 ||
+       ! "$TEST_REAL_GCC" -std=c11 -Wall -Wextra -Werror \
+            -O2 -fcf-protection=full -Wl,--fatal-warnings,-z,ibt,-z,shstk \
+            -o "$bin" tests/x86_cet_state.c -ldl -pthread \
+            >/dev/null 2>&1; then
+        skip "$label" "compiler/linker does not support x86 CET fixtures"
+        rm -rf "$root"
+        return
+    fi
+    if ! LC_ALL=C readelf -n "$bin" 2>/dev/null |
+            grep -E 'x86 feature:.*SHSTK' >/dev/null ||
+       LC_ALL=C readelf -n "$legacy" 2>/dev/null |
+            grep -E 'x86 feature:.*SHSTK' >/dev/null; then
+        skip "$label" "toolchain did not produce one SHSTK and one legacy object"
+        rm -rf "$root"
+        return
+    fi
+    legacy_path=$(readlink -f "$legacy")
+    capture_output expect "$bin" "$legacy_path" || rc_e=$?
+    if [ "$rc_e" -ne 0 ]; then
+        fail "$label" "native control exit=$rc_e output=$expect"
+        rm -rf "$root"
+        return
+    fi
+    freeze_require_direct "$label" "$log" "$out" \
+        "$bin" "$legacy_path" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "$label" "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+    capture_output actual env DLFREEZE_NO_FORK=1 \
+        "$out" "$legacy_path" || rc_a=$?
+    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+    if [ "$rc_a" -eq "$rc_e" ] && [ "$actual" = "$expect" ]; then
+        pass "$label"
+    else
+        fail "$label" \
+            "native=$rc_e:$expect direct=$rc_a:$actual"
+    fi
+    rm -rf "$root"
+}
+
+# ===================================================================
+# Test 9k: runtime dlopen consumes format-bounded PHDR/DYNAMIC tables
 # ===================================================================
 test_direct_runtime_parser_bounds() {
     echo "--- direct runtime ELF parser bounds ---"
@@ -20920,10 +26925,11 @@ test_direct_runtime_parser_bounds() {
     fi
     pass "packer/runtime GNU property admission policy is shared"
 
-    if ! gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -O2 -Iinclude \
+    if ! gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -O3 -Iinclude \
             -ffunction-sections -fdata-sections -fno-stack-protector \
             -Wl,--gc-sections -o "$dynamic_gate" \
-            tests/runtime_dynamic_reader_gate.c -ldl -pthread ||
+            tests/runtime_dynamic_reader_gate.c src/lazy_trampoline.S \
+            -ldl -pthread ||
        ! run_with_timeout_seconds 10 "$dynamic_gate"; then
         fail "runtime dynamic/version metadata index" \
             "large-table, first-DT_NULL, truncation, or version-index gate failed"
@@ -20941,13 +26947,18 @@ test_direct_runtime_parser_bounds() {
     pass "runtime symbol-key radix sorting is bounded and stable"
     pass "runtime GNU/SysV/version collision chains use bounded keyed name checks"
     pass "runtime loader lock avoids uncontended wakes and preserves fork repair"
+    pass "runtime loader TP ownership avoids steady-state identity syscalls"
+    pass "runtime loader TP ownership preserves signal, pthread, and fork repair"
+    pass "completed startup PLT callers bypass a constructor-held loader lock"
+    pass "constructor reservations allow cold lookup and preserve nested/fork ownership"
     pass "runtime populated TLS DTV hits avoid the loader lock"
     pass "loader memchr is exact-bounds across guard pages and alignments"
 
     if ! gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -O2 -Iinclude \
             -ffunction-sections -fdata-sections -fno-stack-protector \
             -Wl,--gc-sections -o "$relocation_cache_gate" \
-            tests/relocation_replay_cache_gate.c -ldl -pthread ||
+            tests/relocation_replay_cache_gate.c src/lazy_trampoline.S \
+            -ldl -pthread ||
        ! run_with_timeout_seconds 10 "$relocation_cache_gate"; then
         fail "runtime relocation replay cache" \
             "binding epoch, mutable fallback, or phase gate failed"
@@ -20958,11 +26969,15 @@ test_direct_runtime_parser_bounds() {
     pass "runtime relocation binding cache preserves mutable and GNU-unique fallback"
     pass "runtime relocation binding cache is epoch-load bounded"
     pass "runtime relocation replay validates only its owning phase"
+    pass "runtime prelinked phase sidecar is loader-derived with exact legacy fallback"
+    pass "runtime writable relocation authority cannot change a derived phase"
+    pass "runtime broad-manifest fixup admission skips non-owner records"
 
     if ! gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -O2 -Iinclude \
             -ffunction-sections -fdata-sections -fno-stack-protector \
             -Wl,--gc-sections -o "$relr_replay_gate" \
-            tests/relr_replay_admission_gate.c -ldl -pthread ||
+            tests/relr_replay_admission_gate.c src/lazy_trampoline.S \
+            -ldl -pthread ||
        ! run_with_timeout_seconds 10 "$relr_replay_gate"; then
         fail "runtime RELR replay admission" \
             "immutable authority, malicious encoding, or fast replay gate failed"
@@ -20973,10 +26988,11 @@ test_direct_runtime_parser_bounds() {
     pass "runtime RELR replay preserves immutable writable-table authority"
     pass "runtime RELR replay avoids repeated PT_LOAD destination scans"
 
-    if ! gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -Iinclude \
+    if ! gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -O3 -Iinclude \
             -ffunction-sections -fdata-sections -fno-stack-protector \
             -Wl,--gc-sections -o "$stride_gate" \
-            tests/loader_section_stride_gate.c -ldl -pthread ||
+            tests/loader_section_stride_gate.c src/lazy_trampoline.S \
+            -ldl -pthread ||
        ! "$stride_gate"; then
         fail "loader bounded-table gates" "section/special-table gate failed"
         rm -rf "$root"
@@ -20999,11 +27015,15 @@ test_direct_runtime_parser_bounds() {
     pass "loader ORIGIN parsing follows target token grammar"
     pass "loader detects system-wide glibc preload policy"
     pass "loader target-specific atfork registration backends"
+    if [ "$(uname -m)" = x86_64 ]; then
+        pass "loader x86 CET target-contract and late-policy mutation gates"
+    fi
 
     if ! gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -O2 -Iinclude \
             -ffunction-sections -fdata-sections -fno-stack-protector \
             -Wl,--gc-sections -o "$protection_gate" \
-            tests/protection_lifecycle_gate.c -ldl -pthread ||
+            tests/protection_lifecycle_gate.c src/lazy_trampoline.S \
+            -ldl -pthread ||
        ! run_with_timeout_seconds 10 "$protection_gate"; then
         fail "loader protection lifecycle" \
             "producer PT_LOAD or relocation-time RELRO gate failed"
@@ -21834,6 +27854,51 @@ test_ruby_direct_host_run() {
     rm -f "$out" "$log"
 }
 
+# A completely embedded GNU startup does not need ld.so.cache for dependency
+# resolution.  Deny every openat with a positive ENOENT result after exec so
+# this exercises the real startup path without changing a system cache.
+test_direct_missing_gnu_cache_startup() {
+    echo "--- direct startup with absent GNU cache ---"
+    local launcher="$BUILD/gnu_cache_absent_launcher"
+    local out="$BUILD/gnu_cache_absent.frozen"
+    local log="$BUILD/gnu_cache_absent.log"
+    local target actual="" freeze_rc=0 rc=0
+
+    if ! getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
+        skip "direct startup with absent GNU cache" \
+            "target runtime does not use the GNU cache"
+        return
+    fi
+    target=$(type -P true 2>/dev/null || true)
+    if [ -z "$target" ] || [ ! -x "$target" ]; then
+        skip "direct startup with absent GNU cache" "/usr/bin/true unavailable"
+        return
+    fi
+    if ! gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -O2 \
+            -o "$launcher" tests/gnu_cache_absent_launcher.c; then
+        fail "direct startup with absent GNU cache" \
+            "seccomp launcher compile failed"
+        return
+    fi
+    freeze_require_direct "direct startup with absent GNU cache" \
+        "$log" "$out" -- "$target" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "direct startup with absent GNU cache" "$DIRECT_FREEZE_REASON"
+    elif [ "$freeze_rc" -eq 0 ]; then
+        capture_output actual "$launcher" "$out" || rc=$?
+        if [ "$rc" -eq 77 ]; then
+            skip "direct startup with absent GNU cache" \
+                "seccomp filter unavailable"
+        elif [ "$rc" -eq 0 ] && [ -z "$actual" ]; then
+            pass "fully embedded direct startup accepts an absent GNU cache"
+        else
+            fail "direct startup with absent GNU cache" \
+                "filtered direct exit=$rc output=$actual"
+        fi
+    fi
+    rm -f "$launcher" "$out" "$log"
+}
+
 # ===================================================================
 # Test 14: dlopen by bare soname in direct-load mode
 #   Real-world: many programs do dlopen("libcrypto.so.3", ...) without an
@@ -21846,13 +27911,13 @@ test_dlopen_soname_direct() {
     if ! gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -Iinclude \
             -ffunction-sections -fdata-sections -fno-stack-protector \
             -Wl,--gc-sections -o "$gate" tests/gnu_cache_gate.c \
-            -ldl -pthread || ! "$gate"; then
+            src/lazy_trampoline.S -ldl -pthread || ! "$gate"; then
         fail "GNU runtime cache parser" \
-            "synthetic cache/hwcaps gate failed"
+            "synthetic cache, tunables, or hwcaps gate failed"
         rm -f "$gate"
         return
     fi
-    pass "GNU runtime cache parser validates legacy, bounds, OS tags, and hwcaps"
+    pass "GNU runtime cache parser validates bounded tunables, legacy, OS tags, and hwcaps"
 
     interp=$(LC_ALL=C readelf -lW "$gate" 2>/dev/null |
         sed -n 's/.*Requesting program interpreter: \([^]]*\)].*/\1/p' |
@@ -22607,7 +28672,7 @@ C
         return
     fi
 
-    if run_freeze env LD_LIBRARY_PATH="$root" "$DLFREEZE" -t -o "$out" \
+    if run_freeze env LD_LIBRARY_PATH="$root" "$DLFREEZE" -x -t -o "$out" \
             -- "$bin" >"$log" 2>&1; then
         fail "bare dlopen alias requires direct-load" \
             "extraction packaging unexpectedly succeeded"
@@ -23573,10 +29638,10 @@ C
 }
 
 # ===================================================================
-# Test 19: unsupported relocations fail closed in strict direct mode
+# Test 19: a deterministic direct-contract miss selects extraction at pack time
 # ===================================================================
 test_unsupported_relocation_direct() {
-    echo "--- unsupported relocation direct-load ---"
+    echo "--- unsupported relocation extraction fallback ---"
     if ! command -v objcopy >/dev/null 2>&1; then
         skip "unsupported relocation direct-load" "objcopy not installed"
         return
@@ -23586,6 +29651,8 @@ test_unsupported_relocation_direct() {
     local rela="$BUILD/unsupported_reloc.rela" out="$BUILD/unsupported_reloc.frozen"
     local log="$BUILD/unsupported_reloc.log" freeze_rc=0
     local rela_size rela_count=0 rela_records
+    local size meta_off native_rc=0 frozen_rc=0
+    local native_actual="" frozen_actual=""
     cat > "$src" <<'C'
 static int value = 1;
 int main(void) { return value != 1; }
@@ -23626,52 +29693,211 @@ C
         rm -f "$src" "$bin" "$rela" "$out" "$log"
         return
     fi
-    freeze_require_direct "unsupported relocation direct-load" "$log" \
-        "$out" "$bin" || freeze_rc=$?
-    if [ "$freeze_rc" -eq 77 ]; then
-        skip "unsupported relocation direct-load" "$DIRECT_FREEZE_REASON"
-        rm -f "$src" "$bin" "$rela" "$out" "$log"
-        return
-    fi
+    capture_output native_actual "$bin" || native_rc=$?
+    set +e
+    run_freeze "$DLFREEZE" -d -o "$out" "$bin" >"$log" 2>&1
+    freeze_rc=$?
+    set -e
     if [ "$freeze_rc" -ne 0 ]; then
+        fail "unsupported relocation extraction fallback" \
+            "freeze failed (exit=$freeze_rc)"
+        tail -n 40 "$log" 2>/dev/null || true
         rm -f "$src" "$bin" "$rela" "$out" "$log"
         return
     fi
-
-    local actual rc=0
-    capture_output actual env DLFREEZE_NO_FORK=1 "$out" || rc=$?
-    if [ "$rc" -eq 127 ] &&
-       printf '%s\n' "$actual" | grep 'unsupported relocation' >/dev/null; then
-        pass "unsupported relocation direct-load"
+    if grep -Eq \
+           'direct-load is unavailable for runtime .*creating an extraction-mode binary' \
+           "$log"; then
+        skip "unsupported relocation extraction fallback" \
+            "target runtime does not support direct load"
+        rm -f "$src" "$bin" "$rela" "$out" "$log"
+        return
+    fi
+    size=$(stat -c %s "$out" 2>/dev/null || true)
+    meta_off=""
+    if [[ "$size" =~ ^[0-9]+$ ]] && [ "$size" -ge 64 ]; then
+        meta_off=$(od -An -tu8 -j $((size - 24)) -N8 "$out" 2>/dev/null |
+            tr -d '[:space:]')
+    fi
+    capture_output frozen_actual env DLFREEZE_NO_FORK=1 "$out" || frozen_rc=$?
+    if [ "$meta_off" = 0 ] && [ "$frozen_rc" -eq "$native_rc" ] &&
+       grep -Fq \
+           'dlfreeze: pre-linker found unsupported direct-load semantics' \
+           "$log" &&
+       grep -Eq \
+           'pre-linked[[:space:]]*:[[:space:]]*no \(unsupported direct contract; using extraction\)' \
+           "$log"; then
+        pass "unsupported relocation selects extraction"
     else
-        fail "unsupported relocation direct-load" "rc=$rc out=$actual"
+        fail "unsupported relocation extraction fallback" \
+            "meta=$meta_off native-exit=$native_rc frozen-exit=$frozen_rc"
+        tail -n 40 "$log" 2>/dev/null || true
     fi
     rm -f "$src" "$bin" "$rela" "$out" "$log"
 }
 
+# A traced lazy object's relocations still run at dlopen time, but its static
+# ELF contract must be admitted before the artifact is published.  Use an
+# advisory dynamic tag which the native loader ignores to prove that the
+# packer, rather than an accidental trace failure, makes the decision.
+test_lazy_prelink_admission() {
+    echo "--- lazy-object pack-time admission ---"
+    local root="$BUILD/lazy_prelink_admission"
+    local lib_src="$root/lazy.c" lib="$root/liblazy_admission.so"
+    local main_src="$root/main.c" main="$root/main"
+    local gate="$root/gate" fallback="$root/fallback.frozen"
+    local fallback_log="$root/fallback.log"
+    local direct_only="$root/direct-only.frozen"
+    local direct_only_log="$root/direct-only.log"
+    local actual="" rc=0 freeze_rc=0 gate_rc=0 size meta_off
+    local label="lazy-object pack-time admission"
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    cat > "$lib_src" <<'C'
+int lazy_admission_value(void) { return 91; }
+C
+    cat > "$main_src" <<'C'
+#include <dlfcn.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void) {
+    const char *request = getenv("DLFRZ_LAZY_ADMISSION_REQUEST");
+    void *handle;
+    int (*value)(void);
+
+    if (!request || !request[0])
+        request = "liblazy_admission.so";
+    handle = dlopen(request, RTLD_NOW | RTLD_LOCAL);
+    if (!handle) {
+        fprintf(stderr, "dlopen: %s\n", dlerror());
+        return 2;
+    }
+    value = (int (*)(void))dlsym(handle, "lazy_admission_value");
+    if (!value || value() != 91)
+        return 3;
+    puts("lazy-admission-ok");
+    return dlclose(handle) == 0 ? 0 : 4;
+}
+C
+    if ! gcc -shared -fPIC -Wl,-soname,liblazy_admission.so \
+            -o "$lib" "$lib_src" ||
+       ! gcc -o "$main" "$main_src" -ldl ||
+       ! gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -Iinclude \
+            -o "$gate" tests/elf_prelink_gate.c; then
+        fail "$label" "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+    set +e
+    "$gate" dynamic-feature "$lib"
+    gate_rc=$?
+    set -e
+    if [ "$gate_rc" -eq 77 ]; then
+        skip "$label" "DSO has no replaceable advisory dynamic entry"
+        rm -rf "$root"
+        return
+    elif [ "$gate_rc" -ne 0 ]; then
+        fail "$label" "could not mutate lazy DSO"
+        rm -rf "$root"
+        return
+    fi
+    capture_output actual env LD_LIBRARY_PATH="$root" "$main" || rc=$?
+    if [ "$rc" -ne 0 ] || [ "$actual" != lazy-admission-ok ]; then
+        fail "$label" "native lazy-load control failed (exit=$rc output=$actual)"
+        rm -rf "$root"
+        return
+    fi
+
+    set +e
+    run_freeze env LD_LIBRARY_PATH="$root" "$DLFREEZE" -d -t \
+        -o "$fallback" -- "$main" >"$fallback_log" 2>&1
+    freeze_rc=$?
+    set -e
+    if grep -Eq \
+           'direct-load is unavailable for runtime .*creating an extraction-mode binary' \
+           "$fallback_log"; then
+        skip "$label" "target runtime does not support direct load"
+        rm -rf "$root"
+        return
+    fi
+    size=$(stat -c %s "$fallback" 2>/dev/null || true)
+    meta_off=""
+    if [[ "$size" =~ ^[0-9]+$ ]] && [ "$size" -ge 64 ]; then
+        meta_off=$(od -An -tu8 -j $((size - 24)) -N8 "$fallback" \
+            2>/dev/null | tr -d '[:space:]')
+    fi
+    mv "$lib" "$lib.hidden"
+    actual=""; rc=0
+    capture_output actual env -u LD_LIBRARY_PATH "$fallback" || rc=$?
+    mv "$lib.hidden" "$lib"
+    if [ "$freeze_rc" -eq 0 ] && [ "$meta_off" = 0 ] &&
+       [ "$rc" -eq 0 ] && [ "$actual" = lazy-admission-ok ] &&
+       grep -Fq \
+           'dlfreeze: pre-linker found unsupported direct-load semantics' \
+           "$fallback_log" &&
+       grep -Eq \
+           'pre-linked[[:space:]]*:[[:space:]]*no \(unsupported direct contract; using extraction\)' \
+           "$fallback_log"; then
+        pass "lazy unsupported contract selects extraction"
+    else
+        fail "$label extraction fallback" \
+            "freeze=$freeze_rc meta=$meta_off run=$rc output=$actual"
+        tail -n 50 "$fallback_log" 2>/dev/null || true
+    fi
+
+    set +e
+    run_freeze env \
+        DLFRZ_LAZY_ADMISSION_REQUEST="$lib" \
+        LD_LIBRARY_PATH="$root" \
+        "$DLFREEZE" -d -t -o "$direct_only" -- "$main" \
+        >"$direct_only_log" 2>&1
+    freeze_rc=$?
+    set -e
+    if [ "$freeze_rc" -ne 0 ] && [ ! -e "$direct_only" ] &&
+       grep -Fq \
+           'dlfreeze: pre-linker found unsupported direct-load semantics' \
+           "$direct_only_log" &&
+       grep -Fq \
+           'dlfreeze: unsupported direct-load semantics cannot represent this direct-only manifest' \
+           "$direct_only_log"; then
+        pass "lazy unsupported direct-only contract is refused"
+    else
+        fail "$label direct-only refusal" \
+            "freeze=$freeze_rc output-exists=$([ -e "$direct_only" ] && echo yes || echo no)"
+        tail -n 50 "$direct_only_log" 2>/dev/null || true
+    fi
+    rm -rf "$root"
+}
+
 # Dynamic-table, symbol, and relocation records are untrusted pack inputs.
-# Relocation-only metadata can fall back to an un-prelinked artifact, which the
-# runtime validator must refuse.  Metadata consumed again while constructing
-# the profiler symbol table must instead abort the outer pack transaction.
+# Valid semantics outside the direct loader's contract select extraction while
+# malformed metadata aborts the outer pack transaction.  Neither class may be
+# published as a direct artifact which is already known to fail at runtime.
 test_malformed_prelink_metadata() {
     echo "--- malformed prelink input validation ---"
     local root="$BUILD/malformed_prelink_metadata"
     local src="$root/main.c" base="$root/main" gate="$root/gate"
     local semantic_gate="$root/dynamic_semantics_gate"
     local probe="$root/probe.frozen" probe_log="$root/probe.log"
+    local resource="$root/resource.txt"
+    local direct_only="$root/direct-only.frozen"
+    local direct_only_log="$root/direct-only.log"
     local cc mode bad out log actual rc freeze_rc gate_rc
+    local size meta_off runtime_ok
     local label="malformed prelink input validation"
-    local runtime_modes=(versym relocation-offset symbol-index audit depaudit \
-                         auxiliary filter textrel-tag flags-textrel \
-                         flags1-global flags1-group flags1-initfirst \
-                         flags1-globaudit dynamic-relcount dynamic-shndx \
-                         dynamic-posflag dynamic-feature dynamic-move \
-                         dynamic-syminfo dynamic-config \
-                         dynamic-android-rela dynamic-android-relr \
-                         dynamic-gnu-prelinked dynamic-gnu-conflictsz \
-                         dynamic-gnu-liblistsz dynamic-pltpadsz \
-                         dynamic-gnu-conflict dynamic-gnu-liblist \
-                         dynamic-pltpad)
+    local unsupported_modes=(audit depaudit auxiliary filter textrel-tag \
+                             flags-textrel flags1-global flags1-group \
+                             flags1-initfirst flags1-globaudit \
+                             dynamic-relcount dynamic-shndx dynamic-posflag \
+                             dynamic-feature dynamic-move dynamic-syminfo \
+                             dynamic-config dynamic-android-rela \
+                             dynamic-android-relr dynamic-gnu-prelinked \
+                             dynamic-gnu-conflictsz dynamic-gnu-liblistsz \
+                             dynamic-pltpadsz dynamic-gnu-conflict \
+                             dynamic-gnu-liblist dynamic-pltpad)
+    local malformed_modes=(versym relocation-offset symbol-index)
     local profiler_modes=(syment sysv-hash symtab symbol-name gnu-hash \
                           gnu-count)
 
@@ -23684,11 +29910,19 @@ test_malformed_prelink_metadata() {
     fi
     cat > "$src" <<'C'
 #include <stdio.h>
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc > 1) {
+        char buffer[32];
+        FILE *file = fopen(argv[1], "r");
+        if (!file || !fgets(buffer, sizeof(buffer), file) || fclose(file) != 0)
+            return 2;
+    }
     puts("prelink-malformed-target-ran");
     return 0;
 }
 C
+    printf 'captured-resource\n' >"$resource"
+    resource=$(realpath "$resource")
     if ! gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -Iinclude \
             -o "$semantic_gate" tests/dynamic_semantics_gate.c ||
        ! "$semantic_gate"; then
@@ -23729,7 +29963,7 @@ C
         return
     fi
 
-    for mode in "${runtime_modes[@]}"; do
+    for mode in "${unsupported_modes[@]}"; do
         bad="$root/main.$mode"
         out="$bad.frozen"
         log="$bad.log"
@@ -23748,29 +29982,85 @@ C
         fi
 
         freeze_rc=0
-        freeze_require_direct "$label ($mode)" "$log" "$out" "$bad" ||
-            freeze_rc=$?
+        set +e
+        run_freeze "$DLFREEZE" -d -o "$out" "$bad" >"$log" 2>&1
+        freeze_rc=$?
+        set -e
         if [ "$freeze_rc" -ne 0 ]; then
-            if [ "$freeze_rc" -eq 77 ]; then
-                skip "$label ($mode)" "$DIRECT_FREEZE_REASON"
-            fi
-            continue
-        fi
-        if ! grep -Fq 'dlfreeze: pre-linker failed' "$log" ||
-           grep -Fq 'dlfreeze: pre-linker crashed' "$log"; then
-            fail "$label ($mode)" \
-                "prelink child did not report a clean failure"
+            fail "$label unsupported contract ($mode)" \
+                "freeze failed (exit=$freeze_rc)"
             tail -n 40 "$log" || true
             continue
         fi
-
+        size=$(stat -c %s "$out" 2>/dev/null || true)
+        meta_off=""
+        if [[ "$size" =~ ^[0-9]+$ ]] && [ "$size" -ge 64 ]; then
+            meta_off=$(od -An -tu8 -j $((size - 24)) -N8 "$out" \
+                2>/dev/null | tr -d '[:space:]')
+        fi
         actual=""; rc=0
         capture_output actual env DLFREEZE_NO_FORK=1 "$out" || rc=$?
-        if [ "$rc" -eq 127 ] && [[ "$actual" == *"malformed"* ]] &&
-           [[ "$actual" != *"prelink-malformed-target-ran"* ]]; then
+        runtime_ok=1
+        if [ "$mode" = dynamic-feature ] &&
+           { [ "$rc" -ne 0 ] ||
+             [ "$actual" != "prelink-malformed-target-ran" ]; }; then
+            runtime_ok=0
+        fi
+        if [ "$meta_off" = 0 ] && [ "$runtime_ok" -eq 1 ] &&
+           grep -Fq \
+               'dlfreeze: pre-linker found unsupported direct-load semantics' \
+               "$log" &&
+           grep -Eq \
+               'pre-linked[[:space:]]*:[[:space:]]*no \(unsupported direct contract; using extraction\)' \
+               "$log"; then
+            pass "$label unsupported contract ($mode)"
+        else
+            fail "$label unsupported contract ($mode)" \
+                "meta=$meta_off frozen-exit=$rc output=$actual"
+            tail -n 40 "$log" || true
+        fi
+    done
+
+    for mode in "${malformed_modes[@]}"; do
+        bad="$root/main.$mode"
+        out="$bad.frozen"
+        log="$bad.log"
+        cp "$base" "$bad"
+        set +e
+        "$gate" "$mode" "$bad"
+        gate_rc=$?
+        set -e
+        if [ "$gate_rc" -eq 77 ]; then
+            skip "$label ($mode)" "fixture lacks required dynamic metadata"
+            continue
+        fi
+        if [ "$gate_rc" -ne 0 ]; then
+            fail "$label ($mode)" "could not mutate fixture"
+            continue
+        fi
+
+        freeze_rc=0
+        set +e
+        run_freeze "$DLFREEZE" -d -o "$out" "$bad" >"$log" 2>&1
+        freeze_rc=$?
+        set -e
+        if [ "$freeze_rc" -eq 0 ]; then
+            fail "$label ($mode)" "invalid ELF metadata was packaged"
+        elif [ "$freeze_rc" -eq 124 ] || [ "$freeze_rc" -eq 137 ]; then
+            fail "$label ($mode)" \
+                "packer did not reject the input promptly (exit=$freeze_rc)"
+        elif [ -e "$out" ]; then
+            fail "$label ($mode)" \
+                "failed pack left a visible output"
+        elif grep -Fq \
+                 'dlfreeze: pre-linker rejected invalid ELF metadata' \
+                 "$log" &&
+             ! grep -Fq 'dlfreeze: pre-linker crashed' "$log"; then
             pass "$label ($mode)"
         else
-            fail "$label ($mode)" "exit=$rc output=$actual"
+            fail "$label ($mode)" \
+                "input did not reach the typed invalid-metadata rejection"
+            tail -n 40 "$log" || true
         fi
     done
 
@@ -23807,29 +30097,63 @@ C
         elif [ -e "$out" ]; then
             fail "$label profiler gate ($mode)" \
                 "failed pack left a visible output"
-        elif ! grep -Fq 'dlfreeze: pre-linker failed' "$log" ||
-             grep -Fq 'dlfreeze: pre-linker crashed' "$log" ||
-             ! grep -Fq 'dlfreeze: cannot append profiler symbol table' \
-                  "$log"; then
+        elif ! grep -Fq \
+                  'dlfreeze: pre-linker rejected invalid ELF metadata' \
+                  "$log" ||
+             grep -Fq 'dlfreeze: pre-linker crashed' "$log"; then
             fail "$label profiler gate ($mode)" \
-                "input did not reach a clean bounded profiler rejection"
+                "input did not reach the typed invalid-metadata rejection"
             tail -n 40 "$log" || true
         else
             pass "$label profiler gate ($mode)"
         fi
     done
+
+    bad="$root/main.direct-only-unsupported"
+    cp "$base" "$bad"
+    set +e
+    "$gate" dynamic-feature "$bad"
+    gate_rc=$?
+    set -e
+    if [ "$gate_rc" -eq 77 ]; then
+        skip "$label direct-only unsupported contract" \
+            "fixture lacks a replaceable dynamic entry"
+    elif [ "$gate_rc" -ne 0 ]; then
+        fail "$label direct-only unsupported contract" \
+            "could not mutate fixture"
+    else
+        freeze_rc=0
+        set +e
+        run_freeze "$DLFREEZE" -d -t -f "$resource" \
+            -o "$direct_only" -- "$bad" "$resource" \
+            >"$direct_only_log" 2>&1
+        freeze_rc=$?
+        set -e
+        if [ "$freeze_rc" -ne 0 ] && [ ! -e "$direct_only" ] &&
+           grep -Fq \
+               'dlfreeze: pre-linker found unsupported direct-load semantics' \
+               "$direct_only_log" &&
+           grep -Fq \
+               'dlfreeze: unsupported direct-load semantics cannot represent this direct-only manifest' \
+               "$direct_only_log"; then
+            pass "$label direct-only unsupported contract"
+        else
+            fail "$label direct-only unsupported contract" \
+                "exit=$freeze_rc output-exists=$([ -e "$direct_only" ] && echo yes || echo no)"
+            tail -n 40 "$direct_only_log" 2>/dev/null || true
+        fi
+    fi
     rm -rf "$root"
 }
 
-# A RELR bitmap cannot be the first stream entry.  The pack-time prelinker
-# must reject that grammar without dereferencing an uninitialized relocation
-# cursor, and the runtime validator must refuse the non-prelinked artifact.
+# A RELR bitmap cannot be the first stream entry.  The pack-time prelinker must
+# reject that malformed grammar without publishing a direct artifact.
 test_malformed_relr_prelink() {
     echo "--- malformed RELR prelink validation ---"
     local root="$BUILD/malformed_relr_prelink"
     local src="$root/main.c" bin="$root/main" bad="$root/main.bad"
     local gate="$root/elf_relr_gate" out="$root/main.frozen"
-    local log="$root/freeze.log" actual="" rc=0 freeze_rc=0
+    local log="$root/freeze.log" freeze_rc=0
 
     rm -rf "$root"
     mkdir -p "$root"
@@ -23858,26 +30182,23 @@ C
         return
     fi
 
-    freeze_require_direct "malformed RELR prelink validation" "$log" \
-        "$out" "$bad" || freeze_rc=$?
-    if [ "$freeze_rc" -eq 77 ]; then
-        skip "malformed RELR prelink validation" "$DIRECT_FREEZE_REASON"
-        rm -rf "$root"
-        return
-    fi
-    if [ "$freeze_rc" -ne 0 ]; then
-        rm -rf "$root"
-        return
-    fi
-
-    capture_output actual env DLFREEZE_NO_FORK=1 "$out" || rc=$?
-    if [ "$rc" -eq 127 ] &&
-       [[ "$actual" == *"malformed relocation metadata"* ]] &&
-       [[ "$actual" != *"relr-target-ran"* ]]; then
-        pass "malformed RELR fails closed before target execution"
+    set +e
+    run_freeze "$DLFREEZE" -d -o "$out" "$bad" >"$log" 2>&1
+    freeze_rc=$?
+    set -e
+    if [ "$freeze_rc" -eq 0 ] && grep -Eq \
+           'direct-load is unavailable for runtime .*creating an extraction-mode binary' \
+           "$log"; then
+        skip "malformed RELR prelink validation" \
+            "target runtime does not support direct load"
+    elif [ "$freeze_rc" -ne 0 ] && [ ! -e "$out" ] &&
+       grep -Fq 'dlfreeze: pre-linker rejected invalid ELF metadata' \
+           "$log" &&
+       ! grep -Fq 'dlfreeze: pre-linker crashed' "$log"; then
+        pass "malformed RELR rejected during packing"
     else
         fail "malformed RELR prelink validation" \
-            "exit=$rc output=$actual"
+            "freeze-exit=$freeze_rc output-exists=$([ -e "$out" ] && echo yes || echo no)"
         tail -n 60 "$log" || true
     fi
     rm -rf "$root"
@@ -24853,6 +31174,7 @@ C
             pass "$label (forged, name-only target runtime)"
         elif [ "$native_bad_rc" -ne 0 ] && [ "$rc" -eq 127 ] &&
            { [[ "$actual" == *"unresolved relocation symbol: memcpy"* ]] ||
+             [[ "$actual" == *"native lazy PLT binding is required for symbol: memcpy"* ]] ||
              [[ "$actual" == *"native lazy PLT binding is required for unresolved symbol: memcpy"* ]]; } &&
            [[ "$actual" != *"memcpy-version-ok"* ]]; then
             pass "$label (forged)"
@@ -25128,10 +31450,11 @@ test_musl_layout_gate() {
 
     if [ "$(uname -m)" = x86_64 ]; then
         decoder_helper="$BUILD/x86_64_musl_decoder_gate"
-        if ! gcc -Wall -Wextra -D_GNU_SOURCE -Iinclude \
+        if ! gcc -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
                 -fno-stack-protector -ffunction-sections -fdata-sections \
                 -Wl,--gc-sections -o "$decoder_helper" \
-                tests/x86_64_musl_decoder_gate.c -ldl -pthread; then
+                tests/x86_64_musl_decoder_gate.c src/lazy_trampoline.S \
+                -ldl -pthread; then
             fail "x86-64 musl layout decoder" "compile failed"
         elif "$decoder_helper"; then
             pass "x86-64 musl layout decoder"
@@ -25141,10 +31464,11 @@ test_musl_layout_gate() {
         fi
     elif [ "$(uname -m)" = aarch64 ]; then
         decoder_helper="$BUILD/aarch64_musl_decoder_gate"
-        if ! gcc -Wall -Wextra -D_GNU_SOURCE -Iinclude \
+        if ! gcc -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
                 -fno-stack-protector -ffunction-sections -fdata-sections \
                 -Wl,--gc-sections -o "$decoder_helper" \
-                tests/aarch64_musl_decoder_gate.c -ldl -pthread; then
+                tests/aarch64_musl_decoder_gate.c src/lazy_trampoline.S \
+                -ldl -pthread; then
             fail "AArch64 musl layout decoder" "compile failed"
         elif "$decoder_helper"; then
             pass "AArch64 musl layout decoder"
@@ -25270,7 +31594,8 @@ C
     fi
 
     actual=""; rc=0
-    capture_output actual env -u DLFREEZE_NO_FORK "$out" || rc=$?
+    capture_output actual env -u DLFREEZE_NO_FORK \
+        DLFREEZE_SUPERVISED_FALLBACK=1 "$out" || rc=$?
     if [ "$rc" -eq 0 ] && [ "$actual" = "musl-layout-target-ran" ]; then
         pass "stale direct musl layout supervised fallback"
     else
@@ -25327,10 +31652,11 @@ test_glibc_layout_gate() {
         return
     fi
 
-    if ! gcc -Wall -Wextra -D_GNU_SOURCE -Iinclude \
+    if ! gcc -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
             -fno-stack-protector -ffunction-sections -fdata-sections \
             -Wl,--gc-sections -o "$decoder_helper" \
-            tests/glibc_tls_dtor_decoder_gate.c -ldl -pthread; then
+            tests/glibc_tls_dtor_decoder_gate.c src/lazy_trampoline.S \
+            -ldl -pthread; then
         fail "glibc TLS-dtor counter decoder" "compile failed"
     elif "$decoder_helper"; then
         pass "glibc TLS-dtor counter decoder"
@@ -25344,10 +31670,15 @@ test_glibc_layout_gate() {
         if ! gcc -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
                 -fno-stack-protector -ffunction-sections -fdata-sections \
                 -Wl,--gc-sections -o "$aarch64_rseq_helper" \
-                tests/glibc_aarch64_rseq_gate.c -ldl -pthread; then
+                tests/glibc_aarch64_rseq_gate.c src/lazy_trampoline.S \
+                -ldl -pthread; then
             fail "glibc AArch64 rseq control-flow decoder" \
                 "compile failed"
             fail "glibc AArch64 code-view file provenance" \
+                "compile failed"
+            fail "glibc AArch64 initial-thread lifetime decoder" \
+                "compile failed"
+            fail "glibc AArch64 tunable-accessor CFG decoder" \
                 "compile failed"
         else
             if "$aarch64_rseq_helper" --rseq; then
@@ -25361,6 +31692,18 @@ test_glibc_layout_gate() {
             else
                 fail "glibc AArch64 code-view file provenance" \
                     "executable zero-fill was accepted as target code"
+            fi
+            if "$aarch64_rseq_helper" --initial-thread; then
+                pass "glibc AArch64 initial-thread lifetime decoder"
+            else
+                fail "glibc AArch64 initial-thread lifetime decoder" \
+                    "completion-word provenance fixture was misclassified"
+            fi
+            if "$aarch64_rseq_helper" --tunable; then
+                pass "glibc AArch64 tunable-accessor CFG decoder"
+            else
+                fail "glibc AArch64 tunable-accessor CFG decoder" \
+                    "scalar control-flow fixture was misclassified"
             fi
         fi
         rm -f "$aarch64_rseq_helper"
@@ -25584,6 +31927,7 @@ C
 
         actual=""; rc=0
         capture_output actual env -u DLFREEZE_NO_FORK \
+            DLFREEZE_SUPERVISED_FALLBACK=1 \
             "$mismatched_libc_out" || rc=$?
         if [ "$rc" -eq 0 ] && [ "$actual" = "layout-target-ran" ]; then
             pass "stale glibc libc/interpreter pairing supervised fallback"
@@ -25617,6 +31961,7 @@ C
 
         actual=""; rc=0
         capture_output actual env -u DLFREEZE_NO_FORK \
+            DLFREEZE_SUPERVISED_FALLBACK=1 \
             "$hook_consumer_out" || rc=$?
         if [ "$rc" -eq 0 ] && [ "$actual" = "layout-target-ran" ]; then
             pass "stale glibc dlfcn-hook consumer supervised fallback"
@@ -25651,6 +31996,7 @@ C
 
         actual=""; rc=0
         capture_output actual env -u DLFREEZE_NO_FORK \
+            DLFREEZE_SUPERVISED_FALLBACK=1 \
             "$tls_dtor_counter_out" || rc=$?
         if [ "$rc" -eq 0 ] && [ "$actual" = "layout-target-ran" ]; then
             pass "glibc TLS-dtor counter mismatch supervised fallback"
@@ -25770,7 +32116,10 @@ C
     # Preserve the release banner and both private-object sizes, but remove
     # one relative relocation that positively identifies an overwritten
     # _rtld_global_ro function-pointer field.  Admission must fail before the
-    # target is mapped or handed control.
+    # target is mapped or handed control.  This mutation also corrupts the
+    # interpreter used by extraction mode, so it is not a valid supervised-
+    # fallback fixture on every architecture; only strict pre-target refusal
+    # is part of this adversarial-corruption contract.
     if ! cp "$out" "$missing_reloc_out" ||
        ! "$helper" --frozen-reloc-missing "$missing_reloc_out"; then
         skip "missing glibc GLRO relocation refusal" \
@@ -25788,15 +32137,6 @@ C
                 "exit=$rc output=$actual"
         fi
 
-        actual=""; rc=0
-        capture_output actual env -u DLFREEZE_NO_FORK \
-            "$missing_reloc_out" || rc=$?
-        if [ "$rc" -eq 0 ] && [ "$actual" = "layout-target-ran" ]; then
-            pass "missing glibc GLRO relocation supervised fallback"
-        else
-            fail "missing glibc GLRO relocation supervised fallback" \
-                "exit=$rc output=$actual"
-        fi
     fi
     rm -f "$missing_reloc_out"
 
@@ -25821,6 +32161,7 @@ C
 
         actual=""; rc=0
         capture_output actual env -u DLFREEZE_NO_FORK \
+            DLFREEZE_SUPERVISED_FALLBACK=1 \
             "$missing_release_out" || rc=$?
         if [ "$rc" -eq 0 ] && [ "$actual" = "layout-target-ran" ]; then
             pass "missing glibc release identity supervised fallback"
@@ -25850,7 +32191,8 @@ C
     fi
 
     actual=""; rc=0
-    capture_output actual env -u DLFREEZE_NO_FORK "$out" || rc=$?
+    capture_output actual env -u DLFREEZE_NO_FORK \
+        DLFREEZE_SUPERVISED_FALLBACK=1 "$out" || rc=$?
     if [ "$rc" -eq 0 ] && [ "$actual" = "layout-target-ran" ]; then
         pass "stale direct glibc layout supervised fallback"
     else
@@ -25868,13 +32210,22 @@ echo "build dir: $BUILD"
 
 TEST_FUNCTIONS=(
 test_hello
+test_default_direct_policy
+test_packer_helper_discovery_without_proc
+test_static_executable_extraction
+test_unknown_interpreter_kernel_extraction
+test_default_direct_pipe2_seccomp_fallback
+test_supervisor_child_mask_restore_failure
 test_libc_semantics_gate
 test_bootstrap_secure_gate
 test_bootstrap_fileback_gate
 test_loader_fileback_gate
 test_packer_alias_gate
+test_packer_strict_alias_gate
 test_packer_elf_alignment_gate
 test_packer_prelink_relocation_gate
+test_packer_publish_fallback_gate
+test_packer_transaction_identity_handoff_gate
 test_file_pattern_option_scaling
 test_musl_hello_direct
 test_glibc_tunable_environment_direct
@@ -25885,14 +32236,19 @@ test_musl_copy_reloc_direct
 test_musl_multibyte_direct
 test_musl_shared_tls_direct
 test_musl_target_contract_direct
+test_musl_default_stack_direct
 test_renamed_runtime_identity
 test_failed_loader_trace_records
 test_loader_post_tls_import_gate
+test_bootstrap_cet_isolation
+test_bootstrap_x86_isa_isolation
+test_bootstrap_aarch64_branch_isolation
 test_direct_bootstrap_libc_independence
 test_musl_layout_gate
 test_glibc_gnu_hash_shift_gate
 test_glibc_layout_gate
 test_glibc_stack_end_direct
+test_glibc_initial_thread_scheduler_direct
 test_direct_constructor_stack_identity
 test_direct_target_auxv_identity
 test_direct_x86_cache_sysconf_identity
@@ -25907,6 +32263,7 @@ test_captured_file_request_identity_direct
 test_vfs_explicit_directory_kind
 test_vfs_dir_handle_registry
 test_direct_handoff_once
+test_direct_inherited_posix_lock
 test_supervisor_signal_forwarding
 test_supervisor_inherited_sigchld
 test_direct_cpu_probe_seccomp_fallback
@@ -25938,19 +32295,24 @@ test_relative_executable_identity_extraction
 test_exact_range_duplicate_extraction
 test_direct_fork_lifecycle
 test_direct_runtime_service_collisions
+test_direct_constructor_binding
 test_direct_runtime_loader_concurrency
 test_direct_loader_introspection
+test_direct_loader_callback_unwind
+test_direct_loader_callback_order
 test_external_program_headers_direct
 test_direct_dladdr_visibility
 test_direct_dladdr_layout
 test_direct_vdso_namespace
 test_direct_exit_lifecycle
 test_direct_constructor_signal
+test_direct_crash_handler_transaction
 test_direct_preinit_order
 test_direct_constructor_prefix_collision
 test_direct_metadata_validation
 test_prelinked_runtime_fixup_canonical
 test_aux_phdr_bounds_direct
+test_local_exec_tls_direct
 test_static_tls_alignment_direct
 test_tls_firstbyte_semantics_direct
 test_nobits_tls_outside_load_direct
@@ -25967,16 +32329,21 @@ test_pathful_glibc_direct_admission
 test_gnu_pack_cache_contract
 test_long_elf_metadata_strings
 test_vfs_hash_complexity_gate
+test_vfs_registry_fastpath_gate
 test_startup_dependency_index_gate
 test_high_cardinality_data_manifest
 test_ls
 test_cat
 test_negative_dot_path_manifest
 test_direct_startup_elf_vfs
+test_direct_dlopen_only_vfs
+test_vfs_backing_fallback
+test_captured_file_timestamp_metadata
 test_vfs_faccessat_flag_routing
 test_vfs_environment_and_kernel_identity
 test_direct_kernel_runtime_parameters
 test_packer_main_detection
+test_glibc_legacy_crt_init_direct
 test_program_smoke_matrix
 test_zig_cc_trace_direct
 test_symlink_exe_identity_direct
@@ -26016,12 +32383,26 @@ test_direct_gnu_unique_local_scopes
 test_direct_gnu_unique_transaction_rollback
 test_direct_dlopen_admission_flags
 test_direct_dlopen_mode_contract
+test_direct_transaction_atomicity_gate
+test_direct_transaction_ifunc_tls_callback
 test_gnu_traced_lazy_binding_fallback
+test_gnu_runtime_lazy_ifunc_direct
+test_gnu_startup_lazy_plt_direct
+test_gnu_startup_lazy_ifunc_direct
+test_gnu_startup_lazy_ifunc_concurrent_once
+test_gnu_startup_lazy_ifunc_fork_owner
+test_gnu_startup_lazy_link_map_identity
+test_gnu_startup_lazy_start_main_constructor_once
+test_gnu_startup_lazy_layout_alias_rejection
+test_aarch64_gnu_lazy_ifunc_argument_abi_direct
 test_gnu_startup_lazy_binding_fallback
 test_gnu_startup_weak_lazy_binding_fallback
+test_gnu_startup_lazy_ifunc_fallback
+test_gnu_lazy_admission_malformed_metadata
 test_direct_dlopen_local_caller_scope
 test_direct_dlopen_embedded_static_tls
 test_direct_dlopen_startup_owned_ie
+test_direct_x86_cet_state
 test_direct_runtime_parser_bounds
 test_unaligned_relocation_destinations
 test_direct_dlopen_fallback
@@ -26031,6 +32412,7 @@ test_python3_direct
 test_python_repl_pty_direct
 test_glibc_tls_dtor_direct
 test_ruby_direct_host_run
+test_direct_missing_gnu_cache_startup
 test_dlopen_soname_direct
 test_dlopen_relpath_direct
 test_dlopen_exact_pathful_replay_direct
@@ -26047,6 +32429,7 @@ test_glibc_dtv_capacity_direct
 test_direct_memory_protections
 test_direct_symbol_definition_addresses
 test_unsupported_relocation_direct
+test_lazy_prelink_admission
 test_malformed_prelink_metadata
 test_malformed_relr_prelink
 test_malformed_dynamic_bounds_direct

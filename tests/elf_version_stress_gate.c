@@ -6,6 +6,7 @@
 
 #include <elf.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,6 +27,19 @@
 static size_t align_up(size_t value, size_t alignment)
 {
     return (value + alignment - 1) & ~(alignment - 1);
+}
+
+static int make_temp_template(char path[PATH_MAX], const char *leaf)
+{
+    const char *tmpdir = getenv("TMPDIR");
+    int length;
+
+    if (!tmpdir || !tmpdir[0])
+        tmpdir = "/tmp";
+    length = snprintf(path, PATH_MAX, "%s%s%s", tmpdir,
+                      tmpdir[strlen(tmpdir) - 1] == '/' ? "" : "/",
+                      leaf);
+    return length >= 0 && length < PATH_MAX ? 0 : -1;
 }
 
 static uint32_t elf_name_hash(const char *name)
@@ -91,7 +105,7 @@ static int pread_all(int fd, void *data, size_t size)
     return 0;
 }
 
-static int make_version_fixture(int stress, char path[64])
+static int make_version_fixture(int stress, char path[PATH_MAX])
 {
     const size_t phnum = (size_t)PN_XNUM - 1;
     const size_t definition_count = stress ? 16 : 1;
@@ -196,7 +210,9 @@ static int make_version_fixture(int stress, char path[64])
         if (i + 1 < auxiliary_count)
             auxiliary[i].vda_next = sizeof(Elf64_Verdaux);
     }
-    strcpy(path, "/tmp/dlfreeze-version-stress.XXXXXX");
+    if (make_temp_template(
+            path, "dlfreeze-version-stress.XXXXXX") < 0)
+        goto out;
     fd = mkstemp(path);
     if (fd < 0 || write_all(fd, image, file_size) < 0)
         goto out;
@@ -215,7 +231,7 @@ out:
 static int valid_large_program_header_control(void)
 {
     struct elf_info info;
-    char path[64] = "";
+    char path[PATH_MAX] = "";
     int fd = -1;
     int result = -1;
 
@@ -239,7 +255,7 @@ out:
 static int reused_auxiliary_chain_rejected(void)
 {
     struct elf_info info;
-    char path[64] = "";
+    char path[PATH_MAX] = "";
     int fd = -1;
     int result = -1;
 
@@ -285,7 +301,7 @@ static int repeated_long_requirement_is_linear(int duplicate_index)
     Elf64_Verneed *need;
     Elf64_Vernaux *auxiliary;
     uint32_t name_hash;
-    char path[] = "/tmp/dlfreeze-version-requirements.XXXXXX";
+    char path[PATH_MAX] = "";
     int fd = -1;
     int result = -1;
 
@@ -356,6 +372,9 @@ static int repeated_long_requirement_is_linear(int duplicate_index)
             auxiliary[i].vna_next = sizeof(Elf64_Vernaux);
     }
 
+    if (make_temp_template(
+            path, "dlfreeze-version-requirements.XXXXXX") < 0)
+        goto out;
     fd = mkstemp(path);
     if (fd < 0 || write_all(fd, image, file_size) < 0)
         goto out;
@@ -389,7 +408,7 @@ static int concurrent_truncation_is_safe(void)
 {
     struct elf_info info;
     struct stat st;
-    char path[64] = "";
+    char path[PATH_MAX] = "";
     uint8_t *image = NULL;
     volatile int *stop = MAP_FAILED;
     pid_t child = -1;
@@ -457,7 +476,7 @@ static int conflicting_dynamic_value_rejected(void)
     Elf64_Ehdr ehdr;
     Elf64_Phdr dynamic_phdr;
     Elf64_Dyn conflicting;
-    char path[64] = "";
+    char path[PATH_MAX] = "";
     int fd = -1;
     int result = -1;
 
@@ -494,7 +513,7 @@ static int orphan_relocation_tag_rejected(Elf64_Sxword tag, uint64_t value)
     Elf64_Ehdr ehdr;
     Elf64_Phdr dynamic_phdr;
     Elf64_Dyn orphan;
-    char path[64] = "";
+    char path[PATH_MAX] = "";
     int fd = -1;
     int result = -1;
 
@@ -529,7 +548,7 @@ static int invalid_string_sentinel_rejected(void)
 {
     struct elf_info info;
     struct stat st;
-    char path[64] = "";
+    char path[PATH_MAX] = "";
     const char nonzero = 'X';
     int fd = -1;
     int result = -1;

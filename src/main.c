@@ -29,6 +29,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <sys/file.h>
+#include <sys/auxv.h>
 
 #include "elf_parser.h"
 #include "dep_resolver.h"
@@ -290,16 +291,17 @@ static void usage(const char *prog)
         "Usage: %s [options] [--] <executable> [args...]\n\n"
         "Options:\n"
         "  -o <path>   Output file  (default: <name>.frozen)\n"
-        "  -d          Direct-load mode (in-process loader, no tmpdir)\n"
+        "  -d          Prefer direct-load mode (the default)\n"
+        "  -x          Force extraction mode instead of direct loading\n"
         "  -t          Trace runtime loading by running the program (TTY preserved)\n"
-        "  -f <glob>   Embed data files matching glob (requires -d -t, repeatable)\n"
+        "  -f <glob>   Embed data files matching glob (requires -t, repeatable)\n"
         "  -v          Verbose\n"
         "  -h          Help\n\n"
         "Examples:\n"
         "  %s /bin/ls\n"
         "  %s -o frozen_ls /bin/ls\n"
         "  %s -t -o frozen_app -- myapp --load-plugins\n"
-        "  %s -d -t -f '/usr/share/myapp/*' -- myapp --self-test\n",
+        "  %s -t -f '/usr/share/myapp/*' -- myapp --self-test\n",
         prog, prog, prog, prog, prog);
 }
 
@@ -467,6 +469,39 @@ static int target_runtime_provider(const struct dep_list *deps,
     return 1;
 }
 
+/* musl resolves a slash-free DT_NEEDED by reusing the first already-loaded
+ * object whose loader shortname exactly matches the request.  That identity
+ * is the name by which the startup closure loaded the object, not an
+ * arbitrary DT_SONAME or the provider selected by resolving the helper in
+ * isolation.  Reproduce that rule from the immutable target closure and
+ * reject distinct providers for one shortname as ambiguous. */
+static int target_musl_shortname_provider(const struct dep_list *deps,
+                                          const char *name,
+                                          const char **path_out)
+{
+    const char *provider = NULL;
+
+    if (!deps || deps->runtime_family != DEP_RUNTIME_MUSL || !name ||
+        !name[0] || strchr(name, '/') || !path_out)
+        return -1;
+    if (dlfrz_musl_reserved_soname(name) &&
+        target_provider_add(&provider, deps->interp_path) < 0)
+        return -1;
+    for (int i = 0; i < deps->count; i++) {
+        const char *loaded_name = deps->libs[i].name;
+
+        if (!loaded_name || strchr(loaded_name, '/') ||
+            strcmp(loaded_name, name) != 0)
+            continue;
+        if (target_provider_add(&provider, deps->libs[i].path) < 0)
+            return -1;
+    }
+    if (!provider)
+        return 0;
+    *path_out = provider;
+    return 1;
+}
+
 static int preload_versions_compatible(const char *helper_path,
                                        const struct elf_info *helper,
                                        struct dep_list *deps,
@@ -538,9 +573,30 @@ static int preload_target_score(const char *path, struct dep_list *deps,
     for (int i = 0; i < info.needed_count; i++) {
         const char *startup_provider = NULL;
         char *helper_provider = NULL;
-        int runtime_match = target_runtime_provider(
-            deps, interp_soname, info.needed[i], &startup_provider);
+        int runtime_match;
         int helper_match;
+
+        /* Unlike the GNU loader, musl performs this slash-free lookup
+         * against loader shortnames before searching the helper's RUNPATH.
+         * Resolving the helper alone can therefore name a different file
+         * even though that file will never be mapped.  The traced child is
+         * still the authoritative strong-import/relocation check: a helper
+         * whose name-only imports are absent cannot publish V8 readiness and
+         * the trace fails without producing an artifact. */
+        if (deps->runtime_family == DEP_RUNTIME_MUSL &&
+            !strchr(info.needed[i], '/')) {
+            runtime_match = target_musl_shortname_provider(
+                deps, info.needed[i], &startup_provider);
+            if (runtime_match != 1) {
+                score = -1;
+                goto out;
+            }
+            score++;
+            continue;
+        }
+
+        runtime_match = target_runtime_provider(
+            deps, interp_soname, info.needed[i], &startup_provider);
 
         if (runtime_match != 1 ||
             dep_resolve_aux_dependency(
@@ -686,6 +742,50 @@ static char *resolve_exe(const char *name)
     }
     free(default_path);
     return NULL;
+}
+
+/* /proc/self/exe is the strongest identity because it remains attached to
+ * the running file after rename/unlink.  It is not universally mounted in
+ * containers and chroots, however.  AT_EXECFN is kernel-supplied and normally
+ * names the same execve input; argv[0]/PATH is the final conventional fallback.
+ * Both fallback spellings are canonicalized before sibling discovery so a
+ * relative invocation does not accidentally search the current directory. */
+static int resolve_running_executable(const char *argv0,
+                                      char path[PATH_MAX])
+{
+    ssize_t length;
+    char *resolved = NULL;
+    const char *execfn;
+
+    if (!path) {
+        errno = EINVAL;
+        return -1;
+    }
+    length = readlink("/proc/self/exe", path, PATH_MAX - 1);
+    if (length >= 0 && length < PATH_MAX - 1) {
+        path[length] = '\0';
+        return 0;
+    }
+
+    execfn = (const char *)(uintptr_t)getauxval(AT_EXECFN);
+    if (execfn && execfn[0])
+        resolved = resolve_exe(execfn);
+    if (!resolved && argv0 && argv0[0] &&
+        (!execfn || strcmp(argv0, execfn) != 0))
+        resolved = resolve_exe(argv0);
+    if (!resolved) {
+        errno = ENOENT;
+        return -1;
+    }
+    length = (ssize_t)strlen(resolved);
+    if (length >= PATH_MAX) {
+        free(resolved);
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(path, resolved, (size_t)length + 1);
+    free(resolved);
+    return 0;
 }
 
 static int match_glob(const char *pattern, const char *path)
@@ -2104,7 +2204,8 @@ static int capture_data_files(const char *exe_path, const char *exe_identity,
 int main(int argc, char **argv)
 {
     const char *out_path = NULL;
-    int do_trace = 0, verbose = 0, direct_load = 0;
+    int do_trace = 0, verbose = 0, direct_load = 1;
+    int direct_option = 0, extraction_option = 0;
     const char **file_patterns;
     int nfile_patterns = 0;
 
@@ -2120,10 +2221,11 @@ int main(int argc, char **argv)
     }
 
     int opt;
-    while ((opt = getopt(argc, argv, "+o:f:dtvh")) != -1) {
+    while ((opt = getopt(argc, argv, "+o:f:dtxvh")) != -1) {
         switch (opt) {
         case 'o': out_path = optarg;  break;
-        case 'd': direct_load = 1;   break;
+        case 'd': direct_load = 1; direct_option = 1; break;
+        case 'x': direct_load = 0; extraction_option = 1; break;
         case 't': do_trace = 1;      break;
         case 'f':
             file_patterns[nfile_patterns++] = optarg;
@@ -2139,6 +2241,12 @@ int main(int argc, char **argv)
         free(file_patterns);
         return 1;
     }
+    if (direct_option && extraction_option) {
+        fprintf(stderr,
+                "dlfreeze: -d and -x select incompatible runtime modes\n");
+        free(file_patterns);
+        return 1;
+    }
     if (nfile_patterns > 0 && !do_trace) {
         fprintf(stderr, "dlfreeze: -f requires -t (tracing mode)\n");
         free(file_patterns);
@@ -2146,7 +2254,8 @@ int main(int argc, char **argv)
     }
     if (nfile_patterns > 0 && !direct_load) {
         fprintf(stderr,
-                "dlfreeze: captured files require direct-load mode (-d)\n");
+                "dlfreeze: captured files are incompatible with forced "
+                "extraction mode (-x)\n");
         free(file_patterns);
         return 1;
     }
@@ -2176,15 +2285,11 @@ int main(int argc, char **argv)
 
     /* locate our helper binaries */
     char self[PATH_MAX];
-    ssize_t slen = readlink("/proc/self/exe", self, sizeof(self)-1);
-    if (slen < 0 || (size_t)slen >= sizeof(self) - 1) {
-        if (slen >= 0)
-            errno = ENAMETOOLONG;
-        perror("readlink");
+    if (resolve_running_executable(argv[0], self) < 0) {
+        perror("dlfreeze: cannot resolve its executable path");
         free(exe_name); free(exe_path); free(file_patterns);
         return 1;
     }
-    self[slen] = '\0';
 
     char *bootstrap = find_sibling(self, "dlfreeze-bootstrap");
     if (!bootstrap) {

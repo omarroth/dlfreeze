@@ -31,6 +31,40 @@ enum {
     TEST_LOADER_INFO_OFFSET = 400
 };
 
+enum test_gate_result {
+    TEST_GATE_SETUP_FAILURE = -1,
+    TEST_GATE_STRUCTURAL_FAILURE = 0,
+    TEST_GATE_PASS = 1,
+};
+
+static int initialize_temp_template(char path[PATH_MAX], const char *leaf)
+{
+    const char *directory = getenv("TMPDIR");
+    int length;
+
+    /* Never let a relative environment value redirect fixture creation into
+     * the source tree.  /tmp remains the conventional absolute fallback. */
+    if (!directory || directory[0] != '/')
+        directory = "/tmp";
+    length = snprintf(path, PATH_MAX, "%s/%s", directory, leaf);
+    if (length < 0 || length >= PATH_MAX) {
+        errno = ENAMETOOLONG;
+        return 0;
+    }
+    return 1;
+}
+
+static int report_setup_failure(const char *operation, const char *path)
+{
+    int saved_errno = errno ? errno : EIO;
+
+    fprintf(stderr, "packer alignment test setup: cannot %s %s: %s\n",
+            operation, path && path[0] ? path : "(fixture)",
+            strerror(saved_errno));
+    errno = saved_errno;
+    return TEST_GATE_SETUP_FAILURE;
+}
+
 static void initialize_ehdr(Elf64_Ehdr *ehdr, uint16_t phnum)
 {
     memset(ehdr, 0, sizeof(*ehdr));
@@ -129,7 +163,7 @@ static int phdr_byte_access_gate(void)
 static int compute_meta_unaligned_gate(void)
 {
     unsigned char image[TEST_IMAGE_SIZE] = {0};
-    char path[] = "/tmp/dlfreeze-packer-unaligned-meta.XXXXXX";
+    char path[PATH_MAX] = {0};
     struct packed_input_snapshot snapshot = {0};
     struct dlfrz_lib_meta meta = {0};
     Elf64_Ehdr ehdr;
@@ -156,13 +190,28 @@ static int compute_meta_unaligned_gate(void)
                            sizeof(Elf64_Phdr), &stack))
         goto out;
 
+    if (!initialize_temp_template(
+            path, "dlfreeze-packer-unaligned-meta.XXXXXX"))
+        return report_setup_failure("construct path for", path);
     fd = mkstemp(path);
-    if (fd < 0 || !write_exact(fd, image, sizeof(image)) ||
-        fstat(fd, &snapshot.st) < 0)
+    if (fd < 0) {
+        result = report_setup_failure("create", path);
         goto out;
+    }
+    if (!write_exact(fd, image, sizeof(image))) {
+        result = report_setup_failure("write", path);
+        goto out;
+    }
+    if (fstat(fd, &snapshot.st) < 0) {
+        result = report_setup_failure("stat", path);
+        goto out;
+    }
     snapshot.valid = 1;
-    if (close(fd) < 0)
+    if (close(fd) < 0) {
+        fd = -1;
+        result = report_setup_failure("close", path);
         goto out;
+    }
     fd = -1;
 
     if (compute_lib_meta(path, &snapshot, DIRECT_LOAD_BASE,
@@ -172,7 +221,7 @@ static int compute_meta_unaligned_gate(void)
         meta.phdr_entsz != sizeof(Elf64_Phdr) ||
         meta.vaddr_lo != 0 || meta.vaddr_hi != sizeof(image))
         goto out;
-    result = 1;
+    result = TEST_GATE_PASS;
 
 out:
     if (fd >= 0)
@@ -278,25 +327,58 @@ static int patch_unaligned_bootstrap_gate(void)
 {
     unsigned char *image = calloc(1, TEST_TOTAL_SIZE);
     unsigned char *result_image = calloc(1, TEST_TOTAL_SIZE);
-    char path[] = "/tmp/dlfreeze-packer-unaligned-bootstrap.XXXXXX";
+    char path[PATH_MAX] = {0};
+    struct stat identity;
     int fd = -1;
     int result = 0;
 
-    if (!image || !result_image || !initialize_bootstrap(image, 1))
+    if (!image || !result_image) {
+        errno = ENOMEM;
+        result = report_setup_failure("allocate", "bootstrap fixture");
         goto out;
+    }
+    if (!initialize_bootstrap(image, 1))
+        goto out;
+    if (!initialize_temp_template(
+            path, "dlfreeze-packer-unaligned-bootstrap.XXXXXX")) {
+        result = report_setup_failure("construct path for", path);
+        goto out;
+    }
     fd = mkstemp(path);
-    if (fd < 0 || !write_exact(fd, image, TEST_TOTAL_SIZE) || close(fd) < 0)
+    if (fd < 0) {
+        result = report_setup_failure("create", path);
         goto out;
+    }
+    if (!write_exact(fd, image, TEST_TOTAL_SIZE)) {
+        result = report_setup_failure("write", path);
+        goto out;
+    }
+    if (fstat(fd, &identity) < 0) {
+        result = report_setup_failure("inspect", path);
+        goto out;
+    }
+    if (close(fd) < 0) {
+        fd = -1;
+        result = report_setup_failure("close", path);
+        goto out;
+    }
     fd = -1;
-    if (patch_elf_for_upx_inplace(path, TEST_BOOTSTRAP_SIZE,
-                                  TEST_PAYLOAD_OFFSET,
-                                  TEST_TOTAL_SIZE) < 0)
+    if (patch_elf_for_mapped_payload_inplace(
+            path, &identity, TEST_BOOTSTRAP_SIZE,
+            TEST_PAYLOAD_OFFSET, TEST_TOTAL_SIZE, TEST_MACHINE) < 0)
         goto out;
     fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0 || !read_exact_at(fd, result_image, TEST_TOTAL_SIZE, 0) ||
-        !patched_bootstrap_valid(result_image))
+    if (fd < 0) {
+        result = report_setup_failure("open verification file", path);
         goto out;
-    result = 1;
+    }
+    if (!read_exact_at(fd, result_image, TEST_TOTAL_SIZE, 0)) {
+        result = report_setup_failure("read verification file", path);
+        goto out;
+    }
+    if (!patched_bootstrap_valid(result_image))
+        goto out;
+    result = TEST_GATE_PASS;
 
 out:
     if (fd >= 0)
@@ -311,25 +393,125 @@ static int failed_patch_is_transactional_gate(void)
 {
     unsigned char *image = calloc(1, TEST_TOTAL_SIZE);
     unsigned char *after = calloc(1, TEST_TOTAL_SIZE);
-    char path[] = "/tmp/dlfreeze-packer-transaction.XXXXXX";
+    char path[PATH_MAX] = {0};
+    struct stat identity;
     int fd = -1;
     int result = 0;
 
-    if (!image || !after || !initialize_bootstrap(image, 0))
+    if (!image || !after) {
+        errno = ENOMEM;
+        result = report_setup_failure("allocate", "transaction fixture");
         goto out;
+    }
+    if (!initialize_bootstrap(image, 0))
+        goto out;
+    if (!initialize_temp_template(
+            path, "dlfreeze-packer-transaction.XXXXXX")) {
+        result = report_setup_failure("construct path for", path);
+        goto out;
+    }
     fd = mkstemp(path);
-    if (fd < 0 || !write_exact(fd, image, TEST_TOTAL_SIZE) || close(fd) < 0)
+    if (fd < 0) {
+        result = report_setup_failure("create", path);
         goto out;
+    }
+    if (!write_exact(fd, image, TEST_TOTAL_SIZE)) {
+        result = report_setup_failure("write", path);
+        goto out;
+    }
+    if (fstat(fd, &identity) < 0) {
+        result = report_setup_failure("inspect", path);
+        goto out;
+    }
+    if (close(fd) < 0) {
+        fd = -1;
+        result = report_setup_failure("close", path);
+        goto out;
+    }
     fd = -1;
     errno = 0;
-    if (patch_elf_for_upx(path, TEST_BOOTSTRAP_SIZE,
-                          TEST_PAYLOAD_OFFSET, TEST_TOTAL_SIZE) == 0)
+    if (patch_elf_for_mapped_payload(
+            path, &identity, TEST_BOOTSTRAP_SIZE,
+            TEST_PAYLOAD_OFFSET, TEST_TOTAL_SIZE, TEST_MACHINE) == 0)
         goto out;
     fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0 || !read_exact_at(fd, after, TEST_TOTAL_SIZE, 0) ||
-        memcmp(after, image, TEST_TOTAL_SIZE) != 0)
+    if (fd < 0) {
+        result = report_setup_failure("open verification file", path);
         goto out;
-    result = 1;
+    }
+    if (!read_exact_at(fd, after, TEST_TOTAL_SIZE, 0)) {
+        result = report_setup_failure("read verification file", path);
+        goto out;
+    }
+    if (memcmp(after, image, TEST_TOTAL_SIZE) != 0)
+        goto out;
+    result = TEST_GATE_PASS;
+
+out:
+    if (fd >= 0)
+        close(fd);
+    unlink(path);
+    free(after);
+    free(image);
+    return result;
+}
+
+static int mismatched_bootstrap_machine_gate(void)
+{
+    unsigned char *image = calloc(1, TEST_TOTAL_SIZE);
+    unsigned char *after = calloc(1, TEST_TOTAL_SIZE);
+    char path[PATH_MAX] = {0};
+    struct stat identity;
+    Elf64_Ehdr ehdr;
+    int fd = -1;
+    int result = 0;
+
+    if (!image || !after) {
+        errno = ENOMEM;
+        result = report_setup_failure("allocate", "machine fixture");
+        goto out;
+    }
+    if (!initialize_bootstrap(image, 1))
+        goto out;
+    memcpy(&ehdr, image, sizeof(ehdr));
+    ehdr.e_machine = TEST_MACHINE == EM_X86_64
+        ? EM_AARCH64 : EM_X86_64;
+    memcpy(image, &ehdr, sizeof(ehdr));
+    if (!initialize_temp_template(
+            path, "dlfreeze-packer-machine-bootstrap.XXXXXX")) {
+        result = report_setup_failure("construct path for", path);
+        goto out;
+    }
+    fd = mkstemp(path);
+    if (fd < 0) {
+        result = report_setup_failure("create", path);
+        goto out;
+    }
+    if (!write_exact(fd, image, TEST_TOTAL_SIZE) ||
+        fstat(fd, &identity) < 0) {
+        result = report_setup_failure("initialize", path);
+        goto out;
+    }
+    if (close(fd) < 0) {
+        fd = -1;
+        result = report_setup_failure("close", path);
+        goto out;
+    }
+    fd = -1;
+    errno = 0;
+    if (patch_elf_for_mapped_payload(
+            path, &identity, TEST_BOOTSTRAP_SIZE,
+            TEST_PAYLOAD_OFFSET, TEST_TOTAL_SIZE, TEST_MACHINE) == 0)
+        goto out;
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0 ||
+        !read_exact_at(fd, after, TEST_TOTAL_SIZE, 0)) {
+        result = report_setup_failure("verify", path);
+        goto out;
+    }
+    if (memcmp(after, image, TEST_TOTAL_SIZE) != 0)
+        goto out;
+    result = TEST_GATE_PASS;
 
 out:
     if (fd >= 0)
@@ -392,20 +574,38 @@ static int prelink_manifest_bounds_gate(void)
 
 int main(void)
 {
+    int gate_result;
+
     if (!phdr_byte_access_gate()) {
         fprintf(stderr, "unaligned program-header byte access failed\n");
         return 1;
     }
-    if (!compute_meta_unaligned_gate()) {
+    gate_result = compute_meta_unaligned_gate();
+    if (gate_result == TEST_GATE_SETUP_FAILURE)
+        return 2;
+    if (gate_result != TEST_GATE_PASS) {
         fprintf(stderr, "unaligned application e_phoff admission failed\n");
         return 1;
     }
-    if (!patch_unaligned_bootstrap_gate()) {
+    gate_result = patch_unaligned_bootstrap_gate();
+    if (gate_result == TEST_GATE_SETUP_FAILURE)
+        return 2;
+    if (gate_result != TEST_GATE_PASS) {
         fprintf(stderr, "unaligned bootstrap mutation failed\n");
         return 1;
     }
-    if (!failed_patch_is_transactional_gate()) {
+    gate_result = failed_patch_is_transactional_gate();
+    if (gate_result == TEST_GATE_SETUP_FAILURE)
+        return 2;
+    if (gate_result != TEST_GATE_PASS) {
         fprintf(stderr, "failed bootstrap mutation changed the artifact\n");
+        return 1;
+    }
+    gate_result = mismatched_bootstrap_machine_gate();
+    if (gate_result == TEST_GATE_SETUP_FAILURE)
+        return 2;
+    if (gate_result != TEST_GATE_PASS) {
+        fprintf(stderr, "mismatched bootstrap machine was admitted\n");
         return 1;
     }
     if (!prelink_manifest_bounds_gate()) {

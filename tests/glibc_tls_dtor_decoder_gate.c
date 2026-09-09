@@ -793,6 +793,28 @@ static int run_decoder_gate(void)
             decoded == counter_offset,
         1);
 
+    /* The helper's semantic body is identical when the target is not built
+     * with BTI landing pads. */
+    memcpy(relaxed_bad, relaxed_helper, sizeof(relaxed_bad));
+    memcpy(release_bad, release_helper, sizeof(release_bad));
+    memmove(relaxed_helper, relaxed_helper + 1,
+            11 * sizeof(*relaxed_helper));
+    memmove(release_helper, release_helper + 1,
+            11 * sizeof(*release_helper));
+    relaxed_helper[11] = UINT32_C(0xd503201f);
+    release_helper[11] = UINT32_C(0xd503201f);
+    ok &= expect_result(
+        "valid paired AArch64 counter without BTI",
+        glibc_tls_dtor_counter_from_code(
+            &libc_object, (const uint8_t *)registration,
+            registration_count * sizeof(*registration),
+            (const uint8_t *)destruction,
+            destruction_count * sizeof(*destruction), &decoded) &&
+            decoded == counter_offset,
+        1);
+    memcpy(relaxed_helper, relaxed_bad, sizeof(relaxed_bad));
+    memcpy(release_helper, release_bad, sizeof(release_bad));
+
     memcpy(registration_bad, registration,
            registration_count * sizeof(*registration));
     registration_bad[2] = UINT32_C(0xd2800040); /* mov x0, #2 */

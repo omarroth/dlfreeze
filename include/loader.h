@@ -29,15 +29,33 @@ struct dlfrz_entry;
  * mem as the sole byte authority. */
 #define DLFRZ_SOURCE_EXACT_CLEAN_FILE (1U << 0)
 
+/* The bootstrap sets this only after a disposable, signal-zero clone has
+ * successfully exercised the complete eligible startup PT_LOAD transfer
+ * batch with MREMAP_DONTUNMAP, then positively authenticated exactly the
+ * resulting target VMAs as clean mappings of the expected file ranges.  The
+ * loader may consume this token only before application handoff; it is
+ * cleared before target code can replace the inherited seccomp policy.
+ * Unlike DLFRZ_SOURCE_EXACT_CLEAN_FILE, this proof intentionally requires no
+ * retained source descriptor and makes no claim about unselected payload
+ * pages. */
+#define DLFRZ_SOURCE_MREMAP_DONTUNMAP (1U << 1)
+
+/* A bootstrap-owned anonymous page whose MADV_WIPEONFORK state was positively
+ * verified before any target callback.  The loader consumes the armed word;
+ * a zero inherited word then proves a later fork without a getpid syscall. */
+#define DLFRZ_RUNTIME_FORK_COOKIE UINT32_C(0x444c4652)
+
 /*
  * Load all libraries from the frozen binary's in-memory payload,
  * resolve relocations, set up TLS, and jump to the executable's _start.
  *
  *   mem:          pointer to start of frozen file / payload in memory
  *   mem_foff:     file offset corresponding to mem[0]
- *                 (mapped/canonical/UPX payload: payload file offset;
+ *                 (mapped canonical payload: payload file offset;
  *                  compatibility whole-file mapping: 0)
  *   source_flags: bootstrap-proven properties of mem/srcfd
+ *   runtime_fork_cookie: optional verified, armed WIPEONFORK page; ownership
+ *                       transfers to the loader, NULL keeps syscall identity
  *   metas:        per-library metadata array (num_entries elements)
  *   entries:      manifest entry array (num_entries elements)
  *   strtab:       string table
@@ -52,6 +70,7 @@ struct dlfrz_entry;
  */
 int loader_run(const uint8_t *mem, uint64_t mem_foff, int srcfd,
                uint32_t source_flags,
+               volatile uint32_t *runtime_fork_cookie,
                const struct dlfrz_lib_meta *metas,
                const struct dlfrz_entry *entries,
                const char *strtab,

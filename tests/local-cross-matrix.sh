@@ -15,11 +15,24 @@ else
     REQUIRE_DIRECT_CONTRACTS_EXPLICIT=0
 fi
 REQUIRE_DIRECT_CONTRACTS="${DLFREEZE_REQUIRE_DIRECT_CONTRACTS:-${DLFREEZE_REQUIRE_RUNTIME_ARTIFACTS:-1}}"
+if [[ -n "${DLFREEZE_REQUIRE_ALL_DIRECT_CONTRACTS+x}" ]]; then
+    REQUIRE_ALL_DIRECT_CONTRACTS_EXPLICIT=1
+else
+    REQUIRE_ALL_DIRECT_CONTRACTS_EXPLICIT=0
+fi
+REQUIRE_ALL_DIRECT_CONTRACTS="${DLFREEZE_REQUIRE_ALL_DIRECT_CONTRACTS:-$REQUIRE_DIRECT_CONTRACTS}"
 
 case "$REQUIRE_DIRECT_CONTRACTS" in
     0|1) ;;
     *)
         echo "DLFREEZE_REQUIRE_DIRECT_CONTRACTS must be 0 or 1" >&2
+        exit 2
+        ;;
+esac
+case "$REQUIRE_ALL_DIRECT_CONTRACTS" in
+    0|1) ;;
+    *)
+        echo "DLFREEZE_REQUIRE_ALL_DIRECT_CONTRACTS must be 0 or 1" >&2
         exit 2
         ;;
 esac
@@ -39,6 +52,11 @@ Environment:
   DLFREEZE_REQUIRE_DIRECT_CONTRACTS=0
                          Allow a targeted run without aggregate direct+UPX
                          artifacts. Aggregate runs require them by default;
+                         one-environment runs do not unless explicitly set.
+  DLFREEZE_REQUIRE_ALL_DIRECT_CONTRACTS=0
+                         Allow discovered producer runtimes to report an
+                         explicit unsupported result. Full matrix runs require
+                         every discovered runtime to be direct by default;
                          one-environment runs do not unless explicitly set.
   TEST_START_AT=FUNC     Start run_tests.sh at this exact test function.
   TEST_STOP_AFTER=FUNC   Stop run_tests.sh after this exact test function.
@@ -145,8 +163,14 @@ FROZEN_ROOT="$(cd "$FROZEN_ROOT" && pwd -P)"
 ENVS=(
     "ubuntu-18.04|ubuntu:18.04"
     "ubuntu-20.04|ubuntu:20.04"
+    "ubuntu-22.04|ubuntu:22.04"
     "ubuntu-24.04|ubuntu:24.04"
+    "alpine-3.14|alpine:3.14"
+    "alpine-3.16|alpine:3.16"
+    "alpine-3.18|alpine:3.18"
     "alpine-3.20|alpine:3.20"
+    "alpine-3.22|alpine:3.22"
+    "alpine-edge|alpine:edge"
     "debian-12|debian:12"
     "debian-trixie|debian:trixie"
     "fedora-41|fedora:41"
@@ -182,6 +206,9 @@ if [[ -n "$ENV_FILTER" ]]; then
     # targeted producer to satisfy the aggregate direct+UPX coverage rule.
     if [[ "$REQUIRE_DIRECT_CONTRACTS_EXPLICIT" -eq 0 ]]; then
         REQUIRE_DIRECT_CONTRACTS=0
+    fi
+    if [[ "$REQUIRE_ALL_DIRECT_CONTRACTS_EXPLICIT" -eq 0 ]]; then
+        REQUIRE_ALL_DIRECT_CONTRACTS=0
     fi
 fi
 
@@ -269,7 +296,7 @@ if [[ "$DO_RUN" -eq 1 ]]; then
         name="${pair%%|*}"
         image="${pair##*|}"
         echo "[cross-matrix] run on $image against $source_glob"
-        if ! run_in_image "$image" "DLFREEZE_REQUIRE_DIRECT_CONTRACTS=$REQUIRE_DIRECT_CONTRACTS DLFREEZE_REQUIRE_RUNTIME_ARTIFACTS=$REQUIRE_DIRECT_CONTRACTS FROZEN_DIR=/frozen-all FROZEN_GLOB='$source_glob' sh /work/tests/cross-run.sh"; then
+        if ! run_in_image "$image" "DLFREEZE_REQUIRE_DIRECT_CONTRACTS=$REQUIRE_DIRECT_CONTRACTS DLFREEZE_REQUIRE_ALL_DIRECT_CONTRACTS=$REQUIRE_ALL_DIRECT_CONTRACTS DLFREEZE_REQUIRE_RUNTIME_ARTIFACTS=$REQUIRE_DIRECT_CONTRACTS FROZEN_DIR=/frozen-all FROZEN_GLOB='$source_glob' sh /work/tests/cross-run.sh"; then
             echo "[cross-matrix] ERROR: run failed in $image" >&2
             matrix_status=1
         fi

@@ -108,11 +108,24 @@ parse_perf_file() {
     printf '%s\t%s\t%s\n' "$cycles" "$page_faults" "$task_clock_ms"
 }
 
+parse_elapsed_file() {
+    local perf_file="$1"
+
+    awk '
+        $2 == "seconds" && $3 == "time" && $4 == "elapsed" {
+            printf "%.6f\n", $1 * 1000.0;
+            found = 1;
+        }
+        END { if (!found) exit 1 }
+    ' "$perf_file" || die "failed to parse wall-clock output from $perf_file"
+}
+
 measure_command() {
-    local perf_file samples metrics
+    local perf_file duration_file samples metrics duration_ms
     local -a cmd=("$@")
 
     perf_file="$(mktemp)"
+    duration_file="$(mktemp)"
     samples="$(mktemp)"
 
     if [[ "$BENCH_WARM_CACHE" != "0" ]]; then
@@ -124,21 +137,37 @@ measure_command() {
         if ! perf stat -x, --no-big-num -o "$perf_file" \
             -e cycles,page-faults,task-clock -- \
             "${cmd[@]}" >/dev/null 2>/dev/null; then
-            rm -f "$perf_file" "$samples"
+            rm -f "$perf_file" "$duration_file" "$samples"
             die "perf stat failed: ${cmd[*]}"
         fi
-        parse_perf_file "$perf_file" >> "$samples"
+        : > "$duration_file"
+        # CSV mode omits perf's elapsed-time footer, while duration_time is
+        # unavailable on older perf/kernel pairs and can inherit a hardware
+        # event's user-only fallback modifier.  Use one separate, portable
+        # perf invocation and parse its locale-stable elapsed footer.  This
+        # is true exec-to-exit latency, including time spent waiting for any
+        # startup helper process.
+        if ! LC_ALL=C perf stat --no-big-num -o "$duration_file" \
+            -e task-clock -- \
+            "${cmd[@]}" >/dev/null 2>/dev/null; then
+            rm -f "$perf_file" "$duration_file" "$samples"
+            die "perf wall-clock measurement failed: ${cmd[*]}"
+        fi
+        duration_ms="$(parse_elapsed_file "$duration_file")"
+        printf '%s\t%s\n' "$(parse_perf_file "$perf_file")" \
+            "$duration_ms" >> "$samples"
     done
 
     metrics="$(awk -F '\t' '
-        { cycles += $1; faults += $2; clock += $3; runs += 1 }
+        { cycles += $1; faults += $2; clock += $3; wall += $4; runs += 1 }
         END {
             if (runs == 0) exit 1;
-            printf "%.0f\t%.0f\t%.6f\n", cycles / runs, faults / runs, clock / runs;
+            printf "%.0f\t%.0f\t%.6f\t%.6f\n",
+                cycles / runs, faults / runs, clock / runs, wall / runs;
         }
     ' "$samples")"
 
-    rm -f "$perf_file" "$samples"
+    rm -f "$perf_file" "$duration_file" "$samples"
     printf '%s\n' "$metrics"
 }
 
@@ -160,9 +189,9 @@ run_case() {
     local bin=""
     local out=""
     local native_metrics frozen_metrics
-    local native_cycles native_faults native_ms
-    local frozen_cycles frozen_faults frozen_ms
-    local cycles_ratio faults_ratio ms_ratio
+    local native_cycles native_faults native_ms native_wall_ms
+    local frozen_cycles frozen_faults frozen_ms frozen_wall_ms
+    local cycles_ratio faults_ratio ms_ratio wall_ratio
     local -a freeze_cmd=()
     local -a native_cmd=()
     local -a frozen_cmd=()
@@ -172,7 +201,7 @@ run_case() {
             desc="ls"
             bin="$LS_BIN"
             out="$BENCH_DIR/ls.frozen"
-            freeze_cmd=("$DLFREEZE" -d -o "$out" "$bin")
+            freeze_cmd=("$DLFREEZE" -o "$out" "$bin")
             native_cmd=("$bin")
             frozen_cmd=("$out")
             ;;
@@ -180,7 +209,7 @@ run_case() {
             desc="python3 --version"
             bin="$PYTHON_BIN"
             out="$BENCH_DIR/python3.frozen"
-            freeze_cmd=("$DLFREEZE" -d -o "$out" "$bin")
+            freeze_cmd=("$DLFREEZE" -o "$out" "$bin")
             native_cmd=("$bin" --version)
             frozen_cmd=("$out" --version)
             ;;
@@ -188,7 +217,7 @@ run_case() {
             desc="python3 traced imports"
             bin="$PYTHON_BIN"
             out="$BENCH_DIR/python3-imports.frozen"
-            freeze_cmd=("$DLFREEZE" -d -t -f "$PYTHON_DATA_GLOB" -o "$out" -- "$bin" -c "$PYTHON_IMPORT_EXPR")
+            freeze_cmd=("$DLFREEZE" -t -f "$PYTHON_DATA_GLOB" -o "$out" -- "$bin" -c "$PYTHON_IMPORT_EXPR")
             native_cmd=("$bin" -c "$PYTHON_IMPORT_EXPR")
             frozen_cmd=("$out" -c "$PYTHON_IMPORT_EXPR")
             ;;
@@ -196,7 +225,7 @@ run_case() {
             desc="python3 numpy imports"
             bin="$PYTHON_BIN"
             out="$BENCH_DIR/python3-numpy.frozen"
-            freeze_cmd=("$DLFREEZE" -d -t -f "$PYTHON_DATA_GLOB" -o "$out" -- "$bin" -c "$PYTHON_NUMPY_EXPR")
+            freeze_cmd=("$DLFREEZE" -t -f "$PYTHON_DATA_GLOB" -o "$out" -- "$bin" -c "$PYTHON_NUMPY_EXPR")
             native_cmd=("$bin" -c "$PYTHON_NUMPY_EXPR")
             frozen_cmd=("$out" -c "$PYTHON_NUMPY_EXPR")
             ;;
@@ -204,7 +233,7 @@ run_case() {
             desc="clang --version"
             bin="$CLANG_BIN"
             out="$BENCH_DIR/clang.frozen"
-            freeze_cmd=("$DLFREEZE" -d -o "$out" "$bin")
+            freeze_cmd=("$DLFREEZE" -o "$out" "$bin")
             native_cmd=("$bin" --version)
             frozen_cmd=("$out" --version)
             ;;
@@ -212,7 +241,7 @@ run_case() {
             desc="ffmpeg -version"
             bin="$FFMPEG_BIN"
             out="$BENCH_DIR/ffmpeg.frozen"
-            freeze_cmd=("$DLFREEZE" -d -o "$out" "$bin")
+            freeze_cmd=("$DLFREEZE" -o "$out" "$bin")
             native_cmd=("$bin" -version)
             frozen_cmd=("$out" -version)
             ;;
@@ -220,7 +249,7 @@ run_case() {
             desc="ffmpeg -version (traced)"
             bin="$FFMPEG_BIN"
             out="$BENCH_DIR/ffmpeg-traced.frozen"
-            freeze_cmd=("$DLFREEZE" -d -t -o "$out" -- "$bin" -version)
+            freeze_cmd=("$DLFREEZE" -t -o "$out" -- "$bin" -version)
             native_cmd=("$bin" -version)
             frozen_cmd=("$out" -version)
             ;;
@@ -248,18 +277,20 @@ run_case() {
     native_metrics="$(measure_command "${native_cmd[@]}")"
     frozen_metrics="$(measure_command "${frozen_cmd[@]}")"
 
-    IFS=$'\t' read -r native_cycles native_faults native_ms <<< "$native_metrics"
-    IFS=$'\t' read -r frozen_cycles frozen_faults frozen_ms <<< "$frozen_metrics"
+    IFS=$'\t' read -r native_cycles native_faults native_ms native_wall_ms <<< "$native_metrics"
+    IFS=$'\t' read -r frozen_cycles frozen_faults frozen_ms frozen_wall_ms <<< "$frozen_metrics"
 
     cycles_ratio="$(ratio_string "$frozen_cycles" "$native_cycles")"
     faults_ratio="$(ratio_string "$frozen_faults" "$native_faults")"
     ms_ratio="$(ratio_string "$frozen_ms" "$native_ms")"
+    wall_ratio="$(ratio_string "$frozen_wall_ms" "$native_wall_ms")"
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$desc" \
         "$native_cycles" "$frozen_cycles" "$cycles_ratio" \
         "$native_faults" "$frozen_faults" "$faults_ratio" \
         "$native_ms" "$frozen_ms" "$ms_ratio" \
+        "$native_wall_ms" "$frozen_wall_ms" "$wall_ratio" \
         >> "$SUMMARY_FILE"
 }
 
@@ -271,8 +302,7 @@ mkdir -p "$BENCH_DIR"
 if ! perf stat -x, --no-big-num -o /dev/null -e cycles,page-faults,task-clock -- true >/dev/null 2>/dev/null; then
     die "perf stat failed; check perf permissions on this system"
 fi
-
-printf 'workload\tnative_cycles\tfrozen_cycles\tcycles_ratio\tnative_faults\tfrozen_faults\tfaults_ratio\tnative_ms\tfrozen_ms\tms_ratio\n' > "$SUMMARY_FILE"
+printf 'workload\tnative_cycles\tfrozen_cycles\tcycles_ratio\tnative_faults\tfrozen_faults\tfaults_ratio\tnative_task_ms\tfrozen_task_ms\ttask_ratio\tnative_wall_ms\tfrozen_wall_ms\twall_ratio\n' > "$SUMMARY_FILE"
 
 note "======== dlfreeze startup benchmarks ========"
 note "build dir       : $BUILD"
@@ -289,16 +319,18 @@ note
 note "Summary"
 awk -F '\t' '
     NR == 1 {
-        printf "%-24s %14s %14s %10s %14s %14s %10s %11s %11s %10s\n",
+        printf "%-24s %14s %14s %10s %14s %14s %10s %11s %11s %10s %11s %11s %10s\n",
             "workload",
             "native cycles", "frozen cycles", "ratio",
             "native faults", "frozen faults", "ratio",
-            "native ms", "frozen ms", "ratio";
+            "native CPU", "frozen CPU", "ratio",
+            "native wall", "frozen wall", "ratio";
         next;
     }
     {
-        printf "%-24s %14s %14s %10s %14s %14s %10s %11.3f %11.3f %10s\n",
-            $1, $2, $3, $4, $5, $6, $7, $8 + 0.0, $9 + 0.0, $10;
+        printf "%-24s %14s %14s %10s %14s %14s %10s %11.3f %11.3f %10s %11.3f %11.3f %10s\n",
+            $1, $2, $3, $4, $5, $6, $7, $8 + 0.0, $9 + 0.0, $10,
+            $11 + 0.0, $12 + 0.0, $13;
     }
 ' "$SUMMARY_FILE"
 

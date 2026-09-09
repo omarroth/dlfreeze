@@ -139,6 +139,107 @@ distro_name() {
     fi
 }
 
+cross_run_direct_policy_selftest() {
+    selftest_script=$0
+    selftest_root=$(mktemp -d)
+    selftest_producer="$selftest_root/frozen-selftest"
+    selftest_log="$selftest_root/validation.log"
+
+    case "$selftest_script" in
+        /*) ;;
+        *) selftest_script=$(pwd)/$selftest_script ;;
+    esac
+    trap 'rm -rf "$selftest_root"' 0 HUP INT TERM
+
+    mkdir -p "$selftest_producer"
+    : > "$selftest_producer/hello.frozen"
+    : > "$selftest_producer/hello.expected"
+    : > "$selftest_producer/exitcode.frozen"
+    : > "$selftest_producer/direct-runtime-alpha.frozen"
+    : > "$selftest_producer/direct-runtime-alpha.expected"
+    : > "$selftest_producer/direct-runtime-alpha.upx.frozen"
+    : > "$selftest_producer/direct-runtime-beta.frozen"
+    : > "$selftest_producer/direct-runtime-beta.expected"
+    printf '%s\n' \
+        '1|runtime-alpha|direct|upx' \
+        '1|runtime-beta|direct|plain' \
+        > "$selftest_producer/direct-contracts.v1"
+
+    if ! FROZEN_DIR="$selftest_root" \
+            FROZEN_GLOB="$selftest_root/frozen-*" \
+            DLFREEZE_REQUIRE_DIRECT_CONTRACTS=1 \
+            DLFREEZE_REQUIRE_ALL_DIRECT_CONTRACTS=1 \
+            sh "$selftest_script" --validate-direct-contract-status-only \
+            > "$selftest_log" 2>&1; then
+        echo "cross-run direct-policy selftest rejected its all-direct control" >&2
+        cat "$selftest_log" >&2
+        return 1
+    fi
+
+    # Mutate exactly one discovered runtime from direct to unsupported while
+    # retaining another direct+UPX runtime.  Aggregate coverage alone therefore
+    # remains satisfied, but the all-direct policy must reject the producer.
+    printf '%s\n' \
+        '1|runtime-alpha|direct|upx' \
+        '1|runtime-beta|unsupported|none' \
+        > "$selftest_producer/direct-contracts.v1"
+    rm -f "$selftest_producer/direct-runtime-beta.frozen" \
+          "$selftest_producer/direct-runtime-beta.expected"
+
+    if ! FROZEN_DIR="$selftest_root" \
+            FROZEN_GLOB="$selftest_root/frozen-*" \
+            DLFREEZE_REQUIRE_DIRECT_CONTRACTS=1 \
+            DLFREEZE_REQUIRE_ALL_DIRECT_CONTRACTS=0 \
+            sh "$selftest_script" --validate-direct-contract-status-only \
+            > "$selftest_log" 2>&1; then
+        echo "cross-run direct-policy selftest lost aggregate control coverage" >&2
+        cat "$selftest_log" >&2
+        return 1
+    fi
+    if FROZEN_DIR="$selftest_root" \
+            FROZEN_GLOB="$selftest_root/frozen-*" \
+            DLFREEZE_REQUIRE_DIRECT_CONTRACTS=1 \
+            DLFREEZE_REQUIRE_ALL_DIRECT_CONTRACTS=1 \
+            sh "$selftest_script" --validate-direct-contract-status-only \
+            > "$selftest_log" 2>&1; then
+        echo "cross-run direct-policy selftest admitted an unsupported runtime" >&2
+        return 1
+    fi
+    if ! grep -F \
+            'all-direct contract policy rejects runtime-beta' \
+            "$selftest_log" >/dev/null; then
+        echo "cross-run direct-policy selftest produced the wrong rejection" >&2
+        cat "$selftest_log" >&2
+        return 1
+    fi
+
+    echo "cross-run all-direct contract policy: PASS"
+}
+
+contract_validation_only=0
+case "${1:-}" in
+    '') ;;
+    --selftest-direct-contract-policy)
+        if [ "$#" -ne 1 ]; then
+            echo "--selftest-direct-contract-policy takes no arguments" >&2
+            exit 2
+        fi
+        cross_run_direct_policy_selftest
+        exit
+        ;;
+    --validate-direct-contract-status-only)
+        if [ "$#" -ne 1 ]; then
+            echo "--validate-direct-contract-status-only takes no arguments" >&2
+            exit 2
+        fi
+        contract_validation_only=1
+        ;;
+    *)
+        echo "unknown cross-run option: $1" >&2
+        exit 2
+        ;;
+esac
+
 echo "========================================================"
 echo "Cross-run: $(uname -m) | $(distro_name)"
 echo "========================================================"
@@ -155,13 +256,24 @@ fi
 # Each producer describes every distinct glibc/musl runtime it found in a
 # small, non-executable status file.  A `direct` entry must have a generic C
 # artifact and expectation; `unsupported` is an explicit capability result.
-# The legacy environment-variable name is retained for workflow compatibility,
-# but Python and Ruby artifacts are no longer part of this coverage contract.
+# Aggregate coverage permits those explicit refusals.  Full portability CI can
+# additionally require every discovered runtime to be direct, independently of
+# its runtime name or producer environment.  The legacy environment-variable
+# name is retained for workflow compatibility, but Python and Ruby artifacts are
+# no longer part of this coverage contract.
 require_direct_contracts=${DLFREEZE_REQUIRE_DIRECT_CONTRACTS:-${DLFREEZE_REQUIRE_RUNTIME_ARTIFACTS:-0}}
 case "$require_direct_contracts" in
     0|1) ;;
     *)
         echo "ERROR: DLFREEZE_REQUIRE_DIRECT_CONTRACTS must be 0 or 1"
+        exit 2
+        ;;
+esac
+require_all_direct_contracts=${DLFREEZE_REQUIRE_ALL_DIRECT_CONTRACTS:-0}
+case "$require_all_direct_contracts" in
+    0|1) ;;
+    *)
+        echo "ERROR: DLFREEZE_REQUIRE_ALL_DIRECT_CONTRACTS must be 0 or 1"
         exit 2
         ;;
 esac
@@ -183,7 +295,8 @@ for src_dir in $FROZEN_GLOB; do
     fi
     contract_status="$src_dir/direct-contracts.v1"
     if [ ! -f "$contract_status" ]; then
-        if [ "$require_direct_contracts" = 1 ]; then
+        if [ "$require_direct_contracts" = 1 ] ||
+           [ "$require_all_direct_contracts" = 1 ]; then
             echo "ERROR: $src_dir has no generic direct-contract status"
             contract_error=1
         fi
@@ -246,6 +359,10 @@ for src_dir in $FROZEN_GLOB; do
                 fi
                 ;;
             unsupported\|none)
+                if [ "$require_all_direct_contracts" = 1 ]; then
+                    echo "ERROR: all-direct contract policy rejects $contract_runtime in $contract_status"
+                    contract_error=1
+                fi
                 if [ -e "$contract_artifact" ] ||
                    [ -e "$contract_expected" ] ||
                    [ -e "$contract_upx" ]; then
@@ -280,6 +397,9 @@ if [ "$require_direct_contracts" = 1 ]; then
         echo "  sources=$contract_source_count direct=$contract_direct_total upx=$contract_upx_total"
         exit 1
     fi
+fi
+if [ "$contract_validation_only" = 1 ]; then
+    exit 0
 fi
 
 # ── Iterate over each source environment's frozen artifacts ────────
@@ -330,7 +450,8 @@ for src_dir in $FROZEN_GLOB; do
                     "$src_env/direct-$contract_runtime.upx.frozen"
             fi
         done < "$contract_status"
-    elif [ "$require_direct_contracts" = 1 ]; then
+    elif [ "$require_direct_contracts" = 1 ] ||
+         [ "$require_all_direct_contracts" = 1 ]; then
         fail "$src_env/direct-contract" "status file not found"
     else
         skip "$src_env/direct-contract" "status file not found"

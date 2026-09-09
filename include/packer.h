@@ -40,7 +40,7 @@ struct pack_options {
     struct data_file_list *data_files; /* non-ELF files to embed       */
 };
 
-/* Create a frozen (self-extracting) ELF binary. */
+/* Create a frozen ELF binary with direct or extraction runtime metadata. */
 int pack_frozen(const struct pack_options *opts);
 
 #endif /* DLFREEZE_PACKER_H */

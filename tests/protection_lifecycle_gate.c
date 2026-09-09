@@ -301,7 +301,7 @@ static int run_anonymous_edge_case(size_t page_size)
     phdr = (Elf64_Phdr *)(source + sizeof(*ehdr));
     memcpy(ehdr->e_ident, ELFMAG, SELFMAG);
     ehdr->e_phoff = sizeof(*ehdr);
-    ehdr->e_phnum = 4;
+    ehdr->e_phnum = 5;
     ehdr->e_phentsize = sizeof(*phdr);
 
     /* A read-only, partially file-backed segment spans two pages. */
@@ -340,6 +340,9 @@ static int run_anonymous_edge_case(size_t page_size)
     phdr[3].p_vaddr = 6 * page_size;
     phdr[3].p_memsz = page_size;
     phdr[3].p_align = page_size;
+
+    phdr[4].p_type = PT_GNU_STACK;
+    phdr[4].p_flags = PF_R | PF_W;
 
     memset(source + page_size, 0xa5, partial_filesz);
     memset(source + 2 * page_size, 0xb6, write_filesz);
@@ -521,10 +524,10 @@ int main(void)
     ehdr = (Elf64_Ehdr *)source;
     phdr = (Elf64_Phdr *)(source + sizeof(*ehdr));
     memset(ehdr, 0, sizeof(*ehdr));
-    memset(phdr, 0, 4 * sizeof(*phdr));
+    memset(phdr, 0, 5 * sizeof(*phdr));
     memcpy(ehdr->e_ident, ELFMAG, SELFMAG);
     ehdr->e_phoff = sizeof(*ehdr);
-    ehdr->e_phnum = 4;
+    ehdr->e_phnum = 5;
     ehdr->e_phentsize = sizeof(*phdr);
 
     phdr[0].p_type = PT_LOAD;
@@ -556,6 +559,9 @@ int main(void)
     phdr[3].p_vaddr = 3 * page_size;
     phdr[3].p_memsz = page_size;
     phdr[3].p_align = page_size;
+
+    phdr[4].p_type = PT_GNU_STACK;
+    phdr[4].p_flags = PF_R | PF_W;
 
     entry.data_size = source_size;
     meta.base_addr = (uintptr_t)target;

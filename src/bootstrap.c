@@ -37,6 +37,21 @@
 #ifndef PROC_SUPER_MAGIC
 #define PROC_SUPER_MAGIC 0x9fa0
 #endif
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+#ifndef MREMAP_MAYMOVE
+#define MREMAP_MAYMOVE 1
+#endif
+#ifndef MREMAP_FIXED
+#define MREMAP_FIXED 2
+#endif
+#ifndef MREMAP_DONTUNMAP
+#define MREMAP_DONTUNMAP 4
+#endif
+#ifndef MADV_WIPEONFORK
+#define MADV_WIPEONFORK 18
+#endif
 
 /*
  * Reserve one program-header slot for the packer to turn into the payload
@@ -138,13 +153,20 @@ static int authenticated_fdinfo_mount_id(int fd, uint64_t *mount_id)
 
     for (;;) {
         static const char field[] = "mnt_id:";
-        ssize_t line_length = getline(&line, &line_capacity, stream);
+        ssize_t line_length;
         char *end;
         char *value;
         uint64_t parsed = 0;
 
-        if (line_length < 0)
+        /* EOF does not define errno.  Clear it before getline so a stream
+         * error is never diagnosed from an unrelated earlier syscall. */
+        errno = 0;
+        line_length = getline(&line, &line_capacity, stream);
+        if (line_length < 0) {
+            if (ferror(stream))
+                saved_errno = errno ? errno : EIO;
             break;
+        }
         end = line + (size_t)line_length;
         if (end > line && end[-1] == '\n')
             end--;
@@ -176,9 +198,6 @@ static int authenticated_fdinfo_mount_id(int fd, uint64_t *mount_id)
         result = 0;
         break;
     }
-    if (result < 0 && ferror(stream))
-        saved_errno = errno ? errno : EIO;
-
 out:
     free(line);
     if (fclose(stream) != 0 && result == 0) {
@@ -794,9 +813,12 @@ created:
         if (chmod_result < 0)
             goto fail_created;
     }
-    if (fstat(workdir_fd, &opened_status) < 0 ||
-        (opened_status.st_mode & 07777) != 0700)
+    if (fstat(workdir_fd, &opened_status) < 0)
         goto fail_created;
+    if ((opened_status.st_mode & 07777) != 0700) {
+        errno = EACCES;
+        goto fail_created;
+    }
     {
         int execution_support = directory_execution_support(workdir_fd);
 
@@ -1817,10 +1839,28 @@ static int full_pread(int fd, void *buffer, size_t size, uint64_t offset)
     return 0;
 }
 
+static int file_revision_matches(const struct stat *left,
+                                 const struct stat *right)
+{
+    return left && right &&
+           left->st_dev == right->st_dev &&
+           left->st_ino == right->st_ino &&
+           left->st_mode == right->st_mode &&
+           left->st_uid == right->st_uid &&
+           left->st_gid == right->st_gid &&
+           left->st_size == right->st_size &&
+           left->st_mtim.tv_sec == right->st_mtim.tv_sec &&
+           left->st_mtim.tv_nsec == right->st_mtim.tv_nsec &&
+           left->st_ctim.tv_sec == right->st_ctim.tv_sec &&
+           left->st_ctim.tv_nsec == right->st_ctim.tv_nsec;
+}
+
 static int files_identical(const char *left, const char *right)
 {
     int left_fd = -1, right_fd = -1;
     struct stat left_st, right_st;
+    struct stat left_after, right_after;
+    struct stat left_path, right_path;
     unsigned char left_buf[16384], right_buf[16384];
     int identical = 0;
 
@@ -1850,6 +1890,19 @@ static int files_identical(const char *left, const char *right)
             goto out;
         offset += (off_t)chunk;
     }
+    /* Establish that each sampled descriptor stayed on one complete file
+     * revision and that its pathname still names that inode.  The kernel
+     * necessarily resolves a literal PT_INTERP pathname again during the
+     * later exec, so this closes races during comparison but cannot make a
+     * mutable system pathname descriptor-bound across execve(). */
+    if (fstat(left_fd, &left_after) < 0 ||
+        fstat(right_fd, &right_after) < 0 ||
+        stat(left, &left_path) < 0 || stat(right, &right_path) < 0 ||
+        !file_revision_matches(&left_st, &left_after) ||
+        !file_revision_matches(&right_st, &right_after) ||
+        !file_revision_matches(&left_after, &left_path) ||
+        !file_revision_matches(&right_after, &right_path))
+        goto out;
     identical = 1;
 
 out:
@@ -1966,7 +2019,7 @@ static int extract(int srcfd, int rootfd, const char *relative_path,
     return finish_extraction_file(rootfd, relative_path, dfd);
 }
 
-/* ---- extract from memory (UPX path) to a file -------------------- */
+/* ---- extract from a canonical mapped payload to a file ----------- */
 static int extract_mem(const uint8_t *base, uint64_t base_foff, int rootfd,
                        const char *relative_path, uint64_t off, uint64_t sz,
                        int exec)
@@ -2981,42 +3034,85 @@ static int bs_proc_self_context_open_at(
 
     context->root_fd = open(proc_root, O_PATH | O_DIRECTORY | O_CLOEXEC |
                                        O_NOFOLLOW);
-    if (context->root_fd < 0 || fstat(context->root_fd, &root_status) < 0 ||
-        !S_ISDIR(root_status.st_mode) || !bs_fd_is_procfs(context->root_fd))
+    if (context->root_fd < 0) {
+        saved_errno = errno ? errno : EIO;
         goto fail;
+    }
+    if (fstat(context->root_fd, &root_status) < 0) {
+        saved_errno = errno ? errno : EIO;
+        goto fail;
+    }
+    if (!S_ISDIR(root_status.st_mode)) {
+        saved_errno = ENOTDIR;
+        goto fail;
+    }
+    errno = 0;
+    if (!bs_fd_is_procfs(context->root_fd)) {
+        saved_errno = errno ? errno : ENODEV;
+        goto fail;
+    }
     context->device = root_status.st_dev;
 
     self_link_fd = openat(context->root_fd, "self",
                           O_PATH | O_NOFOLLOW | O_CLOEXEC);
-    if (!bs_proc_entry_status(self_link_fd, context->device, S_IFLNK,
-                              &self_link_status))
+    if (self_link_fd < 0) {
+        saved_errno = errno ? errno : EIO;
         goto fail;
+    }
+    errno = 0;
+    if (!bs_proc_entry_status(self_link_fd, context->device, S_IFLNK,
+                              &self_link_status)) {
+        saved_errno = errno ? errno : ESTALE;
+        goto fail;
+    }
     pid_length = readlinkat(context->root_fd, "self", pid_component,
                             sizeof(pid_component));
-    if (pid_length <= 0 || (size_t)pid_length >= sizeof(pid_component) ||
-        !bs_proc_pid_component(pid_component, (size_t)pid_length))
+    if (pid_length < 0) {
+        saved_errno = errno ? errno : EIO;
         goto fail;
+    }
+    if (pid_length == 0 || (size_t)pid_length >= sizeof(pid_component) ||
+        !bs_proc_pid_component(pid_component, (size_t)pid_length)) {
+        saved_errno = EINVAL;
+        goto fail;
+    }
     pid_component[pid_length] = '\0';
 
     context->self_fd = openat(context->root_fd, "self",
                               O_PATH | O_DIRECTORY | O_CLOEXEC);
+    if (context->self_fd < 0) {
+        saved_errno = errno ? errno : EIO;
+        goto fail;
+    }
     pid_fd = openat(context->root_fd, pid_component,
                     O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    if (!bs_proc_entry_status(context->self_fd, context->device, S_IFDIR,
-                              &self_status) ||
-        !bs_proc_entry_status(pid_fd, context->device, S_IFDIR,
-                              &pid_status) ||
-        self_status.st_dev != pid_status.st_dev ||
-        self_status.st_ino != pid_status.st_ino)
+    if (pid_fd < 0) {
+        saved_errno = errno ? errno : EIO;
         goto fail;
+    }
+    errno = 0;
+    if (!bs_proc_entry_status(context->self_fd, context->device, S_IFDIR,
+                              &self_status)) {
+        saved_errno = errno ? errno : ESTALE;
+        goto fail;
+    }
+    errno = 0;
+    if (!bs_proc_entry_status(pid_fd, context->device, S_IFDIR,
+                              &pid_status)) {
+        saved_errno = errno ? errno : ESTALE;
+        goto fail;
+    }
+    if (self_status.st_dev != pid_status.st_dev ||
+        self_status.st_ino != pid_status.st_ino) {
+        saved_errno = ESTALE;
+        goto fail;
+    }
 
     close(pid_fd);
     close(self_link_fd);
     return 0;
 
 fail:
-    if (errno)
-        saved_errno = errno;
     if (pid_fd >= 0)
         close(pid_fd);
     if (self_link_fd >= 0)
@@ -3043,32 +3139,57 @@ static int bs_proc_self_executable_open(
     }
     link_fd = openat(context->self_fd, "exe",
                      O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    if (link_fd < 0) {
+        saved_errno = errno ? errno : EIO;
+        goto fail;
+    }
+    errno = 0;
     if (!bs_proc_entry_status(link_fd, context->device, S_IFLNK,
-                              &link_status))
+                              &link_status)) {
+        saved_errno = errno ? errno : ESTALE;
         goto fail;
+    }
     executable_fd = openat(context->self_fd, "exe", O_RDONLY | O_CLOEXEC);
-    if (executable_fd < 0 || fstat(executable_fd, &executable_status) < 0 ||
-        !S_ISREG(executable_status.st_mode) || executable_status.st_ino == 0)
+    if (executable_fd < 0) {
+        saved_errno = errno ? errno : EIO;
         goto fail;
+    }
+    if (fstat(executable_fd, &executable_status) < 0) {
+        saved_errno = errno ? errno : EIO;
+        goto fail;
+    }
+    if (!S_ISREG(executable_status.st_mode) ||
+        executable_status.st_ino == 0) {
+        saved_errno = ESTALE;
+        goto fail;
+    }
 
     /* Procfs entries cannot normally be replaced, but verifying the pinned
      * link again makes mount manipulation fail closed rather than silently
      * changing which executable the followed open names. */
     link_after_fd = openat(context->self_fd, "exe",
                            O_PATH | O_NOFOLLOW | O_CLOEXEC);
-    if (!bs_proc_entry_status(link_after_fd, context->device, S_IFLNK,
-                              &link_after_status) ||
-        link_status.st_dev != link_after_status.st_dev ||
-        link_status.st_ino != link_after_status.st_ino)
+    if (link_after_fd < 0) {
+        saved_errno = errno ? errno : EIO;
         goto fail;
+    }
+    errno = 0;
+    if (!bs_proc_entry_status(link_after_fd, context->device, S_IFLNK,
+                              &link_after_status)) {
+        saved_errno = errno ? errno : ESTALE;
+        goto fail;
+    }
+    if (link_status.st_dev != link_after_status.st_dev ||
+        link_status.st_ino != link_after_status.st_ino) {
+        saved_errno = ESTALE;
+        goto fail;
+    }
 
     close(link_after_fd);
     close(link_fd);
     return executable_fd;
 
 fail:
-    if (errno)
-        saved_errno = errno;
     if (link_after_fd >= 0)
         close(link_after_fd);
     if (link_fd >= 0)
@@ -3304,7 +3425,8 @@ static int manifest_is_valid(const struct dlfrz_footer *footer,
                                        DLFRZ_FLAG_DATA_NEGATIVE |
                                        DLFRZ_FLAG_DATA_DIRECTORY);
 
-        if (entries[i].name_offset >= footer->strtab_size)
+        if (entries[i].name_offset >= footer->strtab_size ||
+            !dlfrz_manifest_entry_timestamps_canonical(&entries[i]))
             goto out;
         refs[ref_count++] = (struct manifest_string_ref) {
             entries[i].name_offset, i, MANIFEST_STRING_NAME
@@ -3603,14 +3725,14 @@ static int direct_elf_metadata_is_valid(
         int phdr_translation_readable = 0;
         int saw_load_header = 0;
         /* Older GCC data-flow analysis does not reliably correlate the
-         * have_tls_phdr guard with the whole-structure assignment below.
-         * Keep the inactive state defined as well; it is never consumed, but
+         * presence guards with the whole-structure assignments below.  Keep
+         * the inactive states defined as well; they are never consumed, but
          * doing so makes that invariant explicit to every supported compiler. */
         Elf64_Phdr tls_phdr = {0};
         int have_tls_phdr = 0;
-        Elf64_Phdr dynamic_phdr;
+        Elf64_Phdr dynamic_phdr = {0};
         int have_dynamic_phdr = 0;
-        Elf64_Phdr self_phdr;
+        Elf64_Phdr self_phdr = {0};
         int have_self_phdr = 0;
         uint64_t phdr_file_end;
 
@@ -3852,7 +3974,8 @@ static int direct_metadata_is_valid(const uint8_t *mem, uint64_t mem_foff,
         const struct dlfrz_entry *entry = &entries[i];
         const struct dlfrz_lib_meta *meta = &metas[i];
 
-        if ((meta->flags & ~metadata_flag_mask) != 0 ||
+        if ((entry->flags & DLFRZ_FLAG_INTERP_KERNEL_ONLY) != 0 ||
+            (meta->flags & ~metadata_flag_mask) != 0 ||
             meta->_reserved != 0 ||
             (meta->flags & entry_type_mask) !=
                 (entry->flags & entry_type_mask) ||
@@ -4042,6 +4165,1009 @@ out:
     free(intervals);
     free(refs);
     return valid;
+}
+
+/* A contained proof has fixed overhead (one clone/reap, a bounded procfs VMA
+ * check, and the prospective remap syscalls).  Below this amount, anonymous
+ * copy is generally cheaper and avoids adding a process to tiny launches. */
+#ifndef BS_MREMAP_MIN_STARTUP_BYTES
+#define BS_MREMAP_MIN_STARTUP_BYTES (UINT64_C(4) * 1024 * 1024)
+#endif
+#define BS_MREMAP_WAIT_CLONE UINT32_C(0x80000000)
+
+#ifdef DLFREEZE_BOOTSTRAP_FILEBACK_GATE
+static size_t g_bs_mremap_clone_attempts;
+#endif
+
+enum bs_mremap_probe_status {
+    /* Nonzero, uncommon values cannot be confused with an unmodified wait
+     * status or with ordinary program exit conventions. */
+    BS_MREMAP_PROBE_READY = 72,
+    BS_MREMAP_PROBE_DECLINED = 73,
+    BS_MREMAP_PROBE_READY_WITH_COOKIE = 74,
+    BS_MREMAP_PROBE_COOKIE_ONLY = 75
+};
+
+struct bs_mremap_range {
+    uintptr_t source;
+    uintptr_t target;
+    size_t length;
+    uint64_t file_offset;
+};
+
+/* Re-derive exactly the complete, entry-owned page prefix map_object may
+ * transfer for one PT_LOAD.  Returning zero means that the segment remains
+ * on the bounded copy path; malformed/overflowing geometry returns -1. */
+static int bs_startup_mremap_range(
+    const uint8_t *mem, uint64_t mem_foff,
+    const struct dlfrz_entry *entry,
+    const struct dlfrz_lib_meta *meta,
+    const Elf64_Phdr *load, uint64_t page_size,
+    struct bs_mremap_range *range)
+{
+    uint64_t page_mask;
+    uint64_t page_delta;
+    uint64_t page_offset;
+    uint64_t page_vaddr;
+    uint64_t map_input;
+    uint64_t map_length;
+    uint64_t available;
+    uint64_t entry_delta;
+    uint64_t source_delta;
+    uint64_t source_value;
+    uint64_t target_value;
+    uint64_t source_end;
+    uint64_t target_end;
+    uint64_t file_offset;
+
+    if (!mem || !entry || !meta || !load || !range ||
+        page_size == 0 || (page_size & (page_size - 1)) != 0)
+        return -1;
+    if (load->p_type != PT_LOAD || load->p_memsz == 0 ||
+        load->p_filesz == 0)
+        return 0;
+    if (load->p_offset > entry->data_size ||
+        load->p_filesz > entry->data_size - load->p_offset ||
+        load->p_filesz > load->p_memsz ||
+        entry->data_offset < mem_foff)
+        return -1;
+
+    page_mask = page_size - 1;
+    page_delta = load->p_vaddr & page_mask;
+    if (page_delta != (load->p_offset & page_mask))
+        return 0;
+    page_offset = load->p_offset & ~page_mask;
+    page_vaddr = load->p_vaddr & ~page_mask;
+    if (!u64_add_checked(page_delta, load->p_filesz, &map_input) ||
+        !u64_align_up_checked(map_input, page_size, &map_length) ||
+        page_offset > entry->data_size)
+        return -1;
+    available = entry->data_size - page_offset;
+    if (map_length > available)
+        map_length = available & ~page_mask;
+    if (map_length <= page_delta)
+        return 0;
+    if (map_length > SIZE_MAX)
+        return -1;
+
+    entry_delta = entry->data_offset - mem_foff;
+    if (!u64_add_checked(entry_delta, page_offset, &source_delta) ||
+        source_delta > UINTPTR_MAX ||
+        (uintptr_t)mem > UINTPTR_MAX - (uintptr_t)source_delta)
+        return -1;
+    source_value = (uint64_t)((uintptr_t)mem + (uintptr_t)source_delta);
+    if (!u64_add_checked(meta->base_addr, page_vaddr, &target_value) ||
+        source_value > UINTPTR_MAX || target_value > UINTPTR_MAX ||
+        (source_value & page_mask) != 0 ||
+        (target_value & page_mask) != 0 ||
+        !u64_add_checked(source_value, map_length, &source_end) ||
+        !u64_add_checked(target_value, map_length, &target_end) ||
+        source_end > UINTPTR_MAX || target_end > UINTPTR_MAX)
+        return -1;
+    if (source_value < target_end && target_value < source_end)
+        return 0;
+    if (!u64_add_checked(entry->data_offset, page_offset, &file_offset) ||
+        map_length > UINT64_MAX - file_offset)
+        return -1;
+
+    range->source = (uintptr_t)source_value;
+    range->target = (uintptr_t)target_value;
+    range->length = (size_t)map_length;
+    range->file_offset = file_offset;
+    return 1;
+}
+
+struct bs_startup_mremap_plan {
+    /* Loader order is semantic when two targets use the same source page. */
+    struct bs_mremap_range *ranges;
+    /* A separately sorted copy drives non-overlapping target reservations
+     * and the single-pass smaps proof. */
+    struct bs_mremap_range *targets;
+    size_t count;
+    uint64_t total_bytes;
+};
+
+static void bs_startup_mremap_plan_destroy(
+    struct bs_startup_mremap_plan *plan)
+{
+    if (!plan)
+        return;
+    free(plan->targets);
+    free(plan->ranges);
+    memset(plan, 0, sizeof(*plan));
+}
+
+/* Scan one representative for every exact startup-source alias group.
+ * direct_metadata_is_valid() has already authenticated the same records, but
+ * retain complete local bounds checks so this optional proof cannot become
+ * authority if call ordering changes later.  A NULL output prices the vector;
+ * the second parent-side pass fills it once for the disposable child. */
+static int bs_startup_mremap_collect(
+    const uint8_t *mem, uint64_t mem_foff,
+    const struct dlfrz_lib_meta *metas,
+    const struct dlfrz_entry *entries,
+    uint32_t num_entries, uint64_t page_size,
+    struct bs_mremap_range *ranges, size_t range_capacity,
+    size_t *range_count_out, uint64_t *total_bytes_out)
+{
+    uint64_t total = 0;
+    size_t range_count = 0;
+
+    if (!mem || !metas || !entries || num_entries == 0 ||
+        page_size == 0 || (page_size & (page_size - 1)) != 0)
+        return 0;
+    for (uint32_t i = 0; i < num_entries; i++) {
+        const struct dlfrz_entry *entry = &entries[i];
+        const struct dlfrz_lib_meta *meta = &metas[i];
+        const Elf64_Ehdr *ehdr;
+        uint64_t entry_delta;
+        int duplicate = 0;
+
+        if (!direct_entry_is_startup_mapped(entry, meta))
+            continue;
+        for (uint32_t previous = 0; previous < i; previous++) {
+            if (!direct_entry_is_startup_mapped(
+                    &entries[previous], &metas[previous]))
+                continue;
+            if (entries[previous].data_offset == entry->data_offset &&
+                entries[previous].data_size == entry->data_size) {
+                duplicate = 1;
+                break;
+            }
+        }
+        if (duplicate)
+            continue;
+        if (entry->data_offset < mem_foff ||
+            entry->data_offset - mem_foff > SIZE_MAX ||
+            entry->data_size < sizeof(*ehdr))
+            return 0;
+        entry_delta = entry->data_offset - mem_foff;
+        if (entry_delta > UINTPTR_MAX ||
+            (uintptr_t)mem > UINTPTR_MAX - (uintptr_t)entry_delta)
+            return 0;
+        ehdr = (const Elf64_Ehdr *)
+            ((uintptr_t)mem + (uintptr_t)entry_delta);
+        if (ehdr->e_phentsize != sizeof(Elf64_Phdr) ||
+            ehdr->e_phnum == 0 || ehdr->e_phnum == PN_XNUM ||
+            ehdr->e_phoff > entry->data_size ||
+            (uint64_t)ehdr->e_phnum >
+                (entry->data_size - ehdr->e_phoff) /
+                    sizeof(Elf64_Phdr))
+            return 0;
+
+        for (uint16_t p = 0; p < ehdr->e_phnum; p++) {
+            Elf64_Phdr load;
+            struct bs_mremap_range range;
+            int eligible;
+
+            memcpy(&load,
+                   (const uint8_t *)ehdr + ehdr->e_phoff +
+                       (size_t)p * sizeof(load),
+                   sizeof(load));
+            eligible = bs_startup_mremap_range(
+                mem, mem_foff, entry, meta, &load, page_size, &range);
+            if (eligible < 0)
+                return 0;
+            if (!eligible)
+                continue;
+            if (total > UINT64_MAX - range.length ||
+                range_count == SIZE_MAX ||
+                (ranges && range_count >= range_capacity))
+                return 0;
+            total += range.length;
+            if (ranges)
+                ranges[range_count] = range;
+            range_count++;
+        }
+    }
+    if (range_count_out)
+        *range_count_out = range_count;
+    if (total_bytes_out)
+        *total_bytes_out = total;
+    return range_count != 0;
+}
+
+static int bs_mremap_target_cmp(const void *left_pointer,
+                                const void *right_pointer)
+{
+    const struct bs_mremap_range *left = left_pointer;
+    const struct bs_mremap_range *right = right_pointer;
+
+    if (left->target < right->target)
+        return -1;
+    if (left->target > right->target)
+        return 1;
+    if (left->length < right->length)
+        return -1;
+    if (left->length > right->length)
+        return 1;
+    return 0;
+}
+
+static int bs_mremap_source_cmp(const void *left_pointer,
+                                const void *right_pointer)
+{
+    const struct bs_mremap_range *left = left_pointer;
+    const struct bs_mremap_range *right = right_pointer;
+
+    if (left->source < right->source)
+        return -1;
+    if (left->source > right->source)
+        return 1;
+    if (left->length < right->length)
+        return -1;
+    if (left->length > right->length)
+        return 1;
+    return 0;
+}
+
+static int bs_startup_mremap_plan_build(
+    const uint8_t *mem, uint64_t mem_foff,
+    const struct dlfrz_lib_meta *metas,
+    const struct dlfrz_entry *entries,
+    uint32_t num_entries, uint64_t page_size,
+    struct bs_startup_mremap_plan *plan)
+{
+    struct bs_mremap_range *sources = NULL;
+    size_t count = 0;
+    size_t filled_count = 0;
+    uint64_t total = 0;
+    uint64_t filled_total = 0;
+    int valid = 0;
+
+    if (!plan)
+        return 0;
+    memset(plan, 0, sizeof(*plan));
+    if (!bs_startup_mremap_collect(
+            mem, mem_foff, metas, entries, num_entries, page_size,
+            NULL, 0, &count, &total) ||
+        count > SIZE_MAX / sizeof(*plan->ranges))
+        return 0;
+    plan->ranges = malloc(count * sizeof(*plan->ranges));
+    plan->targets = malloc(count * sizeof(*plan->targets));
+    sources = malloc(count * sizeof(*sources));
+    if (!plan->ranges || !plan->targets || !sources)
+        goto out;
+    if (!bs_startup_mremap_collect(
+            mem, mem_foff, metas, entries, num_entries, page_size,
+            plan->ranges, count, &filled_count, &filled_total) ||
+        filled_count != count || filled_total != total)
+        goto out;
+    memcpy(plan->targets, plan->ranges, count * sizeof(*plan->targets));
+    memcpy(sources, plan->ranges, count * sizeof(*sources));
+    qsort(plan->targets, count, sizeof(*plan->targets),
+          bs_mremap_target_cmp);
+    qsort(sources, count, sizeof(*sources), bs_mremap_source_cmp);
+
+    /* The loader's ordinary object reservations have already been checked,
+     * but the proof remains independently fail-closed.  Overlapping target
+     * transfers would make their final backing order-dependent; a target
+     * which aliases any source could destroy a later proof input. */
+    for (size_t i = 1; i < count; i++) {
+        uint64_t previous_end;
+
+        if (!u64_add_checked(
+                (uint64_t)plan->targets[i - 1].target,
+                plan->targets[i - 1].length, &previous_end) ||
+            previous_end > UINTPTR_MAX ||
+            (uint64_t)plan->targets[i].target < previous_end)
+            goto out;
+    }
+    {
+        size_t source_index = 0;
+        size_t target_index = 0;
+
+        while (source_index < count && target_index < count) {
+            uint64_t source_end;
+            uint64_t target_end;
+
+            if (!u64_add_checked(
+                    (uint64_t)sources[source_index].source,
+                    sources[source_index].length, &source_end) ||
+                !u64_add_checked(
+                    (uint64_t)plan->targets[target_index].target,
+                    plan->targets[target_index].length, &target_end) ||
+                source_end > UINTPTR_MAX || target_end > UINTPTR_MAX)
+                goto out;
+            if (source_end <=
+                    (uint64_t)plan->targets[target_index].target) {
+                source_index++;
+            } else if (target_end <=
+                           (uint64_t)sources[source_index].source) {
+                target_index++;
+            } else {
+                goto out;
+            }
+        }
+    }
+    plan->count = count;
+    plan->total_bytes = total;
+    valid = 1;
+out:
+    free(sources);
+    if (!valid)
+        bs_startup_mremap_plan_destroy(plan);
+    return valid;
+}
+
+static int bs_startup_mremap_plan_matches_payload(
+    const struct bs_startup_mremap_plan *plan,
+    uint64_t payload_vaddr, uint64_t payload_filesz,
+    uint64_t payload_foff)
+{
+    uint64_t payload_end;
+
+    if (!plan || !plan->ranges || plan->count == 0 ||
+        payload_vaddr > UINTPTR_MAX || payload_filesz == 0 ||
+        !u64_add_checked(payload_vaddr, payload_filesz, &payload_end) ||
+        payload_end > UINTPTR_MAX ||
+        payload_filesz > UINT64_MAX - payload_foff)
+        return 0;
+    for (size_t i = 0; i < plan->count; i++) {
+        const struct bs_mremap_range *range = &plan->ranges[i];
+        uint64_t source_end;
+        uint64_t expected_file_offset;
+
+        if ((uint64_t)range->source < payload_vaddr ||
+            !u64_add_checked((uint64_t)range->source, range->length,
+                             &source_end) ||
+            source_end > payload_end ||
+            !u64_add_checked(payload_foff,
+                             (uint64_t)range->source - payload_vaddr,
+                             &expected_file_offset) ||
+            expected_file_offset != range->file_offset)
+            return 0;
+    }
+    return 1;
+}
+
+static int bs_mremap_targets_finish_vma(
+    const struct bs_smaps_evidence *evidence,
+    const struct bs_startup_mremap_plan *plan,
+    size_t *range_index, uint64_t *cursor)
+{
+    const struct bs_maps_entry *entry = &evidence->entry;
+
+    if (!evidence->relevant)
+        return 1;
+    if (!evidence->have_anonymous || !evidence->have_swap ||
+        !evidence->have_vm_flags || evidence->anonymous_kb != 0 ||
+        evidence->swap_kb != 0 || evidence->userfaultfd)
+        return 0;
+
+    while (*range_index < plan->count && entry->end > *cursor) {
+        const struct bs_mremap_range *range =
+            &plan->targets[*range_index];
+        uint64_t range_end;
+        uint64_t overlap_start;
+        uint64_t overlap_end;
+        uint64_t actual_file_offset;
+        uint64_t expected_file_offset;
+
+        if (!u64_add_checked((uint64_t)range->target, range->length,
+                             &range_end))
+            return 0;
+        overlap_start = *cursor;
+        if (overlap_start < (uint64_t)range->target)
+            overlap_start = (uint64_t)range->target;
+        if (entry->end <= overlap_start)
+            break;
+        if (entry->start > overlap_start ||
+            !u64_add_checked(entry->file_offset,
+                             overlap_start - entry->start,
+                             &actual_file_offset) ||
+            !u64_add_checked(range->file_offset,
+                             overlap_start - (uint64_t)range->target,
+                             &expected_file_offset) ||
+            actual_file_offset != expected_file_offset)
+            return 0;
+        overlap_end = entry->end < range_end ? entry->end : range_end;
+        if (overlap_end <= overlap_start)
+            return 0;
+        *cursor = overlap_end;
+        if (*cursor != range_end)
+            break;
+        (*range_index)++;
+        if (*range_index < plan->count)
+            *cursor = (uint64_t)plan->targets[*range_index].target;
+    }
+    return 1;
+}
+
+/* DONTUNMAP itself creates exact child-only target VMAs.  Proving those
+ * mappings avoids treating unrelated captured DATA pages in the source
+ * payload as startup authority while still detecting COW, swap, userfaultfd,
+ * wrong-file, and wrong-offset state in every byte the loader may transfer. */
+static int bs_mremap_targets_smaps_stream_matches(
+    FILE *stream, const struct stat *executable,
+    const struct bs_startup_mremap_plan *plan)
+{
+    unsigned char line[BS_MAX_MAPS_LINE];
+    struct bs_smaps_evidence evidence = {0};
+    size_t range_index = 0;
+    uint64_t cursor;
+    uint64_t previous_end = 0;
+    int have_previous = 0;
+
+    if (!stream || !executable || executable->st_ino == 0 || !plan ||
+        !plan->targets || plan->count == 0)
+        return 0;
+    cursor = (uint64_t)plan->targets[0].target;
+
+    for (uint64_t count = 0; count < BS_MAX_SMAPS_LINES; count++) {
+        struct bs_maps_entry entry;
+        size_t length;
+        int line_status = bs_read_maps_line(stream, line, sizeof(line),
+                                            &length);
+
+        if (line_status == 0) {
+            if (!bs_mremap_targets_finish_vma(
+                    &evidence, plan, &range_index, &cursor))
+                return 0;
+            return range_index == plan->count;
+        }
+        if (line_status < 0)
+            return 0;
+
+        size_t header_prefix = 0;
+        unsigned ignored_digit;
+
+        while (header_prefix < length &&
+               bs_maps_digit(line[header_prefix], 16, &ignored_digit))
+            header_prefix++;
+        if (header_prefix != 0 && header_prefix < length &&
+            line[header_prefix] == '-') {
+            if (!bs_parse_maps_entry(line, length, &entry) ||
+                (have_previous && entry.start < previous_end) ||
+                !bs_mremap_targets_finish_vma(
+                    &evidence, plan, &range_index, &cursor))
+                return 0;
+            if (range_index == plan->count)
+                return 1;
+            previous_end = entry.end;
+            have_previous = 1;
+            memset(&evidence, 0, sizeof(evidence));
+            evidence.have_header = 1;
+            evidence.entry = entry;
+
+            if (entry.end <= cursor)
+                continue;
+            if (entry.start > cursor || !entry.private_readonly ||
+                entry.dev_major != (uint64_t)major(executable->st_dev) ||
+                entry.dev_minor != (uint64_t)minor(executable->st_dev) ||
+                entry.inode != (uint64_t)executable->st_ino)
+                return 0;
+            evidence.relevant = 1;
+            continue;
+        }
+
+        if (!evidence.have_header || !evidence.relevant)
+            continue;
+        if (length >= sizeof("Anonymous:") - 1 &&
+            memcmp(line, "Anonymous:", sizeof("Anonymous:") - 1) == 0) {
+            if (evidence.have_anonymous ||
+                !bs_smaps_kb_field(line, length, "Anonymous:",
+                                   &evidence.anonymous_kb))
+                return 0;
+            evidence.have_anonymous = 1;
+        } else if (length >= sizeof("Swap:") - 1 &&
+                   memcmp(line, "Swap:", sizeof("Swap:") - 1) == 0) {
+            if (evidence.have_swap ||
+                !bs_smaps_kb_field(line, length, "Swap:",
+                                   &evidence.swap_kb))
+                return 0;
+            evidence.have_swap = 1;
+        } else if (length >= sizeof("VmFlags:") - 1 &&
+                   memcmp(line, "VmFlags:", sizeof("VmFlags:") - 1) == 0) {
+            if (evidence.have_vm_flags ||
+                !bs_smaps_vm_flags(line, length, &evidence.userfaultfd))
+                return 0;
+            evidence.have_vm_flags = 1;
+        }
+    }
+    return 0;
+}
+
+static int bs_startup_mremap_target_unions(
+    const struct bs_startup_mremap_plan *plan, int reserve)
+{
+    int valid = 1;
+
+    if (!plan || !plan->targets || plan->count == 0)
+        return 0;
+    for (size_t begin = 0; begin < plan->count;) {
+        uintptr_t start = plan->targets[begin].target;
+        uint64_t end_value;
+        size_t next = begin + 1;
+        size_t union_length;
+
+        if (!u64_add_checked((uint64_t)start,
+                             plan->targets[begin].length, &end_value) ||
+            end_value > UINTPTR_MAX)
+            return 0;
+        while (next < plan->count &&
+               (uint64_t)plan->targets[next].target == end_value) {
+            if (!u64_add_checked(
+                    (uint64_t)plan->targets[next].target,
+                    plan->targets[next].length, &end_value) ||
+                end_value > UINTPTR_MAX)
+                return 0;
+            next++;
+        }
+        if (end_value < (uint64_t)start ||
+            end_value - (uint64_t)start > SIZE_MAX)
+            return 0;
+        union_length = (size_t)(end_value - (uint64_t)start);
+        if (reserve) {
+            void *mapping = mmap(
+                (void *)start, union_length, PROT_NONE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+
+            if (mapping != (void *)start)
+                return 0;
+        } else if (munmap((void *)start, union_length) < 0) {
+            valid = 0;
+        }
+        begin = next;
+    }
+    return valid;
+}
+
+static int bs_startup_mremap_transfer_batch(
+    const struct bs_startup_mremap_plan *plan)
+{
+#if defined(SYS_mremap)
+    if (!plan || !plan->ranges || plan->count == 0)
+        return 0;
+    for (size_t i = 0; i < plan->count; i++) {
+        const struct bs_mremap_range *range = &plan->ranges[i];
+        void *moved = (void *)syscall(
+            SYS_mremap, (void *)range->source,
+            range->length, range->length,
+            MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP,
+            (void *)range->target);
+
+        if (moved != (void *)range->target)
+            return 0;
+    }
+    return 1;
+#else
+    (void)plan;
+    return 0;
+#endif
+}
+
+/* Reuse the bounded smaps grammar, but require a positively observed wf
+ * flag for the complete anonymous cookie page.  Checking the kernel's VMA
+ * state also rejects a SIGSYS handler which resumes an unexecuted madvise
+ * with an apparent success return. */
+static int bs_runtime_fork_cookie_smaps_matches(
+    FILE *stream, uintptr_t cookie, size_t page_size)
+{
+    unsigned char line[BS_MAX_MAPS_LINE];
+    uint64_t cookie_end;
+    uint64_t previous_end = 0;
+    int relevant = 0;
+    int have_flags = 0;
+
+    if (!stream || cookie == 0 || page_size < sizeof(uint32_t) ||
+        !u64_add_checked(cookie, page_size, &cookie_end))
+        return 0;
+    for (uint64_t count = 0; count < BS_MAX_SMAPS_LINES; count++) {
+        struct bs_maps_entry entry;
+        size_t length;
+        size_t prefix = 0;
+        unsigned digit;
+        int status = bs_read_maps_line(stream, line, sizeof(line), &length);
+
+        if (status == 0)
+            return relevant && have_flags;
+        if (status < 0)
+            return 0;
+        while (prefix < length && bs_maps_digit(line[prefix], 16, &digit))
+            prefix++;
+        if (prefix != 0 && prefix < length && line[prefix] == '-') {
+            if (!bs_parse_maps_entry(line, length, &entry) ||
+                entry.start < previous_end)
+                return 0;
+            if (relevant)
+                return have_flags;
+            previous_end = entry.end;
+            if (entry.end <= cookie)
+                continue;
+            if (entry.start > cookie || entry.end < cookie_end ||
+                entry.inode != 0 || entry.dev_major != 0 ||
+                entry.dev_minor != 0 || entry.file_offset != 0)
+                return 0;
+            relevant = 1;
+        } else if (relevant && length >= sizeof("VmFlags:") - 1 &&
+                   memcmp(line, "VmFlags:", sizeof("VmFlags:") - 1) == 0) {
+            const unsigned char *cursor = line + sizeof("VmFlags:") - 1;
+            const unsigned char *end = line + length;
+            int userfaultfd = 0;
+            unsigned flags = 0;
+
+            if (have_flags ||
+                !bs_smaps_vm_flags(line, length, &userfaultfd) ||
+                userfaultfd)
+                return 0;
+            while (cursor < end) {
+                if (!bs_maps_spaces(&cursor, end))
+                    return 0;
+                if (cursor == end)
+                    break;
+                /* The complete grammar was validated above. */
+                if (cursor[0] == 'w' && cursor[1] == 'f')
+                    flags |= 1U;
+                else if (cursor[0] == 'r' && cursor[1] == 'd')
+                    flags |= 2U;
+                else if (cursor[0] == 'w' && cursor[1] == 'r')
+                    flags |= 4U;
+                else if ((cursor[0] == 's' && cursor[1] == 'h') ||
+                         (cursor[0] == 'e' && cursor[1] == 'x') ||
+                         (cursor[0] == 'd' && cursor[1] == 'c') ||
+                         (cursor[0] == 'i' && cursor[1] == 'o') ||
+                         (cursor[0] == 'p' && cursor[1] == 'f'))
+                    return 0;
+                cursor += 2;
+            }
+            if (flags != 7U)
+                return 0;
+            have_flags = 1;
+        }
+    }
+    return 0;
+}
+
+/* This exact helper runs first in the already-required disposable startup
+ * probe and only then in its parent, under the inherited startup policy.
+ * No target resolver, constructor, or thread callback can run between them.
+ * Keep madvise and the authenticated verification together: neither its
+ * return value nor a child-only VMA flag establishes the parent's cookie. */
+static int bs_runtime_fork_cookie_establish(
+    volatile uint32_t *cookie, size_t page_size)
+{
+    struct bs_proc_self_context context = {.root_fd = -1, .self_fd = -1};
+    struct stat status;
+    FILE *stream = NULL;
+    int fd = -1;
+    int ready = 0;
+
+    if (!cookie || syscall(SYS_madvise, (void *)cookie, page_size,
+                            MADV_WIPEONFORK) != 0 ||
+        bs_proc_self_context_open_at("/proc", &context) < 0)
+        goto out;
+    fd = openat(context.self_fd, "smaps", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (!bs_proc_entry_status(fd, context.device, S_IFREG, &status))
+        goto out;
+    stream = fdopen(fd, "r");
+    if (!stream)
+        goto out;
+    fd = -1;
+    ready = bs_runtime_fork_cookie_smaps_matches(
+        stream, (uintptr_t)cookie, page_size);
+    if (fclose(stream) != 0)
+        ready = 0;
+    stream = NULL;
+out:
+    if (stream)
+        fclose(stream);
+    if (fd >= 0)
+        close(fd);
+    bs_proc_self_context_close(&context);
+    return ready;
+}
+
+/* The remap plan contains only eligible file-page prefixes.  Its endpoints
+ * can lie inside noneligible LOAD pages, BSS, guard pages, or the assigned
+ * range of a dormant dlopen object.  Derive the conservative full manifest
+ * envelope, including all four loader-owned trailing pages, before choosing
+ * any address for state which must survive every later object mapping. */
+static int bs_runtime_fork_cookie_envelope(
+    const struct dlfrz_lib_meta *metas, uint32_t num_entries,
+    size_t page_size, uint64_t *lo_out, uint64_t *hi_out)
+{
+    uint64_t lo = UINT64_MAX;
+    uint64_t hi = 0;
+
+    if (!metas || num_entries == 0 || page_size < sizeof(uint32_t) ||
+        (page_size & (page_size - 1)) != 0 || page_size > UINT64_MAX / 4)
+        return 0;
+    for (uint32_t i = 0; i < num_entries; i++) {
+        uint64_t start, aligned_hi, end;
+
+        if (metas[i].flags & DLFRZ_FLAG_DATA)
+            continue;
+        if (metas[i].vaddr_hi <= metas[i].vaddr_lo ||
+            !u64_add_checked(metas[i].base_addr,
+                             metas[i].vaddr_lo & ~(uint64_t)(page_size - 1),
+                             &start) ||
+            !u64_align_up_checked(metas[i].vaddr_hi, page_size, &aligned_hi) ||
+            !u64_add_checked(metas[i].base_addr, aligned_hi, &end) ||
+            !u64_add_checked(end, 4 * page_size, &end) ||
+            end > UINTPTR_MAX)
+            return 0;
+        if (start < lo)
+            lo = start;
+        if (end > hi)
+            hi = end;
+    }
+    if (hi <= lo)
+        return 0;
+    *lo_out = lo;
+    *hi_out = hi;
+    return 1;
+}
+
+/* mmap may ignore a nonfixed hint.  Positively check its actual result and
+ * decline this optional state if both attempts land in the manifest span. */
+static volatile uint32_t *bs_runtime_fork_cookie_allocate(
+    const struct dlfrz_lib_meta *metas, uint32_t num_entries, size_t page_size)
+{
+    uintptr_t hints[2];
+    uint64_t lo, hi;
+
+    if (!bs_runtime_fork_cookie_envelope(metas, num_entries, page_size,
+                                         &lo, &hi))
+        return NULL;
+    hints[0] = lo > page_size ? (uintptr_t)(lo - page_size) : 0;
+    hints[1] = (uintptr_t)hi;
+    for (size_t attempt = 0; attempt < 2; attempt++) {
+        void *mapping = mmap((void *)hints[attempt], page_size,
+                              PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        uint64_t mapping_end;
+
+        if (mapping == MAP_FAILED)
+            continue;
+        if (!mapping || !u64_add_checked((uintptr_t)mapping, page_size,
+                                         &mapping_end)) {
+            munmap(mapping, page_size);
+            continue;
+        }
+        if ((uint64_t)(uintptr_t)mapping >= hi || mapping_end <= lo) {
+            *(volatile uint32_t *)mapping = DLFRZ_RUNTIME_FORK_COOKIE;
+            return mapping;
+        }
+        munmap(mapping, page_size);
+    }
+    return NULL;
+}
+
+static void bs_startup_mremap_probe_child(
+    const struct bs_startup_mremap_plan *plan,
+    int source_fd, int exact_clean_source,
+    uint64_t payload_vaddr, uint64_t payload_filesz,
+    uint64_t payload_foff, volatile uint32_t *runtime_fork_cookie,
+    size_t page_size) __attribute__((noreturn));
+static void bs_startup_mremap_probe_child(
+    const struct bs_startup_mremap_plan *plan,
+    int source_fd, int exact_clean_source,
+    uint64_t payload_vaddr, uint64_t payload_filesz,
+    uint64_t payload_foff, volatile uint32_t *runtime_fork_cookie,
+    size_t page_size)
+{
+    struct bs_proc_self_context context = {
+        .root_fd = -1,
+        .self_fd = -1,
+    };
+    struct stat executable;
+    struct stat smaps_status;
+    FILE *smaps = NULL;
+    int executable_fd = -1;
+    int smaps_fd = -1;
+    int targets_reserved = 0;
+    int ready = 0;
+    int cookie_ready = 0;
+
+    if (runtime_fork_cookie)
+        cookie_ready = bs_runtime_fork_cookie_establish(
+            runtime_fork_cookie, page_size);
+
+    if (!plan || !plan->ranges || !plan->targets || plan->count == 0 ||
+        bs_proc_self_context_open_at("/proc", &context) < 0)
+        goto out;
+    if (exact_clean_source) {
+        if (source_fd < 0 || fstat(source_fd, &executable) < 0)
+            goto out;
+    } else {
+        if (!bs_startup_mremap_plan_matches_payload(
+                plan, payload_vaddr, payload_filesz, payload_foff))
+            goto out;
+        executable_fd = bs_proc_self_executable_open(&context);
+        if (executable_fd < 0 || fstat(executable_fd, &executable) < 0)
+            goto out;
+    }
+    if (!S_ISREG(executable.st_mode) || executable.st_size < 0 ||
+        executable.st_ino == 0)
+        goto out;
+    for (size_t i = 0; i < plan->count; i++) {
+        if (plan->ranges[i].file_offset >
+                (uint64_t)executable.st_size ||
+            plan->ranges[i].length >
+                (uint64_t)executable.st_size -
+                    plan->ranges[i].file_offset)
+            goto out;
+    }
+
+    /* Close every descriptor for the transfer's backing file before the
+     * first mremap.  The pinned proc directory is retained only to inspect
+     * the child after the complete batch has materialized. */
+    if (source_fd >= 0) {
+        if (close(source_fd) != 0)
+            goto out;
+        source_fd = -1;
+    }
+    if (executable_fd >= 0) {
+        if (close(executable_fd) != 0)
+            goto out;
+        executable_fd = -1;
+    }
+    if (!bs_startup_mremap_target_unions(plan, 1))
+        goto out;
+    targets_reserved = 1;
+    if (!bs_startup_mremap_transfer_batch(plan))
+        goto out;
+
+    smaps_fd = openat(context.self_fd, "smaps",
+                      O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (!bs_proc_entry_status(smaps_fd, context.device, S_IFREG,
+                              &smaps_status))
+        goto out;
+    smaps = fdopen(smaps_fd, "r");
+    if (!smaps)
+        goto out;
+    smaps_fd = -1;
+    ready = bs_mremap_targets_smaps_stream_matches(
+        smaps, &executable, plan);
+    if (fclose(smaps) < 0)
+        ready = 0;
+    smaps = NULL;
+
+out:
+    if (smaps)
+        fclose(smaps);
+    if (smaps_fd >= 0)
+        close(smaps_fd);
+    if (targets_reserved &&
+        !bs_startup_mremap_target_unions(plan, 0))
+        ready = 0;
+    if (executable_fd >= 0)
+        close(executable_fd);
+    if (source_fd >= 0)
+        close(source_fd);
+    bs_proc_self_context_close(&context);
+    _exit(cookie_ready
+        ? (ready ? BS_MREMAP_PROBE_READY_WITH_COOKIE
+                 : BS_MREMAP_PROBE_COOKIE_ONLY)
+        : (ready ? BS_MREMAP_PROBE_READY : BS_MREMAP_PROBE_DECLINED));
+}
+
+/* Return one only when a sufficiently large plan passed in a disposable
+ * signal-zero clone.  The clone exercises the complete transfer batch, then
+ * establishes clean file provenance for exactly the resulting target ranges
+ * without faulting payload pages.  Missing procfs and ENOSYS/EINVAL/EPERM are
+ * ordinary optimization misses in the parent; fatal policy outcomes after
+ * clone are contained by the child.
+ *
+ * As with the bootstrap's other contained probes, containment begins only
+ * after clone returns: a policy which kills clone or the parent's wait4
+ * remains fatal, while an errno denial declines the optimization.
+ * DLFREEZE_NO_FORK skips this complete optional boundary before allocating a
+ * plan or touching procfs, so launchers with restrictive inherited policies
+ * have a syscall-safe copy fallback.  A seccomp user-notification supervisor
+ * must otherwise service clone, child probes, and wait4 just as it must
+ * service ordinary startup syscalls; deliberately unanswered notifications
+ * are outside the in-process loader's bounded-progress contract. */
+static int bs_startup_mremap_source_ready(
+    const uint8_t *mem, uint64_t mem_foff,
+    const struct dlfrz_lib_meta *metas,
+    const struct dlfrz_entry *entries,
+    uint32_t num_entries, int source_fd, int exact_clean_source,
+    uint64_t payload_vaddr, uint64_t payload_filesz,
+    uint64_t payload_foff, volatile uint32_t **runtime_fork_cookie_out)
+{
+    if (runtime_fork_cookie_out)
+        *runtime_fork_cookie_out = NULL;
+    if (bs_env_enabled("DLFREEZE_NO_FORK"))
+        return 0;
+#if defined(SYS_clone) && defined(SYS_wait4) && defined(SYS_mremap)
+    long page_value = sysconf(_SC_PAGESIZE);
+    struct bs_startup_mremap_plan plan;
+    int child_status = -1;
+    long child;
+    long waited;
+    volatile uint32_t *runtime_fork_cookie = NULL;
+    int ready = 0;
+
+    if (page_value <= 0 ||
+        ((uint64_t)page_value & ((uint64_t)page_value - 1)) != 0 ||
+        !bs_startup_mremap_plan_build(
+            mem, mem_foff, metas, entries, num_entries,
+            (uint64_t)page_value, &plan))
+        return 0;
+    if (plan.total_bytes < BS_MREMAP_MIN_STARTUP_BYTES ||
+        (!exact_clean_source &&
+         !bs_startup_mremap_plan_matches_payload(
+             &plan, payload_vaddr, payload_filesz, payload_foff))) {
+        bs_startup_mremap_plan_destroy(&plan);
+        return 0;
+    }
+    if (runtime_fork_cookie_out)
+        runtime_fork_cookie = bs_runtime_fork_cookie_allocate(
+            metas, num_entries, (size_t)page_value);
+#ifdef DLFREEZE_BOOTSTRAP_FILEBACK_GATE
+    g_bs_mremap_clone_attempts++;
+#endif
+    child = syscall(SYS_clone, 0, 0, 0, 0, 0);
+    if (child < 0) {
+        if (runtime_fork_cookie)
+            munmap((void *)runtime_fork_cookie, (size_t)page_value);
+        bs_startup_mremap_plan_destroy(&plan);
+        return 0;
+    }
+    if (child == 0)
+        bs_startup_mremap_probe_child(
+            &plan, source_fd, exact_clean_source,
+            payload_vaddr, payload_filesz, payload_foff,
+            runtime_fork_cookie, (size_t)page_value);
+
+    do {
+        waited = syscall(SYS_wait4, child, &child_status,
+                         (int)BS_MREMAP_WAIT_CLONE, NULL);
+    } while (waited < 0 && errno == EINTR);
+    bs_startup_mremap_plan_destroy(&plan);
+    if (waited == child && WIFEXITED(child_status)) {
+        int result = WEXITSTATUS(child_status);
+
+        ready = result == BS_MREMAP_PROBE_READY ||
+                result == BS_MREMAP_PROBE_READY_WITH_COOKIE;
+        if (runtime_fork_cookie &&
+            (result == BS_MREMAP_PROBE_READY_WITH_COOKIE ||
+             result == BS_MREMAP_PROBE_COOKIE_ONLY) &&
+            *runtime_fork_cookie == DLFRZ_RUNTIME_FORK_COOKIE &&
+            bs_runtime_fork_cookie_establish(
+                runtime_fork_cookie, (size_t)page_value)) {
+            *runtime_fork_cookie_out = runtime_fork_cookie;
+            runtime_fork_cookie = NULL;
+        }
+    }
+    if (runtime_fork_cookie)
+        munmap((void *)runtime_fork_cookie, (size_t)page_value);
+    return ready;
+#else
+    (void)mem;
+    (void)mem_foff;
+    (void)metas;
+    (void)entries;
+    (void)num_entries;
+    (void)source_fd;
+    (void)exact_clean_source;
+    (void)payload_vaddr;
+    (void)payload_filesz;
+    (void)payload_foff;
+    return 0;
+#endif
 }
 
 enum extraction_fallback_refusal {
@@ -4297,6 +5423,8 @@ int main(int argc, char **argv)
     }
 
     int has_data_entries = 0;
+    int has_shlib_entries = 0;
+    int has_kernel_only_interpreter = 0;
     int has_pathful_dlopen_entries = 0;
     int has_pathful_needed_entries = 0;
     int has_unextractable_logical_names;
@@ -4304,6 +5432,10 @@ int main(int argc, char **argv)
         if (ent[i].flags & DLFRZ_FLAG_DATA) {
             has_data_entries = 1;
         }
+        if (ent[i].flags & DLFRZ_FLAG_SHLIB)
+            has_shlib_entries = 1;
+        if (ent[i].flags & DLFRZ_FLAG_INTERP_KERNEL_ONLY)
+            has_kernel_only_interpreter = 1;
         if ((ent[i].flags & DLFRZ_FLAG_DLOPEN_PATHFUL) != 0)
             has_pathful_dlopen_entries = 1;
         if ((ent[i].flags & DLFRZ_FLAG_NEEDED_PATHFUL) != 0)
@@ -4424,6 +5556,23 @@ int main(int argc, char **argv)
             return 127;
         }
 
+        /* A live PT_LOAD translation identifies the kernel's intended file
+         * source.  A disposable clone exercises the complete prospective
+         * DONTUNMAP batch, then the hardened procfs verifier proves exact
+         * clean file provenance only for the resulting startup target VMAs.
+         * Unrelated captured DATA state cannot disable the optimization;
+         * uncertainty in any selected page is still an ordinary miss and the
+         * portable bounded-copy path stays authoritative.  A compatibility
+         * mapping already has its source fd and uses the ordinary exact-file
+         * mmap path instead. */
+        volatile uint32_t *runtime_fork_cookie = NULL;
+        if (from_memory && mapped_payload_file_backed &&
+            bs_startup_mremap_source_ready(
+                ldr_mem, ldr_mem_foff, metas, ent, ft.num_entries,
+                -1, 0, loader_payload_vaddr, loader_payload_filesz,
+                loader_payload_foff, &runtime_fork_cookie))
+            source_flags |= DLFRZ_SOURCE_MREMAP_DONTUNMAP;
+
         const enum extraction_fallback_refusal fallback_refusal =
             classify_extraction_fallback(
                 has_data_entries, has_pathful_dlopen_entries,
@@ -4432,13 +5581,19 @@ int main(int argc, char **argv)
         const int direct_only_payload =
             fallback_refusal != EXTRACTION_FALLBACK_ALLOWED;
 
-        /* A supervised child exists solely to preserve extraction fallback
-         * before application handoff.  When validated metadata proves that
-         * extraction cannot reproduce the artifact, enter the loader in the
-         * original process and preserve normal executable PID/signal/job-
-         * control semantics.  DLFREEZE_NO_FORK remains a strict diagnostic
-         * override for clean fallback-capable artifacts. */
-        if (direct_only_payload || bs_env_enabled("DLFREEZE_NO_FORK")) {
+        /* Direct loading normally replaces this bootstrap in the original
+         * process.  Besides preserving PID/signal/job-control semantics,
+         * that is required for process-associated state which survives exec
+         * but not fork, including POSIX record locks.  A clean,
+         * extraction-representable artifact may explicitly opt into the
+         * speculative supervisor which retries an early loader refusal.
+         * DLFREEZE_NO_FORK remains a backwards-compatible override when
+         * both controls are present. */
+        const int supervised_fallback =
+            !direct_only_payload &&
+            bs_env_enabled("DLFREEZE_SUPERVISED_FALLBACK") &&
+            !bs_env_enabled("DLFREEZE_NO_FORK");
+        if (!supervised_fallback) {
             int loader_srcfd = ldr_srcfd;
 
             /* loader_run owns a nonnegative source fd.  Clear the bootstrap
@@ -4448,7 +5603,7 @@ int main(int argc, char **argv)
             if (loader_srcfd == sfd)
                 sfd = -1;
             loader_run(ldr_mem, ldr_mem_foff, loader_srcfd, source_flags,
-                       metas, ent, strtab,
+                       runtime_fork_cookie, metas, ent, strtab,
                        ft.num_entries, runtime_fixups, runtime_fixup_count,
                        -1,
                        argc, argv, environ);
@@ -4464,9 +5619,22 @@ int main(int argc, char **argv)
          * application handoff can fall back without duplicated effects. */
         int handoff_pipe[2];
         if (pipe2(handoff_pipe, O_CLOEXEC) < 0) {
-            perror("pipe2");
-            free(metas); free(ent); free(strtab); close(sfd);
-            return 127;
+            /* This pipe belongs only to the optional speculative direct
+             * attempt.  A sandbox or older syscall allowlist may reject
+             * pipe2 even though the established extraction fork/exec path is
+             * usable.  No target code or direct-loader mutation has run yet,
+             * so release the direct-only view and take that compatibility
+             * path instead of turning a recoverable optimization miss into a
+             * fatal launch failure. */
+            if (bs_debug_enabled())
+                fprintf(stderr,
+                        "dlfreeze-bootstrap: cannot create optional direct "
+                        "handoff pipe; using extraction: %s\n",
+                        strerror(errno));
+            if (from_memory == 0 && ldr_mem_foff == 0)
+                munmap((void *)ldr_mem, st.st_size);
+            free(metas);
+            goto extraction_fallback;
         }
         sigset_t forward_set, old_mask;
         struct sigaction old_forward_actions[FORWARD_SIGNAL_CAPACITY];
@@ -4476,6 +5644,8 @@ int main(int argc, char **argv)
         if (sigprocmask(SIG_BLOCK, &forward_set, &old_mask) < 0) {
             perror("sigprocmask");
             close(handoff_pipe[0]); close(handoff_pipe[1]);
+            if (from_memory == 0 && ldr_mem_foff == 0)
+                munmap((void *)ldr_mem, st.st_size);
             free(metas); free(ent); free(strtab); close(sfd);
             return 127;
         }
@@ -4483,6 +5653,8 @@ int main(int argc, char **argv)
             perror("sigaction");
             sigprocmask(SIG_SETMASK, &old_mask, NULL);
             close(handoff_pipe[0]); close(handoff_pipe[1]);
+            if (from_memory == 0 && ldr_mem_foff == 0)
+                munmap((void *)ldr_mem, st.st_size);
             free(metas); free(ent); free(strtab); close(sfd);
             return 127;
         }
@@ -4492,6 +5664,8 @@ int main(int argc, char **argv)
             restore_inherited_sigchld(&old_sigchld_action);
             sigprocmask(SIG_SETMASK, &old_mask, NULL);
             close(handoff_pipe[0]); close(handoff_pipe[1]);
+            if (from_memory == 0 && ldr_mem_foff == 0)
+                munmap((void *)ldr_mem, st.st_size);
             free(metas); free(ent); free(strtab); close(sfd);
             return 127;
         }
@@ -4501,9 +5675,20 @@ int main(int argc, char **argv)
             int child_srcfd = ldr_srcfd;
             int loader_result;
 
+            /* The optional supervisor fork consumes the first wipe before
+             * loader_run owns the page.  Rearm only the proven zero child
+             * state, still before any target callback can observe it. */
+            if (runtime_fork_cookie) {
+                if (*runtime_fork_cookie == 0)
+                    *runtime_fork_cookie = DLFRZ_RUNTIME_FORK_COOKIE;
+                else
+                    runtime_fork_cookie = NULL;
+            }
+
             if (restore_inherited_sigchld(&old_sigchld_action) < 0)
                 _exit(127);
-            sigprocmask(SIG_SETMASK, &old_mask, NULL);
+            if (sigprocmask(SIG_SETMASK, &old_mask, NULL) < 0)
+                _exit(127);
             close(handoff_pipe[0]);
 
             /* This is optional acceleration, so every syscall needed to
@@ -4521,7 +5706,7 @@ int main(int argc, char **argv)
             /* loader_run() does NOT return on success */
             loader_result = loader_run(
                 ldr_mem, ldr_mem_foff, child_srcfd, child_source_flags,
-                metas, ent, strtab,
+                runtime_fork_cookie, metas, ent, strtab,
                 ft.num_entries, runtime_fixups, runtime_fixup_count,
                 handoff_pipe[1], argc, argv, environ);
             close(handoff_pipe[1]);
@@ -4543,7 +5728,7 @@ int main(int argc, char **argv)
             restore_inherited_sigchld(&old_sigchld_action);
             sigprocmask(SIG_SETMASK, &old_mask, NULL);
             close(handoff_pipe[0]);
-            if (from_memory == 0 && ldr_mem_foff == 0 && ldr_mem)
+            if (from_memory == 0 && ldr_mem_foff == 0)
                 munmap((void *)ldr_mem, st.st_size);
             free(metas); free(ent); free(strtab); close(sfd);
             return 127;
@@ -4564,7 +5749,7 @@ int main(int argc, char **argv)
         if (wait_failed) {
             perror("waitpid");
             close(handoff_pipe[0]);
-            if (from_memory == 0 && ldr_mem_foff == 0 && ldr_mem)
+            if (from_memory == 0 && ldr_mem_foff == 0)
                 munmap((void *)ldr_mem, st.st_size);
             free(metas); free(ent); free(strtab); close(sfd);
             return 127;
@@ -4584,7 +5769,7 @@ int main(int argc, char **argv)
         int terminal_exit = !application_started && WIFEXITED(lst) &&
             WEXITSTATUS(lst) == DLFRZ_LOADER_CHILD_TERMINAL_REFUSAL;
 
-        if (from_memory == 0 && ldr_mem_foff == 0 && ldr_mem)
+        if (from_memory == 0 && ldr_mem_foff == 0)
             munmap((void *)ldr_mem, st.st_size);
 
         free(metas);
@@ -4608,6 +5793,8 @@ int main(int argc, char **argv)
         }
     }
 
+extraction_fallback:
+    ;
     /* DATA entries describe an in-memory filesystem overlay, including
      * negative lookups.  Pathful dynamic-load requests and unrepresented
      * logical names likewise have exact identity/$ORIGIN semantics that a
@@ -4756,11 +5943,27 @@ int main(int argc, char **argv)
      * absent or differs, launch the executable through the bundled copy so
      * the bundled libc and loader remain a matched pair. */
     int launcher_available = interp_path != NULL;
-    int direct_available = !launcher_available ||
+    int kernel_interp_available = !launcher_available ||
         (system_interp_path && system_interp_path[0] == '/' &&
          access(system_interp_path, X_OK) == 0);
     int use_interp_launcher = launcher_available &&
-        !(direct_available && files_identical(system_interp_path, interp_path));
+        !(kernel_interp_available &&
+          files_identical(system_interp_path, interp_path));
+
+    /* Executing an ELF interpreter as `interpreter program` is a loader CLI
+     * convention, not part of the generic ELF PT_INTERP ABI.  An unknown
+     * dependency-free interpreter is useful in extraction mode only while
+     * the original byte-identical pathname remains available for ordinary
+     * kernel startup. */
+    if (has_kernel_only_interpreter && use_interp_launcher) {
+        fprintf(stderr,
+                "dlfreeze-bootstrap: original interpreter is unavailable "
+                "or differs; bundled launcher ABI is unknown\n");
+        cleanup_workdir();
+        free(exe_path);
+        free(interp_path); free(system_interp_path);
+        return 127;
+    }
 
     /* Build the kernel and explicit-interpreter argv variants. */
     char **direct_nav = calloc((size_t)argc + 1, sizeof(char *));
@@ -4795,38 +5998,42 @@ int main(int argc, char **argv)
 
     char **nav = use_interp_launcher ? launcher_nav : direct_nav;
 
-    /* 9. set LD_LIBRARY_PATH */
-    const char *oldlp = getenv("LD_LIBRARY_PATH");
-    size_t root_len = strlen(g_tmpdir);
-    size_t oldlp_len = oldlp && oldlp[0] ? strlen(oldlp) : 0;
-    size_t lp_size = 0;
-    char *lp = NULL;
+    /* 9. Expose extracted shared objects to the native loader.  With no
+     * SHLIB entries there is nothing in the extraction root for a loader to
+     * find, so preserve the caller's exact LD_LIBRARY_PATH. */
+    if (has_shlib_entries) {
+        const char *oldlp = getenv("LD_LIBRARY_PATH");
+        size_t root_len = strlen(g_tmpdir);
+        size_t oldlp_len = oldlp && oldlp[0] ? strlen(oldlp) : 0;
+        size_t lp_size = 0;
+        char *lp = NULL;
 
-    if (oldlp_len &&
-        size_add_checked(root_len, 1, &lp_size) &&
-        size_add_checked(lp_size, oldlp_len, &lp_size) &&
-        size_add_checked(lp_size, 1, &lp_size)) {
-        lp = malloc(lp_size);
-        if (lp) {
-            memcpy(lp, g_tmpdir, root_len);
-            lp[root_len] = ':';
-            memcpy(lp + root_len + 1, oldlp, oldlp_len + 1);
+        if (oldlp_len &&
+            size_add_checked(root_len, 1, &lp_size) &&
+            size_add_checked(lp_size, oldlp_len, &lp_size) &&
+            size_add_checked(lp_size, 1, &lp_size)) {
+            lp = malloc(lp_size);
+            if (lp) {
+                memcpy(lp, g_tmpdir, root_len);
+                lp[root_len] = ':';
+                memcpy(lp + root_len + 1, oldlp, oldlp_len + 1);
+            }
+        } else if (!oldlp_len) {
+            lp = strdup(g_tmpdir);
+        } else {
+            errno = EOVERFLOW;
         }
-    } else if (!oldlp_len) {
-        lp = strdup(g_tmpdir);
-    } else {
-        errno = EOVERFLOW;
-    }
-    if (!lp || setenv("LD_LIBRARY_PATH", lp, 1) < 0) {
-        perror("setenv");
+        if (!lp || setenv("LD_LIBRARY_PATH", lp, 1) < 0) {
+            perror("setenv");
+            free(lp);
+            cleanup_workdir();
+            free(direct_nav); free(launcher_nav);
+            free(exe_path);
+            free(interp_path); free(system_interp_path);
+            return 127;
+        }
         free(lp);
-        cleanup_workdir();
-        free(direct_nav); free(launcher_nav);
-        free(exe_path);
-        free(interp_path); free(system_interp_path);
-        return 127;
     }
-    free(lp);
 
     /* 10. fork→exec, parent waits + cleans up.  Block forwarded signals
      * across fork so only the parent installs the supervisor handlers; caught
@@ -4869,7 +6076,8 @@ int main(int argc, char **argv)
     if (g_child == 0) {
         if (restore_inherited_sigchld(&old_sigchld_action) < 0)
             _exit(127);
-        sigprocmask(SIG_SETMASK, &old_mask, NULL);
+        if (sigprocmask(SIG_SETMASK, &old_mask, NULL) < 0)
+            _exit(127);
         if (use_interp_launcher)
             execve(interp_path, nav, environ);
         else

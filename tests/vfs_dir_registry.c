@@ -9,14 +9,26 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+static int same_node(const struct stat *left, const struct stat *right)
+{
+    return left->st_dev == right->st_dev &&
+           left->st_ino == right->st_ino &&
+           left->st_rdev == right->st_rdev &&
+           left->st_mode == right->st_mode &&
+           left->st_size == right->st_size;
+}
 
 struct worker_args {
     const char *directory;
     const char *file;
     const char *scratch;
     atomic_int *failed;
+    int frozen;
 };
 
 static int directory_has_files(DIR *directory)
@@ -176,11 +188,18 @@ static int check_forked_handle(const struct worker_args *args)
         ok = directory_has_files(directory) && closedir(directory) == 0;
         _exit(ok ? 0 : 1);
     }
+    /* fork(2) preserves the open file description, including its directory
+     * offset.  A parent and child racing readdir() on the inherited stream
+     * therefore have no portable per-process iteration order.  First prove
+     * that the child can consume and close its inherited DIR, then reset the
+     * still-live parent stream and exercise it independently. */
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
+        WEXITSTATUS(status) != 0) {
+        closedir(directory);
+        return 0;
+    }
     rewinddir(directory);
     parent_ok = directory_has_files(directory) && closedir(directory) == 0;
-    if (waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
-        WEXITSTATUS(status) != 0)
-        return 0;
     return parent_ok;
 }
 
@@ -196,13 +215,12 @@ static int check_replaced_synthetic_dirfd(const struct worker_args *args)
     if (!virtual_directory)
         goto out;
     virtual_fd = dirfd(virtual_directory);
-    /* Every synthetic descriptor uses / as its kernel placeholder.  Replace
-     * it with an independently opened description of that exact same inode;
-     * stat identity alone cannot detect this substitution. */
+    /* Bypass the interposed dup API so registry validation, rather than
+     * wrapper propagation, must reject the replacement descriptor. */
     real_fd = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (virtual_fd < 0 || real_fd < 0 || real_fd == virtual_fd)
         goto out;
-    if (dup2(real_fd, virtual_fd) != virtual_fd)
+    if (syscall(SYS_dup3, real_fd, virtual_fd, 0) != virtual_fd)
         goto out;
     if (close(real_fd) != 0)
         goto out;
@@ -311,6 +329,230 @@ static int openat_has_byte(int directory_fd, const char *name, char expected)
     return ok;
 }
 
+static int check_identity_coherence(const struct worker_args *args)
+{
+    char first_path[PATH_MAX];
+    struct stat first_status;
+    struct stat second_status;
+    struct stat directory_status;
+    struct stat descriptor_status;
+    struct stat empty_status;
+    DIR *directory = NULL;
+    struct dirent *entry;
+    int descriptor = -1;
+    int duplicate = -1;
+    int found_first = 0;
+    int ok = 0;
+
+    if (snprintf(first_path, sizeof(first_path), "%s/first.txt",
+                 args->directory) < 0 ||
+        stat(first_path, &first_status) < 0 ||
+        stat(args->file, &second_status) < 0 ||
+        stat(args->directory, &directory_status) < 0 ||
+        (first_status.st_dev == second_status.st_dev &&
+         first_status.st_ino == second_status.st_ino) ||
+        (first_status.st_dev == directory_status.st_dev &&
+         first_status.st_ino == directory_status.st_ino))
+        goto out;
+
+    descriptor = open(first_path, O_RDONLY | O_CLOEXEC);
+    if (descriptor < 0 || fstat(descriptor, &descriptor_status) < 0 ||
+        !same_node(&first_status, &descriptor_status) ||
+        (args->frozen &&
+         (fstatat(descriptor, "", &empty_status, AT_EMPTY_PATH) < 0 ||
+          !same_node(&first_status, &empty_status))))
+        goto out;
+    duplicate = dup(descriptor);
+    if (duplicate < 0 || fstat(duplicate, &descriptor_status) < 0 ||
+        !same_node(&first_status, &descriptor_status) ||
+        close(duplicate) != 0)
+        goto out;
+    duplicate = -1;
+#ifdef F_DUPFD_CLOEXEC
+    duplicate = fcntl(descriptor, F_DUPFD_CLOEXEC, 3);
+#else
+    duplicate = fcntl(descriptor, F_DUPFD, 3);
+#endif
+    if (duplicate < 0 || fstat(duplicate, &descriptor_status) < 0 ||
+        !same_node(&first_status, &descriptor_status) ||
+        close(duplicate) != 0)
+        goto out;
+    duplicate = -1;
+    if (close(descriptor) != 0)
+        goto out;
+    descriptor = -1;
+
+    descriptor = open(args->directory,
+                      O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (descriptor < 0 || fstat(descriptor, &descriptor_status) < 0 ||
+        !same_node(&directory_status, &descriptor_status) ||
+        (args->frozen &&
+         (fstatat(descriptor, "", &empty_status, AT_EMPTY_PATH) < 0 ||
+          !same_node(&directory_status, &empty_status))) ||
+        close(descriptor) != 0)
+        goto out;
+    descriptor = -1;
+
+    directory = opendir(args->directory);
+    if (!directory)
+        goto out;
+    errno = 0;
+    while ((entry = readdir(directory)) != NULL) {
+        if (strcmp(entry->d_name, "first.txt") == 0) {
+            if (entry->d_ino != first_status.st_ino)
+                goto out;
+            found_first++;
+        }
+    }
+    if (errno != 0 || found_first != 1)
+        goto out;
+    ok = 1;
+
+out:
+    if (duplicate >= 0)
+        close(duplicate);
+    if (descriptor >= 0)
+        close(descriptor);
+    if (directory && closedir(directory) != 0)
+        ok = 0;
+    return ok;
+}
+
+static int check_raw_regular_fd_reuse(const struct worker_args *args)
+{
+    char replacement_path[PATH_MAX];
+    struct stat expected;
+    struct stat actual;
+    int source = -1;
+    int target = -1;
+    int ok = 0;
+
+    if (snprintf(replacement_path, sizeof(replacement_path), "%s/reuse.txt",
+                 args->scratch) < 0)
+        return 0;
+    source = open(replacement_path, O_RDONLY | O_CLOEXEC);
+    target = open(args->file, O_RDONLY | O_CLOEXEC);
+    if (source < 0 || target < 0 || source == target ||
+        fstat(source, &expected) < 0 || syscall(SYS_close, target) != 0)
+        goto out;
+    if (syscall(SYS_dup3, source, target, O_CLOEXEC) != target ||
+        fstat(target, &actual) < 0 || !same_node(&expected, &actual))
+        goto out;
+    ok = 1;
+
+out:
+    if (target >= 0)
+        close(target);
+    if (source >= 0)
+        close(source);
+    return ok;
+}
+
+static int check_close_range_independence(const struct worker_args *args)
+{
+#ifdef SYS_close_range
+    struct stat expected;
+    struct stat actual;
+    int descriptor;
+    long result;
+
+    if (!args->frozen)
+        return 1;
+    if (stat(args->file, &expected) < 0 ||
+        (descriptor = open(args->file, O_RDONLY | O_CLOEXEC)) < 0)
+        return 0;
+    result = syscall(SYS_close_range, (unsigned int)descriptor + 1,
+                     ~0U, 0U);
+    if (result < 0 && errno != ENOSYS) {
+        close(descriptor);
+        return 0;
+    }
+    if (fstat(descriptor, &actual) < 0 || !same_node(&expected, &actual)) {
+        close(descriptor);
+        return 0;
+    }
+    return close(descriptor) == 0;
+#else
+    (void)args;
+    return 1;
+#endif
+}
+
+static int check_readlink_contract(const struct worker_args *args)
+{
+    char first_path[PATH_MAX];
+    char negative_path[PATH_MAX];
+    char other_path[PATH_MAX];
+    char target[PATH_MAX];
+    struct stat status;
+    ssize_t length;
+    int descriptor = -1;
+    int probe = -1;
+    int ok = 0;
+
+    if (snprintf(first_path, sizeof(first_path), "%s/first.txt",
+                 args->directory) < 0 ||
+        snprintf(negative_path, sizeof(negative_path), "%s/proc",
+                 args->directory) < 0 ||
+        snprintf(other_path, sizeof(other_path), "%s/other",
+                 args->directory) < 0)
+        return 0;
+#define EXPECT_READLINK_ERROR(path_value, expected_errno) do {          \
+        errno = 0;                                                       \
+        if (readlink((path_value), target, sizeof(target)) != -1 ||     \
+            errno != (expected_errno))                                  \
+            goto out;                                                    \
+    } while (0)
+    EXPECT_READLINK_ERROR(first_path, EINVAL);
+    EXPECT_READLINK_ERROR(args->directory, EINVAL);
+    EXPECT_READLINK_ERROR(other_path, EINVAL);
+    EXPECT_READLINK_ERROR(negative_path, ENOENT);
+#undef EXPECT_READLINK_ERROR
+
+    descriptor = open(args->directory,
+                      O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (descriptor < 0)
+        goto out;
+    errno = 0;
+    if (readlinkat(descriptor, "first.txt", target, sizeof(target)) != -1 ||
+        errno != EINVAL)
+        goto out;
+    errno = 0;
+    if (readlinkat(descriptor, "proc", target, sizeof(target)) != -1 ||
+        errno != ENOENT)
+        goto out;
+    if (args->frozen) {
+        length = readlinkat(descriptor, "host-link", target,
+                            sizeof(target) - 1);
+        if (length < 0 || (size_t)length >= sizeof(target))
+            goto out;
+        target[length] = '\0';
+        if (strcmp(target, "/dev/null") != 0)
+            goto out;
+
+        errno = 0;
+        probe = openat(descriptor, "./first.txt", O_RDONLY | O_CLOEXEC);
+        if (probe >= 0 || errno != EINVAL)
+            goto out;
+        errno = 0;
+        if (fstatat(descriptor, "other/../first.txt", &status, 0) != -1 ||
+            errno != EINVAL)
+            goto out;
+        errno = 0;
+        if (faccessat(descriptor, "other//third.txt", F_OK, 0) != -1 ||
+            errno != EINVAL)
+            goto out;
+    }
+    ok = 1;
+
+out:
+    if (probe >= 0)
+        close(probe);
+    if (descriptor >= 0)
+        close(descriptor);
+    return ok;
+}
+
 static int check_directory_duplication(const struct worker_args *args)
 {
     DIR *directory = NULL;
@@ -405,6 +647,110 @@ out:
     return ok;
 }
 
+static int check_raw_virtual_dirfd_replacement(
+    const struct worker_args *args)
+{
+    char first_path[PATH_MAX];
+    char second_path[PATH_MAX];
+    DIR *first_directory = NULL;
+    DIR *second_directory = NULL;
+    int first_fd;
+    int second_fd;
+    int probe = -1;
+    int ok = 0;
+
+    if (snprintf(first_path, sizeof(first_path), "%s/other",
+                 args->directory) < 0 ||
+        snprintf(second_path, sizeof(second_path), "%s/another",
+                 args->directory) < 0)
+        return 0;
+    first_directory = opendir(first_path);
+    second_directory = opendir(second_path);
+    if (!first_directory || !second_directory)
+        goto out;
+    first_fd = dirfd(first_directory);
+    second_fd = dirfd(second_directory);
+    if (first_fd < 0 || second_fd < 0 || first_fd == second_fd ||
+        syscall(SYS_dup3, second_fd, first_fd, 0) != first_fd)
+        goto out;
+
+    errno = 0;
+    probe = openat(first_fd, "third.txt", O_RDONLY | O_CLOEXEC);
+    if (probe >= 0 || errno != ENOENT)
+        goto out;
+    ok = 1;
+
+out:
+    if (probe >= 0)
+        close(probe);
+    if (first_directory && closedir(first_directory) != 0)
+        ok = 0;
+    if (second_directory && closedir(second_directory) != 0)
+        ok = 0;
+    return ok;
+}
+
+static int check_invalid_virtual_seek(const struct worker_args *args)
+{
+    DIR *directory;
+    struct dirent *entry;
+    int descriptor;
+    int first = 0;
+    int second = 0;
+    int other = 0;
+    int another = 0;
+    int host_only = 0;
+    int host_link = 0;
+    int ok = 0;
+
+    if (!args->frozen)
+        return 1;
+    directory = opendir(args->directory);
+    if (!directory)
+        return 0;
+    descriptor = dirfd(directory);
+    errno = 0;
+    seekdir(directory, 1);
+    if (descriptor < 0 || errno != EINVAL) {
+        fprintf(stderr, "invalid seek: fd=%d errno=%d\n", descriptor,
+                errno);
+        goto out;
+    }
+
+    errno = 0;
+    while ((entry = readdir(directory)) != NULL) {
+        if (strcmp(entry->d_name, "first.txt") == 0)
+            first++;
+        else if (strcmp(entry->d_name, "second.txt") == 0)
+            second++;
+        else if (strcmp(entry->d_name, "other") == 0)
+            other++;
+        else if (strcmp(entry->d_name, "another") == 0)
+            another++;
+        else if (strcmp(entry->d_name, "host-only") == 0)
+            host_only++;
+        else if (strcmp(entry->d_name, "host-link") == 0)
+            host_link++;
+        else if (strcmp(entry->d_name, ".") != 0 &&
+                 strcmp(entry->d_name, "..") != 0)
+            goto out;
+    }
+    if (errno == 0 && first == 1 && second == 1 && other == 1 &&
+        another == 1 && host_only == 1 && host_link == 1)
+        ok = 1;
+    else
+        fprintf(stderr,
+                "invalid-seek listing: errno=%d first=%d second=%d "
+                "other=%d another=%d host-only=%d host-link=%d\n",
+                errno, first, second, other, another, host_only,
+                host_link);
+
+out:
+    if (closedir(directory) != 0)
+        ok = 0;
+    return ok;
+}
+
 int main(int argc, char **argv)
 {
     enum { THREAD_COUNT = 8 };
@@ -412,19 +758,30 @@ int main(int argc, char **argv)
     atomic_int failed = 0;
     struct worker_args args;
     char first_path[PATH_MAX];
+    char fourth_path[PATH_MAX];
+    char negative_path[PATH_MAX];
     char byte;
     int file;
     int opened = 0;
 
-    if (argc != 4)
+    if (argc != 5)
         return 2;
     args.directory = argv[1];
     args.file = argv[2];
     args.scratch = argv[3];
     args.failed = &failed;
+    args.frozen = strcmp(argv[4], "frozen") == 0;
     if (snprintf(first_path, sizeof(first_path), "%s/first.txt",
                  args.directory) < 0 ||
         strlen(first_path) + 1 >= sizeof(first_path))
+        return 3;
+    if (snprintf(negative_path, sizeof(negative_path), "%s/proc",
+                 args.directory) < 0 ||
+        strlen(negative_path) + 1 >= sizeof(negative_path))
+        return 3;
+    if (snprintf(fourth_path, sizeof(fourth_path), "%s/another/fourth.txt",
+                 args.directory) < 0 ||
+        strlen(fourth_path) + 1 >= sizeof(fourth_path))
         return 3;
     file = open(first_path, O_RDONLY | O_CLOEXEC);
     if (file < 0 || read(file, &byte, 1) != 1 || byte != '1' ||
@@ -434,6 +791,17 @@ int main(int argc, char **argv)
     if (file < 0 || read(file, &byte, 1) != 1 || byte != '2' ||
         close(file) != 0)
         return 3;
+    file = open(fourth_path, O_RDONLY | O_CLOEXEC);
+    if (file < 0 || read(file, &byte, 1) != 1 || byte != '4' ||
+        close(file) != 0)
+        return 3;
+    errno = 0;
+    file = open(negative_path, O_RDONLY | O_CLOEXEC);
+    if (file >= 0 || errno != ENOENT) {
+        if (file >= 0)
+            close(file);
+        return 3;
+    }
     for (int index = 0; index < THREAD_COUNT; index++) {
         if (pthread_create(&threads[index], NULL, worker, &args) != 0) {
             atomic_store_explicit(&failed, 1, memory_order_relaxed);
@@ -445,13 +813,29 @@ int main(int argc, char **argv)
         if (pthread_join(threads[index], NULL) != 0)
             atomic_store_explicit(&failed, 1, memory_order_relaxed);
     }
-    if (atomic_load_explicit(&failed, memory_order_relaxed) ||
-        !check_real_directory(&args) || !check_forked_handle(&args) ||
-        !check_replaced_synthetic_dirfd(&args) ||
-        !check_directory_descriptor_flags(&args) ||
-        !check_directory_duplication(&args) ||
-        !check_virtual_dirfd_replacement(&args))
+    if (atomic_load_explicit(&failed, memory_order_relaxed)) {
+        fputs("concurrent directory check failed\n", stderr);
         return 3;
+    }
+#define REQUIRE_DIRECTORY_CHECK(expression) do {                         \
+        if (!(expression)) {                                             \
+            fputs(#expression " failed\n", stderr);                    \
+            return 3;                                                    \
+        }                                                                \
+    } while (0)
+    REQUIRE_DIRECTORY_CHECK(check_real_directory(&args));
+    REQUIRE_DIRECTORY_CHECK(check_forked_handle(&args));
+    REQUIRE_DIRECTORY_CHECK(check_replaced_synthetic_dirfd(&args));
+    REQUIRE_DIRECTORY_CHECK(check_directory_descriptor_flags(&args));
+    REQUIRE_DIRECTORY_CHECK(check_directory_duplication(&args));
+    REQUIRE_DIRECTORY_CHECK(check_identity_coherence(&args));
+    REQUIRE_DIRECTORY_CHECK(check_raw_regular_fd_reuse(&args));
+    REQUIRE_DIRECTORY_CHECK(check_close_range_independence(&args));
+    REQUIRE_DIRECTORY_CHECK(check_readlink_contract(&args));
+    REQUIRE_DIRECTORY_CHECK(check_virtual_dirfd_replacement(&args));
+    REQUIRE_DIRECTORY_CHECK(check_raw_virtual_dirfd_replacement(&args));
+    REQUIRE_DIRECTORY_CHECK(check_invalid_virtual_seek(&args));
+#undef REQUIRE_DIRECTORY_CHECK
     puts("vfs-dir-registry-ok");
     return 0;
 }

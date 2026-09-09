@@ -35,7 +35,7 @@
 #endif
 
 #define ROOT_A_EVENTS "DA"
-#define ROOT_B_EVENTS "DAB"
+#define ROOT_B_EVENTS "DADB"
 
 static char events[16];
 static size_t event_count;
@@ -144,6 +144,7 @@ int main(int argc, char **argv)
         object_is_reported("libdlfrz_early_root_a.so") ||
         object_is_reported("libdlfrz_early_root_b.so") ||
         object_is_reported("libdlfrz_early_tls_dep.so") ||
+        object_is_reported("libdlfrz_early_tls_dep_b.so") ||
         object_is_reported("libdlfrz_external_ie_requester.so") ||
         object_is_reported("libdlfrz_external_ie_owner.so"))
         return 1;
@@ -174,6 +175,7 @@ int main(int argc, char **argv)
         !dlsym(RTLD_DEFAULT, "direct_early_tls_exchange") ||
         !object_is_reported("libdlfrz_early_root_a.so") ||
         !object_is_reported("libdlfrz_early_tls_dep.so") ||
+        object_is_reported("libdlfrz_early_tls_dep_b.so") ||
         object_is_reported("libdlfrz_early_root_b.so"))
         return 5;
 
@@ -186,7 +188,8 @@ int main(int argc, char **argv)
 
     root_b = dlopen(ROOT_B_PATH, RTLD_NOW | RTLD_GLOBAL);
     if (!root_b || strcmp(events, ROOT_B_EVENTS) != 0 ||
-        !object_is_reported("libdlfrz_early_root_b.so")) {
+        !object_is_reported("libdlfrz_early_root_b.so") ||
+        !object_is_reported("libdlfrz_early_tls_dep_b.so")) {
         fprintf(stderr, "root-b activation: handle=%p events=%s error=%s\n",
                 root_b, events, dlerror());
         return 10;

@@ -32,6 +32,28 @@
 #define DLFRZ_DT_SYMINFO        UINT64_C(0x6ffffeff)
 #define DLFRZ_DT_RELCOUNT       UINT64_C(0x6ffffffa)
 
+/* AArch64 processor-specific dynamic tags.  Keep these scoped to AArch64 in
+ * the classifier below: DT_LOPROC + 1 and + 3 are valid x86-64 PLT metadata
+ * with different meanings.  DT_AARCH64_PAC_PLT requires each JUMP_SLOT
+ * result to be signed at load time with the process's APIA key and the GOT
+ * slot address as modifier.  The authenticated-symbol/RELR tags likewise
+ * request relocation semantics which direct replay does not implement.
+ * MemtagABI tags require process, stack/heap, mapping, global-tagging, and
+ * relocation transitions; notably MEMTAG_MODE value zero requests
+ * synchronous MTE and is not an inert payload. */
+#define DLFRZ_DT_AARCH64_BTI_PLT      UINT64_C(0x70000001)
+#define DLFRZ_DT_AARCH64_PAC_PLT      UINT64_C(0x70000003)
+#define DLFRZ_DT_AARCH64_VARIANT_PCS  UINT64_C(0x70000005)
+#define DLFRZ_DT_AARCH64_AUTH_SYM     UINT64_C(0x70000008)
+#define DLFRZ_DT_AARCH64_MEMTAG_MODE  UINT64_C(0x70000009)
+#define DLFRZ_DT_AARCH64_MEMTAG_HEAP  UINT64_C(0x7000000b)
+#define DLFRZ_DT_AARCH64_MEMTAG_STACK UINT64_C(0x7000000c)
+#define DLFRZ_DT_AARCH64_MEMTAG_GLOBALS UINT64_C(0x7000000d)
+#define DLFRZ_DT_AARCH64_MEMTAG_GLOBALSSZ UINT64_C(0x7000000f)
+#define DLFRZ_DT_AARCH64_AUTH_RELRSZ  UINT64_C(0x70000011)
+#define DLFRZ_DT_AARCH64_AUTH_RELR    UINT64_C(0x70000012)
+#define DLFRZ_DT_AARCH64_AUTH_RELRENT UINT64_C(0x70000013)
+
 /* DT_FLAGS/DT_FLAGS_1 values used by the direct-loader admission contract.
  * Keep private spellings here as well: the bootstrap, packer, and trace
  * interposer can be built against different libc header versions. */
@@ -116,6 +138,27 @@ static inline int dlfrz_dlopen_mode_requires_lazy_binding(int flags)
 static inline int dlfrz_dynamic_tag_requires_unsupported_semantics(
     int64_t tag, uint64_t value)
 {
+#if defined(__aarch64__)
+    /* These are presence tags/tables.  In particular, GNU ld emits
+     * DT_AARCH64_PAC_PLT with a zero d_val, and MEMTAG_MODE value zero means
+     * synchronous MTE.  Both still require loader transitions. */
+    switch ((uint64_t)tag) {
+    case DLFRZ_DT_AARCH64_PAC_PLT:
+    case DLFRZ_DT_AARCH64_AUTH_SYM:
+    case DLFRZ_DT_AARCH64_MEMTAG_MODE:
+    case DLFRZ_DT_AARCH64_MEMTAG_HEAP:
+    case DLFRZ_DT_AARCH64_MEMTAG_STACK:
+    case DLFRZ_DT_AARCH64_MEMTAG_GLOBALS:
+    case DLFRZ_DT_AARCH64_MEMTAG_GLOBALSSZ:
+    case DLFRZ_DT_AARCH64_AUTH_RELRSZ:
+    case DLFRZ_DT_AARCH64_AUTH_RELR:
+    case DLFRZ_DT_AARCH64_AUTH_RELRENT:
+        return 1;
+    default:
+        break;
+    }
+#endif
+
     if (value == 0)
         return 0;
 

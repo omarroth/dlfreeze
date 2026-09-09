@@ -27,10 +27,29 @@
 #define DLFRZ_GNU_PROPERTY_AARCH64_FEATURE_1_PAC UINT32_C(2)
 #define DLFRZ_GNU_PROPERTY_AARCH64_FEATURE_1_GCS UINT32_C(4)
 
+/* Linux AArch64 UAPI values.  Keep private spellings so old glibc/musl
+ * headers make the same mapping decision as current headers.  GCS is in
+ * AT_HWCAP (not AT_HWCAP2); it is recorded here to keep future policy code
+ * from repeating that easy-to-miss distinction. */
+#define DLFRZ_AARCH64_HWCAP_GCS  (UINT64_C(1) << 32)
+#define DLFRZ_AARCH64_HWCAP2_BTI (UINT64_C(1) << 17)
+#define DLFRZ_AARCH64_PROT_BTI   UINT32_C(0x10)
+
 struct dlfrz_gnu_property_profile {
     uint32_t feature_1;
     uint8_t feature_1_seen;
+    uint64_t stack_size;
+    uint8_t stack_size_seen;
 };
+
+static inline int dlfrz_aarch64_bti_mapping_required(
+    const struct dlfrz_gnu_property_profile *profile, uint64_t hwcap2)
+{
+    return profile && profile->feature_1_seen &&
+           (profile->feature_1 &
+            DLFRZ_GNU_PROPERTY_AARCH64_FEATURE_1_BTI) != 0 &&
+           (hwcap2 & DLFRZ_AARCH64_HWCAP2_BTI) != 0;
+}
 
 static inline int dlfrz_gnu_property_align_up(size_t value,
                                                size_t alignment,
@@ -58,6 +77,47 @@ static inline int dlfrz_gnu_property_u32(const uint8_t *data,
     return 1;
 }
 
+static inline int dlfrz_gnu_property_u64(const uint8_t *data,
+                                          size_t size,
+                                          uint64_t *value)
+{
+    if (!data || !value || size != sizeof(*value))
+        return 0;
+    memcpy(value, data, sizeof(*value));
+    return 1;
+}
+
+/* A final ELF object carries its effective stack contract in PT_GNU_STACK.
+ * GNU_PROPERTY_STACK_SIZE is the link-time minimum which led to that header,
+ * not an independent runtime authority.  Require one non-executable stack
+ * header and prove that it represents every parsed property requirement.
+ * Keep the table byte-based because e_phoff has no C alignment guarantee. */
+static inline int dlfrz_gnu_property_profile_matches_phdrs(
+    const uint8_t *phdr, size_t phdr_size, size_t phnum, size_t phentsize,
+    const struct dlfrz_gnu_property_profile *profile)
+{
+    Elf64_Phdr stack = {0};
+    int stack_count = 0;
+
+    if (!phdr || !profile || phentsize != sizeof(Elf64_Phdr) ||
+        phnum == 0 || phnum > SIZE_MAX / phentsize ||
+        phnum * phentsize > phdr_size)
+        return 0;
+    for (size_t i = 0; i < phnum; i++) {
+        Elf64_Phdr current;
+
+        memcpy(&current, phdr + i * phentsize, sizeof(current));
+        if (current.p_type != PT_GNU_STACK)
+            continue;
+        if (++stack_count != 1 || (current.p_flags & PF_X) != 0)
+            return 0;
+        stack = current;
+    }
+    return stack_count == 1 &&
+           (!profile->stack_size_seen ||
+            stack.p_memsz >= profile->stack_size);
+}
+
 /* Parse the complete contents of one PT_GNU_PROPERTY segment.  Direct mode
  * implements one canonical ELF64 GNU note with strictly increasing property
  * types.  Loader-affecting requirements which direct replay cannot enforce
@@ -67,7 +127,7 @@ static inline int dlfrz_gnu_property_segment_parse(
     struct dlfrz_gnu_property_profile *profile_out)
 {
     const uint8_t *bytes = (const uint8_t *)segment;
-    struct dlfrz_gnu_property_profile profile = {0, 0};
+    struct dlfrz_gnu_property_profile profile = {0};
     Elf64_Nhdr header;
     size_t cursor = 0;
     size_t name_bytes;
@@ -117,8 +177,13 @@ static inline int dlfrz_gnu_property_segment_parse(
         previous_type = type;
         have_previous = 1;
 
-        if (type == DLFRZ_GNU_PROPERTY_STACK_SIZE ||
-            type == DLFRZ_GNU_PROPERTY_NO_COPY_ON_PROTECTED) {
+        if (type == DLFRZ_GNU_PROPERTY_STACK_SIZE) {
+            if (!dlfrz_gnu_property_u64(
+                    data, data_size, &profile.stack_size) ||
+                profile.stack_size_seen)
+                return 0;
+            profile.stack_size_seen = 1;
+        } else if (type == DLFRZ_GNU_PROPERTY_NO_COPY_ON_PROTECTED) {
             return 0;
         } else if (type == DLFRZ_GNU_PROPERTY_1_NEEDED) {
             if (!dlfrz_gnu_property_u32(data, data_size, &value) ||

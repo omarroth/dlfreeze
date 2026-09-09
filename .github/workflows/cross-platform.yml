@@ -22,8 +22,11 @@ on:
           - all
           - ubuntu-18.04
           - ubuntu-20.04
+          - ubuntu-22.04
           - ubuntu-24.04
+          - alpine-3.14
           - alpine-3.20
+          - alpine-edge
           - debian-12
           - debian-trixie
           - fedora-41
@@ -54,8 +57,11 @@ jobs:
           # x86_64
           - { env: ubuntu-18.04,  image: "ubuntu:18.04",      arch: amd64 }
           - { env: ubuntu-20.04,  image: "ubuntu:20.04",      arch: amd64 }
+          - { env: ubuntu-22.04,  image: "ubuntu:22.04",      arch: amd64 }
           - { env: ubuntu-24.04,  image: "ubuntu:24.04",      arch: amd64 }
+          - { env: alpine-3.14,   image: "alpine:3.14",       arch: amd64 }
           - { env: alpine-3.20,   image: "alpine:3.20",       arch: amd64 }
+          - { env: alpine-edge,   image: "alpine:edge",       arch: amd64 }
           - { env: debian-12,     image: "debian:12",         arch: amd64 }
           - { env: debian-trixie, image: "debian:trixie",     arch: amd64 }
           - { env: fedora-41,     image: "fedora:41",         arch: amd64 }
@@ -64,8 +70,11 @@ jobs:
           # aarch64 (native GitHub-hosted arm64 runner)
           - { env: ubuntu-18.04,  image: "ubuntu:18.04",      arch: arm64 }
           - { env: ubuntu-20.04,  image: "ubuntu:20.04",      arch: arm64 }
+          - { env: ubuntu-22.04,  image: "ubuntu:22.04",      arch: arm64 }
           - { env: ubuntu-24.04,  image: "ubuntu:24.04",      arch: arm64 }
+          - { env: alpine-3.14,   image: "alpine:3.14",       arch: arm64 }
           - { env: alpine-3.20,   image: "alpine:3.20",       arch: arm64 }
+          - { env: alpine-edge,   image: "alpine:edge",       arch: arm64 }
           - { env: debian-12,     image: "debian:12",         arch: arm64 }
           - { env: debian-trixie, image: "debian:trixie",     arch: arm64 }
           - { env: fedora-41,     image: "fedora:41",         arch: arm64 }
@@ -86,12 +95,23 @@ jobs:
           TEST_STOP_AFTER: ${{ inputs.test_stop_after || '' }}
         run: |
           set -o pipefail
+          mkdir -p build
           docker run --rm --platform linux/${{ matrix.arch }} \
-            -v "$PWD":/work -w /work \
+            -v "$PWD":/source:ro -v "$PWD/build":/out -w /work \
+            -e DLFREEZE_HOST_UID="$(id -u)" \
+            -e DLFREEZE_HOST_GID="$(id -g)" \
             -e TEST_START_AT \
             -e TEST_STOP_AFTER \
             ${{ matrix.image }} \
-            sh /work/tests/cross-build.sh 2>&1 | tee cross-build.log
+            sh -lc '
+              cp -a /source/Makefile /source/LICENSE /source/README.md \
+                /source/include /source/src /source/tests /work/
+              status=0
+              OUTDIR=/out/cross-test sh /work/tests/cross-build.sh || status=$?
+              chown -R "$DLFREEZE_HOST_UID:$DLFREEZE_HOST_GID" \
+                /out/cross-test 2>/dev/null || true
+              exit "$status"
+            ' 2>&1 | tee cross-build.log
 
       - name: Upload frozen artifacts
         if: >-
@@ -129,8 +149,11 @@ jobs:
           # x86_64
           - { env: ubuntu-18.04,  image: "ubuntu:18.04",      arch: amd64 }
           - { env: ubuntu-20.04,  image: "ubuntu:20.04",      arch: amd64 }
+          - { env: ubuntu-22.04,  image: "ubuntu:22.04",      arch: amd64 }
           - { env: ubuntu-24.04,  image: "ubuntu:24.04",      arch: amd64 }
+          - { env: alpine-3.14,   image: "alpine:3.14",       arch: amd64 }
           - { env: alpine-3.20,   image: "alpine:3.20",       arch: amd64 }
+          - { env: alpine-edge,   image: "alpine:edge",       arch: amd64 }
           - { env: debian-12,     image: "debian:12",         arch: amd64 }
           - { env: debian-trixie, image: "debian:trixie",     arch: amd64 }
           - { env: fedora-41,     image: "fedora:41",         arch: amd64 }
@@ -139,8 +162,11 @@ jobs:
           # aarch64
           - { env: ubuntu-18.04,  image: "ubuntu:18.04",      arch: arm64 }
           - { env: ubuntu-20.04,  image: "ubuntu:20.04",      arch: arm64 }
+          - { env: ubuntu-22.04,  image: "ubuntu:22.04",      arch: arm64 }
           - { env: ubuntu-24.04,  image: "ubuntu:24.04",      arch: arm64 }
+          - { env: alpine-3.14,   image: "alpine:3.14",       arch: arm64 }
           - { env: alpine-3.20,   image: "alpine:3.20",       arch: arm64 }
+          - { env: alpine-edge,   image: "alpine:edge",       arch: arm64 }
           - { env: debian-12,     image: "debian:12",         arch: arm64 }
           - { env: debian-trixie, image: "debian:trixie",     arch: arm64 }
           - { env: fedora-41,     image: "fedora:41",         arch: arm64 }
@@ -166,9 +192,11 @@ jobs:
            (inputs.environment == 'all' || inputs.environment == matrix.env))
         run: |
           set -o pipefail
+          sh tests/cross-run.sh --selftest-direct-contract-policy
           docker run --rm --platform linux/${{ matrix.arch }} \
             -v "$PWD":/work -w /work \
             -e DLFREEZE_REQUIRE_DIRECT_CONTRACTS=${{ (github.event_name != 'workflow_dispatch' || inputs.environment == 'all') && '1' || '0' }} \
+            -e DLFREEZE_REQUIRE_ALL_DIRECT_CONTRACTS=${{ (github.event_name != 'workflow_dispatch' || inputs.environment == 'all') && '1' || '0' }} \
             ${{ matrix.image }} \
             sh /work/tests/cross-run.sh 2>&1 | tee cross-run.log
 

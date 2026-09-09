@@ -3,12 +3,13 @@
 #include <stdint.h>
 
 #define DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE 1
+#define DLFREEZE_RELOCATION_SNAPSHOT_GATE 1
 #include "../src/loader.c"
 
-static char requester_strings[] = "\0hot\0";
-static char provider_strings[] = "\0hot\0";
-static Elf64_Sym requester_symbols[2];
-static Elf64_Sym provider_symbols[2];
+static char requester_strings[] = "\0hot\0cold\0";
+static char provider_strings[] = "\0hot\0cold\0";
+static Elf64_Sym requester_symbols[3];
+static Elf64_Sym provider_symbols[3];
 static uint16_t requester_versions[2];
 
 enum { MANY_SCOPE_SYMBOLS = 33, MANY_SCOPE_STRINGS = 512 };
@@ -499,6 +500,408 @@ static uint64_t phase_ifunc_resolver(void)
     return UINT64_C(0x1020304050607080);
 }
 
+struct prelinked_phase_plan_fixture {
+    uint8_t *mapping;
+    size_t page_size;
+    Elf64_Phdr requester_phdr;
+    Elf64_Phdr provider_phdr;
+    Elf64_Rela relocations[5];
+    struct dlfrz_lib_meta metas[2];
+    struct dlfrz_entry entries[2];
+    int idx_map[2];
+    uint32_t fixups[5];
+    struct loader_readonly_snapshot snapshot;
+    const uint32_t *admitted_fixups;
+    struct prelinked_relocation_phase_plan plan;
+};
+
+static void reset_prelinked_phase_plan_counters(void)
+{
+    g_relocation_ifunc_classification_calls = 0;
+    g_prelinked_phase_plan_classified = 0;
+    g_prelinked_phase_plan_stable = 0;
+    g_prelinked_phase_plan_fast_skips = 0;
+    g_prelinked_phase_plan_legacy_visits = 0;
+    g_prelinked_phase_plan_record_reads = 0;
+    g_prelinked_phase_plan_publications = 0;
+    g_prelinked_phase_plan_fallbacks = 0;
+    g_prelinked_fixup_owner_probes = 0;
+}
+
+/* Captured DATA records cannot own prelinked relocation fixups.  Keep the
+ * admission cost proportional to actual prelinked objects rather than the
+ * Cartesian product of a broad file capture and the startup graph. */
+static int broad_manifest_fixup_validation_gate(void)
+{
+    enum { DATA_RECORDS = 4096, OBJECTS = 64 };
+    struct dlfrz_lib_meta *metas;
+    struct dlfrz_entry *entries;
+    struct loaded_obj objects[OBJECTS];
+    int idx_map[OBJECTS];
+    int valid = 0;
+
+    metas = calloc(DATA_RECORDS + 1, sizeof(*metas));
+    entries = calloc(DATA_RECORDS + 1, sizeof(*entries));
+    if (!metas || !entries)
+        goto out;
+    memset(objects, 0, sizeof(objects));
+    for (int i = 0; i < OBJECTS; i++)
+        idx_map[i] = -1;
+
+    /* One real prelinked owner has no relocations; every other manifest
+     * record is ordinary captured DATA with the mandatory empty slice. */
+    metas[0].flags = LDR_FLAG_PRELINKED;
+    idx_map[0] = 0;
+    for (size_t i = 1; i <= DATA_RECORDS; i++) {
+        metas[i].flags = LDR_FLAG_DATA;
+        entries[i].flags = DLFRZ_FLAG_DATA;
+    }
+    g_prelinked_fixup_owner_probes = 0;
+    if (validate_prelinked_runtime_fixups(
+            objects, OBJECTS, metas, idx_map, entries,
+            DATA_RECORDS + 1, NULL, 0, NULL) < 0 ||
+        g_prelinked_fixup_owner_probes != OBJECTS)
+        goto out;
+    valid = 1;
+
+out:
+    free(entries);
+    free(metas);
+    return valid;
+}
+
+static int initialize_prelinked_phase_plan_fixture(
+    struct prelinked_phase_plan_fixture *fixture)
+{
+    long page_size_long = sysconf(_SC_PAGESIZE);
+
+    memset(fixture, 0, sizeof(*fixture));
+    if (page_size_long <= 0 || (uintmax_t)page_size_long > SIZE_MAX)
+        return 0;
+    fixture->page_size = (size_t)page_size_long;
+    fixture->mapping = mmap(NULL, fixture->page_size,
+                            PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (fixture->mapping == MAP_FAILED) {
+        fixture->mapping = NULL;
+        return 0;
+    }
+
+    initialize_symbol_scope();
+    requester_symbols[2].st_name = 5;
+    requester_symbols[2].st_info = ELF64_ST_INFO(STB_GLOBAL, STT_FUNC);
+    requester_symbols[2].st_other = STV_DEFAULT;
+    requester_symbols[2].st_shndx = SHN_UNDEF;
+    provider_symbols[1].st_info = ELF64_ST_INFO(STB_GLOBAL, STT_OBJECT);
+    provider_symbols[1].st_value = 512;
+    provider_symbols[1].st_size = sizeof(uint64_t);
+    provider_symbols[2].st_name = 5;
+    provider_symbols[2].st_info =
+        ELF64_ST_INFO(STB_GLOBAL, STT_GNU_IFUNC);
+    provider_symbols[2].st_other = STV_DEFAULT;
+    provider_symbols[2].st_shndx = 1;
+    provider_symbols[2].st_value = 600;
+    provider_symbols[2].st_size = 1;
+    g_all_objs[0].dynsym_count = 3;
+    g_all_objs[0].dynsym_admitted_count = 3;
+    g_all_objs[1].dynsym_count = 3;
+    g_all_objs[1].dynsym_admitted_count = 3;
+
+    fixture->requester_phdr.p_type = PT_LOAD;
+    fixture->requester_phdr.p_flags = PF_R | PF_W | PF_X;
+    fixture->requester_phdr.p_filesz = fixture->page_size;
+    fixture->requester_phdr.p_memsz = fixture->page_size;
+    fixture->provider_phdr = fixture->requester_phdr;
+    g_all_objs[0].base = (uintptr_t)fixture->mapping;
+    g_all_objs[0].phdr = &fixture->requester_phdr;
+    g_all_objs[0].phdr_num = 1;
+    g_all_objs[0].flags = LDR_FLAG_PRELINKED | LDR_FLAG_RUNTIME_SCAN;
+    g_all_objs[0].lazy_plt = 1;
+    g_all_objs[1].base = (uintptr_t)fixture->mapping;
+    g_all_objs[1].phdr = &fixture->provider_phdr;
+    g_all_objs[1].phdr_num = 1;
+    g_all_objs[1].flags = LDR_FLAG_PRELINKED;
+
+    for (size_t i = 0; i < 5; i++)
+        fixture->relocations[i].r_offset = 64 + i * sizeof(uint64_t);
+    fixture->relocations[0].r_info =
+        ELF64_R_INFO(1, ARCH_RELOC_GLOB_DAT);
+    fixture->relocations[1].r_info =
+        ELF64_R_INFO(2, ARCH_RELOC_GLOB_DAT);
+    fixture->relocations[2].r_info =
+        ELF64_R_INFO(1, ARCH_RELOC_COPY);
+    fixture->relocations[3].r_info =
+        ELF64_R_INFO(0, ARCH_RELOC_IRELATIVE);
+    fixture->relocations[3].r_addend = 256;
+    fixture->relocations[4].r_info =
+        ELF64_R_INFO(1, ARCH_RELOC_JUMP_SLOT);
+    if (publish_loaded_relocation_authority(
+            &g_all_objs[0], fixture->relocations, 4,
+            &fixture->relocations[4], 1, NULL, 0) < 0 ||
+        !g_all_objs[0].runtime_relocation_mapping ||
+        g_all_objs[0].rela == fixture->relocations) {
+        munmap(fixture->mapping, fixture->page_size);
+        fixture->mapping = NULL;
+        return 0;
+    }
+
+    fixture->metas[0].flags =
+        LDR_FLAG_PRELINKED | LDR_FLAG_RUNTIME_SCAN;
+    fixture->metas[0].runtime_fixup_count = 5;
+    fixture->metas[1].flags = LDR_FLAG_PRELINKED;
+    fixture->idx_map[0] = 0;
+    fixture->idx_map[1] = 1;
+    fixture->fixups[0] = 0;
+    fixture->fixups[1] = 1;
+    fixture->fixups[2] = 2;
+    fixture->fixups[3] = 3;
+    fixture->fixups[4] = LDR_PRELINK_FIXUP_JMPREL;
+    relocation_store_u64(fixture->mapping + 512,
+                         UINT64_C(0x8877665544332211));
+    return 1;
+}
+
+static void release_prelinked_phase_plan_fixture(
+    struct prelinked_phase_plan_fixture *fixture)
+{
+    loader_readonly_snapshot_release(&fixture->snapshot);
+    dl_release_runtime_mapping(&g_all_objs[0]);
+    if (fixture->mapping)
+        munmap(fixture->mapping, fixture->page_size);
+    memset(g_all_objs, 0, 2 * sizeof(g_all_objs[0]));
+    g_nobj = 0;
+}
+
+static enum prelinked_runtime_authority_status
+prepare_prelinked_phase_plan_fixture(
+    struct prelinked_phase_plan_fixture *fixture)
+{
+    fixture->admitted_fixups = NULL;
+    memset(&fixture->plan, 0, sizeof(fixture->plan));
+    return prepare_prelinked_runtime_authority(
+        g_all_objs, 2, fixture->metas, fixture->idx_map,
+        fixture->entries, 2, fixture->fixups, 5,
+        &fixture->snapshot, &fixture->admitted_fixups,
+        &fixture->plan);
+}
+
+/* The phase sidecar is wholly loader-derived and optional.  Exercise exact
+ * canonical population, owning-pass replay, compact resolver preflight,
+ * stale-epoch and writable-metadata fallback, and both larger-snapshot
+ * failure paths without weakening the original mandatory snapshot. */
+static int prelinked_phase_plan_gate(void)
+{
+    struct prelinked_phase_plan_fixture fixture;
+    static const uint8_t expected_phases[5] = {
+        PRELINKED_FIXUP_PHASE_ORDINARY,
+        PRELINKED_FIXUP_PHASE_IFUNC,
+        PRELINKED_FIXUP_PHASE_COPY,
+        PRELINKED_FIXUP_PHASE_IRELATIVE,
+        PRELINKED_FIXUP_PHASE_LEGACY,
+    };
+    int has_resolvers = 0;
+    int valid = 0;
+    Elf64_Rela pinned_relocation;
+
+    if (!initialize_prelinked_phase_plan_fixture(&fixture))
+        return 0;
+    if (prelinked_phase_plan_count_worthwhile(
+            PRELINKED_PHASE_PLAN_MIN_FIXUPS - 1) ||
+        !prelinked_phase_plan_count_worthwhile(
+            PRELINKED_PHASE_PLAN_MIN_FIXUPS))
+        goto out;
+    g_prelinked_phase_plan_force_small = 1;
+    reset_prelinked_phase_plan_counters();
+    if (prepare_prelinked_phase_plan_fixture(&fixture) !=
+            PRELINKED_RUNTIME_AUTHORITY_READY ||
+        !fixture.admitted_fixups || !fixture.plan.phases ||
+        fixture.snapshot.mapping_size !=
+            sizeof(fixture.fixups) + sizeof(expected_phases) ||
+        memcmp(fixture.admitted_fixups, fixture.fixups,
+               sizeof(fixture.fixups)) != 0 ||
+        memcmp(fixture.plan.phases, expected_phases,
+               sizeof(expected_phases)) != 0 ||
+        g_prelinked_phase_plan_classified != 5 ||
+        g_prelinked_phase_plan_stable != 4 ||
+        g_relocation_ifunc_classification_calls != 2 ||
+        g_prelinked_phase_plan_publications != 1 ||
+        g_prelinked_phase_plan_fallbacks != 0)
+        goto out;
+
+    /* The source table was declared through a writable range and therefore
+     * published as loader-owned relocation authority.  Mutating that source
+     * after canonical phase derivation cannot turn the admitted ordinary
+     * slot into an IFUNC or disagree with its sidecar byte. */
+    fixture.relocations[0].r_info =
+        ELF64_R_INFO(2, ARCH_RELOC_GLOB_DAT);
+    if (!loaded_rela_read(
+            &g_all_objs[0], LOADED_RELA_DYNAMIC, 0,
+            &pinned_relocation) ||
+        ELF64_R_SYM(pinned_relocation.r_info) != 1 ||
+        fixture.plan.phases[0] != PRELINKED_FIXUP_PHASE_ORDINARY)
+        goto out;
+    if (preflight_prelinked_runtime_fixup_destinations(
+            g_all_objs, 2, fixture.metas, fixture.idx_map, 2,
+            fixture.admitted_fixups, 5, &fixture.plan,
+            &has_resolvers) != 0 ||
+        !has_resolvers || g_relocation_ifunc_classification_calls != 2)
+        goto out;
+
+    reset_prelinked_phase_plan_counters();
+    g_relocation_validation_calls = 0;
+    relocation_store_u64(fixture.mapping +
+                             fixture.relocations[0].r_offset,
+                         0);
+    for (int phase = RELOC_PASS_ORDINARY;
+         phase <= RELOC_PASS_IRELATIVE; phase++) {
+        if (apply_prelinked_runtime_fixups_for_phase(
+                &g_all_objs[0], g_all_objs, 2,
+                fixture.admitted_fixups, 1, 0, &fixture.plan,
+                (enum relocation_pass)phase) < 0)
+            goto out;
+    }
+    if (relocation_load_u64(fixture.mapping +
+                                fixture.relocations[0].r_offset) !=
+            (uint64_t)(uintptr_t)(fixture.mapping + 512) ||
+        g_prelinked_phase_plan_fast_skips != 3 ||
+        g_prelinked_phase_plan_record_reads != 1 ||
+        g_prelinked_phase_plan_legacy_visits != 0 ||
+        g_relocation_ifunc_classification_calls != 0 ||
+        g_relocation_validation_calls != 1)
+        goto out;
+
+    /* An epoch change invalidates the entire accelerator, not individual
+     * slots.  Replay then performs the exact historical four live reads and
+     * two symbolic classifications. */
+    clear_resolution_caches();
+    reset_prelinked_phase_plan_counters();
+    g_relocation_validation_calls = 0;
+    relocation_store_u64(fixture.mapping +
+                             fixture.relocations[0].r_offset,
+                         0);
+    for (int phase = RELOC_PASS_ORDINARY;
+         phase <= RELOC_PASS_IRELATIVE; phase++) {
+        if (apply_prelinked_runtime_fixups_for_phase(
+                &g_all_objs[0], g_all_objs, 2,
+                fixture.admitted_fixups, 1, 0, &fixture.plan,
+                (enum relocation_pass)phase) < 0)
+            goto out;
+    }
+    if (g_prelinked_phase_plan_fast_skips != 0 ||
+        g_prelinked_phase_plan_record_reads != 4 ||
+        g_prelinked_phase_plan_legacy_visits != 4 ||
+        g_relocation_ifunc_classification_calls != 2 ||
+        g_relocation_validation_calls != 1)
+        goto out;
+    loader_readonly_snapshot_release(&fixture.snapshot);
+
+    /* A larger optional allocation failure recreates the original
+     * fixup-only snapshot and publishes no phase pointer. */
+    clear_resolution_caches();
+    reset_prelinked_phase_plan_counters();
+    g_prelinked_phase_plan_force_allocation_failure = 1;
+    if (prepare_prelinked_phase_plan_fixture(&fixture) !=
+            PRELINKED_RUNTIME_AUTHORITY_READY ||
+        fixture.plan.phases ||
+        fixture.snapshot.mapping_size != sizeof(fixture.fixups) ||
+        g_prelinked_phase_plan_fallbacks != 1 ||
+        g_prelinked_phase_plan_publications != 0 ||
+        g_prelinked_phase_plan_classified != 0)
+        goto out;
+    g_prelinked_phase_plan_force_allocation_failure = 0;
+    loader_readonly_snapshot_release(&fixture.snapshot);
+
+    /* Likewise, failure to seal the combined mapping retries the mandatory
+     * smaller authority and discards every derived byte. */
+    clear_resolution_caches();
+    reset_prelinked_phase_plan_counters();
+    g_prelinked_phase_plan_force_protection_failure = 1;
+    if (prepare_prelinked_phase_plan_fixture(&fixture) !=
+            PRELINKED_RUNTIME_AUTHORITY_READY ||
+        fixture.plan.phases ||
+        fixture.snapshot.mapping_size != sizeof(fixture.fixups) ||
+        g_prelinked_phase_plan_fallbacks != 1 ||
+        g_prelinked_phase_plan_publications != 0 ||
+        g_prelinked_phase_plan_classified != 5)
+        goto out;
+    g_prelinked_phase_plan_force_protection_failure = 0;
+    loader_readonly_snapshot_release(&fixture.snapshot);
+
+    /* Failure of that smaller historical snapshot is still fatal. */
+    reset_prelinked_phase_plan_counters();
+    g_prelinked_phase_plan_force_allocation_failure = 1;
+    g_loader_snapshot_fail_protect = 1;
+    if (prepare_prelinked_phase_plan_fixture(&fixture) !=
+            PRELINKED_RUNTIME_AUTHORITY_SNAPSHOT_FAILED ||
+        fixture.snapshot.mapping || fixture.snapshot.bytes)
+        goto out;
+    g_loader_snapshot_fail_protect = 0;
+    g_prelinked_phase_plan_force_allocation_failure = 0;
+
+    /* An encoded reorder is a canonical-authority failure, not an excuse to
+     * retry without the accelerator. */
+    fixture.fixups[0] = 1;
+    reset_prelinked_phase_plan_counters();
+    if (prepare_prelinked_phase_plan_fixture(&fixture) !=
+            PRELINKED_RUNTIME_AUTHORITY_INVALID ||
+        fixture.snapshot.mapping || fixture.plan.phases ||
+        g_prelinked_phase_plan_classified != 0)
+        goto out;
+    fixture.fixups[0] = 0;
+
+    /* Either requester or provider lookup metadata being writable keeps
+     * every symbolic decision live while static COPY/IRELATIVE phases remain
+     * safely derivable from immutable relocation types. */
+    for (int mutable_object = 0; mutable_object < 2; mutable_object++) {
+        clear_resolution_caches();
+        g_all_objs[mutable_object].dynsym_readonly = 0;
+        reset_prelinked_phase_plan_counters();
+        if (prepare_prelinked_phase_plan_fixture(&fixture) !=
+                PRELINKED_RUNTIME_AUTHORITY_READY ||
+            fixture.plan.phases[0] != PRELINKED_FIXUP_PHASE_LEGACY ||
+            fixture.plan.phases[1] != PRELINKED_FIXUP_PHASE_LEGACY ||
+            fixture.plan.phases[2] != PRELINKED_FIXUP_PHASE_COPY ||
+            fixture.plan.phases[3] !=
+                PRELINKED_FIXUP_PHASE_IRELATIVE ||
+            fixture.plan.phases[4] != PRELINKED_FIXUP_PHASE_LEGACY ||
+            g_prelinked_phase_plan_stable != 2)
+            goto out;
+        loader_readonly_snapshot_release(&fixture.snapshot);
+        g_all_objs[mutable_object].dynsym_readonly = 1;
+    }
+
+    /* A weak miss and GNU-unique definition have no immutable cached
+     * binding authority, so neither may acquire a stable phase byte. */
+    clear_resolution_caches();
+    requester_symbols[1].st_info = ELF64_ST_INFO(STB_WEAK, STT_OBJECT);
+    provider_symbols[1].st_shndx = SHN_UNDEF;
+    if (prepare_prelinked_phase_plan_fixture(&fixture) !=
+            PRELINKED_RUNTIME_AUTHORITY_READY ||
+        fixture.plan.phases[0] != PRELINKED_FIXUP_PHASE_LEGACY)
+        goto out;
+    loader_readonly_snapshot_release(&fixture.snapshot);
+    requester_symbols[1].st_info = ELF64_ST_INFO(STB_GLOBAL, STT_OBJECT);
+    provider_symbols[1].st_shndx = 1;
+    provider_symbols[1].st_info =
+        ELF64_ST_INFO(STB_GNU_UNIQUE, STT_OBJECT);
+    clear_resolution_caches();
+    if (prepare_prelinked_phase_plan_fixture(&fixture) !=
+            PRELINKED_RUNTIME_AUTHORITY_READY ||
+        fixture.plan.phases[0] != PRELINKED_FIXUP_PHASE_LEGACY)
+        goto out;
+    loader_readonly_snapshot_release(&fixture.snapshot);
+    provider_symbols[1].st_info = ELF64_ST_INFO(STB_GLOBAL, STT_OBJECT);
+    valid = 1;
+
+out:
+    g_prelinked_phase_plan_force_small = 0;
+    g_prelinked_phase_plan_force_allocation_failure = 0;
+    g_prelinked_phase_plan_force_protection_failure = 0;
+    g_loader_snapshot_fail_protect = 0;
+    release_prelinked_phase_plan_fixture(&fixture);
+    return valid;
+}
+
 static int run_all_relocation_phases(struct loaded_obj *obj,
                                      struct loaded_obj *all, int nobj,
                                      Elf64_Rela *relocation, int prelinked)
@@ -515,7 +918,8 @@ static int run_all_relocation_phases(struct loaded_obj *obj,
         int status = prelinked
             ? apply_prelinked_runtime_reloc(
                   obj, all, nobj, relocation,
-                  (enum relocation_pass)phase)
+                  LOADED_RELA_DYNAMIC,
+                  (enum relocation_pass)phase, 0)
             : apply_relocs_rela(
                   obj, LOADED_RELA_DYNAMIC, all, nobj,
                   (enum relocation_pass)phase);
@@ -699,7 +1103,7 @@ static int mutable_phase_filter_fail_closed_gate(void)
         } else {
             status = apply_prelinked_runtime_reloc(
                 &g_all_objs[0], g_all_objs, 2, &relocation,
-                RELOC_PASS_ORDINARY);
+                LOADED_RELA_DYNAMIC, RELOC_PASS_ORDINARY, 0);
         }
         if (status < 0 || g_relocation_validation_calls != 1 ||
             phase_ifunc_calls != 0)
@@ -718,7 +1122,7 @@ static int mutable_phase_filter_fail_closed_gate(void)
         } else {
             status = apply_prelinked_runtime_reloc(
                 &g_all_objs[0], g_all_objs, 2, &relocation,
-                RELOC_PASS_IFUNC);
+                LOADED_RELA_DYNAMIC, RELOC_PASS_IFUNC, 0);
         }
         if (status >= 0 || g_relocation_validation_calls != 2 ||
             phase_ifunc_calls != 0 ||
@@ -854,7 +1258,8 @@ static int relocation_phase_validation_gate(void)
          phase <= RELOC_PASS_IRELATIVE; phase++) {
         if (apply_prelinked_runtime_reloc(
                 &obj, &obj, 1, &relocation,
-                (enum relocation_pass)phase) < 0)
+                LOADED_RELA_DYNAMIC,
+                (enum relocation_pass)phase, 0) < 0)
             goto out;
     }
     if (g_relocation_validation_calls != 1 ||
@@ -915,5 +1320,9 @@ int main(void)
         return 11;
     if (!mutable_gnu_unique_phase_filter_fail_closed_gate())
         return 12;
+    if (!prelinked_phase_plan_gate())
+        return 13;
+    if (!broad_manifest_fixup_validation_gate())
+        return 14;
     return 0;
 }

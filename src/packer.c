@@ -15,6 +15,10 @@
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#if defined(__aarch64__) && !defined(STO_AARCH64_VARIANT_PCS)
+#define STO_AARCH64_VARIANT_PCS 0x80
+#endif
 #include <stdint.h>
 #include <elf.h>
 #include <errno.h>
@@ -26,6 +30,19 @@
 #endif
 #ifndef RENAME_EXCHANGE
 #define RENAME_EXCHANGE (1U << 1)
+#endif
+
+#ifdef DLFREEZE_PACKER_TRANSACTION_GATE
+enum packer_transaction_test_replacement_stage {
+    PACKER_TRANSACTION_TEST_AFTER_PRELINK = 1,
+    PACKER_TRANSACTION_TEST_AFTER_SYMTAB = 2,
+    PACKER_TRANSACTION_TEST_AFTER_PAYLOAD = 3,
+};
+extern int dlfreeze_packer_transaction_gate_after_replacement(
+    int stage,
+    const struct stat *replacement_identity);
+extern int dlfreeze_packer_transaction_gate_after_private_rename(
+    const struct stat *replacement_identity);
 #endif
 
 #ifndef DLFRZ_FLAG_DATA_VIRTUAL
@@ -808,18 +825,43 @@ static int packed_canonicalize_alias_metadata(
     return 0;
 }
 
+static int packer_pread_exact(int fd, void *buffer, size_t size,
+                              uint64_t offset);
+
 static int validate_copied_elf(FILE *output, const char *path,
                               uint64_t offset, size_t length,
                               int expected_class, uint16_t expected_machine,
                               uint32_t entry_flags)
 {
+    Elf64_Ehdr header;
     struct elf_info info;
     int fd;
     int valid;
 
     memset(&info, 0, sizeof(info));
     fd = fileno(output);
-    if (fd < 0 || elf_parse_fd_range(fd, offset, length, &info) < 0) {
+    if (fd < 0 || length < sizeof(header) ||
+        packer_pread_exact(fd, &header, sizeof(header), offset) < 0) {
+        fprintf(stderr, "dlfreeze: copied ELF input is malformed: %s\n",
+                path ? path : "(null)");
+        errno = EINVAL;
+        return -1;
+    }
+    /* The full parser is intentionally compiled for one ELF machine and
+     * rejects foreign relocation encodings as malformed.  Classify a
+     * recognizable ABI mismatch from the fixed header first so callers get
+     * a stable, specific refusal and never confuse it with damaged bytes. */
+    if (memcmp(header.e_ident, ELFMAG, SELFMAG) == 0 &&
+        header.e_ident[EI_DATA] == ELFDATA2LSB &&
+        header.e_ident[EI_VERSION] == EV_CURRENT &&
+        (header.e_ident[EI_CLASS] != expected_class ||
+         header.e_machine != expected_machine)) {
+        fprintf(stderr, "dlfreeze: copied ELF input is incompatible: %s\n",
+                path ? path : "(null)");
+        errno = ENOEXEC;
+        return -1;
+    }
+    if (elf_parse_fd_range(fd, offset, length, &info) < 0) {
         fprintf(stderr, "dlfreeze: copied ELF input is malformed: %s\n",
                 path ? path : "(null)");
         errno = EINVAL;
@@ -958,6 +1000,44 @@ out:
     return -1;
 }
 
+static int publish_captured_data_timestamps(
+    struct dlfrz_entry *entry,
+    const struct packed_input_snapshot *snapshot,
+    const char *path)
+{
+    int64_t mtime_sec;
+    int64_t ctime_sec;
+
+    if (!entry || !snapshot || !snapshot->valid ||
+        snapshot->st.st_mtim.tv_nsec < 0 ||
+        snapshot->st.st_mtim.tv_nsec > 999999999L ||
+        snapshot->st.st_ctim.tv_nsec < 0 ||
+        snapshot->st.st_ctim.tv_nsec > 999999999L) {
+        fprintf(stderr,
+                "dlfreeze: captured input has invalid timestamps: %s\n",
+                path ? path : "(null)");
+        errno = EINVAL;
+        return -1;
+    }
+    mtime_sec = (int64_t)snapshot->st.st_mtim.tv_sec;
+    ctime_sec = (int64_t)snapshot->st.st_ctim.tv_sec;
+    if ((time_t)mtime_sec != snapshot->st.st_mtim.tv_sec ||
+        (time_t)ctime_sec != snapshot->st.st_ctim.tv_sec) {
+        fprintf(stderr,
+                "dlfreeze: captured input timestamp is not representable: %s\n",
+                path ? path : "(null)");
+        errno = EOVERFLOW;
+        return -1;
+    }
+    entry->captured_mtime_sec = mtime_sec;
+    entry->captured_ctime_sec = ctime_sec;
+    entry->captured_mtime_nsec =
+        (uint32_t)snapshot->st.st_mtim.tv_nsec;
+    entry->captured_ctime_nsec =
+        (uint32_t)snapshot->st.st_ctim.tv_nsec;
+    return 0;
+}
+
 static int size_add_assign(size_t *value, size_t increment)
 {
     if (!value || increment > SIZE_MAX - *value) {
@@ -994,15 +1074,68 @@ static int write_pad(FILE *out, size_t *cur, size_t align)
     return 0;
 }
 
-static int filesize(const char *path, size_t *size_out)
+static int output_identity_equal(const struct stat *left,
+                                 const struct stat *right)
+{
+    return left && right && left->st_dev == right->st_dev &&
+           left->st_ino == right->st_ino &&
+           (left->st_mode & S_IFMT) == (right->st_mode & S_IFMT);
+}
+
+static int open_owned_transaction(const char *path, int flags,
+                                  const struct stat *expected,
+                                  struct stat *opened_identity)
+{
+    struct stat current;
+    int fd;
+    int saved_errno;
+
+    if (!path || !expected) {
+        errno = EINVAL;
+        return -1;
+    }
+    fd = open(path, flags | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0)
+        return -1;
+    if (fstat(fd, &current) < 0) {
+        saved_errno = errno ? errno : EIO;
+        close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+    if (!output_identity_equal(&current, expected) ||
+        !S_ISREG(current.st_mode) || current.st_nlink != 1) {
+        close(fd);
+        errno = ESTALE;
+        return -1;
+    }
+    if (opened_identity)
+        *opened_identity = current;
+    return fd;
+}
+
+static int filesize(const char *path, const struct stat *expected,
+                    size_t *size_out)
 {
     struct stat st;
+    int fd;
+    int saved_errno;
 
-    if (!path || !size_out || stat(path, &st) < 0)
+    if (!path || !expected || !size_out) {
+        errno = EINVAL;
         return -1;
-    if (!S_ISREG(st.st_mode) || st.st_size < 0 ||
-        (uintmax_t)st.st_size > SIZE_MAX) {
+    }
+    fd = open_owned_transaction(path, O_RDONLY, expected, &st);
+    if (fd < 0)
+        return -1;
+    if (st.st_size < 0 || (uintmax_t)st.st_size > SIZE_MAX) {
+        close(fd);
         errno = EFBIG;
+        return -1;
+    }
+    if (close(fd) < 0) {
+        saved_errno = errno ? errno : EIO;
+        errno = saved_errno;
         return -1;
     }
     *size_out = (size_t)st.st_size;
@@ -1028,9 +1161,14 @@ static int packer_fchmod_retry(int fd, mode_t mode)
     return result;
 }
 
+static int cleanup_output_transaction(
+    const char *transaction_path,
+    const struct stat *transaction_identity);
+
 static int create_output_transaction(const char *output_path,
                                      char transaction_path[PATH_MAX],
-                                     FILE **stream_out)
+                                     FILE **stream_out,
+                                     struct stat *identity_out)
 {
     static const char leaf[] = ".dlfreeze-pack.XXXXXX";
     const char *slash;
@@ -1038,10 +1176,11 @@ static int create_output_transaction(const char *output_path,
     size_t leaf_len = sizeof(leaf) - 1;
     int fd = -1;
     int fd_flags;
+    int identity_valid = 0;
     FILE *stream = NULL;
 
     if (!output_path || output_path[0] == '\0' || !transaction_path ||
-        !stream_out) {
+        !stream_out || !identity_out) {
         errno = EINVAL;
         return -1;
     }
@@ -1068,6 +1207,13 @@ static int create_output_transaction(const char *output_path,
     fd = mkstemp(transaction_path);
     if (fd < 0)
         return -1;
+    if (fstat(fd, identity_out) < 0)
+        goto fail;
+    identity_valid = 1;
+    if (!S_ISREG(identity_out->st_mode) || identity_out->st_nlink != 1) {
+        errno = ESTALE;
+        goto fail;
+    }
     /* mkstemp's 0600 request is still filtered by the caller's umask.  Keep
      * an incomplete artifact non-executable, but make its owner permissions
      * exact so later transaction phases can safely reopen it even under a
@@ -1090,7 +1236,18 @@ fail:
 
         if (fd >= 0)
             close(fd);
-        unlink(transaction_path);
+        if (identity_valid) {
+            if (cleanup_output_transaction(
+                    transaction_path, identity_out) < 0 &&
+                errno != ENOENT && errno != ESTALE)
+                fprintf(stderr,
+                        "dlfreeze: cannot remove failed output transaction "
+                        "%s: %s\n", transaction_path, strerror(errno));
+        } else {
+            fprintf(stderr,
+                    "dlfreeze: cannot identify failed output transaction "
+                    "%s; leaving it untouched\n", transaction_path);
+        }
         transaction_path[0] = '\0';
         errno = saved_errno;
         return -1;
@@ -1125,12 +1282,126 @@ static int finish_output_stream(FILE **stream_ptr)
     return 0;
 }
 
-static int sync_output_transaction(const char *path)
+static int open_output_parent_directory(const char *output_path);
+static const char *output_path_leaf(const char *path);
+static int output_stat_at(int directory_fd, const char *leaf,
+                          struct stat *result);
+
+static int output_require_private_identity_at(
+    int directory_fd, const char *leaf, const struct stat *expected)
+{
+    struct stat current;
+
+    if (output_stat_at(directory_fd, leaf, &current) < 0)
+        return -1;
+    if (!output_identity_equal(&current, expected) ||
+        !S_ISREG(current.st_mode) || current.st_nlink != 1) {
+        errno = ESTALE;
+        return -1;
+    }
+    return 0;
+}
+
+/* Replace one still-private transaction inode with another.  replacement is
+ * the identity captured from the owned copy's open descriptor before this
+ * rename.  TRANSACTION_IDENTITY is an ownership token as well as a
+ * precondition: update it immediately after rename succeeds, before any
+ * fallible post-rename validation, so every caller can clean the live private
+ * name with the exact new identity even when this function returns an error.
+ * No post-rename pathname identity is ever adopted as authority. */
+static int replace_owned_transaction(
+    const char *replacement_path,
+    const struct stat *replacement_identity,
+    const char *transaction_path,
+    struct stat *transaction_identity)
+{
+    const char *replacement_leaf = output_path_leaf(replacement_path);
+    const char *transaction_leaf = output_path_leaf(transaction_path);
+    struct stat replacement_directory_identity;
+    struct stat transaction_directory_identity;
+    int replacement_directory_fd = -1;
+    int transaction_directory_fd = -1;
+    int saved_errno = 0;
+    int result = -1;
+
+    if (!replacement_leaf || !transaction_leaf || !replacement_identity ||
+        !transaction_identity) {
+        errno = EINVAL;
+        return -1;
+    }
+    replacement_directory_fd =
+        open_output_parent_directory(replacement_path);
+    transaction_directory_fd = open_output_parent_directory(transaction_path);
+    if (replacement_directory_fd < 0 || transaction_directory_fd < 0 ||
+        fstat(replacement_directory_fd,
+              &replacement_directory_identity) < 0 ||
+        fstat(transaction_directory_fd,
+              &transaction_directory_identity) < 0)
+        goto out;
+    if (!output_identity_equal(&replacement_directory_identity,
+                               &transaction_directory_identity) ||
+        !S_ISDIR(replacement_directory_identity.st_mode)) {
+        errno = EXDEV;
+        goto out;
+    }
+    if (output_require_private_identity_at(
+            replacement_directory_fd, replacement_leaf,
+            replacement_identity) < 0 ||
+        output_require_private_identity_at(
+            transaction_directory_fd, transaction_leaf,
+            transaction_identity) < 0 ||
+        renameat(replacement_directory_fd, replacement_leaf,
+                 transaction_directory_fd, transaction_leaf) < 0)
+        goto out;
+
+    *transaction_identity = *replacement_identity;
+#ifdef DLFREEZE_PACKER_TRANSACTION_GATE
+    if (dlfreeze_packer_transaction_gate_after_private_rename(
+            transaction_identity)) {
+        errno = EIO;
+        goto out;
+    }
+#endif
+    if (output_require_private_identity_at(
+            transaction_directory_fd, transaction_leaf,
+            transaction_identity) < 0)
+        goto out;
+    result = 0;
+
+out:
+    if (result < 0)
+        saved_errno = errno ? errno : EIO;
+    if (replacement_directory_fd >= 0)
+        close(replacement_directory_fd);
+    if (transaction_directory_fd >= 0)
+        close(transaction_directory_fd);
+    if (result < 0)
+        errno = saved_errno;
+    return result;
+}
+
+static void discard_owned_transaction(const char *path,
+                                      const struct stat *identity,
+                                      const char *description)
+{
+    int saved_errno = errno ? errno : EIO;
+
+    if (path && path[0] && identity &&
+        cleanup_output_transaction(path, identity) < 0 &&
+        errno != ENOENT && errno != ESTALE)
+        fprintf(stderr, "dlfreeze: cannot remove %s %s: %s\n",
+                description ? description : "transaction", path,
+                strerror(errno));
+    errno = saved_errno;
+}
+
+static int sync_output_transaction(const char *path,
+                                   const struct stat *expected)
 {
     int fd;
     int saved_errno = 0;
 
-    fd = open(path, O_RDWR | O_CLOEXEC);
+    fd = open_owned_transaction(path, O_RDWR, expected, NULL);
     if (fd < 0)
         return -1;
     if (packer_fchmod_retry(fd, 0755) < 0)
@@ -1170,48 +1441,591 @@ static int open_output_parent_directory(const char *output_path)
     return open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 }
 
+#ifdef DLFREEZE_PACKER_PUBLISH_GATE
+enum packer_publish_test_stage {
+    PACKER_PUBLISH_TEST_AFTER_DESTINATION_PROBE = 1,
+    PACKER_PUBLISH_TEST_BEFORE_FALLBACK_RENAME = 2,
+    PACKER_PUBLISH_TEST_AFTER_FAST_RENAME = 3,
+    PACKER_PUBLISH_TEST_AFTER_BACKUP_LINK = 4,
+};
+
+static int g_packer_publish_test_renameat2_errno;
+static int g_packer_publish_test_backup_stat_errno;
+static unsigned int g_packer_publish_test_fsync_calls;
+static unsigned int g_packer_publish_test_fail_fsync_call;
+static void (*g_packer_publish_test_stage_hook)(
+    enum packer_publish_test_stage stage, int directory_fd,
+    const char *transaction_leaf, const char *output_leaf);
+#endif
+
 static int fsync_retry(int fd)
 {
     int result;
 
+#ifdef DLFREEZE_PACKER_PUBLISH_GATE
+    g_packer_publish_test_fsync_calls++;
+    if (g_packer_publish_test_fail_fsync_call != 0 &&
+        g_packer_publish_test_fsync_calls ==
+            g_packer_publish_test_fail_fsync_call) {
+        errno = EIO;
+        return -1;
+    }
+#endif
     do {
         result = fsync(fd);
     } while (result < 0 && errno == EINTR);
     return result;
 }
 
-static int rename_with_flags(const char *old_path, const char *new_path,
-                             unsigned int flags)
+static int rename_with_flags_at(int directory_fd, const char *old_leaf,
+                                const char *new_leaf, unsigned int flags)
 {
+#ifdef DLFREEZE_PACKER_PUBLISH_GATE
+    if (g_packer_publish_test_renameat2_errno != 0) {
+        errno = g_packer_publish_test_renameat2_errno;
+        return -1;
+    }
+#endif
 #if defined(SYS_renameat2)
-    return (int)syscall(SYS_renameat2, AT_FDCWD, old_path, AT_FDCWD,
-                        new_path, flags);
+    return (int)syscall(SYS_renameat2, directory_fd, old_leaf, directory_fd,
+                        new_leaf, flags);
 #elif defined(__NR_renameat2)
-    return (int)syscall(__NR_renameat2, AT_FDCWD, old_path, AT_FDCWD,
-                        new_path, flags);
+    return (int)syscall(__NR_renameat2, directory_fd, old_leaf, directory_fd,
+                        new_leaf, flags);
 #else
-    (void)old_path;
-    (void)new_path;
+    (void)directory_fd;
+    (void)old_leaf;
+    (void)new_leaf;
     (void)flags;
     errno = ENOTSUP;
     return -1;
 #endif
 }
 
+static int rename_flags_unsupported(int error)
+{
+    return error == ENOSYS || error == EINVAL || error == EOPNOTSUPP
+#if defined(ENOTSUP) && ENOTSUP != EOPNOTSUPP
+        || error == ENOTSUP
+#endif
+        ;
+}
+
+static const char *output_path_leaf(const char *path)
+{
+    const char *slash;
+    const char *leaf;
+
+    if (!path || path[0] == '\0') {
+        errno = EINVAL;
+        return NULL;
+    }
+    slash = strrchr(path, '/');
+    leaf = slash ? slash + 1 : path;
+    if (leaf[0] == '\0' || strcmp(leaf, ".") == 0 ||
+        strcmp(leaf, "..") == 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+    return leaf;
+}
+
+static int output_stat_at(int directory_fd, const char *leaf,
+                          struct stat *result)
+{
+    return fstatat(directory_fd, leaf, result, AT_SYMLINK_NOFOLLOW);
+}
+
+static int output_require_identity_at(int directory_fd, const char *leaf,
+                                      const struct stat *expected)
+{
+    struct stat current;
+
+    if (output_stat_at(directory_fd, leaf, &current) < 0)
+        return -1;
+    if (!output_identity_equal(&current, expected)) {
+        errno = ESTALE;
+        return -1;
+    }
+    return 0;
+}
+
+/* unlinkat has no compare-and-remove form.  Revalidate immediately before
+ * removing a transaction-owned name and refuse to touch it if another inode
+ * has won the name.  A hostile directory can still race the final syscall;
+ * POSIX fallback primitives cannot close that interval, so every detected
+ * race is fail-closed and the renameat2 path remains preferred. */
+static int output_unlink_identity_at(int directory_fd, const char *leaf,
+                                     const struct stat *expected)
+{
+    if (output_require_identity_at(directory_fd, leaf, expected) < 0)
+        return -1;
+    return unlinkat(directory_fd, leaf, 0);
+}
+
+static void output_report_rollback_failure(const char *operation)
+{
+    fprintf(stderr, "dlfreeze: cannot %s: %s\n", operation,
+            strerror(errno));
+}
+
+static int rollback_new_output(int directory_fd, const char *output_leaf,
+                               const struct stat *transaction_identity)
+{
+    if (output_unlink_identity_at(directory_fd, output_leaf,
+                                  transaction_identity) < 0)
+        return -1;
+    return fsync_retry(directory_fd);
+}
+
+static int finish_fast_new_output(int directory_fd,
+                                  const char *transaction_leaf,
+                                  const char *output_leaf,
+                                  const struct stat *transaction_identity)
+{
+    struct stat ignored;
+    int saved_errno;
+    int transaction_status;
+
+    if (output_require_identity_at(directory_fd, output_leaf,
+                                   transaction_identity) < 0) {
+        saved_errno = errno ? errno : ESTALE;
+        if (output_require_identity_at(directory_fd, output_leaf,
+                                       transaction_identity) == 0 &&
+            rollback_new_output(directory_fd, output_leaf,
+                                transaction_identity) < 0)
+            output_report_rollback_failure("roll back invalid output commit");
+        errno = saved_errno;
+        return -1;
+    }
+    transaction_status = output_stat_at(
+        directory_fd, transaction_leaf, &ignored);
+    if (transaction_status == 0 || errno != ENOENT) {
+        /* A successful probe does not define errno.  Report the unexpected
+         * surviving/reused transaction name as an identity failure rather
+         * than leaking a stale diagnostic from an earlier syscall. */
+        saved_errno = transaction_status == 0
+            ? ESTALE : (errno ? errno : ESTALE);
+        if (output_require_identity_at(directory_fd, output_leaf,
+                                       transaction_identity) == 0 &&
+            rollback_new_output(directory_fd, output_leaf,
+                                transaction_identity) < 0)
+            output_report_rollback_failure("roll back invalid output commit");
+        errno = saved_errno;
+        return -1;
+    }
+    if (fsync_retry(directory_fd) < 0) {
+        saved_errno = errno ? errno : EIO;
+        if (rollback_new_output(directory_fd, output_leaf,
+                                transaction_identity) < 0)
+            output_report_rollback_failure("roll back failed output commit");
+        errno = saved_errno;
+        return -1;
+    }
+    return 0;
+}
+
+static int fallback_new_output(int directory_fd,
+                               const char *transaction_leaf,
+                               const char *output_leaf,
+                               const struct stat *transaction_identity)
+{
+    int saved_errno;
+
+    /* linkat is the portable same-filesystem atomic no-replace primitive.
+     * It preserves transaction_leaf until the new directory entry is known
+     * durable, so a failed commit can remove only the inode we created. */
+    if (linkat(directory_fd, transaction_leaf, directory_fd, output_leaf,
+               0) < 0)
+        return -1;
+    if (output_require_identity_at(directory_fd, output_leaf,
+                                   transaction_identity) < 0) {
+        saved_errno = errno ? errno : ESTALE;
+        if (output_require_identity_at(directory_fd, output_leaf,
+                                       transaction_identity) == 0 &&
+            rollback_new_output(directory_fd, output_leaf,
+                                transaction_identity) < 0)
+            output_report_rollback_failure("roll back invalid output link");
+        errno = saved_errno;
+        return -1;
+    }
+    if (fsync_retry(directory_fd) < 0) {
+        saved_errno = errno ? errno : EIO;
+        if (rollback_new_output(directory_fd, output_leaf,
+                                transaction_identity) < 0)
+            output_report_rollback_failure("roll back failed output link");
+        errno = saved_errno;
+        return -1;
+    }
+    if (output_unlink_identity_at(directory_fd, transaction_leaf,
+                                  transaction_identity) < 0) {
+        saved_errno = errno ? errno : EIO;
+        if (rollback_new_output(directory_fd, output_leaf,
+                                transaction_identity) < 0)
+            output_report_rollback_failure("roll back output cleanup failure");
+        errno = saved_errno;
+        return -1;
+    }
+    if (fsync_retry(directory_fd) < 0) {
+        saved_errno = errno ? errno : EIO;
+        if (rollback_new_output(directory_fd, output_leaf,
+                                transaction_identity) < 0)
+            output_report_rollback_failure("roll back undurable output cleanup");
+        errno = saved_errno;
+        return -1;
+    }
+    return 0;
+}
+
+static int make_output_backup(int directory_fd, const char *output_leaf,
+                              const char *transaction_leaf,
+                              const struct stat *old_identity,
+                              char backup_leaf[NAME_MAX + 1],
+                              struct stat *backup_identity)
+{
+    const char *transaction_suffix = transaction_leaf;
+
+    if (strncmp(transaction_suffix, ".dlfreeze-pack.", 16) == 0)
+        transaction_suffix += 16;
+    for (unsigned int attempt = 0; attempt < 128; attempt++) {
+        int length = snprintf(backup_leaf, NAME_MAX + 1,
+                              ".dlfreeze-backup.%s.%u",
+                              transaction_suffix, attempt);
+
+        if (length < 0 || length > NAME_MAX) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        if (linkat(directory_fd, output_leaf, directory_fd, backup_leaf,
+                   0) == 0) {
+#ifdef DLFREEZE_PACKER_PUBLISH_GATE
+            if (g_packer_publish_test_stage_hook)
+                g_packer_publish_test_stage_hook(
+                    PACKER_PUBLISH_TEST_AFTER_BACKUP_LINK,
+                    directory_fd, backup_leaf, output_leaf);
+            if (g_packer_publish_test_backup_stat_errno != 0) {
+                errno = g_packer_publish_test_backup_stat_errno;
+                g_packer_publish_test_backup_stat_errno = 0;
+            } else
+#endif
+            if (output_stat_at(directory_fd, backup_leaf,
+                               backup_identity) == 0)
+                return 0;
+            {
+                int saved_errno = errno ? errno : EIO;
+                struct stat recovered_identity;
+
+                /* The name is visible in a caller-controlled directory.  If
+                 * its first identity probe fails, another process may have
+                 * replaced it already; never raw-unlink that unverified
+                 * name.  A successful retry permits only identity-bound
+                 * cleanup of the exact old output inode. */
+                if (output_stat_at(directory_fd, backup_leaf,
+                                   &recovered_identity) == 0 &&
+                    output_identity_equal(&recovered_identity,
+                                          old_identity) &&
+                    output_unlink_identity_at(directory_fd, backup_leaf,
+                                              &recovered_identity) < 0)
+                    output_report_rollback_failure(
+                        "remove recovered output backup");
+                errno = saved_errno;
+                return -1;
+            }
+        }
+        if (errno != EEXIST)
+            return -1;
+    }
+    errno = EEXIST;
+    return -1;
+}
+
+static int cleanup_output_backup(int directory_fd, const char *backup_leaf,
+                                 const struct stat *backup_identity)
+{
+    if (output_unlink_identity_at(directory_fd, backup_leaf,
+                                  backup_identity) < 0)
+        return -1;
+    return fsync_retry(directory_fd);
+}
+
+/* Failed pack cleanup is permitted to remove only the latest inode captured
+ * from an owned descriptor and handed off by a successful private rename.
+ * In particular, an exchange or racing process can move that inode away from
+ * transaction_path before another inode reuses the name. */
+static int cleanup_output_transaction(
+    const char *transaction_path,
+    const struct stat *transaction_identity)
+{
+    const char *transaction_leaf = output_path_leaf(transaction_path);
+    struct stat current;
+    int directory_fd;
+    int saved_errno;
+
+    if (!transaction_leaf || !transaction_identity) {
+        errno = EINVAL;
+        return -1;
+    }
+    directory_fd = open_output_parent_directory(transaction_path);
+    if (directory_fd < 0)
+        return -1;
+    if (output_stat_at(directory_fd, transaction_leaf, &current) < 0) {
+        saved_errno = errno;
+        close(directory_fd);
+        if (saved_errno == ENOENT)
+            return 0;
+        errno = saved_errno;
+        return -1;
+    }
+    if (output_unlink_identity_at(directory_fd, transaction_leaf,
+                                  transaction_identity) < 0) {
+        saved_errno = errno ? errno : EIO;
+        close(directory_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    if (fsync_retry(directory_fd) < 0) {
+        saved_errno = errno ? errno : EIO;
+        close(directory_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    if (close(directory_fd) < 0)
+        return -1;
+    return 0;
+}
+
+static int rollback_replaced_output(int directory_fd,
+                                    const char *backup_leaf,
+                                    const char *output_leaf,
+                                    const struct stat *old_identity,
+                                    const struct stat *new_identity)
+{
+    if (output_require_identity_at(directory_fd, backup_leaf,
+                                   old_identity) < 0 ||
+        output_require_identity_at(directory_fd, output_leaf,
+                                   new_identity) < 0)
+        return -1;
+    if (renameat(directory_fd, backup_leaf, directory_fd, output_leaf) < 0)
+        return -1;
+    if (output_require_identity_at(directory_fd, output_leaf,
+                                   old_identity) < 0)
+        return -1;
+    return fsync_retry(directory_fd);
+}
+
+static int fallback_replace_output(int directory_fd,
+                                   const char *transaction_leaf,
+                                   const char *output_leaf,
+                                   const struct stat *old_identity,
+                                   const struct stat *transaction_identity)
+{
+    char backup_leaf[NAME_MAX + 1];
+    struct stat backup_identity;
+    int saved_errno;
+
+    if (!S_ISREG(old_identity->st_mode)) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (output_require_identity_at(directory_fd, output_leaf,
+                                   old_identity) < 0)
+        return -1;
+    if (make_output_backup(directory_fd, output_leaf, transaction_leaf,
+                           old_identity, backup_leaf,
+                           &backup_identity) < 0)
+        return -1;
+    if (!output_identity_equal(&backup_identity, old_identity)) {
+        saved_errno = ESTALE;
+        if (cleanup_output_backup(directory_fd, backup_leaf,
+                                  &backup_identity) < 0)
+            output_report_rollback_failure("remove uncommitted output backup");
+        errno = saved_errno;
+        return -1;
+    }
+    if (output_require_identity_at(directory_fd, output_leaf,
+                                   old_identity) < 0 ||
+        output_require_identity_at(directory_fd, transaction_leaf,
+                                   transaction_identity) < 0) {
+        saved_errno = errno ? errno : ESTALE;
+        if (cleanup_output_backup(directory_fd, backup_leaf,
+                                  &backup_identity) < 0)
+            output_report_rollback_failure("remove uncommitted output backup");
+        errno = saved_errno;
+        return -1;
+    }
+
+    /* The retained old inode must itself be durable before renameat can
+     * remove its original name. */
+    if (fsync_retry(directory_fd) < 0) {
+        saved_errno = errno ? errno : EIO;
+        if (cleanup_output_backup(directory_fd, backup_leaf,
+                                  &backup_identity) < 0)
+            output_report_rollback_failure("remove undurable output backup");
+        errno = saved_errno;
+        return -1;
+    }
+
+#ifdef DLFREEZE_PACKER_PUBLISH_GATE
+    if (g_packer_publish_test_stage_hook)
+        g_packer_publish_test_stage_hook(
+            PACKER_PUBLISH_TEST_BEFORE_FALLBACK_RENAME,
+            directory_fd, transaction_leaf, output_leaf);
+#endif
+
+    /* The backup is a same-inode hard link, so it retains the exact old
+     * regular file while POSIX rename atomically publishes the transaction. */
+    if (output_require_identity_at(directory_fd, output_leaf,
+                                   old_identity) < 0 ||
+        output_require_identity_at(directory_fd, transaction_leaf,
+                                   transaction_identity) < 0 ||
+        renameat(directory_fd, transaction_leaf,
+                 directory_fd, output_leaf) < 0) {
+        saved_errno = errno ? errno : EIO;
+        if (cleanup_output_backup(directory_fd, backup_leaf,
+                                  &backup_identity) < 0)
+            output_report_rollback_failure("remove uncommitted output backup");
+        errno = saved_errno;
+        return -1;
+    }
+    if (output_require_identity_at(directory_fd, output_leaf,
+                                   transaction_identity) < 0 ||
+        output_require_identity_at(directory_fd, backup_leaf,
+                                   old_identity) < 0) {
+        saved_errno = errno ? errno : ESTALE;
+        if (rollback_replaced_output(directory_fd, backup_leaf, output_leaf,
+                                     old_identity,
+                                     transaction_identity) < 0)
+            output_report_rollback_failure("roll back invalid output rename");
+        errno = saved_errno;
+        return -1;
+    }
+    if (fsync_retry(directory_fd) < 0) {
+        saved_errno = errno ? errno : EIO;
+        if (rollback_replaced_output(directory_fd, backup_leaf, output_leaf,
+                                     old_identity,
+                                     transaction_identity) < 0)
+            output_report_rollback_failure("roll back failed output rename");
+        errno = saved_errno;
+        return -1;
+    }
+    if (output_unlink_identity_at(directory_fd, backup_leaf,
+                                  &backup_identity) < 0) {
+        saved_errno = errno ? errno : EIO;
+        if (rollback_replaced_output(directory_fd, backup_leaf, output_leaf,
+                                     old_identity,
+                                     transaction_identity) < 0)
+            output_report_rollback_failure("roll back output cleanup failure");
+        errno = saved_errno;
+        return -1;
+    }
+
+    /* The published rename is already durable.  As on the renameat2 fast
+     * path, failure of the cleanup sync is advisory: rollback is no longer
+     * exact after the sole backup name has been removed. */
+    if (fsync_retry(directory_fd) < 0)
+        fprintf(stderr,
+                "dlfreeze: warning: output backup cleanup is not durable: %s\n",
+                strerror(errno));
+    return 0;
+}
+
+static int rollback_fast_exchange(int directory_fd,
+                                  const char *transaction_leaf,
+                                  const char *output_leaf,
+                                  const struct stat *old_identity,
+                                  const struct stat *new_identity)
+{
+    if (output_require_identity_at(directory_fd, transaction_leaf,
+                                   old_identity) < 0 ||
+        output_require_identity_at(directory_fd, output_leaf,
+                                   new_identity) < 0)
+        return -1;
+    if (rename_with_flags_at(directory_fd, transaction_leaf, output_leaf,
+                             RENAME_EXCHANGE) < 0)
+        return -1;
+    if (output_require_identity_at(directory_fd, output_leaf,
+                                   old_identity) < 0 ||
+        output_require_identity_at(directory_fd, transaction_leaf,
+                                   new_identity) < 0)
+        return -1;
+    return fsync_retry(directory_fd);
+}
+
+static int finish_fast_replace_output(
+    int directory_fd, const char *transaction_leaf, const char *output_leaf,
+    const struct stat *old_identity,
+    const struct stat *transaction_identity)
+{
+    int saved_errno;
+
+    if (output_require_identity_at(directory_fd, output_leaf,
+                                   transaction_identity) < 0 ||
+        output_require_identity_at(directory_fd, transaction_leaf,
+                                   old_identity) < 0) {
+        saved_errno = errno ? errno : ESTALE;
+        if (rollback_fast_exchange(directory_fd, transaction_leaf,
+                                   output_leaf, old_identity,
+                                   transaction_identity) < 0)
+            output_report_rollback_failure("roll back invalid output exchange");
+        errno = saved_errno;
+        return -1;
+    }
+    if (fsync_retry(directory_fd) < 0) {
+        saved_errno = errno ? errno : EIO;
+        if (rollback_fast_exchange(directory_fd, transaction_leaf,
+                                   output_leaf, old_identity,
+                                   transaction_identity) < 0)
+            output_report_rollback_failure("roll back failed output exchange");
+        errno = saved_errno;
+        return -1;
+    }
+    if (output_unlink_identity_at(directory_fd, transaction_leaf,
+                                  old_identity) < 0) {
+        saved_errno = errno ? errno : EIO;
+        if (rollback_fast_exchange(directory_fd, transaction_leaf,
+                                   output_leaf, old_identity,
+                                   transaction_identity) < 0)
+            output_report_rollback_failure("roll back output cleanup failure");
+        errno = saved_errno;
+        return -1;
+    }
+    if (fsync_retry(directory_fd) < 0)
+        fprintf(stderr,
+                "dlfreeze: warning: old output cleanup is not durable: %s\n",
+                strerror(errno));
+    return 0;
+}
+
 /* Publish only after the file and its temporary directory entry are durable.
- * Linux renameat2 flags are used fail-closed: RENAME_EXCHANGE retains an
- * existing destination at transaction_path until the committed directory
- * state is synced, while RENAME_NOREPLACE prevents a concurrent destination
- * from being overwritten.  A kernel/filesystem without these semantics is
- * rejected before publication rather than weakening the transaction. */
+ * renameat2 remains the preferred path.  On kernels/filesystems which reject
+ * its flags, an absent output uses hard-link no-replace publication; a regular
+ * existing output is retained under a unique same-directory hard link while
+ * POSIX rename atomically replaces it.  Captured inode identities bind every
+ * destructive cleanup and prevent a detected competitor from being removed. */
 static int commit_output_transaction(char transaction_path[PATH_MAX],
-                                     const char *output_path)
+                                     const char *output_path,
+                                     const struct stat *owned_identity,
+                                     int *transaction_name_owned)
 {
     struct stat existing;
+    struct stat transaction_identity;
+    struct stat transaction_path_identity;
+    const char *output_leaf;
+    const char *transaction_leaf;
     int directory_fd;
     int destination_exists;
     int saved_errno;
+    int rename_errno;
 
+    if (!transaction_name_owned || !owned_identity) {
+        errno = EINVAL;
+        return -1;
+    }
+    *transaction_name_owned = 1;
+    output_leaf = output_path_leaf(output_path);
+    transaction_leaf = output_path_leaf(transaction_path);
+    if (!output_leaf || !transaction_leaf)
+        return -1;
     directory_fd = open_output_parent_directory(output_path);
     if (directory_fd < 0)
         return -1;
@@ -1222,99 +2036,112 @@ static int commit_output_transaction(char transaction_path[PATH_MAX],
         return -1;
     }
 
-    destination_exists = lstat(output_path, &existing) == 0;
+    /* The transaction was created through output_path's textual parent.
+     * Prove that the now-open parent still names that exact, private file. */
+    if (lstat(transaction_path, &transaction_path_identity) < 0 ||
+        output_stat_at(directory_fd, transaction_leaf,
+                       &transaction_identity) < 0) {
+        saved_errno = errno ? errno : EIO;
+        close(directory_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    if (!output_identity_equal(&transaction_path_identity,
+                               &transaction_identity) ||
+        !output_identity_equal(owned_identity, &transaction_identity) ||
+        !S_ISREG(transaction_identity.st_mode) ||
+        transaction_identity.st_nlink != 1) {
+        saved_errno = ESTALE;
+        close(directory_fd);
+        errno = saved_errno;
+        return -1;
+    }
+
+    destination_exists = output_stat_at(directory_fd, output_leaf,
+                                        &existing) == 0;
     if (!destination_exists && errno != ENOENT) {
         saved_errno = errno ? errno : EIO;
         close(directory_fd);
         errno = saved_errno;
         return -1;
     }
+    if (destination_exists && !S_ISREG(existing.st_mode)) {
+        close(directory_fd);
+        errno = EINVAL;
+        return -1;
+    }
+
+#ifdef DLFREEZE_PACKER_PUBLISH_GATE
+    if (g_packer_publish_test_stage_hook)
+        g_packer_publish_test_stage_hook(
+            PACKER_PUBLISH_TEST_AFTER_DESTINATION_PROBE,
+            directory_fd, transaction_leaf, output_leaf);
+#endif
 
     if (destination_exists) {
-        if (rename_with_flags(transaction_path, output_path,
-                              RENAME_EXCHANGE) < 0) {
-            saved_errno = errno ? errno : EIO;
-            close(directory_fd);
-            errno = saved_errno;
-            return -1;
-        }
-        if (fsync_retry(directory_fd) < 0) {
-            saved_errno = errno ? errno : EIO;
-            if (rename_with_flags(transaction_path, output_path,
-                                  RENAME_EXCHANGE) < 0) {
-                fprintf(stderr,
-                        "dlfreeze: cannot roll back failed output commit: %s\n",
-                        strerror(errno));
-            } else if (fsync_retry(directory_fd) < 0) {
-                fprintf(stderr,
-                        "dlfreeze: cannot sync rolled-back output: %s\n",
-                        strerror(errno));
+        if (rename_with_flags_at(directory_fd, transaction_leaf, output_leaf,
+                                 RENAME_EXCHANGE) == 0) {
+#ifdef DLFREEZE_PACKER_PUBLISH_GATE
+            if (g_packer_publish_test_stage_hook)
+                g_packer_publish_test_stage_hook(
+                    PACKER_PUBLISH_TEST_AFTER_FAST_RENAME,
+                    directory_fd, transaction_leaf, output_leaf);
+#endif
+            if (finish_fast_replace_output(
+                    directory_fd, transaction_leaf, output_leaf, &existing,
+                    &transaction_identity) < 0)
+                goto fail;
+        } else {
+            rename_errno = errno ? errno : EIO;
+            if (!rename_flags_unsupported(rename_errno)) {
+                errno = rename_errno;
+                goto fail;
             }
-            close(directory_fd);
-            errno = saved_errno;
-            return -1;
+            if (fallback_replace_output(
+                    directory_fd, transaction_leaf, output_leaf, &existing,
+                    &transaction_identity) < 0)
+                goto fail;
         }
-
-        /* transaction_path now names the old destination.  If it cannot be
-         * removed, exchange it back before reporting failure. */
-        if (unlink(transaction_path) < 0) {
-            saved_errno = errno ? errno : EIO;
-            if (rename_with_flags(transaction_path, output_path,
-                                  RENAME_EXCHANGE) < 0) {
-                fprintf(stderr,
-                        "dlfreeze: cannot roll back output cleanup failure: "
-                        "%s\n", strerror(errno));
-            } else {
-                if (unlink(transaction_path) < 0 && errno != ENOENT)
-                    fprintf(stderr,
-                            "dlfreeze: cannot remove rolled-back transaction: "
-                            "%s\n", strerror(errno));
-                if (fsync_retry(directory_fd) < 0)
-                    fprintf(stderr,
-                            "dlfreeze: cannot sync rolled-back output: %s\n",
-                            strerror(errno));
-            }
-            close(directory_fd);
-            errno = saved_errno;
-            return -1;
-        }
-
-        /* The exchange itself is already durable.  This second sync makes
-         * removal of the retained old destination durable as well. */
-        if (fsync_retry(directory_fd) < 0)
-            fprintf(stderr,
-                    "dlfreeze: warning: old output cleanup is not durable: %s\n",
-                    strerror(errno));
     } else {
-        if (rename_with_flags(transaction_path, output_path,
-                              RENAME_NOREPLACE) < 0) {
-            saved_errno = errno ? errno : EIO;
-            close(directory_fd);
-            errno = saved_errno;
-            return -1;
-        }
-        if (fsync_retry(directory_fd) < 0) {
-            saved_errno = errno ? errno : EIO;
-            if (rename_with_flags(output_path, transaction_path,
-                                  RENAME_NOREPLACE) < 0) {
-                fprintf(stderr,
-                        "dlfreeze: cannot roll back failed output commit: %s\n",
-                        strerror(errno));
-            } else if (fsync_retry(directory_fd) < 0) {
-                fprintf(stderr,
-                        "dlfreeze: cannot sync rolled-back output: %s\n",
-                        strerror(errno));
+        if (rename_with_flags_at(directory_fd, transaction_leaf, output_leaf,
+                                 RENAME_NOREPLACE) == 0) {
+#ifdef DLFREEZE_PACKER_PUBLISH_GATE
+            if (g_packer_publish_test_stage_hook)
+                g_packer_publish_test_stage_hook(
+                    PACKER_PUBLISH_TEST_AFTER_FAST_RENAME,
+                    directory_fd, transaction_leaf, output_leaf);
+#endif
+            if (finish_fast_new_output(
+                    directory_fd, transaction_leaf, output_leaf,
+                    &transaction_identity) < 0)
+                goto fail;
+        } else {
+            rename_errno = errno ? errno : EIO;
+            if (!rename_flags_unsupported(rename_errno)) {
+                errno = rename_errno;
+                goto fail;
             }
-            close(directory_fd);
-            errno = saved_errno;
-            return -1;
+            if (fallback_new_output(directory_fd, transaction_leaf,
+                                    output_leaf,
+                                    &transaction_identity) < 0)
+                goto fail;
         }
     }
 
     if (close(directory_fd) < 0)
         fprintf(stderr, "dlfreeze: warning: output directory close failed: %s\n",
                 strerror(errno));
+    *transaction_name_owned = 0;
     return 0;
+
+fail:
+    saved_errno = errno ? errno : EIO;
+    *transaction_name_owned =
+        output_require_identity_at(directory_fd, transaction_leaf,
+                                   owned_identity) == 0;
+    close(directory_fd);
+    errno = saved_errno;
+    return -1;
 }
 
 static int reject_output_alias(const struct stat *output_st,
@@ -1376,25 +2203,42 @@ static int validate_output_aliases(const struct pack_options *opts)
 }
 
 static int make_transaction_copy(const char *path, const char *suffix,
-                                 char copy_path[PATH_MAX])
+                                 const struct stat *source_identity,
+                                 char copy_path[PATH_MAX],
+                                 struct stat *copy_identity)
 {
     struct stat st;
+    struct stat completed;
     char buffer[1 << 16];
     int src = -1;
     int dst = -1;
+    int identity_valid = 0;
     int rc = -1;
 
+    if (!path || !suffix || !source_identity || !copy_path ||
+        !copy_identity) {
+        errno = EINVAL;
+        return -1;
+    }
+    copy_path[0] = '\0';
     if (snprintf(copy_path, PATH_MAX, "%s.%s.XXXXXX", path, suffix) >=
         PATH_MAX) {
         errno = ENAMETOOLONG;
         return -1;
     }
-    src = open(path, O_RDONLY | O_CLOEXEC);
-    if (src < 0 || fstat(src, &st) < 0)
+    src = open_owned_transaction(path, O_RDONLY, source_identity, &st);
+    if (src < 0)
         goto out;
     dst = mkstemp(copy_path);
     if (dst < 0)
         goto out;
+    if (fstat(dst, copy_identity) < 0)
+        goto out;
+    identity_valid = 1;
+    if (!S_ISREG(copy_identity->st_mode) || copy_identity->st_nlink != 1) {
+        errno = ESTALE;
+        goto out;
+    }
     if (packer_fchmod_retry(dst, st.st_mode & 0777) < 0)
         goto out;
 
@@ -1423,8 +2267,13 @@ static int make_transaction_copy(const char *path, const char *suffix,
             written += n;
         }
     }
-    if (fsync(dst) < 0)
+    if (fsync(dst) < 0 || fstat(dst, &completed) < 0)
         goto out;
+    if (!output_identity_equal(&completed, copy_identity) ||
+        !S_ISREG(completed.st_mode) || completed.st_nlink != 1) {
+        errno = ESTALE;
+        goto out;
+    }
     rc = 0;
 
 out:
@@ -1432,8 +2281,9 @@ out:
         rc = -1;
     if (dst >= 0 && close(dst) < 0)
         rc = -1;
-    if (rc < 0 && dst >= 0)
-        unlink(copy_path);
+    if (rc < 0 && identity_valid)
+        discard_owned_transaction(copy_path, copy_identity,
+                                  "failed transaction copy");
     return rc;
 }
 
@@ -1758,6 +2608,8 @@ static int find_named_symbol(FILE *file, const Elf64_Ehdr *ehdr,
         const Elf64_Shdr *sym_section = &table.items[i];
         Elf64_Sym *symbols = NULL;
         char *strings = NULL;
+        void *symbols_data = NULL;
+        void *strings_data = NULL;
         size_t symbols_size = 0;
         size_t strings_size = 0;
 
@@ -1765,14 +2617,16 @@ static int find_named_symbol(FILE *file, const Elf64_Ehdr *ehdr,
             sym_section->sh_type != SHT_DYNSYM)
             continue;
         if (bounded_elf_section_read(&table, sym_section->sh_link,
-                                     (void **)&strings,
+                                     &strings_data,
                                      &strings_size) < 0 ||
-            bounded_elf_section_read(&table, i, (void **)&symbols,
+            bounded_elf_section_read(&table, i, &symbols_data,
                                      &symbols_size) < 0) {
-            free(strings);
-            free(symbols);
+            free(strings_data);
+            free(symbols_data);
             goto out;
         }
+        strings = strings_data;
+        symbols = symbols_data;
 
         size_t symbol_count = symbols_size / sizeof(*symbols);
         for (size_t j = 0; j < symbol_count; j++) {
@@ -1816,20 +2670,24 @@ static int has_rtld_import(FILE *file, const Elf64_Ehdr *ehdr)
         const Elf64_Shdr *sym_section = &table.items[i];
         Elf64_Sym *symbols = NULL;
         char *strings = NULL;
+        void *symbols_data = NULL;
+        void *strings_data = NULL;
         size_t symbols_size = 0;
         size_t strings_size = 0;
 
         if (sym_section->sh_type != SHT_DYNSYM)
             continue;
         if (bounded_elf_section_read(&table, sym_section->sh_link,
-                                     (void **)&strings,
+                                     &strings_data,
                                      &strings_size) < 0 ||
-            bounded_elf_section_read(&table, i, (void **)&symbols,
+            bounded_elf_section_read(&table, i, &symbols_data,
                                      &symbols_size) < 0) {
-            free(strings);
-            free(symbols);
+            free(strings_data);
+            free(symbols_data);
             goto out;
         }
+        strings = strings_data;
+        symbols = symbols_data;
 
         size_t symbol_count = symbols_size / sizeof(*symbols);
         for (size_t j = 0; j < symbol_count; j++) {
@@ -1867,6 +2725,8 @@ static int needs_runtime_reloc_scan(FILE *f, const Elf64_Ehdr *ehdr)
     size_t dynsym_index = SIZE_MAX;
     Elf64_Sym *syms = NULL;
     char *strtab = NULL;
+    void *syms_data = NULL;
+    void *strtab_data = NULL;
     size_t symtab_size = 0;
     size_t strtab_size = 0;
     int needs_scan = 0;
@@ -1889,19 +2749,22 @@ static int needs_runtime_reloc_scan(FILE *f, const Elf64_Ehdr *ehdr)
     }
     if (bounded_elf_section_read(&table,
                                  table.items[dynsym_index].sh_link,
-                                 (void **)&strtab, &strtab_size) < 0 ||
+                                 &strtab_data, &strtab_size) < 0 ||
         bounded_elf_section_read(&table, dynsym_index,
-                                 (void **)&syms, &symtab_size) < 0) {
-        free(strtab);
-        free(syms);
+                                 &syms_data, &symtab_size) < 0) {
+        free(strtab_data);
+        free(syms_data);
         bounded_elf_sections_close(&table);
         return -1;
     }
+    strtab = strtab_data;
+    syms = syms_data;
 
     size_t nsyms = symtab_size / sizeof(*syms);
     for (size_t i = 0; i < table.count && !needs_scan; i++) {
         const Elf64_Shdr *sh = &table.items[i];
         Elf64_Rela *rels = NULL;
+        void *relocation_data = NULL;
         size_t relasz = 0;
 
         /* Only dynamic relocations indexed through the selected DYNSYM can
@@ -1912,11 +2775,12 @@ static int needs_runtime_reloc_scan(FILE *f, const Elf64_Ehdr *ehdr)
         if (sh->sh_type != SHT_RELA || sh->sh_link != dynsym_index)
             continue;
         if (sh->sh_size == 0) continue;
-        if (bounded_elf_section_read(&table, i, (void **)&rels,
+        if (bounded_elf_section_read(&table, i, &relocation_data,
                                      &relasz) < 0) {
             needs_scan = -1;
             break;
         }
+        rels = relocation_data;
 
         size_t nrels = relasz / sizeof(Elf64_Rela);
         for (size_t j = 0; j < nrels; j++) {
@@ -2074,6 +2938,7 @@ static int compute_lib_meta(const char *path,
     int phdr_count = 0;
     int saw_load_header = 0;
     int executable_stack = 0;
+    struct dlfrz_gnu_property_profile gnu_property_profile = {0};
     Elf64_Phdr tls_phdr = {0};
     Elf64_Phdr dynamic_phdr = {0};
     Elf64_Phdr gnu_property_phdr = {0};
@@ -2209,7 +3074,8 @@ static int compute_lib_meta(const char *path,
                 return -1;
             }
             property_admitted = dlfrz_gnu_property_segment_parse(
-                property_bytes, (size_t)gnu_property_phdr.p_filesz, NULL);
+                property_bytes, (size_t)gnu_property_phdr.p_filesz,
+                &gnu_property_profile);
         }
         free(property_bytes);
         if (!property_admitted) {
@@ -2253,6 +3119,19 @@ static int compute_lib_meta(const char *path,
                     ? "has no PT_GNU_STACK and therefore requires legacy "
                       "executable-stack semantics"
                     : "requires an executable process stack");
+        free(phdrs);
+        if (fclose(f) != 0)
+            return -1;
+        return 1;
+    }
+    if (!dlfrz_gnu_property_profile_matches_phdrs(
+            phdrs, phsz, ehdr.e_phnum, ehdr.e_phentsize,
+            &gnu_property_profile)) {
+        fprintf(stderr,
+                "dlfreeze: warning: %s has a GNU stack-size property "
+                "which is not represented by PT_GNU_STACK; direct-load "
+                "is unavailable\n",
+                path);
         free(phdrs);
         if (fclose(f) != 0)
             return -1;
@@ -2360,6 +3239,26 @@ enum pl_relocation_table_kind {
     PL_RELOCATION_TABLE_RELA,
     PL_RELOCATION_TABLE_JMPREL,
     PL_RELOCATION_TABLE_RELR
+};
+
+/* Keep deterministic admission outcomes separate from an optional prelink
+ * optimization miss.  Negative values preserve the existing helper contract
+ * that every non-zero result is a refusal while allowing the worker to tell
+ * the parent why it stopped. */
+enum pl_admission_result {
+    PL_ADMISSION_OK = 0,
+    PL_ADMISSION_INVALID = -1,
+    PL_ADMISSION_UNSUPPORTED = -2,
+    PL_ADMISSION_MISSED = -3,
+};
+
+/* These values also cross the fork boundary as child exit statuses. */
+enum prelink_result {
+    PRELINK_APPLIED = 0,
+    PRELINK_MISSED = 1,
+    PRELINK_UNSUPPORTED = 2,
+    PRELINK_INVALID = 3,
+    PRELINK_ERROR = 4,
 };
 
 /* Relocation tables are ordinary PT_LOAD bytes and may legally alias one
@@ -2471,8 +3370,10 @@ static void *pl_relocation_snapshot_allocate(size_t size)
     void *storage;
 
 #ifdef DLFREEZE_PRELINK_RELOCATION_GATE
-    if (g_pl_relocation_snapshot_fail_allocation)
+    if (g_pl_relocation_snapshot_fail_allocation) {
+        errno = ENOMEM;
         return NULL;
+    }
 #endif
     storage = malloc(size);
 #ifdef DLFREEZE_PRELINK_RELOCATION_GATE
@@ -3307,11 +4208,13 @@ static int pl_validate_sysv_hash(struct prelink_obj *obj, uint64_t address,
     uint64_t bytes;
     uint32_t nbuckets;
     uint32_t nchain;
+    void *table_bytes = NULL;
 
     if ((address & (_Alignof(uint32_t) - 1)) != 0 ||
         !pl_vaddr_pointer(obj, address, 2 * sizeof(uint32_t), 1, PF_R,
-                          (void **)&header))
+                          &table_bytes))
         return 0;
+    header = table_bytes;
     nbuckets = header[0];
     nchain = header[1];
     if (nbuckets == 0 || nchain == 0 ||
@@ -3319,8 +4222,9 @@ static int pl_validate_sysv_hash(struct prelink_obj *obj, uint64_t address,
         !pl_u64_add(words, nchain, &words) ||
         !pl_u64_mul(words, sizeof(uint32_t), &bytes) || bytes > SIZE_MAX ||
         !pl_vaddr_pointer(obj, address, (size_t)bytes, 1, PF_R,
-                          (void **)&header))
+                          &table_bytes))
         return 0;
+    header = table_bytes;
     buckets = &header[2];
     chains = &buckets[nbuckets];
     for (uint32_t i = 0; i < nbuckets; i++) {
@@ -3361,11 +4265,13 @@ static int pl_validate_gnu_hash(struct prelink_obj *obj, uint64_t address,
     size_t chain_available;
     size_t chain_capacity;
     int have_symbol = 0;
+    void *table_bytes = NULL;
 
     if ((address & (_Alignof(uint64_t) - 1)) != 0 ||
         !pl_vaddr_pointer(obj, address, 4 * sizeof(uint32_t), 1, PF_R,
-                          (void **)&header))
+                          &table_bytes))
         return 0;
+    header = table_bytes;
     nbuckets = header[0];
     symoffset = header[1];
     bloom_size = header[2];
@@ -3377,10 +4283,11 @@ static int pl_validate_gnu_hash(struct prelink_obj *obj, uint64_t address,
         !pl_u64_add(prefix_bytes, bucket_bytes, &prefix_bytes) ||
         prefix_bytes > SIZE_MAX ||
         !pl_vaddr_pointer(obj, address, (size_t)prefix_bytes, 1, PF_R,
-                          (void **)&header) ||
+                          &table_bytes) ||
         !pl_u64_add(address, prefix_bytes, &chain_address) ||
         !pl_file_bytes_available(obj, chain_address, &chain_available))
         return 0;
+    header = table_bytes;
 
     buckets = (const uint32_t *)(
         (const uint8_t *)header + 4 * sizeof(uint32_t) + bloom_bytes);
@@ -3420,8 +4327,9 @@ static int pl_validate_gnu_hash(struct prelink_obj *obj, uint64_t address,
         !pl_u64_add(prefix_bytes, chain_offset, &total_bytes) ||
         total_bytes > SIZE_MAX ||
         !pl_vaddr_pointer(obj, address, (size_t)total_bytes, 1, PF_R,
-                          (void **)&header))
+                          &table_bytes))
         return 0;
+    header = table_bytes;
     for (uint32_t i = 0; i < nbuckets; i++) {
         if (buckets[i] != STN_UNDEF &&
             (buckets[i] < symoffset || buckets[i] >= count))
@@ -3722,7 +4630,7 @@ static int pl_parse_dynamic(struct prelink_obj *obj, uint64_t base,
         }
         if (dlfrz_dynamic_tag_requires_unsupported_semantics(
                 dyn[i].d_tag, dyn[i].d_un.d_val))
-            return -1;
+            return PL_ADMISSION_UNSUPPORTED;
         switch (dyn[i].d_tag) {
         case DT_SYMTAB:
             PL_SET_DYNAMIC(have_symtab, symtab, dyn[i].d_un.d_ptr);
@@ -3787,7 +4695,7 @@ static int pl_parse_dynamic(struct prelink_obj *obj, uint64_t base,
                            dyn[i].d_un.d_val);
             break;
         case DT_TEXTREL:
-            return -1;
+            return PL_ADMISSION_UNSUPPORTED;
         case 36: /* DT_RELR */
             PL_SET_DYNAMIC(have_relr, v_relr, dyn[i].d_un.d_ptr);
             break;
@@ -3803,12 +4711,12 @@ static int pl_parse_dynamic(struct prelink_obj *obj, uint64_t base,
         case DT_FILTER:
             /* Audit and filter objects alter rtld callbacks and symbol
              * lookup.  Direct mode does not implement those contracts. */
-            return -1;
+            return PL_ADMISSION_UNSUPPORTED;
         case DT_REL:
         case DT_RELSZ:
         case DT_RELENT:
             if (dyn[i].d_un.d_val != 0)
-                return -1;
+                return PL_ADMISSION_UNSUPPORTED;
             break;
         }
     }
@@ -3819,17 +4727,17 @@ static int pl_parse_dynamic(struct prelink_obj *obj, uint64_t base,
         have_symtab != have_syment ||
         (have_symtab && (symtab == 0 || strtab == 0 || strsz == 0 ||
                          syment != sizeof(Elf64_Sym))) ||
-        ((have_rela || have_relasz || have_relaent) &&
+        ((have_rela || have_relasz) &&
          (!have_rela || !have_relasz || !have_relaent || v_rela == 0 ||
-          rela_ent != sizeof(Elf64_Rela) ||
           rela_sz % sizeof(Elf64_Rela) != 0)) ||
-        ((have_jmprel || have_pltrelsz || have_pltrel) &&
+        (have_relaent && rela_ent != sizeof(Elf64_Rela)) ||
+        ((have_jmprel || have_pltrelsz) &&
          (!have_jmprel || !have_pltrelsz || !have_pltrel || jmprel == 0 ||
           pltrel != DT_RELA || pltrelsz % sizeof(Elf64_Rela) != 0)) ||
-        ((have_relr || have_relrsz || have_relrent) &&
+        ((have_relr || have_relrsz) &&
          (!have_relr || !have_relrsz || !have_relrent || v_relr == 0 ||
-          relr_ent != sizeof(Elf64_Relr) ||
           relr_sz % sizeof(Elf64_Relr) != 0)) ||
+        (have_relrent && relr_ent != sizeof(Elf64_Relr)) ||
         (have_gnu_hash && gnu_hash_addr == 0) ||
         (have_sysv_hash && sysv_hash_addr == 0) ||
         (have_versym && versym_addr == 0) ||
@@ -3843,7 +4751,7 @@ static int pl_parse_dynamic(struct prelink_obj *obj, uint64_t base,
     if (!dlfrz_dynamic_flags_are_supported(
             dynamic_flags, dynamic_flags_1,
             (obj->flags & DLFRZ_FLAG_MAIN_EXE) != 0))
-        return -1;
+        return PL_ADMISSION_UNSUPPORTED;
 
     if (have_strtab) {
         if (strsz > SIZE_MAX ||
@@ -4099,7 +5007,7 @@ static int pl_persisted_relative_destinations(
             return -1;
         destinations = malloc(capacity * sizeof(*destinations));
         if (!destinations)
-            return -1;
+            return PL_ADMISSION_MISSED;
     }
 
     for (size_t table = 0; table < 2; table++) {
@@ -4153,10 +5061,14 @@ static int pl_apply_relr(struct prelink_obj *obj)
         return -1;
     if (count == 0)
         return 0;
-    if (pl_persisted_relative_destinations(
+    {
+        int admission = pl_persisted_relative_destinations(
             obj, &persisted_relative_destinations,
-            &persisted_relative_count) < 0)
-        return -1;
+            &persisted_relative_count);
+
+        if (admission != PL_ADMISSION_OK)
+            return admission;
+    }
 
     for (size_t i = 0; i < count; i++) {
         Elf64_Relr entry;
@@ -4210,6 +5122,57 @@ out:
     return result;
 }
 
+/* Lazy objects must be admitted before publication even though their
+ * relocations retain native dlopen timing.  Validate RELR's grammar and
+ * writable destinations without applying it and without imposing the
+ * additional cross-table restrictions needed only when startup RELA writes
+ * are serialized by the prelinker. */
+static int pl_validate_runtime_relr(const struct prelink_obj *obj)
+{
+    uint64_t where_offset = 0;
+    int have_where = 0;
+
+    if (!obj || (obj->relr_count != 0 && !obj->relr))
+        return PL_ADMISSION_INVALID;
+    for (size_t i = 0; i < obj->relr_count; i++) {
+        Elf64_Relr entry;
+
+        memcpy(&entry, &obj->relr[i], sizeof(entry));
+        if ((entry & 1) == 0) {
+            if ((entry & (sizeof(uint64_t) - 1)) != 0 ||
+                !pl_vaddr_pointer(obj, entry, sizeof(uint64_t), 0, PF_W,
+                                  NULL) ||
+                entry > UINT64_MAX - sizeof(uint64_t))
+                return PL_ADMISSION_INVALID;
+            where_offset = entry + sizeof(uint64_t);
+            have_where = 1;
+        } else {
+            uint64_t bitmap = entry >> 1;
+
+            if (!have_where)
+                return PL_ADMISSION_INVALID;
+            for (unsigned int bit = 0; bitmap; bit++, bitmap >>= 1) {
+                uint64_t offset;
+
+                if (!(bitmap & 1))
+                    continue;
+                if (where_offset > UINT64_MAX -
+                                   (uint64_t)bit * sizeof(uint64_t))
+                    return PL_ADMISSION_INVALID;
+                offset = where_offset +
+                         (uint64_t)bit * sizeof(uint64_t);
+                if (!pl_vaddr_pointer(obj, offset, sizeof(uint64_t), 0,
+                                      PF_W, NULL))
+                    return PL_ADMISSION_INVALID;
+            }
+            if (where_offset > UINT64_MAX - 63 * sizeof(uint64_t))
+                return PL_ADMISSION_INVALID;
+            where_offset += 63 * sizeof(uint64_t);
+        }
+    }
+    return PL_ADMISSION_OK;
+}
+
 static int pl_signed_offset_pointer(const struct prelink_obj *obj,
                                     int64_t offset, size_t size,
                                     uint32_t required_flags,
@@ -4256,7 +5219,7 @@ static int pl_signed_offset_pointer(const struct prelink_obj *obj,
     return 0;
 }
 
-static int pl_validate_rela_record(struct prelink_obj *obj,
+static int pl_validate_rela_record(const struct prelink_obj *obj,
                                    const Elf64_Rela *rel, void **slot_out)
 {
     uint32_t type = ELF64_R_TYPE(rel->r_info);
@@ -4265,10 +5228,27 @@ static int pl_validate_rela_record(struct prelink_obj *obj,
     size_t width = sizeof(uint64_t);
     void *slot = NULL;
 
+    switch (type) {
+    case 0: /* R_X86_64_NONE / R_AARCH64_NONE */
+    case ARCH_RELOC_RELATIVE:
+    case ARCH_RELOC_IRELATIVE:
+    case ARCH_RELOC_COPY:
+    case ARCH_RELOC_TLSDESC:
+    case ARCH_RELOC_GLOB_DAT:
+    case ARCH_RELOC_JUMP_SLOT:
+    case ARCH_RELOC_ABS:
+    case ARCH_RELOC_TPOFF:
+    case ARCH_RELOC_DTPMOD:
+    case ARCH_RELOC_DTPOFF:
+        break;
+    default:
+        return PL_ADMISSION_UNSUPPORTED;
+    }
+
     if (symbol_index != 0) {
         symbol = pl_dynsym(obj, symbol_index);
         if (!symbol || !pl_symbol_name(obj, symbol))
-            return 0;
+            return PL_ADMISSION_INVALID;
     }
     switch (type) {
     case 0: /* R_X86_64_NONE / R_AARCH64_NONE */
@@ -4277,11 +5257,11 @@ static int pl_validate_rela_record(struct prelink_obj *obj,
     case ARCH_RELOC_RELATIVE:
     case ARCH_RELOC_IRELATIVE:
         if (symbol_index != 0)
-            return 0;
+            return PL_ADMISSION_INVALID;
         break;
     case ARCH_RELOC_COPY:
         if (!symbol || symbol->st_size > SIZE_MAX)
-            return 0;
+            return PL_ADMISSION_INVALID;
         width = (size_t)symbol->st_size;
         break;
     case ARCH_RELOC_TLSDESC:
@@ -4295,18 +5275,18 @@ static int pl_validate_rela_record(struct prelink_obj *obj,
     case ARCH_RELOC_DTPOFF:
         break;
     default:
-        return 0;
+        return PL_ADMISSION_UNSUPPORTED;
     }
 
     if (width != 0 &&
         !pl_vaddr_pointer(obj, rel->r_offset, width, 0, PF_W, &slot))
-        return 0;
+        return PL_ADMISSION_INVALID;
     if (type == ARCH_RELOC_IRELATIVE &&
         !pl_signed_offset_pointer(obj, rel->r_addend, 1, PF_X, NULL))
-        return 0;
+        return PL_ADMISSION_INVALID;
     if (slot_out)
         *slot_out = slot;
-    return 1;
+    return PL_ADMISSION_OK;
 }
 
 static int pl_apply_rela(struct prelink_obj *obj,
@@ -4325,8 +5305,12 @@ static int pl_apply_rela(struct prelink_obj *obj,
         memcpy(&relocation, &rtab[i], sizeof(relocation));
         type = ELF64_R_TYPE(r->r_info);
 
-        if (!pl_validate_rela_record(obj, r, &slot))
-            return -1;
+        {
+            int admission = pl_validate_rela_record(obj, r, &slot);
+
+            if (admission != PL_ADMISSION_OK)
+                return admission;
+        }
 
         switch (type) {
         case 0: /* R_X86_64_NONE / R_AARCH64_NONE */
@@ -4369,10 +5353,27 @@ static int pl_apply_rela(struct prelink_obj *obj,
             fprintf(stderr,
                     "dlfreeze: unsupported relocation type %u during pre-link\n",
                     type);
-            return -1;
+            return PL_ADMISSION_UNSUPPORTED;
         }
     }
     return 0;
+}
+
+static int pl_validate_runtime_rela(const struct prelink_obj *obj,
+                                    const Elf64_Rela *table, size_t count)
+{
+    if (!obj || (count != 0 && !table))
+        return PL_ADMISSION_INVALID;
+    for (size_t i = 0; i < count; i++) {
+        Elf64_Rela relocation;
+        int admission;
+
+        memcpy(&relocation, &table[i], sizeof(relocation));
+        admission = pl_validate_rela_record(obj, &relocation, NULL);
+        if (admission != PL_ADMISSION_OK)
+            return admission;
+    }
+    return PL_ADMISSION_OK;
 }
 
 /* Per-object runtime fixup table entries encode the relocation table in the
@@ -4390,7 +5391,7 @@ static int prelink_obj_collect_runtime_fixups(const struct prelink_obj *obj,
     size_t counts[] = { obj->rela_count, obj->jmprel_count };
 
     if (*fixup_count > UINT32_MAX)
-        return -1;
+        return PL_ADMISSION_UNSUPPORTED;
 
     *out_off = (uint32_t)*fixup_count;
     *out_count = 0;
@@ -4448,20 +5449,20 @@ static int prelink_obj_collect_runtime_fixups(const struct prelink_obj *obj,
 
             if (*fixup_count >= UINT32_MAX ||
                 i >= PRELINK_FIXUP_JMPREL)
-                return -1;
+                return PL_ADMISSION_UNSUPPORTED;
 
             if (*fixup_count == *fixup_cap) {
                 size_t newcap;
                 uint32_t *grown;
 
                 if (*fixup_cap > SIZE_MAX / 2)
-                    return -1;
+                    return PL_ADMISSION_UNSUPPORTED;
                 newcap = *fixup_cap ? *fixup_cap * 2 : 256;
                 if (newcap > SIZE_MAX / sizeof(**fixups))
-                    return -1;
+                    return PL_ADMISSION_UNSUPPORTED;
                 grown = realloc(*fixups, newcap * sizeof(**fixups));
                 if (!grown)
-                    return -1;
+                    return PL_ADMISSION_MISSED;
                 *fixups = grown;
                 *fixup_cap = newcap;
             }
@@ -4844,33 +5845,304 @@ out:
     return result;
 }
 
-static int prelink_objects(const char *output_path,
-                           const struct dlfrz_entry *entries,
-                           struct dlfrz_lib_meta *metas,
-                           const int *startup_aliases,
-                           uint64_t meta_off,
-                           int nobj)
+static enum prelink_result prelink_validation_outcome(int admission)
+{
+    if (admission == PL_ADMISSION_UNSUPPORTED)
+        return PRELINK_UNSUPPORTED;
+    if (admission == PL_ADMISSION_MISSED)
+        return PRELINK_MISSED;
+    return PRELINK_INVALID;
+}
+
+static int prelink_same_embedded_source(
+    const struct dlfrz_entry *entries, int left, int right)
+{
+    return entries && left >= 0 && right >= 0 &&
+           entries[left].data_size != 0 &&
+           entries[left].data_offset == entries[right].data_offset &&
+           entries[left].data_size == entries[right].data_size;
+}
+
+/* An exact source alias needs one structural admission, not one admission per
+ * lookup identity.  A startup instance is already parsed by the ordinary
+ * prelink pass regardless of manifest order; otherwise select the first lazy
+ * identity.  INTERP is deliberately not an owner because direct mode never
+ * maps the native interpreter as a target object. */
+static int prelink_lazy_admission_required(
+    const struct dlfrz_entry *entries, int nobj, int index)
+{
+    uint32_t flags;
+
+    if (!entries || nobj <= 0 || index < 0 || index >= nobj)
+        return 0;
+    flags = entries[index].flags;
+    if ((flags & DLFRZ_FLAG_DLOPEN) == 0 ||
+        (flags & (DLFRZ_FLAG_INTERP | DLFRZ_FLAG_DATA)) != 0)
+        return 0;
+
+    for (int i = 0; i < nobj; i++) {
+        uint32_t candidate_flags = entries[i].flags;
+
+        if (!prelink_same_embedded_source(entries, index, i))
+            continue;
+        if ((candidate_flags & (DLFRZ_FLAG_INTERP |
+                                DLFRZ_FLAG_DLOPEN |
+                                DLFRZ_FLAG_DATA)) == 0)
+            return 0;
+    }
+    for (int i = 0; i < index; i++) {
+        uint32_t candidate_flags = entries[i].flags;
+
+        if ((candidate_flags & DLFRZ_FLAG_DLOPEN) != 0 &&
+            (candidate_flags & (DLFRZ_FLAG_INTERP |
+                                DLFRZ_FLAG_DATA)) == 0 &&
+            prelink_same_embedded_source(entries, index, i))
+            return 0;
+    }
+    return 1;
+}
+
+/* Admit a lazy object's complete direct-loader relocation contract without
+ * occupying its assigned runtime address and without changing one embedded
+ * byte.  A private scratch mapping avoids false failures from packer-host
+ * address collisions.  Allocation/address-space exhaustion is an optional
+ * optimization miss; malformed ELF and unsupported semantics retain their
+ * typed deterministic outcomes. */
+static enum prelink_result prelink_admit_object_scratch(
+    FILE *outf, const struct dlfrz_entry *entry,
+    const struct dlfrz_lib_meta *meta, size_t output_size)
+{
+    struct prelink_obj obj = {0};
+    struct pl_control_range_builder control_builder = {0};
+    Elf64_Ehdr embedded_ehdr;
+    uint8_t *phdr_buf = NULL;
+    void *mapping = MAP_FAILED;
+    void *runtime_request;
+    size_t runtime_span;
+    size_t mapping_size = 0;
+    size_t phdr_size = 0;
+    uint64_t lo;
+    uint64_t hi;
+    uint64_t input_offset;
+    enum prelink_result result = PRELINK_INVALID;
+
+    if (!outf || !entry || !meta || entry->data_size > SIZE_MAX)
+        return PRELINK_INVALID;
+    if (packer_stream_seek(outf, entry->data_offset) < 0 ||
+        fread(&embedded_ehdr, 1, sizeof(embedded_ehdr), outf) !=
+            sizeof(embedded_ehdr))
+        return PRELINK_ERROR;
+    if (!prelink_embedded_header_valid(
+            &embedded_ehdr, entry, meta, output_size, &phdr_size))
+        return PRELINK_INVALID;
+
+    phdr_buf = malloc(phdr_size);
+    if (!phdr_buf)
+        return PRELINK_MISSED;
+    if (!u64_add_checked(entry->data_offset, embedded_ehdr.e_phoff,
+                         &input_offset) ||
+        packer_stream_seek(outf, input_offset) < 0 ||
+        fread(phdr_buf, 1, phdr_size, outf) != phdr_size) {
+        result = PRELINK_ERROR;
+        goto out;
+    }
+
+    /* Validate the published fixed-address geometry too, even though this
+     * pass intentionally uses a collision-free scratch address. */
+    if (!prelink_mapping_span(
+            meta, &runtime_span, &runtime_request) ||
+        !u64_align_up_checked(meta->vaddr_hi, PAYLOAD_ALIGN, &hi))
+        goto out;
+    lo = meta->vaddr_lo & ~(uint64_t)(PAYLOAD_ALIGN - 1);
+    if (hi <= lo || hi - lo > SIZE_MAX)
+        goto out;
+    mapping_size = (size_t)(hi - lo);
+    mapping = mmap(NULL, mapping_size, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapping == MAP_FAILED) {
+        result = PRELINK_MISSED;
+        goto out;
+    }
+    if ((uintptr_t)mapping < lo) {
+        result = PRELINK_MISSED;
+        goto out;
+    }
+
+    obj.base = (uint64_t)((uintptr_t)mapping - (uintptr_t)lo);
+    obj.flags = meta->flags;
+    obj.file_size = (size_t)entry->data_size;
+    obj.phdr_base = phdr_buf;
+    obj.phdr_num = meta->phdr_num;
+    obj.phdr_entsz = meta->phdr_entsz;
+
+    for (uint16_t i = 0; i < meta->phdr_num; i++) {
+        Elf64_Phdr ph;
+        uint64_t within;
+        uint8_t *destination;
+
+        if (!packer_phdr_read(phdr_buf, phdr_size, i,
+                              meta->phdr_entsz, &ph) ||
+            !prelink_program_header_valid(&ph, entry))
+            goto out;
+        if (ph.p_type != PT_LOAD)
+            continue;
+        if (!prelink_load_header_valid(&ph, entry, meta) ||
+            ph.p_vaddr < lo)
+            goto out;
+        within = ph.p_vaddr - lo;
+        if (within > mapping_size ||
+            ph.p_memsz > mapping_size - (size_t)within)
+            goto out;
+        destination = (uint8_t *)mapping + (size_t)within;
+        if (ph.p_filesz != 0) {
+            if (!u64_add_checked(entry->data_offset, ph.p_offset,
+                                 &input_offset) ||
+                packer_stream_seek(outf, input_offset) < 0 ||
+                fread(destination, 1, (size_t)ph.p_filesz, outf) !=
+                    (size_t)ph.p_filesz) {
+                result = PRELINK_ERROR;
+                goto out;
+            }
+        }
+        if (ph.p_memsz > ph.p_filesz)
+            memset(destination + (size_t)ph.p_filesz, 0,
+                   (size_t)(ph.p_memsz - ph.p_filesz));
+    }
+
+    errno = 0;
+    if (!pl_collect_object_control_ranges(
+            outf, entry, &embedded_ehdr, &obj, &control_builder)) {
+        result = ferror(outf) ? PRELINK_ERROR :
+                 errno == ENOMEM ? PRELINK_MISSED : PRELINK_INVALID;
+        goto out;
+    }
+    errno = 0;
+    {
+        int admission = pl_parse_dynamic(
+            &obj, obj.base, obj.phdr_base, obj.phdr_num,
+            obj.phdr_entsz, &control_builder);
+
+        if (admission == PL_ADMISSION_INVALID && errno == ENOMEM)
+            admission = PL_ADMISSION_MISSED;
+        if (admission != PL_ADMISSION_OK) {
+            result = prelink_validation_outcome(admission);
+            goto out;
+        }
+    }
+
+    {
+        int admission = pl_validate_runtime_relr(&obj);
+
+        if (admission == PL_ADMISSION_OK)
+            admission = pl_validate_runtime_rela(
+                &obj, obj.rela, obj.rela_count);
+        if (admission == PL_ADMISSION_OK)
+            admission = pl_validate_runtime_rela(
+                &obj, obj.jmprel, obj.jmprel_count);
+        if (admission != PL_ADMISSION_OK) {
+            result = prelink_validation_outcome(admission);
+            goto out;
+        }
+    }
+    if (!pl_relocation_sources_unchanged(&obj) ||
+        !pl_control_authority_unchanged(&obj))
+        goto out;
+    errno = 0;
+    if (!pl_serialized_loads_coherent(&obj)) {
+        result = errno == ENOMEM ? PRELINK_MISSED : PRELINK_INVALID;
+        goto out;
+    }
+    result = PRELINK_APPLIED;
+
+out:
+    pl_control_range_builder_release(&control_builder);
+    pl_control_authority_release(&obj);
+    pl_relocation_sources_release(&obj);
+    if (mapping != MAP_FAILED)
+        munmap(mapping, mapping_size);
+    free(phdr_buf);
+    return result;
+}
+
+/* A fixed-address prelink miss is not allowed to hide a deterministic
+ * object-contract result.  Inspect each distinct target source once at a
+ * collision-free scratch address before reporting the optional optimization
+ * miss.  INTERP is not a target mapping, while DATA is not ELF. */
+static int prelink_source_admission_required(
+    const struct dlfrz_entry *entries, int nobj, int index)
+{
+    uint32_t flags;
+
+    if (!entries || nobj <= 0 || index < 0 || index >= nobj)
+        return 0;
+    flags = entries[index].flags;
+    if ((flags & (DLFRZ_FLAG_INTERP | DLFRZ_FLAG_DATA)) != 0)
+        return 0;
+    for (int i = 0; i < index; i++) {
+        uint32_t candidate_flags = entries[i].flags;
+
+        if ((candidate_flags & (DLFRZ_FLAG_INTERP |
+                                DLFRZ_FLAG_DATA)) == 0 &&
+            prelink_same_embedded_source(entries, index, i))
+            return 0;
+    }
+    return 1;
+}
+
+static enum prelink_result prelink_admit_all_object_sources(
+    FILE *outf, const struct dlfrz_entry *entries,
+    const struct dlfrz_lib_meta *metas, size_t output_size, int nobj)
+{
+    if (!outf || !entries || !metas || nobj <= 0)
+        return PRELINK_INVALID;
+    for (int i = 0; i < nobj; i++) {
+        enum prelink_result outcome;
+
+        if (!prelink_source_admission_required(entries, nobj, i))
+            continue;
+        outcome = prelink_admit_object_scratch(
+            outf, &entries[i], &metas[i], output_size);
+        if (outcome != PRELINK_APPLIED)
+            return outcome;
+    }
+    return PRELINK_APPLIED;
+}
+
+static enum prelink_result prelink_objects(
+    const char *output_path, const struct dlfrz_entry *entries,
+    struct dlfrz_lib_meta *metas, const int *startup_aliases,
+    uint64_t meta_off, int nobj,
+    struct stat *output_identity)
 {
     char transaction_path[PATH_MAX];
+    struct stat transaction_identity;
 
-    if (!entries || !metas || !startup_aliases || nobj <= 0) {
+    if (!entries || !metas || !startup_aliases || nobj <= 0 ||
+        !output_identity) {
         errno = EINVAL;
-        return -1;
+        return PRELINK_INVALID;
     }
 
     /* Relocations and metadata form one commit.  Work on a same-directory
      * copy so a child crash, ENOSPC, or short write cannot leave a partially
      * relocated artifact that the runtime later treats as clean input. */
-    if (make_transaction_copy(output_path, "prelink", transaction_path) < 0) {
+    if (make_transaction_copy(output_path, "prelink", output_identity,
+                              transaction_path,
+                              &transaction_identity) < 0) {
         perror("pre-link transaction copy");
-        return -1;
+        return PRELINK_ERROR;
     }
 
     pid_t pid = fork();
     if (pid < 0) {
+        int fork_errno = errno;
+
         perror("fork");
-        unlink(transaction_path);
-        return -1;
+        discard_owned_transaction(transaction_path, &transaction_identity,
+                                  "pre-link transaction");
+        errno = fork_errno;
+        return fork_errno == EAGAIN || fork_errno == ENOMEM
+            ? PRELINK_MISSED : PRELINK_ERROR;
     }
 
     if (pid > 0) {
@@ -4879,41 +6151,85 @@ static int prelink_objects(const char *output_path,
         while (waitpid(pid, &status, 0) < 0) {
             if (errno != EINTR) {
                 perror("waitpid");
-                unlink(transaction_path);
-                return -1;
+                discard_owned_transaction(transaction_path,
+                                          &transaction_identity,
+                                          "pre-link transaction");
+                return PRELINK_ERROR;
             }
         }
         if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-            if (rename(transaction_path, output_path) == 0)
-                return 0;
+            if (replace_owned_transaction(
+                    transaction_path, &transaction_identity,
+                    output_path, output_identity) == 0)
+                return PRELINK_APPLIED;
             perror("pre-link transaction commit");
-            unlink(transaction_path);
-            return -1;
+            discard_owned_transaction(transaction_path,
+                                      &transaction_identity,
+                                      "pre-link transaction");
+            return PRELINK_ERROR;
         }
-
-        fprintf(stderr, "dlfreeze: pre-linker %s\n",
-                WIFSIGNALED(status) ? "crashed" : "failed");
-        unlink(transaction_path);
-        return -1;
+        discard_owned_transaction(transaction_path, &transaction_identity,
+                                  "pre-link transaction");
+        if (WIFSIGNALED(status)) {
+            fprintf(stderr, "dlfreeze: pre-linker crashed\n");
+            return PRELINK_ERROR;
+        }
+        if (!WIFEXITED(status)) {
+            fprintf(stderr, "dlfreeze: pre-linker ended unexpectedly\n");
+            return PRELINK_ERROR;
+        }
+        switch (WEXITSTATUS(status)) {
+        case PRELINK_MISSED:
+            fprintf(stderr,
+                    "dlfreeze: pre-linker resource/address miss\n");
+            return PRELINK_MISSED;
+        case PRELINK_UNSUPPORTED:
+            fprintf(stderr,
+                    "dlfreeze: pre-linker found unsupported direct-load "
+                    "semantics\n");
+            return PRELINK_UNSUPPORTED;
+        case PRELINK_INVALID:
+            fprintf(stderr,
+                    "dlfreeze: pre-linker rejected invalid ELF metadata\n");
+            return PRELINK_INVALID;
+        case PRELINK_ERROR:
+            fprintf(stderr,
+                    "dlfreeze: pre-linker encountered an I/O error\n");
+            return PRELINK_ERROR;
+        default:
+            fprintf(stderr,
+                    "dlfreeze: pre-linker returned an unknown status\n");
+            return PRELINK_ERROR;
+        }
     }
 
     /* ==== Child process ==== */
 
-    FILE *outf = fopen(transaction_path, "r+b");
+    int output_fd = open_owned_transaction(
+        transaction_path, O_RDWR, &transaction_identity, NULL);
+    FILE *outf = output_fd >= 0 ? fdopen(output_fd, "r+b") : NULL;
     struct stat output_st;
     size_t output_size;
 
-    if (!outf || fstat(fileno(outf), &output_st) < 0 ||
-        !S_ISREG(output_st.st_mode) || output_st.st_size < 0 ||
+    if (!outf) {
+        if (output_fd >= 0)
+            close(output_fd);
+        _exit(PRELINK_ERROR);
+    }
+    if (fstat(fileno(outf), &output_st) < 0 ||
+        !output_identity_equal(&output_st, &transaction_identity))
+        _exit(PRELINK_ERROR);
+    if (!S_ISREG(output_st.st_mode) || output_st.st_size < 0 ||
         (uintmax_t)output_st.st_size > SIZE_MAX)
-        _exit(1);
+        _exit(PRELINK_INVALID);
     output_size = (size_t)output_st.st_size;
 
     struct prelink_obj *objs = calloc(nobj, sizeof(*objs));
     uint32_t *runtime_fixups = NULL;
     size_t runtime_fixup_count = 0;
     size_t runtime_fixup_cap = 0;
-    if (!objs) _exit(1);
+    if (!objs)
+        _exit(PRELINK_MISSED);
 
     /* 1. Map all objects at assigned base addresses and load segments */
     for (int i = 0; i < nobj; i++) {
@@ -4936,15 +6252,25 @@ static int prelink_objects(const char *output_path,
         void *mapped;
 
         if (!prelink_mapping_span(m, &span, &requested))
-            _exit(1);
+            _exit(PRELINK_INVALID);
         mapped = mmap(requested, span,
-                            PROT_READ | PROT_WRITE | PROT_EXEC,
-                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
-                            -1, 0);
-        if (mapped == MAP_FAILED) _exit(1);
+                      PROT_READ | PROT_WRITE | PROT_EXEC,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+                      -1, 0);
+        if (mapped == MAP_FAILED) {
+            enum prelink_result outcome =
+                prelink_admit_all_object_sources(
+                    outf, entries, metas, output_size, nobj);
+
+            _exit(outcome == PRELINK_APPLIED ? PRELINK_MISSED : outcome);
+        }
         if (mapped != requested) {
+            enum prelink_result outcome;
+
             munmap(mapped, span);
-            _exit(1);
+            outcome = prelink_admit_all_object_sources(
+                outf, entries, metas, output_size, nobj);
+            _exit(outcome == PRELINK_APPLIED ? PRELINK_MISSED : outcome);
         }
 
         /* Read program headers */
@@ -4955,18 +6281,18 @@ static int prelink_objects(const char *output_path,
         if (packer_stream_seek(outf, entries[i].data_offset) < 0 ||
             fread(&embedded_ehdr, 1, sizeof(embedded_ehdr), outf) !=
             sizeof(embedded_ehdr))
-            _exit(1);
+            _exit(PRELINK_ERROR);
         if (!prelink_embedded_header_valid(
                 &embedded_ehdr, &entries[i], m, output_size, &phsz))
-            _exit(1);
+            _exit(PRELINK_INVALID);
         phdr_buf = malloc(phsz);
         if (!phdr_buf)
-            _exit(1);
+            _exit(PRELINK_MISSED);
         if (!u64_add_checked(entries[i].data_offset, embedded_ehdr.e_phoff,
                              &input_off) ||
             packer_stream_seek(outf, input_off) < 0 ||
             fread(phdr_buf, 1, phsz, outf) != phsz)
-            _exit(1);
+            _exit(PRELINK_ERROR);
 
         objs[i].base = base;
         objs[i].flags = m->flags;
@@ -4982,11 +6308,11 @@ static int prelink_objects(const char *output_path,
             if (!packer_phdr_read(phdr_buf, phsz, (size_t)p,
                                   m->phdr_entsz, &ph) ||
                 !prelink_program_header_valid(&ph, &entries[i]))
-                _exit(1);
+                _exit(PRELINK_INVALID);
             if (ph.p_type != PT_LOAD)
                 continue;
             if (!prelink_load_header_valid(&ph, &entries[i], m))
-                _exit(1);
+                _exit(PRELINK_INVALID);
             if (ph.p_filesz == 0)
                 continue;
             if (!u64_add_checked(entries[i].data_offset, ph.p_offset,
@@ -4994,7 +6320,7 @@ static int prelink_objects(const char *output_path,
                 packer_stream_seek(outf, input_off) < 0 ||
                 fread((void *)(uintptr_t)(base + ph.p_vaddr), 1,
                       (size_t)ph.p_filesz, outf) != (size_t)ph.p_filesz)
-                _exit(1);
+                _exit(PRELINK_ERROR);
             if (ph.p_memsz > ph.p_filesz)
                 memset((void *)(uintptr_t)(base + ph.p_vaddr + ph.p_filesz),
                        0, (size_t)(ph.p_memsz - ph.p_filesz));
@@ -5003,21 +6329,55 @@ static int prelink_objects(const char *output_path,
         /* 2. Admit every runtime-control byte before applying even the
          * first relocation.  The builder remains transactional until the
          * dynamic parser publishes its PF_W alias snapshots. */
+        errno = 0;
         if (!pl_collect_object_control_ranges(
                 outf, &entries[i], &embedded_ehdr, &objs[i],
-                &control_builder) ||
-            pl_parse_dynamic(&objs[i], base,
-                             objs[i].phdr_base,
-                             m->phdr_num, m->phdr_entsz,
-                             &control_builder) < 0) {
+                &control_builder)) {
+            enum prelink_result outcome = PRELINK_INVALID;
+
+            if (ferror(outf))
+                outcome = PRELINK_ERROR;
+            else if (errno == ENOMEM)
+                outcome = PRELINK_MISSED;
             pl_control_range_builder_release(&control_builder);
-            _exit(1);
+            _exit(outcome);
+        }
+        errno = 0;
+        {
+            int admission = pl_parse_dynamic(
+                &objs[i], base, objs[i].phdr_base,
+                m->phdr_num, m->phdr_entsz, &control_builder);
+
+            if (admission == PL_ADMISSION_INVALID && errno == ENOMEM)
+                admission = PL_ADMISSION_MISSED;
+            if (admission != PL_ADMISSION_OK) {
+                enum prelink_result outcome =
+                    prelink_validation_outcome(admission);
+
+                pl_control_range_builder_release(&control_builder);
+                _exit(outcome);
+            }
         }
         pl_control_range_builder_release(&control_builder);
 
         /* pl_vaddr_pointer() uses these headers throughout relocation and
          * hash validation.  The prelink worker exits after this transaction,
          * so retain the small buffer for the child's lifetime. */
+    }
+
+    /* Lazy and early-promoted dlopen objects retain runtime relocation and
+     * constructor timing, but their deterministic loader contract must not
+     * remain undiscovered until an application happens to open them.  Admit
+     * one instance of every embedded source which has no startup owner. */
+    for (int i = 0; i < nobj; i++) {
+        enum prelink_result outcome;
+
+        if (!prelink_lazy_admission_required(entries, nobj, i))
+            continue;
+        outcome = prelink_admit_object_scratch(
+            outf, &entries[i], &metas[i], output_size);
+        if (outcome != PRELINK_APPLIED)
+            _exit(outcome);
     }
 
     /* 3. Pre-apply only RELA RELATIVE relocations.  Their explicit addends
@@ -5034,16 +6394,28 @@ static int prelink_objects(const char *output_path,
             if (metas[i].flags & DLFRZ_FLAG_DATA) continue;
             if (startup_aliases[i] >= 0)
                 continue;
-        if (pl_apply_relr(&objs[i]) < 0)
-            _exit(1);
-        if (objs[i].rela_count > 0 &&
-            pl_apply_rela(&objs[i], objs[i].rela,
-                          objs[i].rela_count) < 0)
-            _exit(1);
-        if (objs[i].jmprel_count > 0 &&
-            pl_apply_rela(&objs[i], objs[i].jmprel,
-                          objs[i].jmprel_count) < 0)
-            _exit(1);
+        {
+            int admission;
+
+            errno = 0;
+            admission = pl_apply_relr(&objs[i]);
+            if (admission != PL_ADMISSION_OK)
+                _exit(prelink_validation_outcome(admission));
+            if (objs[i].rela_count > 0) {
+                errno = 0;
+                admission = pl_apply_rela(
+                    &objs[i], objs[i].rela, objs[i].rela_count);
+                if (admission != PL_ADMISSION_OK)
+                    _exit(prelink_validation_outcome(admission));
+            }
+            if (objs[i].jmprel_count > 0) {
+                errno = 0;
+                admission = pl_apply_rela(
+                    &objs[i], objs[i].jmprel, objs[i].jmprel_count);
+                if (admission != PL_ADMISSION_OK)
+                    _exit(prelink_validation_outcome(admission));
+            }
+        }
     }
 
     /* Every compact runtime fixup and every written relocation table must
@@ -5053,7 +6425,7 @@ static int prelink_objects(const char *output_path,
     for (int i = 0; i < nobj; i++)
         if (!pl_relocation_sources_unchanged(&objs[i]) ||
             !pl_control_authority_unchanged(&objs[i]))
-            _exit(1);
+            _exit(PRELINK_INVALID);
 
     for (int i = 0; i < nobj; i++) {
         uint32_t fixup_off = 0, fixup_count = 0;
@@ -5089,13 +6461,16 @@ static int prelink_objects(const char *output_path,
         }
         metas[i].flags |= DLFRZ_FLAG_PRELINKED;
 
-        if (prelink_obj_collect_runtime_fixups(&objs[i],
-                                              &runtime_fixups,
-                                              &runtime_fixup_count,
-                                              &runtime_fixup_cap,
-                                              &fixup_off,
-                                              &fixup_count) < 0)
-            _exit(1);
+        {
+            int admission;
+
+            errno = 0;
+            admission = prelink_obj_collect_runtime_fixups(
+                &objs[i], &runtime_fixups, &runtime_fixup_count,
+                &runtime_fixup_cap, &fixup_off, &fixup_count);
+            if (admission != PL_ADMISSION_OK)
+                _exit(prelink_validation_outcome(admission));
+        }
 
         /* An empty per-object range has one canonical representation.  Its
          * offset is semantically inapplicable, so do not retain the running
@@ -5118,9 +6493,11 @@ static int prelink_objects(const char *output_path,
         if (startup_aliases[i] >= 0)
             continue;
         if (!pl_relocation_sources_unchanged(&objs[i]) ||
-            !pl_control_authority_unchanged(&objs[i]) ||
-            !pl_serialized_loads_coherent(&objs[i]))
-            _exit(1);
+            !pl_control_authority_unchanged(&objs[i]))
+            _exit(PRELINK_INVALID);
+        errno = 0;
+        if (!pl_serialized_loads_coherent(&objs[i]))
+            _exit(errno == ENOMEM ? PRELINK_MISSED : PRELINK_INVALID);
     }
 
     /* 4. Write patched segments back to frozen binary */
@@ -5142,11 +6519,11 @@ static int prelink_objects(const char *output_path,
             if (!packer_phdr_read(phdr_mem, phdr_size, (size_t)p,
                                   m->phdr_entsz, &ph) ||
                 !prelink_program_header_valid(&ph, &entries[i]))
-                _exit(1);
+                _exit(PRELINK_INVALID);
             if (ph.p_type != PT_LOAD)
                 continue;
             if (!prelink_load_header_valid(&ph, &entries[i], m))
-                _exit(1);
+                _exit(PRELINK_INVALID);
             if (ph.p_filesz == 0)
                 continue;
             if (!u64_add_checked(entries[i].data_offset, ph.p_offset,
@@ -5154,14 +6531,14 @@ static int prelink_objects(const char *output_path,
                 packer_stream_seek(outf, foff) < 0 ||
                 fwrite((void *)(uintptr_t)(base + ph.p_vaddr), 1,
                        (size_t)ph.p_filesz, outf) != (size_t)ph.p_filesz)
-                _exit(1);
+                _exit(PRELINK_ERROR);
         }
     }
 
     if (meta_off != 0) {
         if (packer_stream_seek(outf, meta_off) < 0 ||
             fwrite(metas, sizeof(*metas), (size_t)nobj, outf) != (size_t)nobj)
-            _exit(1);
+            _exit(PRELINK_ERROR);
     }
 
     if (runtime_fixup_count > 0) {
@@ -5174,35 +6551,36 @@ static int prelink_objects(const char *output_path,
         if (fseeko(outf, 0, SEEK_END) != 0 ||
             (file_end_off = ftello(outf)) < 0 ||
             (uintmax_t)file_end_off > SIZE_MAX)
-            _exit(1);
+            _exit(PRELINK_ERROR);
         file_end = (size_t)file_end_off;
         if (file_end < sizeof(saved_ft))
-            _exit(1);
+            _exit(PRELINK_INVALID);
         footer_pos = file_end - sizeof(saved_ft);
 
         if (packer_stream_seek(outf, footer_pos) < 0 ||
             fread(&saved_ft, 1, sizeof(saved_ft), outf) != sizeof(saved_ft))
-            _exit(1);
+            _exit(PRELINK_ERROR);
 
-        if (packer_stream_seek(outf, footer_pos) < 0 ||
-            footer_pos > SIZE_MAX - 7)
-            _exit(1);
+        if (footer_pos > SIZE_MAX - 7)
+            _exit(PRELINK_INVALID);
+        if (packer_stream_seek(outf, footer_pos) < 0)
+            _exit(PRELINK_ERROR);
         pad_to = (footer_pos + 7) & ~(size_t)7;
         if (pad_to > footer_pos) {
             static const char zeros[8];
             if (fwrite(zeros, 1, pad_to - footer_pos, outf) != pad_to - footer_pos)
-                _exit(1);
+                _exit(PRELINK_ERROR);
         }
 
         fixup_off = pad_to;
         if (fwrite(runtime_fixups, sizeof(*runtime_fixups), runtime_fixup_count, outf)
             != runtime_fixup_count)
-            _exit(1);
+            _exit(PRELINK_ERROR);
 
         memcpy(saved_ft.pad + 8, &fixup_off, sizeof(fixup_off));
         memcpy(saved_ft.pad + 16, &fixup_total, sizeof(fixup_total));
         if (fwrite(&saved_ft, 1, sizeof(saved_ft), outf) != sizeof(saved_ft))
-            _exit(1);
+            _exit(PRELINK_ERROR);
     }
 
     {
@@ -5215,7 +6593,7 @@ static int prelink_objects(const char *output_path,
         if (fclose(outf) != 0)
             output_error = 1;
         if (output_error)
-            _exit(1);
+            _exit(PRELINK_ERROR);
     }
     for (int i = 0; i < nobj; i++) {
         pl_control_authority_release(&objs[i]);
@@ -5223,10 +6601,83 @@ static int prelink_objects(const char *output_path,
     }
     free(runtime_fixups);
     free(objs);
-    _exit(0);
+    _exit(PRELINK_APPLIED);
 }
 
-/* ---- ELF patching for UPX compatibility -------------------------- */
+/* output_path is itself the still-private outer pack transaction.  Clearing
+ * the footer authority there is therefore atomic with publishing the final
+ * artifact: any write or sync failure discards the whole transaction.  The
+ * now-unreferenced metadata bytes may remain in the payload, but neither the
+ * bootstrap nor the mapped-payload descriptor can discover them. */
+static int disable_direct_metadata(const char *output_path,
+                                   const struct stat *output_identity)
+{
+    FILE *outf = NULL;
+    int output_fd = -1;
+    struct stat st;
+    struct dlfrz_footer footer;
+    uint64_t footer_offset;
+    uint64_t meta_offset = 0;
+    int result = -1;
+    int saved_errno = 0;
+
+    if (!output_path || !output_identity) {
+        errno = EINVAL;
+        return -1;
+    }
+    output_fd = open_owned_transaction(
+        output_path, O_RDWR, output_identity, NULL);
+    if (output_fd < 0)
+        goto out;
+    outf = fdopen(output_fd, "r+b");
+    if (!outf) {
+        int open_errno = errno ? errno : EIO;
+
+        close(output_fd);
+        output_fd = -1;
+        errno = open_errno;
+        goto out;
+    }
+    output_fd = -1;
+    if (fstat(fileno(outf), &st) < 0 ||
+        !output_identity_equal(&st, output_identity))
+        goto out;
+    if (!S_ISREG(st.st_mode) || st.st_size < (off_t)sizeof(footer)) {
+        errno = EINVAL;
+        goto out;
+    }
+    footer_offset = (uint64_t)st.st_size - sizeof(footer);
+    if (packer_stream_seek(outf, footer_offset) < 0 ||
+        fread(&footer, 1, sizeof(footer), outf) != sizeof(footer))
+        goto out;
+    memcpy(&meta_offset, footer.pad, sizeof(meta_offset));
+    if (memcmp(footer.magic, DLFRZ_MAGIC, sizeof(footer.magic)) != 0 ||
+        footer.version != DLFRZ_VERSION || meta_offset == 0) {
+        errno = EINVAL;
+        goto out;
+    }
+    memset(footer.pad, 0, sizeof(meta_offset));
+    if (packer_stream_seek(outf, footer_offset) < 0 ||
+        fwrite(&footer, 1, sizeof(footer), outf) != sizeof(footer) ||
+        fflush(outf) != 0 || fsync(fileno(outf)) < 0)
+        goto out;
+    result = 0;
+
+out:
+    if (result < 0)
+        saved_errno = errno ? errno : EIO;
+    if (outf && fclose(outf) != 0 && result == 0) {
+        saved_errno = errno ? errno : EIO;
+        result = -1;
+    }
+    if (output_fd >= 0)
+        close(output_fd);
+    if (result < 0)
+        errno = saved_errno;
+    return result;
+}
+
+/* ---- canonical mapped-payload ELF ABI ---------------------------- */
 static int phdr_has_payload_note(const uint8_t *image, size_t image_size,
                                  const Elf64_Phdr *ph)
 {
@@ -5326,7 +6777,7 @@ static int place_payload_phdr_after_loads(uint8_t *table, size_t table_size,
  * ELF headers so that:
  *
  *  1. The "DLFRZLDR" sentinel in .data is filled with the payload VA
- *     and size.  This survives UPX decompression because it lives in a
+ *     and size.  This survives post-link rewriting because it lives in a
  *     PT_LOAD segment.
  *
  *  2. The bootstrap's reserved .note.dlfreeze.payload PT_NOTE entry is
@@ -5334,22 +6785,35 @@ static int place_payload_phdr_after_loads(uint8_t *table, size_t table_size,
  *     explicit part of the bootstrap/packer ABI; it does not depend on a
  *     linker happening to emit a build-id or GNU property note.  PT_GNU_STACK
  *     is deliberately preserved so the frozen executable retains the
- *     bootstrap's non-executable-stack policy.  UPX compresses all PT_LOAD
- *     segments and restores them at runtime.
+ *     bootstrap's non-executable-stack policy.  ELF-aware compressors and
+ *     other post-link tools preserve loadable segments as runtime mappings.
  *
- *  3. Section-header metadata is zeroed out (UPX strips it anyway).
+ *  3. Section-header metadata remains optional runtime metadata.
  */
-static int patch_elf_for_upx_inplace(const char *path, size_t bootstrap_sz,
-                                     size_t payload_off, size_t total_sz)
+static int patch_elf_for_mapped_payload_inplace(
+    const char *path, const struct stat *path_identity, size_t bootstrap_sz,
+    size_t payload_off, size_t total_sz, uint16_t expected_machine)
 {
-    FILE *f = fopen(path, "r+b");
+    int output_fd = open_owned_transaction(
+        path, O_RDWR, path_identity, NULL);
+    FILE *f = output_fd >= 0 ? fdopen(output_fd, "r+b") : NULL;
     struct stat st;
     Elf64_Ehdr ehdr;
     uint8_t *phdr_table;
     size_t phdr_table_size;
 
-    if (!f) { perror(path); return -1; }
-    if (fstat(fileno(f), &st) < 0 || !S_ISREG(st.st_mode) ||
+    if (!f) {
+        int saved_errno = errno ? errno : EIO;
+
+        if (output_fd >= 0)
+            close(output_fd);
+        errno = saved_errno;
+        perror(path);
+        return -1;
+    }
+    if (fstat(fileno(f), &st) < 0 ||
+        !output_identity_equal(&st, path_identity) ||
+        !S_ISREG(st.st_mode) ||
         st.st_size < 0 || (uintmax_t)st.st_size > SIZE_MAX ||
         (size_t)st.st_size != total_sz || bootstrap_sz > total_sz) {
         fclose(f);
@@ -5375,7 +6839,9 @@ static int patch_elf_for_upx_inplace(const char *path, size_t bootstrap_sz,
         ehdr.e_ident[EI_DATA] != ELFDATA2LSB ||
         ehdr.e_ident[EI_VERSION] != EV_CURRENT ||
         ehdr.e_version != EV_CURRENT || ehdr.e_type != ET_EXEC ||
-        (ehdr.e_machine != EM_X86_64 && ehdr.e_machine != EM_AARCH64) ||
+        (expected_machine != EM_X86_64 &&
+         expected_machine != EM_AARCH64) ||
+        ehdr.e_machine != expected_machine ||
         ehdr.e_ehsize != sizeof(Elf64_Ehdr) ||
         ehdr.e_phentsize != sizeof(Elf64_Phdr) ||
         ehdr.e_phnum == 0 || ehdr.e_phnum == PN_XNUM ||
@@ -5489,7 +6955,7 @@ static int patch_elf_for_upx_inplace(const char *path, size_t bootstrap_sz,
      * The marker bytes may also occur in notes, debug data, or other
      * file-only metadata.  Patching the first raw match can leave the live
      * descriptor at zero: the ordinary EOF-footer path still works, while a
-     * UPX image fails because it needs the in-memory descriptor. */
+     * rewritten image fails because it needs the in-memory descriptor. */
     const char sentinel[] = "DLFRZLDR";
     size_t loader_info_off = SIZE_MAX;
     for (size_t i = 0; i + sizeof(struct dlfrz_loader_info) <= bootstrap_sz; i++) {
@@ -5571,27 +7037,43 @@ static int patch_elf_for_upx_inplace(const char *path, size_t bootstrap_sz,
     return 0;
 }
 
-static int patch_elf_for_upx(const char *path, size_t bootstrap_sz,
-                             size_t payload_off, size_t total_sz)
+static int patch_elf_for_mapped_payload(const char *path,
+                                        struct stat *path_identity,
+                                        size_t bootstrap_sz,
+                                        size_t payload_off,
+                                        size_t total_sz,
+                                        uint16_t expected_machine)
 {
     char transaction_path[PATH_MAX];
+    struct stat transaction_identity;
     int saved_errno;
 
+    if (!path || !path_identity) {
+        errno = EINVAL;
+        return -1;
+    }
     /* Header fields and the live loader descriptor are one commit.  A short
      * write, ENOSPC, or process interruption must not leave a plausible ELF
      * with only half of that pair updated. */
-    if (make_transaction_copy(path, "upx", transaction_path) < 0)
+    if (make_transaction_copy(path, "payload", path_identity,
+                              transaction_path,
+                              &transaction_identity) < 0)
         return -1;
-    if (patch_elf_for_upx_inplace(transaction_path, bootstrap_sz,
-                                  payload_off, total_sz) < 0) {
+    if (patch_elf_for_mapped_payload_inplace(
+            transaction_path, &transaction_identity, bootstrap_sz,
+            payload_off, total_sz, expected_machine) < 0) {
         saved_errno = errno ? errno : EIO;
-        unlink(transaction_path);
+        discard_owned_transaction(transaction_path, &transaction_identity,
+                                  "payload-patch transaction");
         errno = saved_errno;
         return -1;
     }
-    if (rename(transaction_path, path) < 0) {
+    if (replace_owned_transaction(
+            transaction_path, &transaction_identity,
+            path, path_identity) < 0) {
         saved_errno = errno ? errno : EIO;
-        unlink(transaction_path);
+        discard_owned_transaction(transaction_path, &transaction_identity,
+                                  "payload-patch transaction");
         errno = saved_errno;
         return -1;
     }
@@ -5682,12 +7164,15 @@ struct symtab_elf_view {
     const uint8_t *dynsym;
     const char *dynstr;
     const uint8_t *versym;
+    const uint8_t *jmprel;
     uint32_t dynsym_count;
     size_t dynstr_size;
+    size_t jmprel_count;
     uint64_t verneed_address;
     uint64_t verneed_count;
     int have_versym;
     int have_verneed;
+    int bind_now;
 };
 
 static int symtab_image_range(const uint8_t *image, size_t image_size,
@@ -6003,6 +7488,8 @@ static int symtab_elf_view_init(const uint8_t *file_image,
     uint64_t versym_address = 0;
     uint64_t verneed_address = 0;
     uint64_t verneed_count = 0;
+    uint64_t dynamic_flags = 0;
+    uint64_t dynamic_flags_1 = 0;
     uint32_t gnu_count = 0;
     uint32_t sysv_count = 0;
     uint32_t symbol_count = 0;
@@ -6029,6 +7516,9 @@ static int symtab_elf_view_init(const uint8_t *file_image,
     int have_versym = 0;
     int have_verneed = 0;
     int have_verneed_count = 0;
+    int have_dynamic_flags = 0;
+    int have_dynamic_flags_1 = 0;
+    int have_bind_now = 0;
 
     if (!file_image || !entry || !meta || !view || !text ||
         entry->data_size > SIZE_MAX ||
@@ -6199,6 +7689,20 @@ static int symtab_elf_view_init(const uint8_t *file_image,
                                     item.d_un.d_val))
                 goto malformed;
             break;
+        case 24: /* DT_BIND_NOW */
+            have_bind_now = 1;
+            break;
+        case DT_FLAGS:
+            if (!symtab_set_dynamic(&have_dynamic_flags, &dynamic_flags,
+                                    item.d_un.d_val))
+                goto malformed;
+            break;
+        case DT_FLAGS_1:
+            if (!symtab_set_dynamic(&have_dynamic_flags_1,
+                                    &dynamic_flags_1,
+                                    item.d_un.d_val))
+                goto malformed;
+            break;
         }
     }
     if (!saw_null)
@@ -6293,6 +7797,13 @@ static int symtab_elf_view_init(const uint8_t *file_image,
                                &view->versym, NULL))
             goto malformed;
     }
+    if (include_relocation_symbols && have_jmprel && pltrel_size != 0) {
+        if (pltrel_size > SIZE_MAX ||
+            !symtab_vaddr_file(view, jmprel_address,
+                               (size_t)pltrel_size, &view->jmprel, NULL))
+            goto malformed;
+        view->jmprel_count = (size_t)pltrel_size / sizeof(Elf64_Rela);
+    }
 
     for (uint32_t i = 0; i < symbol_count; i++) {
         Elf64_Sym symbol;
@@ -6311,6 +7822,11 @@ static int symtab_elf_view_init(const uint8_t *file_image,
     view->verneed_count = verneed_count;
     view->have_versym = have_versym;
     view->have_verneed = have_verneed;
+    view->bind_now = have_bind_now ||
+        (have_dynamic_flags &&
+         (dynamic_flags & DLFRZ_DF_BIND_NOW) != 0) ||
+        (have_dynamic_flags_1 &&
+         (dynamic_flags_1 & DLFRZ_DF_1_NOW) != 0);
     return 0;
 
 malformed:
@@ -6512,11 +8028,217 @@ out:
     return result;
 }
 
+struct prelink_lazy_name_slot {
+    const char *name;
+    uint64_t hash;
+};
+
+static uint64_t prelink_lazy_name_hash(const char *name)
+{
+    uint64_t hash = UINT64_C(1469598103934665603);
+
+    while (name && *name) {
+        hash ^= (unsigned char)*name++;
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static struct prelink_lazy_name_slot *prelink_lazy_name_find(
+    struct prelink_lazy_name_slot *slots, size_t capacity,
+    const char *name, uint64_t hash, int insert)
+{
+    size_t index;
+
+    if (!slots || capacity == 0 ||
+        (capacity & (capacity - 1)) != 0 || !name || !name[0])
+        return NULL;
+    index = (size_t)hash & (capacity - 1);
+    for (size_t probes = 0; probes < capacity; probes++) {
+        struct prelink_lazy_name_slot *slot = &slots[index];
+
+        if (!slot->name) {
+            if (!insert)
+                return NULL;
+            slot->name = name;
+            slot->hash = hash;
+            return slot;
+        }
+        if (slot->hash == hash && strcmp(slot->name, name) == 0)
+            return slot;
+        index = (index + 1) & (capacity - 1);
+    }
+    return NULL;
+}
+
+static int prelink_lazy_graph_object(const struct dlfrz_entry *entry,
+                                     const int *startup_aliases,
+                                     int index)
+{
+    if (!entry || !startup_aliases || index < 0 ||
+        (entry->flags & (DLFRZ_FLAG_DATA | DLFRZ_FLAG_DLOPEN)) != 0)
+        return 0;
+    return startup_aliases[index] < 0;
+}
+
+/* GNU leaves an object's PLT lazy unless that object requests NOW.  The
+ * direct runtime resolves those slots through the object's native PLT0, so
+ * unresolved/weak, GNU-unique, and IFUNC definitions are all valid here.
+ * Keep this immutable scan as an early structural check, while leaving exact
+ * version/scope/provider selection to the runtime at the first call.
+ *
+ * The table is sized from the number of PLT records, not all exported
+ * symbols.  Provider discovery is then one linear DYNSYM pass, avoiding the
+ * quadratic startup-graph scan which made large programs expensive to pack. */
+static enum prelink_result prelink_gnu_lazy_plt_admission(
+    const char *path, const struct stat *path_identity,
+    const struct dlfrz_entry *entries,
+    const struct dlfrz_lib_meta *metas, const int *startup_aliases,
+    int nobj)
+{
+    struct symtab_elf_view *views = NULL;
+    struct prelink_lazy_name_slot *slots = NULL;
+    uint8_t *file_map = MAP_FAILED;
+    struct stat st;
+    size_t mapped_size = 0;
+    size_t candidate_upper = 0;
+    size_t capacity = 16;
+    int fd = -1;
+    enum prelink_result result = PRELINK_INVALID;
+
+    if (!path || !path_identity || !entries || !metas ||
+        !startup_aliases || nobj <= 0)
+        return PRELINK_INVALID;
+    fd = open_owned_transaction(path, O_RDONLY, path_identity, &st);
+    if (fd < 0 || !S_ISREG(st.st_mode) ||
+        st.st_size <= 0 || (uintmax_t)st.st_size > SIZE_MAX) {
+        if (fd >= 0)
+            close(fd);
+        return PRELINK_ERROR;
+    }
+    mapped_size = (size_t)st.st_size;
+    file_map = mmap(NULL, mapped_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    fd = -1;
+    if (file_map == MAP_FAILED)
+        return PRELINK_ERROR;
+
+    views = calloc((size_t)nobj, sizeof(*views));
+    if (!views) {
+        result = PRELINK_ERROR;
+        goto out;
+    }
+    for (int i = 0; i < nobj; i++) {
+        struct symtab_text_info text = {0};
+
+        if (!prelink_lazy_graph_object(&entries[i], startup_aliases, i))
+            continue;
+        if (symtab_elf_view_init(file_map, mapped_size, &entries[i],
+                                 &metas[i], &views[i], &text, 1) < 0)
+            goto out;
+        if ((entries[i].flags & DLFRZ_FLAG_INTERP) != 0 ||
+            views[i].bind_now)
+            continue;
+        if (views[i].jmprel_count > SIZE_MAX - candidate_upper) {
+            result = PRELINK_ERROR;
+            goto out;
+        }
+        candidate_upper += views[i].jmprel_count;
+    }
+    if (candidate_upper == 0) {
+        result = PRELINK_APPLIED;
+        goto out;
+    }
+    if (candidate_upper > SIZE_MAX / 2) {
+        result = PRELINK_ERROR;
+        goto out;
+    }
+    while (capacity < candidate_upper * 2) {
+        if (capacity > SIZE_MAX / 2) {
+            result = PRELINK_ERROR;
+            goto out;
+        }
+        capacity *= 2;
+    }
+    if (capacity > SIZE_MAX / sizeof(*slots)) {
+        result = PRELINK_ERROR;
+        goto out;
+    }
+    slots = calloc(capacity, sizeof(*slots));
+    if (!slots) {
+        result = PRELINK_ERROR;
+        goto out;
+    }
+
+    for (int i = 0; i < nobj; i++) {
+        const struct symtab_elf_view *view = &views[i];
+
+        if (!prelink_lazy_graph_object(&entries[i], startup_aliases, i) ||
+            (entries[i].flags & DLFRZ_FLAG_INTERP) != 0 ||
+            view->bind_now)
+            continue;
+        for (size_t r = 0; r < view->jmprel_count; r++) {
+            Elf64_Rela relocation;
+            Elf64_Sym reference;
+            const char *name;
+            uint32_t symbol_index;
+            uint64_t hash;
+            struct prelink_lazy_name_slot *slot;
+
+            memcpy(&relocation,
+                   view->jmprel + r * sizeof(relocation),
+                   sizeof(relocation));
+            if (ELF64_R_TYPE(relocation.r_info) != ARCH_RELOC_JUMP_SLOT)
+                continue;
+            symbol_index = ELF64_R_SYM(relocation.r_info);
+            if (symbol_index == 0 || symbol_index >= view->dynsym_count)
+                goto out;
+            symtab_view_symbol(view, symbol_index, &reference);
+#if defined(__aarch64__)
+            /* Variant-PCS is a property of this PLT reference, not of the
+             * definition eventually selected by interposition.  The
+             * AArch64 psABI requires such a slot to bind eagerly. */
+            if ((reference.st_other & STO_AARCH64_VARIANT_PCS) != 0)
+                continue;
+#endif
+            name = symtab_view_string(view, reference.st_name);
+            if (!name || !name[0])
+                goto out;
+            if (reference.st_shndx != SHN_UNDEF) {
+                unsigned int binding =
+                    ELF64_ST_BIND(reference.st_info);
+                unsigned int visibility =
+                    ELF64_ST_VISIBILITY(reference.st_other);
+
+                if (binding == STB_LOCAL || visibility == STV_HIDDEN ||
+                    visibility == STV_INTERNAL ||
+                    visibility == STV_PROTECTED) {
+                    continue;
+                }
+            }
+            hash = prelink_lazy_name_hash(name);
+            slot = prelink_lazy_name_find(
+                slots, capacity, name, hash, 1);
+            if (!slot)
+                goto out;
+        }
+    }
+
+    result = PRELINK_APPLIED;
+
+out:
+    free(slots);
+    free(views);
+    if (file_map != MAP_FAILED)
+        munmap(file_map, mapped_size);
+    return result;
+}
+
 /*
  * append_combined_symtab - Append a combined .symtab to the frozen binary.
  *
  * After packing and pre-linking, the frozen binary's outer ELF has its
- * section headers zeroed (for UPX compat).  perf and other profiling tools
+ * section headers zeroed (for post-link compatibility).  perf and other profiling tools
  * try to read symbols from the outer ELF and fail.  This function creates a
  * combined .symtab/.strtab from *all* embedded objects' .dynsym sections,
  * rebased to their pre-assigned load addresses, and appends it to the file
@@ -6529,11 +8251,12 @@ out:
  *   Elf64_Shdr[4]  (NULL, .shstrtab, .strtab, .symtab)
  */
 static int append_combined_symtab_inplace(
-    const char *path, const struct dlfrz_entry *entries,
+    const char *path, const struct stat *path_identity,
+    const struct dlfrz_entry *entries,
     const struct dlfrz_lib_meta *metas, int nent,
     size_t *symbol_count_out, size_t *symbol_bytes_out)
 {
-    if (!path || !entries || !metas || !symbol_count_out ||
+    if (!path || !path_identity || !entries || !metas || !symbol_count_out ||
         !symbol_bytes_out || nent <= 0) {
         errno = EINVAL;
         return -1;
@@ -6572,9 +8295,9 @@ static int append_combined_symtab_inplace(
         goto symtab_scan_fail;
     for (int e = 0; e < nent; e++)
         strtab_bases[e] = SIZE_MAX;
-    scan_fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (scan_fd < 0 || fstat(scan_fd, &scan_stat) < 0 ||
-        !S_ISREG(scan_stat.st_mode) || scan_stat.st_size <= 0 ||
+    scan_fd = open_owned_transaction(
+        path, O_RDWR, path_identity, &scan_stat);
+    if (scan_fd < 0 || !S_ISREG(scan_stat.st_mode) || scan_stat.st_size <= 0 ||
         (uintmax_t)scan_stat.st_size > SIZE_MAX) {
         if (errno == 0)
             errno = EINVAL;
@@ -6584,9 +8307,6 @@ static int append_combined_symtab_inplace(
     file_map = mmap(NULL, mapped_size, PROT_READ, MAP_PRIVATE, scan_fd, 0);
     if (file_map == MAP_FAILED)
         goto symtab_scan_fail;
-    close(scan_fd);
-    scan_fd = -1;
-
     /* ---- Pass 1: validate and size symbols and names. ---- */
     for (int e = 0; e < nent; e++) {
         const struct symtab_elf_view *view = &views[e];
@@ -6632,6 +8352,8 @@ static int append_combined_symtab_inplace(
 
     if (total_syms <= 1) {
         munmap(file_map, mapped_size);
+        close(scan_fd);
+        scan_fd = -1;
         free(views);
         free(strtab_bases);
         free(text_info);
@@ -6801,9 +8523,10 @@ symtab_scan_complete:
         symtab_size_mul(sh_count, sizeof(Elf64_Shdr), &shdr_sz) < 0)
         goto append_out;
 
-    f = fopen(path, "r+b");
+    f = fdopen(scan_fd, "r+b");
     if (!f)
         goto append_out;
+    scan_fd = -1;
     if (fstat(fileno(f), &output_stat) < 0 ||
         !S_ISREG(output_stat.st_mode) || output_stat.st_size < 0 ||
         (uintmax_t)output_stat.st_size > SIZE_MAX) {
@@ -6966,6 +8689,8 @@ append_out:
         saved_errno = errno ? errno : EIO;
         result = -1;
     }
+    if (scan_fd >= 0)
+        close(scan_fd);
     free(shdrs);
     free(symtab);
     free(symtab_shndx);
@@ -6987,33 +8712,46 @@ append_out:
 }
 
 static int append_combined_symtab(const char *path,
+                                  struct stat *path_identity,
                                   const struct dlfrz_entry *entries,
                                   const struct dlfrz_lib_meta *metas,
                                   int nent)
 {
     char transaction_path[PATH_MAX];
+    struct stat transaction_identity;
     size_t symbol_count = 0;
     size_t symbol_bytes = 0;
     int saved_errno;
 
-    if (make_transaction_copy(path, "symtab", transaction_path) < 0) {
+    if (!path || !path_identity) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (make_transaction_copy(path, "symtab", path_identity,
+                              transaction_path,
+                              &transaction_identity) < 0) {
         saved_errno = errno ? errno : EIO;
         fprintf(stderr, "dlfreeze: cannot start symbol-table transaction: %s\n",
                 strerror(saved_errno));
         errno = saved_errno;
         return -1;
     }
-    if (append_combined_symtab_inplace(transaction_path, entries, metas,
+    if (append_combined_symtab_inplace(transaction_path,
+                                       &transaction_identity, entries, metas,
                                        nent, &symbol_count,
                                        &symbol_bytes) < 0) {
         saved_errno = errno ? errno : EIO;
-        unlink(transaction_path);
+        discard_owned_transaction(transaction_path, &transaction_identity,
+                                  "symbol-table transaction");
         errno = saved_errno;
         return -1;
     }
-    if (rename(transaction_path, path) < 0) {
+    if (replace_owned_transaction(
+            transaction_path, &transaction_identity,
+            path, path_identity) < 0) {
         saved_errno = errno ? errno : EIO;
-        unlink(transaction_path);
+        discard_owned_transaction(transaction_path, &transaction_identity,
+                                  "symbol-table transaction");
         errno = saved_errno;
         return -1;
     }
@@ -7294,6 +9032,275 @@ static int packed_library_name_matches_logical(
     return strcmp(slash ? slash + 1 : lib->logical_path, lib->name) == 0;
 }
 
+enum packed_manifest_alias_domain {
+    PACKED_MANIFEST_ALIAS_EXACT_PATH,
+    PACKED_MANIFEST_ALIAS_LOOKUP_BARE,
+    PACKED_MANIFEST_ALIAS_LOOKUP_PATHFUL,
+};
+
+struct packed_manifest_alias_ref {
+    const char *name;
+    uint64_t data_offset;
+    uint64_t data_size;
+    uint32_t entry_index;
+    uint8_t domain;
+    uint8_t request;
+    uint8_t directory;
+    uint8_t negative;
+};
+
+static int packed_manifest_alias_ref_cmp(const void *left_pointer,
+                                         const void *right_pointer)
+{
+    const struct packed_manifest_alias_ref *left = left_pointer;
+    const struct packed_manifest_alias_ref *right = right_pointer;
+    int comparison;
+
+    if (left->domain != right->domain)
+        return left->domain < right->domain ? -1 : 1;
+    comparison = strcmp(left->name, right->name);
+    if (comparison != 0)
+        return comparison;
+    if (left->request != right->request)
+        return left->request < right->request ? -1 : 1;
+    if (left->entry_index != right->entry_index)
+        return left->entry_index < right->entry_index ? -1 : 1;
+    return 0;
+}
+
+static int packed_manifest_alias_source_matches(
+    const struct packed_manifest_alias_ref *left,
+    const struct packed_manifest_alias_ref *right)
+{
+    return left->data_size != 0 && right->data_size != 0 &&
+           left->data_offset == right->data_offset &&
+           left->data_size == right->data_size;
+}
+
+static void packed_manifest_alias_ref_add(
+    struct packed_manifest_alias_ref *refs, size_t *count,
+    const struct dlfrz_entry *entry, uint32_t entry_index,
+    const char *name, enum packed_manifest_alias_domain domain, int request)
+{
+    refs[*count] = (struct packed_manifest_alias_ref) {
+        name, entry->data_offset, entry->data_size, entry_index,
+        (uint8_t)domain, (uint8_t)(request != 0),
+        (uint8_t)((entry->flags & (DLFRZ_FLAG_DATA |
+                                   DLFRZ_FLAG_DATA_DIRECTORY)) ==
+                  (DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_DIRECTORY)),
+        (uint8_t)((entry->flags & (DLFRZ_FLAG_DATA |
+                                   DLFRZ_FLAG_DATA_NEGATIVE)) ==
+                  (DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_NEGATIVE))
+    };
+    (*count)++;
+}
+
+static const struct packed_manifest_alias_ref *
+packed_manifest_exact_alias_find(
+    const struct packed_manifest_alias_ref *refs, size_t exact_count,
+    const char *name, size_t name_length)
+{
+    size_t low = 0;
+    size_t high = exact_count;
+
+    while (low < high) {
+        size_t middle = low + (high - low) / 2;
+        const struct packed_manifest_alias_ref *candidate = &refs[middle];
+        size_t candidate_length = strlen(candidate->name);
+        size_t common_length = candidate_length < name_length
+            ? candidate_length : name_length;
+        int comparison = memcmp(candidate->name, name, common_length);
+
+        if (comparison < 0 ||
+            (comparison == 0 && candidate_length < name_length)) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    if (low >= exact_count || strlen(refs[low].name) != name_length ||
+        memcmp(refs[low].name, name, name_length) != 0)
+        return NULL;
+    return &refs[low];
+}
+
+/* A request spelling is stronger evidence than a dependency search alias:
+ * it records the exact object selected by the native loader.  Refuse to
+ * publish an artifact when the same lookup identity can select distinct byte
+ * sources.  The exact-path domain also protects the application-facing ELF
+ * VFS, where canonical, logical, and request spellings share one pathname
+ * namespace even when a non-pathful dependency lookup uses only a basename.
+ * A strict component ancestor in that namespace must be an explicit captured
+ * directory: publishing a file at X while deriving X/child would otherwise
+ * make open/stat and directory traversal disagree about X's type.
+ *
+ * Dependency-only basename collisions remain representable: caller search
+ * scope and first-loaded order decide those at runtime. */
+static int packed_manifest_aliases_are_consistent(
+    const struct dlfrz_entry *entries, uint32_t count, const char *strtab,
+    const char **conflict_out)
+{
+    struct packed_manifest_alias_ref *refs = NULL;
+    size_t capacity;
+    size_t ref_count = 0;
+    int result = -1;
+
+    if (conflict_out)
+        *conflict_out = NULL;
+    if (!entries || count == 0 || !strtab || !conflict_out ||
+        __builtin_mul_overflow((size_t)count, (size_t)5, &capacity) ||
+        capacity > SIZE_MAX / sizeof(*refs)) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    refs = malloc(capacity * sizeof(*refs));
+    if (!refs)
+        return -1;
+
+    for (uint32_t i = 0; i < count; i++) {
+        const struct dlfrz_entry *entry = &entries[i];
+        const char *name;
+        const char *request = NULL;
+
+        name = strtab + entry->name_offset;
+        if (strchr(name, '/'))
+            packed_manifest_alias_ref_add(
+                refs, &ref_count, entry, i, name,
+                PACKED_MANIFEST_ALIAS_EXACT_PATH, 0);
+        if (entry->flags & DLFRZ_FLAG_DATA)
+            continue;
+        if (entry->logical_name_offset != 0) {
+            const char *logical = strtab + entry->logical_name_offset;
+
+            if (strchr(logical, '/'))
+                packed_manifest_alias_ref_add(
+                    refs, &ref_count, entry, i, logical,
+                    PACKED_MANIFEST_ALIAS_EXACT_PATH, 0);
+        }
+        if (entry->dlopen_request_offset != 0) {
+            request = strtab + entry->dlopen_request_offset;
+            if (strchr(request, '/'))
+                packed_manifest_alias_ref_add(
+                    refs, &ref_count, entry, i, request,
+                    PACKED_MANIFEST_ALIAS_EXACT_PATH, 1);
+            packed_manifest_alias_ref_add(
+                refs, &ref_count, entry, i, request,
+                strchr(request, '/')
+                    ? PACKED_MANIFEST_ALIAS_LOOKUP_PATHFUL
+                    : PACKED_MANIFEST_ALIAS_LOOKUP_BARE,
+                1);
+        }
+        if ((entry->flags & DLFRZ_FLAG_SHLIB) &&
+            !((entry->flags & DLFRZ_FLAG_DLOPEN) && request)) {
+            const char *dependency = name;
+            enum packed_manifest_alias_domain domain =
+                PACKED_MANIFEST_ALIAS_LOOKUP_PATHFUL;
+
+            if (!(entry->flags & DLFRZ_FLAG_NEEDED_PATHFUL)) {
+                const char *slash = strrchr(dependency, '/');
+
+                dependency = slash ? slash + 1 : dependency;
+                domain = PACKED_MANIFEST_ALIAS_LOOKUP_BARE;
+            }
+            packed_manifest_alias_ref_add(
+                refs, &ref_count, entry, i, dependency, domain, 0);
+        }
+    }
+
+    qsort(refs, ref_count, sizeof(*refs), packed_manifest_alias_ref_cmp);
+    for (size_t begin = 0; begin < ref_count;) {
+        size_t end = begin + 1;
+        const struct packed_manifest_alias_ref *request = NULL;
+
+        while (end < ref_count && refs[end].domain == refs[begin].domain &&
+               strcmp(refs[end].name, refs[begin].name) == 0)
+            end++;
+        if (refs[begin].domain == PACKED_MANIFEST_ALIAS_EXACT_PATH) {
+            for (size_t i = begin + 1; i < end; i++) {
+                if (!packed_manifest_alias_source_matches(
+                        &refs[begin], &refs[i])) {
+                    *conflict_out = refs[begin].name;
+                    errno = EEXIST;
+                    goto out;
+                }
+            }
+        } else {
+            for (size_t i = begin; i < end; i++) {
+                if (!refs[i].request)
+                    continue;
+                if (request && !packed_manifest_alias_source_matches(
+                                   request, &refs[i])) {
+                    *conflict_out = refs[begin].name;
+                    errno = EEXIST;
+                    goto out;
+                }
+                request = &refs[i];
+            }
+            if (request) {
+                for (size_t i = begin; i < end; i++) {
+                    if (!refs[i].request &&
+                        !packed_manifest_alias_source_matches(
+                            request, &refs[i])) {
+                        *conflict_out = refs[begin].name;
+                        errno = EEXIST;
+                        goto out;
+                    }
+                }
+            }
+        }
+        begin = end;
+    }
+
+    {
+        size_t exact_count = 0;
+
+        while (exact_count < ref_count &&
+               refs[exact_count].domain ==
+                   PACKED_MANIFEST_ALIAS_EXACT_PATH)
+            exact_count++;
+        for (size_t i = 0; i < exact_count; i++) {
+            const char *path = refs[i].name;
+            size_t path_length = strlen(path);
+            const struct packed_manifest_alias_ref *prefix;
+
+            /* A negative lookup has no materialized node and therefore
+             * cannot make any lexical prefix into a derived directory.
+             * It is coherent to record both X and X/child as misses while a
+             * program probes progressively longer candidate prefixes.
+             * Positive, virtual, directory, and ELF identities still
+             * require every recorded ancestor to be a directory. */
+            if (refs[i].negative)
+                continue;
+
+            if (path[0] == '/' && path_length > 1) {
+                prefix = packed_manifest_exact_alias_find(
+                    refs, exact_count, "/", 1);
+                if (prefix && !prefix->directory) {
+                    *conflict_out = prefix->name;
+                    errno = EEXIST;
+                    goto out;
+                }
+            }
+            for (size_t p = 1; p < path_length; p++) {
+                if (path[p] != '/')
+                    continue;
+                prefix = packed_manifest_exact_alias_find(
+                    refs, exact_count, path, p);
+                if (prefix && !prefix->directory) {
+                    *conflict_out = prefix->name;
+                    errno = EEXIST;
+                    goto out;
+                }
+            }
+        }
+    }
+    result = 0;
+
+out:
+    free(refs);
+    return result;
+}
+
 /* A single ELF may be both the process interpreter and a shared object.  In
  * that case its SHLIB logical identity is already represented by the INTERP
  * manifest name.  Reuse that string record rather than encoding an unrelated
@@ -7312,6 +9319,7 @@ int pack_frozen(const struct pack_options *opts)
 {
     FILE *out = NULL;
     char transaction_path[PATH_MAX] = {0};
+    struct stat transaction_identity = {0};
     struct dlfrz_entry *entries = NULL;
     struct dlfrz_entry *entries_copy = NULL;
     struct dlfrz_lib_meta *metas = NULL;
@@ -7328,10 +9336,11 @@ int pack_frozen(const struct pack_options *opts)
     size_t payload_off = 0;
     size_t total_sz = 0;
     int eidx_save = 0;
-    int transaction_live = 0;
+    int transaction_name_owned = 0;
     int saved_errno = 0;
     int direct_supported;
     int traced_requires_native_loader_semantics;
+    int dlopen_early_status = 0;
     const char *native_loader_semantics_reason = NULL;
     int has_pathful_needed = 0;
     int has_pathful_traced_dlopen = 0;
@@ -7370,14 +9379,24 @@ int pack_frozen(const struct pack_options *opts)
         fprintf(stderr, "dlfreeze: incomplete dependency source manifest\n");
         return -1;
     }
+    if (opts->direct_load) {
+        dlopen_early_status =
+            dep_mark_dlopen_early_closures(opts->deps);
+        if (dlopen_early_status < 0) {
+            fprintf(stderr,
+                    "dlfreeze: cannot classify traced static-TLS closures\n");
+            packed_dep_source_plan_free(&dep_source_plan);
+            return -1;
+        }
+    }
     if (opts->deps->traced_requires_native_loader_semantics) {
         traced_requires_native_loader_semantics = 1;
         native_loader_semantics_reason =
             "a failed traced dynamic-loader call";
-    } else if (opts->deps->runtime_family == DEP_RUNTIME_GNU &&
-               opts->deps->traced_requires_native_lazy_semantics) {
+    } else if (dlopen_early_status > 0) {
         traced_requires_native_loader_semantics = 1;
-        native_loader_semantics_reason = "a traced RTLD_LAZY request";
+        native_loader_semantics_reason =
+            "multiple traced static-TLS roots share a dormant dependency";
     } else {
         traced_requires_native_loader_semantics = 0;
     }
@@ -7437,7 +9456,7 @@ int pack_frozen(const struct pack_options *opts)
     if (opts->data_files && opts->data_files->count > 0) {
         if (!opts->direct_load) {
             fprintf(stderr,
-                    "dlfreeze: captured files require direct-load mode (-d)\n");
+                    "dlfreeze: captured files require direct-load mode\n");
             packed_dep_source_plan_free(&dep_source_plan);
             return -1;
         }
@@ -7449,32 +9468,33 @@ int pack_frozen(const struct pack_options *opts)
             return -1;
         }
     }
-    if (direct_supported &&
-        dep_mark_dlopen_early_closures(opts->deps) < 0) {
-        fprintf(stderr,
-                "dlfreeze: cannot classify traced static-TLS closures\n");
-        packed_dep_source_plan_free(&dep_source_plan);
-        return -1;
-    }
-
     if (validate_output_aliases(opts) < 0) {
         packed_dep_source_plan_free(&dep_source_plan);
         return -1;
     }
     if (create_output_transaction(opts->output_path, transaction_path,
-                                  &out) < 0) {
+                                  &out, &transaction_identity) < 0) {
         fprintf(stderr, "dlfreeze: cannot create output transaction for %s: "
                 "%s\n", opts->output_path, strerror(errno));
         packed_dep_source_plan_free(&dep_source_plan);
         return -1;
     }
-    transaction_live = 1;
+    transaction_name_owned = 1;
 
     /* 1. bootstrap binary ------------------------------------------ */
     if (append_file(out, opts->bootstrap_path, NULL, &written, NULL) < 0)
         goto fail;
     bootstrap_sz = written;
     if (size_add_assign(&off, written) < 0)
+        goto fail;
+    /* Validate the exact private-transaction bytes, not the bootstrap path
+     * a second time.  A cross-installed or raced sibling must be rejected
+     * before the potentially large target closure is appended, and its
+     * machine must match the target rather than the compiler running pack. */
+    if (fflush(out) != 0 ||
+        validate_copied_elf(out, opts->bootstrap_path, 0, bootstrap_sz,
+                            opts->deps->target_ei_class,
+                            opts->deps->target_e_machine, 0) < 0)
         goto fail;
 
     /* total entries: main-exe + interpreter? + libs + data files */
@@ -7570,6 +9590,8 @@ int pack_frozen(const struct pack_options *opts)
             goto fail2;
         entries[eidx].data_offset = off;
         entries[eidx].flags       = DLFRZ_FLAG_INTERP;
+        if (opts->deps->runtime_family == DEP_RUNTIME_UNKNOWN)
+            entries[eidx].flags |= DLFRZ_FLAG_INTERP_KERNEL_ONLY;
         entries[eidx].name_offset = stroff;
         interp_name_offset = (uint32_t)stroff;
         strcpy(strtab + stroff, opts->deps->interp_path); stroff += strlen(opts->deps->interp_path) + 1;
@@ -7705,7 +9727,9 @@ int pack_frozen(const struct pack_options *opts)
             entries[eidx].data_offset = off;
             if (append_file(out, source_path,
                             &opts->data_files->snapshots[i], &written,
-                            NULL) < 0)
+                            &src_snapshots[eidx]) < 0 ||
+                publish_captured_data_timestamps(
+                    &entries[eidx], &src_snapshots[eidx], source_path) < 0)
                 goto fail2;
         }
         entries[eidx].data_size = written;
@@ -7780,6 +9804,25 @@ int pack_frozen(const struct pack_options *opts)
                 request && strchr(request, '/') != NULL)) {
             fprintf(stderr,
                     "dlfreeze: inconsistent manifest entry flags\n");
+            goto fail2;
+        }
+    }
+
+    {
+        const char *alias_conflict = NULL;
+
+        if (packed_manifest_aliases_are_consistent(
+                entries, (uint32_t)eidx, strtab,
+                &alias_conflict) < 0) {
+            if (alias_conflict) {
+                fprintf(stderr,
+                        "dlfreeze: manifest identity maps to distinct "
+                        "sources: %s\n", alias_conflict);
+            } else {
+                fprintf(stderr,
+                        "dlfreeze: cannot validate manifest identities: "
+                        "%s\n", strerror(errno));
+            }
             goto fail2;
         }
     }
@@ -8032,9 +10075,43 @@ int pack_frozen(const struct pack_options *opts)
 
     /* 8. pre-link: apply relocations at freeze time ---------------- */
     if (metas) {
+        enum prelink_result prelink_result;
+
         printf("  pre-linking...\n");
-        if (prelink_objects(transaction_path, entries_copy, metas,
-                            startup_aliases, meta_off, eidx_save) == 0) {
+        if (opts->deps->runtime_family == DEP_RUNTIME_GNU) {
+            prelink_result = prelink_gnu_lazy_plt_admission(
+                transaction_path, &transaction_identity,
+                entries_copy, metas,
+                startup_aliases, eidx_save);
+            if (prelink_result == PRELINK_UNSUPPORTED) {
+                fprintf(stderr,
+                        "dlfreeze: pre-linker found unsupported direct-load "
+                        "semantics\n");
+            } else if (prelink_result == PRELINK_INVALID) {
+                fprintf(stderr,
+                        "dlfreeze: pre-linker rejected invalid ELF "
+                        "metadata\n");
+            } else if (prelink_result == PRELINK_ERROR) {
+                fprintf(stderr,
+                        "dlfreeze: pre-linker encountered an I/O error\n");
+            }
+        } else {
+            prelink_result = PRELINK_APPLIED;
+        }
+        if (prelink_result == PRELINK_APPLIED)
+            prelink_result = prelink_objects(
+                transaction_path, entries_copy, metas,
+                startup_aliases, meta_off, eidx_save,
+                &transaction_identity);
+        if (prelink_result == PRELINK_APPLIED) {
+#ifdef DLFREEZE_PACKER_TRANSACTION_GATE
+            if (dlfreeze_packer_transaction_gate_after_replacement(
+                    PACKER_TRANSACTION_TEST_AFTER_PRELINK,
+                    &transaction_identity)) {
+                errno = EIO;
+                goto fail2;
+            }
+#endif
             printf("  pre-linked : yes\n");
             for (int i = 0; i < eidx_save; i++)
                 if (!(metas[i].flags & (DLFRZ_FLAG_INTERP |
@@ -8042,13 +10119,43 @@ int pack_frozen(const struct pack_options *opts)
                                         DLFRZ_FLAG_DATA)) &&
                     startup_aliases[i] < 0)
                     metas[i].flags |= DLFRZ_FLAG_PRELINKED;
+        } else if (prelink_result == PRELINK_MISSED) {
+            printf("  pre-linked : no (resource/address miss; using runtime "
+                   "relocation)\n");
+        } else if (prelink_result == PRELINK_UNSUPPORTED) {
+            if (ndata > 0 || has_pathful_needed ||
+                has_pathful_traced_dlopen ||
+                has_unreproducible_bare_dlopen) {
+                fprintf(stderr,
+                        "dlfreeze: unsupported direct-load semantics cannot "
+                        "represent this direct-only manifest\n");
+                errno = ENOTSUP;
+                goto fail2;
+            }
+            if (disable_direct_metadata(transaction_path,
+                                        &transaction_identity) < 0) {
+                int disable_errno = errno ? errno : EIO;
+
+                fprintf(stderr,
+                        "dlfreeze: cannot disable rejected direct-load "
+                        "metadata: %s\n", strerror(disable_errno));
+                errno = disable_errno;
+                goto fail2;
+            }
+            printf("  pre-linked : no (unsupported direct contract; using "
+                   "extraction)\n");
+            free(metas);
+            metas = NULL;
+            meta_off = 0;
         } else {
-            printf("  pre-linked : no (failed, will use runtime relocation)\n");
+            errno = prelink_result == PRELINK_INVALID ? EINVAL : EIO;
+            goto fail2;
         }
 
         /* 9. append combined symbol table for profiler support ----- */
-        if (append_combined_symtab(transaction_path, entries_copy, metas,
-                                   eidx_save) < 0) {
+        if (metas &&
+            append_combined_symtab(transaction_path, &transaction_identity,
+                                   entries_copy, metas, eidx_save) < 0) {
             int symbol_errno = errno ? errno : EIO;
 
             fprintf(stderr,
@@ -8057,18 +10164,30 @@ int pack_frozen(const struct pack_options *opts)
             errno = symbol_errno;
             goto fail2;
         }
+        if (metas) {
+#ifdef DLFREEZE_PACKER_TRANSACTION_GATE
+            if (dlfreeze_packer_transaction_gate_after_replacement(
+                    PACKER_TRANSACTION_TEST_AFTER_SYMTAB,
+                    &transaction_identity)) {
+                errno = EIO;
+                goto fail2;
+            }
+#endif
+        }
     }
 
-    /* 10. patch ELF for UPX compatibility --------------------------
+    /* 10. publish the canonical mapped-payload ELF ABI --------------
      * Must happen LAST so payload_filesz includes everything appended
      * after the footer (symtab, section headers, re-appended footer). */
-    if (filesize(transaction_path, &total_sz) < 0) {
+    if (filesize(transaction_path, &transaction_identity, &total_sz) < 0) {
         fprintf(stderr, "dlfreeze: cannot inspect completed output: %s\n",
                 strerror(errno));
         goto fail2;
     }
-    if (patch_elf_for_upx(transaction_path, bootstrap_sz,
-                           payload_off, total_sz) < 0) {
+    if (patch_elf_for_mapped_payload(
+            transaction_path, &transaction_identity, bootstrap_sz,
+            payload_off, total_sz,
+            opts->deps->target_e_machine) < 0) {
         int patch_errno = errno ? errno : EIO;
 
         fprintf(stderr, "dlfreeze: ELF patching failed: %s\n",
@@ -8076,17 +10195,28 @@ int pack_frozen(const struct pack_options *opts)
         errno = patch_errno;
         goto fail2;
     }
-    if (sync_output_transaction(transaction_path) < 0) {
+#ifdef DLFREEZE_PACKER_TRANSACTION_GATE
+    if (dlfreeze_packer_transaction_gate_after_replacement(
+            PACKER_TRANSACTION_TEST_AFTER_PAYLOAD,
+            &transaction_identity)) {
+        errno = EIO;
+        goto fail2;
+    }
+#endif
+    if (sync_output_transaction(transaction_path,
+                                &transaction_identity) < 0) {
         fprintf(stderr, "dlfreeze: cannot sync completed output %s: %s\n",
                 opts->output_path, strerror(errno));
         goto fail2;
     }
-    if (commit_output_transaction(transaction_path, opts->output_path) < 0) {
+    if (commit_output_transaction(transaction_path, opts->output_path,
+                                  &transaction_identity,
+                                  &transaction_name_owned) < 0) {
         fprintf(stderr, "dlfreeze: cannot commit output %s: %s\n",
                 opts->output_path, strerror(errno));
         goto fail2;
     }
-    transaction_live = 0;
+    transaction_name_owned = 0;
 
     printf("Frozen binary: %s\n", opts->output_path);
     printf("  bootstrap  : %zu bytes\n", bootstrap_sz);
@@ -8119,7 +10249,10 @@ fail:
     if (out && fclose(out) != 0)
         fprintf(stderr, "dlfreeze: cannot close failed transaction: %s\n",
                 strerror(errno));
-    if (transaction_live && unlink(transaction_path) < 0 && errno != ENOENT)
+    if (transaction_name_owned &&
+        cleanup_output_transaction(transaction_path,
+                                   &transaction_identity) < 0 &&
+        errno != ENOENT)
         fprintf(stderr, "dlfreeze: cannot remove failed transaction %s: %s\n",
                 transaction_path, strerror(errno));
     errno = saved_errno;

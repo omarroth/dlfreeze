@@ -88,7 +88,10 @@ int dep_add_dlopen_libs(struct dep_list *deps, const char *trace_file);
 /* Descriptor-bound variant; consumes trace_fd on every return path. */
 int dep_add_dlopen_libs_fd(struct dep_list *deps, int trace_fd);
 
-/* Mark traced dlopen closures that require startup static-TLS placement. */
+/* Mark traced dlopen closures that require startup static-TLS placement.
+ * Returns 1 when two such direct roots share a dormant closure member and
+ * therefore require native-loader scope semantics, 0 when representable,
+ * and -1 on an inspection/allocation failure. */
 int dep_mark_dlopen_early_closures(struct dep_list *deps);
 
 /* Resolve one dependency of an auxiliary ELF object (for example the trace

@@ -17,8 +17,12 @@ enum {
     CONTRACT_INIT_OFF = 0x300,
     CONTRACT_INIT_TLS_OFF = 0x700,
     CONTRACT_INIT_SSP_OFF = 0x740,
+    CONTRACT_INIT_SSP_SEED_OFF = 0x7f0,
     CONTRACT_COPY_TLS_OFF = 0x800,
+    CONTRACT_CREATE_OFF = 0x1000,
+    CONTRACT_CLONE_OFF = 0x1400,
     CONTRACT_LIBC_OFF = 0x1800,
+    CONTRACT_THREAD_LIST_LOCK_OFF = 0x1880,
     CONTRACT_GUARD_GOT_OFF = 0x1900,
     CONTRACT_GUARD_OFF = 0x1910,
     CONTRACT_DYNSYM_OFF = 0x1a00,
@@ -36,6 +40,24 @@ static uint32_t encode_bl(uintptr_t pc, uintptr_t target)
 
     return 0x94000000u |
            (uint32_t)(((uint64_t)(displacement >> 2)) & 0x03ffffffu);
+}
+
+static uint32_t encode_b(uintptr_t pc, uintptr_t target)
+{
+    int64_t displacement = (int64_t)target - (int64_t)pc;
+
+    return 0x14000000u |
+           (uint32_t)(((uint64_t)(displacement >> 2)) & 0x03ffffffu);
+}
+
+static uint32_t encode_cbz64(unsigned int reg, uintptr_t pc,
+                             uintptr_t target)
+{
+    int64_t displacement = (int64_t)target - (int64_t)pc;
+
+    return 0xb4000000u |
+           (uint32_t)((((uint64_t)(displacement >> 2)) & 0x7ffffu) << 5) |
+           reg;
 }
 
 static const struct dlfrz_musl_layout *modern_aarch64_layout(void)
@@ -80,6 +102,88 @@ static uint32_t encode_ldp64(unsigned int rt, unsigned int rt2,
 {
     return 0xa9400000u | (uint32_t)((offset / 8) << 15) |
            (uint32_t)(rt2 << 10) | (uint32_t)(rn << 5) | rt;
+}
+
+/* GCC 10's musl init_ssp has one GOT-page base shared by its seeded and
+ * fallback arms.  The fallback is placed after RET and jumps backward to
+ * the common guard-to-TCB copy.  Keep this fixture byte-for-byte shaped like
+ * that CFG so each accepted edge and value can be mutated independently. */
+static void build_branched_init_ssp(uint32_t *ssp)
+{
+    size_t got_offset =
+        ((uintptr_t)(contract_image + CONTRACT_GUARD_GOT_OFF)) & 0xfff;
+
+    memset(ssp, 0, 160);
+    ssp[0] = 0xa9be7bfdu; /* stp x29,x30,[sp,#-32]! */
+    ssp[1] = 0x910003fdu; /* mov x29,sp */
+    ssp[2] = 0xf9000bf3u; /* str x19,[sp,#16] */
+    ssp[3] = encode_adrp(
+        (uintptr_t)&ssp[3],
+        (uintptr_t)(contract_image + CONTRACT_GUARD_GOT_OFF), 19);
+    ssp[4] = encode_cbz64(
+        0, (uintptr_t)&ssp[4], (uintptr_t)&ssp[16]);
+    ssp[5] = 0xaa0003e1u; /* mov x1,x0 */
+    ssp[6] = 0xd2800102u; /* mov x2,#8 */
+    ssp[7] = encode_ldrstr64(1, 0, 19, got_offset);
+    ssp[8] = encode_bl(
+        (uintptr_t)&ssp[8],
+        (uintptr_t)(contract_image + CONTRACT_INIT_SSP_SEED_OFF));
+    ssp[9] = encode_ldrstr64(1, 19, 19, got_offset);
+    ssp[10] = 0xd53bd040u; /* mrs x0,tpidr_el0 */
+    ssp[11] = encode_ldrstr64(1, 1, 19, 0);
+    ssp[12] = 0xf9400bf3u; /* ldr x19,[sp,#16] */
+    ssp[13] = 0xf81f0001u; /* stur x1,[x0,#-16] */
+    ssp[14] = 0xa8c27bfdu; /* ldp x29,x30,[sp],#32 */
+    ssp[15] = 0xd65f03c0u;
+    ssp[16] = encode_ldrstr64(1, 0, 19, got_offset);
+    ssp[17] = 0xd289cda1u; /* movz x1,#0x4e6d */
+    ssp[18] = 0xf2a838c1u; /* movk x1,#0x41c6,lsl #16 */
+    ssp[19] = 0x9b017c01u; /* mul x1,x0,x1 */
+    ssp[20] = encode_ldrstr64(0, 1, 0, 0);
+    ssp[21] = encode_b((uintptr_t)&ssp[21], (uintptr_t)&ssp[9]);
+    *(uint32_t *)(contract_image + CONTRACT_INIT_SSP_SEED_OFF) =
+        0xd65f03c0u;
+}
+
+static void build_derived_self_uselocale(uint32_t *locale,
+                                         uintptr_t global)
+{
+    memset(locale, 0, 128);
+    locale[0] = 0xd53bd042u; /* mrs x2,tpidr_el0 */
+    locale[1] = encode_adrp((uintptr_t)&locale[1], global, 1);
+    locale[2] = 0xd1032042u; /* sub x2,x2,#200: struct pthread */
+    locale[3] = encode_ldrstr64(1, 3, 2, 152);
+    locale[4] = 0xb40000a0u; /* cbz x0,join */
+    locale[5] = 0xb100041fu; /* cmn x0,#1 */
+    locale[6] = 0x54000041u; /* b.ne store */
+    locale[7] = encode_add_imm(0, 1, global & 0xfff);
+    locale[8] = encode_ldrstr64(0, 0, 2, 152);
+    locale[9] = encode_add_imm(1, 1, global & 0xfff);
+    locale[10] = 0xeb01007fu; /* cmp x3,x1 */
+    locale[11] = 0xda9f1060u; /* csinv x0,x3,xzr,ne */
+    locale[12] = 0xd65f03c0u;
+}
+
+static void build_split_load_copy_tls(uint32_t *copy)
+{
+    uintptr_t libc_base =
+        (uintptr_t)(contract_image + CONTRACT_LIBC_OFF);
+
+    memset(copy, 0, 192);
+    copy[0] = 0x928018e2u; /* mov x2,#-200 */
+    copy[1] = encode_adrp((uintptr_t)&copy[1], libc_base, 25);
+    copy[2] = encode_add_imm(1, 25, libc_base & 0xfff);
+    copy[3] = encode_ldp64(19, 0, 1, 16); /* TLS head,size */
+    copy[4] = encode_ldrstr64(1, 22, 1, 32); /* TLS align */
+    copy[5] = encode_ldrstr64(1, 24, 1, 40); /* TLS count */
+    copy[6] = 0xd503201fu;
+    copy[7] = encode_add_imm(21, 22, 200);
+    copy[8] = encode_ldrstr64(1, 1, 19, 40); /* module offset */
+    copy[9] = encode_ldrstr64(1, 1, 19, 8);  /* module image */
+    copy[10] = encode_ldrstr64(1, 2, 19, 16); /* module length */
+    copy[11] = encode_ldrstr64(1, 19, 19, 0); /* module next */
+    copy[12] = encode_ldrstr64(0, 26, 22, 192);
+    copy[13] = 0xd65f03c0u;
 }
 
 static int test_init_contract_decoder(void)
@@ -174,6 +278,40 @@ static int test_init_contract_decoder(void)
         return 0;
     ssp[3] = saved;
 
+    /* The relocation-proven guard, byte clear, value load, and TCB store
+     * must occur in that order on one register-preserving basic-block path. */
+    ssp[3] = 0xd503201fu;
+    ssp[6] = 0x3900041fu;
+    ssp[7] = 0xd65f03c0u;
+    if (decode_aarch64_musl_init_libc(
+            &contract_obj, 200, &decoded, &canary))
+        return 0;
+    ssp[3] = 0x3900041fu;
+    ssp[6] = 0xd65f03c0u;
+    ssp[7] = 0;
+
+    memmove(&ssp[3], &ssp[2], 5 * sizeof(*ssp));
+    ssp[2] = 0xaa1f03e0u; /* mov x0,xzr: clobber guard provenance */
+    if (decode_aarch64_musl_init_libc(
+            &contract_obj, 200, &decoded, &canary))
+        return 0;
+    ssp[2] = 0xd53bd041u;
+    ssp[3] = 0x3900041fu;
+    ssp[4] = encode_ldrstr64(1, 0, 0, 0);
+    ssp[5] = 0xf81f0020u;
+    ssp[6] = 0xd65f03c0u;
+    ssp[7] = 0;
+
+    memmove(&ssp[5], &ssp[4], 3 * sizeof(*ssp));
+    ssp[4] = 0x14000001u; /* branch to next instruction */
+    if (decode_aarch64_musl_init_libc(
+            &contract_obj, 200, &decoded, &canary))
+        return 0;
+    ssp[4] = encode_ldrstr64(1, 0, 0, 0);
+    ssp[5] = 0xf81f0020u;
+    ssp[6] = 0xd65f03c0u;
+    ssp[7] = 0;
+
     saved = ssp[5];
     ssp[5] = 0xf81f0022u; /* store a value not loaded from the guard */
     if (decode_aarch64_musl_init_libc(
@@ -206,6 +344,215 @@ static int test_init_contract_decoder(void)
             &contract_obj, 200, &decoded, &canary))
         return 0;
     contract_phdr.p_filesz = sizeof(contract_image);
+
+    /* musl 1.2.2 predates the guard-byte clear used as the modern decoder's
+     * anchor.  Model its exact fallback assignment and guard-to-TCB copy. */
+    memset(ssp, 0, 160);
+    ssp[0] = encode_adrp((uintptr_t)&ssp[0],
+                         (uintptr_t)(contract_image +
+                                     CONTRACT_GUARD_GOT_OFF), 19);
+    ssp[1] = encode_ldrstr64(
+        1, 0, 19,
+        ((uintptr_t)(contract_image + CONTRACT_GUARD_GOT_OFF)) & 0xfff);
+    ssp[2] = 0xd289cda1u; /* movz x1,#0x4e6d */
+    ssp[3] = 0xf2a838c1u; /* movk x1,#0x41c6,lsl #16 */
+    ssp[4] = 0x9b017c01u; /* mul x1,x0,x1 */
+    ssp[5] = encode_ldrstr64(0, 1, 0, 0);
+    ssp[6] = encode_ldrstr64(
+        1, 19, 19,
+        ((uintptr_t)(contract_image + CONTRACT_GUARD_GOT_OFF)) & 0xfff);
+    ssp[7] = 0xd53bd040u; /* mrs x0,tpidr_el0 */
+    ssp[8] = encode_ldrstr64(1, 1, 19, 0);
+    ssp[9] = 0xf81f0001u; /* stur x1,[x0,#-16] */
+    ssp[10] = 0xd65f03c0u;
+    if (!decode_aarch64_musl_init_libc(
+            &contract_obj, 200, &decoded, &canary) ||
+        decoded != (uintptr_t)(contract_image + CONTRACT_INIT_OFF) ||
+        canary != 184)
+        return 0;
+
+    saved = ssp[2];
+    ssp[2] ^= 1u << 5; /* wrong fallback multiplier */
+    if (decode_aarch64_musl_init_libc(
+            &contract_obj, 200, &decoded, &canary))
+        return 0;
+    ssp[2] = saved;
+
+    saved = ssp[5];
+    ssp[5] = encode_ldrstr64(0, 2, 0, 0); /* wrong fallback value */
+    if (decode_aarch64_musl_init_libc(
+            &contract_obj, 200, &decoded, &canary))
+        return 0;
+    ssp[5] = saved;
+
+    saved = ssp[9];
+    ssp[9] = 0xf81f0002u; /* TCB store has wrong source */
+    if (decode_aarch64_musl_init_libc(
+            &contract_obj, 200, &decoded, &canary))
+        return 0;
+    ssp[9] = saved;
+
+    ssp[10] = 0xf81f8001u; /* stur x1,[x0,#-8] */
+    ssp[11] = 0xd65f03c0u;
+    if (decode_aarch64_musl_init_libc(
+            &contract_obj, 200, &decoded, &canary))
+        return 0; /* conflicting canary offsets are ambiguous */
+    ssp[10] = 0xd65f03c0u;
+    ssp[11] = 0;
+
+    /* GCC 10 places the guard-page ADRP before a CBZ and shares it across
+     * the seeded arm, the post-call join, and the out-of-line fallback. */
+    build_branched_init_ssp(ssp);
+    if (!decode_aarch64_musl_init_libc(
+            &contract_obj, 200, &decoded, &canary) ||
+        decoded != (uintptr_t)(contract_image + CONTRACT_INIT_OFF) ||
+        canary != 184) {
+        fprintf(stderr,
+                "branched init positive: decoded=%#lx canary=%zu\n",
+                (unsigned long)decoded, canary);
+        return 0;
+    }
+
+    build_branched_init_ssp(ssp);
+    ssp[4] ^= UINT32_C(1) << 24; /* CBNZ reverses the seeded/fallback arms */
+    if (decode_aarch64_musl_init_libc(
+            &contract_obj, 200, &decoded, &canary))
+        return 0;
+
+    build_branched_init_ssp(ssp);
+    ssp[4] = encode_cbz64(
+        0, (uintptr_t)&ssp[4], (uintptr_t)&ssp[17]);
+    if (decode_aarch64_musl_init_libc(
+            &contract_obj, 200, &decoded, &canary))
+        return 0; /* the conditional edge must start at the guard load */
+
+    build_branched_init_ssp(ssp);
+    ssp[4] = encode_cbz64(
+        0, (uintptr_t)&ssp[4], (uintptr_t)&ssp[3]);
+    if (decode_aarch64_musl_init_libc(
+            &contract_obj, 200, &decoded, &canary))
+        return 0; /* no backward conditional fallback edge */
+
+    build_branched_init_ssp(ssp);
+    ssp[1] = 0xaa1f03e0u; /* mov x0,xzr: no longer the entry entropy */
+    if (decode_aarch64_musl_init_libc(
+            &contract_obj, 200, &decoded, &canary))
+        return 0;
+
+    build_branched_init_ssp(ssp);
+    ssp[21] = encode_b((uintptr_t)&ssp[21], (uintptr_t)&ssp[10]);
+    if (decode_aarch64_musl_init_libc(
+            &contract_obj, 200, &decoded, &canary))
+        return 0; /* both arms must converge at the guard reload */
+
+    build_branched_init_ssp(ssp);
+    ssp[15] = 0xd503201fu; /* seeded arm would fall into the fallback */
+    if (decode_aarch64_musl_init_libc(
+            &contract_obj, 200, &decoded, &canary))
+        return 0;
+
+    build_branched_init_ssp(ssp);
+    ssp[3] = encode_adrp(
+        (uintptr_t)&ssp[3],
+        (uintptr_t)(contract_image + CONTRACT_GUARD_GOT_OFF), 9);
+    ssp[7] = encode_ldrstr64(
+        1, 0, 9,
+        ((uintptr_t)(contract_image + CONTRACT_GUARD_GOT_OFF)) & 0xfff);
+    ssp[9] = encode_ldrstr64(
+        1, 9, 9,
+        ((uintptr_t)(contract_image + CONTRACT_GUARD_GOT_OFF)) & 0xfff);
+    ssp[16] = encode_ldrstr64(
+        1, 0, 9,
+        ((uintptr_t)(contract_image + CONTRACT_GUARD_GOT_OFF)) & 0xfff);
+    if (decode_aarch64_musl_init_libc(
+            &contract_obj, 200, &decoded, &canary))
+        return 0; /* a volatile GOT-page base cannot survive BL */
+
+    build_branched_init_ssp(ssp);
+    ssp[5] = 0xaa1f03f3u; /* mov x19,xzr: destroy the GOT-page base */
+    if (decode_aarch64_musl_init_libc(
+            &contract_obj, 200, &decoded, &canary))
+        return 0;
+
+    build_branched_init_ssp(ssp);
+    ssp[8] = 0xd503201fu; /* missing seeded-arm call */
+    if (decode_aarch64_musl_init_libc(
+            &contract_obj, 200, &decoded, &canary))
+        return 0;
+
+    build_branched_init_ssp(ssp);
+    ssp[8] = 0xd63f0200u; /* blr x16: indirect target has no proof */
+    if (decode_aarch64_musl_init_libc(
+            &contract_obj, 200, &decoded, &canary))
+        return 0;
+
+    build_branched_init_ssp(ssp);
+    ssp[8] = encode_bl(
+        (uintptr_t)&ssp[8],
+        (uintptr_t)contract_image + CONTRACT_IMAGE_SIZE + 0x100);
+    if (decode_aarch64_musl_init_libc(
+            &contract_obj, 200, &decoded, &canary))
+        return 0; /* direct but outside the target's executable image */
+
+    build_branched_init_ssp(ssp);
+    ssp[5] = encode_bl(
+        (uintptr_t)&ssp[5],
+        (uintptr_t)(contract_image + CONTRACT_INIT_SSP_SEED_OFF));
+    if (decode_aarch64_musl_init_libc(
+            &contract_obj, 200, &decoded, &canary))
+        return 0; /* the seeded arm must contain exactly one call */
+
+    build_branched_init_ssp(ssp);
+    ssp[7] = encode_ldrstr64(
+        1, 0, 19,
+        (((uintptr_t)(contract_image + CONTRACT_GUARD_GOT_OFF)) & 0xfff) +
+            8);
+    if (decode_aarch64_musl_init_libc(
+            &contract_obj, 200, &decoded, &canary))
+        return 0; /* seeded load must use the relocated guard slot */
+
+    build_branched_init_ssp(ssp);
+    ssp[9] = encode_ldrstr64(
+        1, 19, 19,
+        (((uintptr_t)(contract_image + CONTRACT_GUARD_GOT_OFF)) & 0xfff) +
+            8);
+    if (decode_aarch64_musl_init_libc(
+            &contract_obj, 200, &decoded, &canary))
+        return 0; /* join must reload from the same relocated slot */
+
+    build_branched_init_ssp(ssp);
+    ssp[16] = encode_ldrstr64(
+        1, 0, 19,
+        (((uintptr_t)(contract_image + CONTRACT_GUARD_GOT_OFF)) & 0xfff) +
+            8);
+    if (decode_aarch64_musl_init_libc(
+            &contract_obj, 200, &decoded, &canary))
+        return 0; /* fallback load must use that same slot */
+
+    build_branched_init_ssp(ssp);
+    ssp[17] ^= UINT32_C(1) << 5; /* wrong fallback multiplier */
+    if (decode_aarch64_musl_init_libc(
+            &contract_obj, 200, &decoded, &canary))
+        return 0;
+
+    build_branched_init_ssp(ssp);
+    ssp[19] = 0x9b027c01u; /* multiply by x2, not the proven constant */
+    if (decode_aarch64_musl_init_libc(
+            &contract_obj, 200, &decoded, &canary))
+        return 0;
+
+    build_branched_init_ssp(ssp);
+    ssp[20] = encode_ldrstr64(0, 2, 0, 0); /* store wrong result */
+    if (decode_aarch64_musl_init_libc(
+            &contract_obj, 200, &decoded, &canary))
+        return 0;
+
+    build_branched_init_ssp(ssp);
+    ssp[14] = 0xf81f8001u; /* second TCB field makes layout ambiguous */
+    if (decode_aarch64_musl_init_libc(
+            &contract_obj, 200, &decoded, &canary))
+        return 0;
+
     return 1;
 }
 
@@ -262,6 +609,58 @@ static int test_target_contract_decoders(void)
         return 0;
     locale[5] = saved;
 
+    build_derived_self_uselocale(locale, expected_global);
+    if (!decode_aarch64_musl_uselocale(
+            &contract_obj, (const uint8_t *)locale, 13 * sizeof(*locale),
+            200, &locale_offset, &global) || locale_offset != 152 ||
+        global != expected_global)
+        return 0;
+
+    build_derived_self_uselocale(locale, expected_global);
+    locale[3] = encode_ldrstr64(1, 3, 4, 152);
+    if (decode_aarch64_musl_uselocale(
+            &contract_obj, (const uint8_t *)locale, 13 * sizeof(*locale),
+            200, &locale_offset, &global))
+        return 0; /* old locale load must use the proven self register */
+
+    build_derived_self_uselocale(locale, expected_global);
+    locale[3] = encode_ldrstr64(1, 3, 2, 144);
+    if (decode_aarch64_musl_uselocale(
+            &contract_obj, (const uint8_t *)locale, 13 * sizeof(*locale),
+            200, &locale_offset, &global))
+        return 0; /* load and conditional store offsets must agree */
+
+    build_derived_self_uselocale(locale, expected_global);
+    memmove(&locale[4], &locale[3], 10 * sizeof(*locale));
+    locale[3] = 0xaa1f03e2u; /* mov x2,xzr: clobber derived self */
+    if (decode_aarch64_musl_uselocale(
+            &contract_obj, (const uint8_t *)locale, 14 * sizeof(*locale),
+            200, &locale_offset, &global))
+        return 0;
+
+    build_derived_self_uselocale(locale, expected_global);
+    memmove(&locale[4], &locale[3], 10 * sizeof(*locale));
+    locale[3] = 0x14000001u; /* branch across the load provenance path */
+    if (decode_aarch64_musl_uselocale(
+            &contract_obj, (const uint8_t *)locale, 14 * sizeof(*locale),
+            200, &locale_offset, &global))
+        return 0;
+
+    build_derived_self_uselocale(locale, expected_global);
+    locale[8] = encode_ldrstr64(0, 0, 2, 144);
+    if (decode_aarch64_musl_uselocale(
+            &contract_obj, (const uint8_t *)locale, 13 * sizeof(*locale),
+            200, &locale_offset, &global))
+        return 0;
+
+    build_derived_self_uselocale(locale, expected_global);
+    memmove(&locale[4], &locale[3], 10 * sizeof(*locale));
+    locale[3] = encode_ldrstr64(1, 4, 2, 144);
+    if (decode_aarch64_musl_uselocale(
+            &contract_obj, (const uint8_t *)locale, 14 * sizeof(*locale),
+            200, &locale_offset, &global))
+        return 0; /* two distinct loaded offsets are ambiguous */
+
     copy = (uint32_t *)(contract_image + CONTRACT_COPY_TLS_OFF);
     copy[0] = 0x928018e2u; /* mov x2,#-200 */
     copy[1] = encode_adrp(
@@ -300,6 +699,143 @@ static int test_target_contract_decoders(void)
             &tls_cnt))
         return 0;
     copy[9] = saved;
+
+    build_split_load_copy_tls(copy);
+    if (!decode_aarch64_musl_copy_tls_contract(
+            &contract_obj,
+            (uintptr_t)(contract_image + CONTRACT_COPY_TLS_OFF),
+            (uintptr_t)(contract_image + CONTRACT_LIBC_OFF),
+            &pthread_size, &dtv, &tls_head, &tls_size, &tls_align,
+            &tls_cnt) || pthread_size != 200 || dtv != 192 ||
+        tls_head != (uintptr_t)(contract_image + CONTRACT_LIBC_OFF + 16) ||
+        tls_size != (uintptr_t)(contract_image + CONTRACT_LIBC_OFF + 24) ||
+        tls_align != (uintptr_t)(contract_image + CONTRACT_LIBC_OFF + 32) ||
+        tls_cnt != (uintptr_t)(contract_image + CONTRACT_LIBC_OFF + 40))
+        return 0;
+
+    build_split_load_copy_tls(copy);
+    copy[4] = encode_ldrstr64(1, 22, 2, 32);
+    if (decode_aarch64_musl_copy_tls_contract(
+            &contract_obj,
+            (uintptr_t)(contract_image + CONTRACT_COPY_TLS_OFF),
+            (uintptr_t)(contract_image + CONTRACT_LIBC_OFF),
+            &pthread_size, &dtv, &tls_head, &tls_size, &tls_align,
+            &tls_cnt))
+        return 0; /* standalone align load has the wrong libc base */
+
+    build_split_load_copy_tls(copy);
+    copy[5] = encode_ldrstr64(1, 24, 1, 48);
+    if (decode_aarch64_musl_copy_tls_contract(
+            &contract_obj,
+            (uintptr_t)(contract_image + CONTRACT_COPY_TLS_OFF),
+            (uintptr_t)(contract_image + CONTRACT_LIBC_OFF),
+            &pthread_size, &dtv, &tls_head, &tls_size, &tls_align,
+            &tls_cnt))
+        return 0; /* standalone count load has the wrong field offset */
+
+    build_split_load_copy_tls(copy);
+    copy[9] = encode_ldrstr64(1, 1, 20, 8);
+    if (decode_aarch64_musl_copy_tls_contract(
+            &contract_obj,
+            (uintptr_t)(contract_image + CONTRACT_COPY_TLS_OFF),
+            (uintptr_t)(contract_image + CONTRACT_LIBC_OFF),
+            &pthread_size, &dtv, &tls_head, &tls_size, &tls_align,
+            &tls_cnt))
+        return 0; /* module image load has the wrong module base */
+
+    build_split_load_copy_tls(copy);
+    copy[10] = encode_ldrstr64(1, 2, 19, 24);
+    if (decode_aarch64_musl_copy_tls_contract(
+            &contract_obj,
+            (uintptr_t)(contract_image + CONTRACT_COPY_TLS_OFF),
+            (uintptr_t)(contract_image + CONTRACT_LIBC_OFF),
+            &pthread_size, &dtv, &tls_head, &tls_size, &tls_align,
+            &tls_cnt))
+        return 0; /* module length load has the wrong field offset */
+
+    build_split_load_copy_tls(copy);
+    copy[10] = 0xd503201fu;
+    if (decode_aarch64_musl_copy_tls_contract(
+            &contract_obj,
+            (uintptr_t)(contract_image + CONTRACT_COPY_TLS_OFF),
+            (uintptr_t)(contract_image + CONTRACT_LIBC_OFF),
+            &pthread_size, &dtv, &tls_head, &tls_size, &tls_align,
+            &tls_cnt))
+        return 0; /* all four module fields remain required */
+    return 1;
+}
+
+static int test_clone_ctid_decoder(void)
+{
+    uint32_t *create =
+        (uint32_t *)(contract_image + CONTRACT_CREATE_OFF);
+    uint32_t *clone =
+        (uint32_t *)(contract_image + CONTRACT_CLONE_OFF);
+    uintptr_t expected =
+        (uintptr_t)(contract_image + CONTRACT_THREAD_LIST_LOCK_OFF);
+    uintptr_t decoded = 0;
+    uint32_t saved;
+
+    memset(create, 0, 16 * sizeof(*create));
+    memset(clone, 0, 12 * sizeof(*clone));
+    create[0] = 0x5281e002u; /* mov w2,#0xf00 */
+    create[1] = encode_adrp((uintptr_t)&create[1], expected, 6);
+    create[2] = encode_add_imm(5, 27, 200); /* TLS: new pthread */
+    create[3] = encode_add_imm(6, 6, expected & 0xfff);
+    create[4] = encode_add_imm(4, 27, 32); /* ptid: new->tid */
+    create[5] = 0xaa1c03e3u; /* mov x3,x28 */
+    create[6] = 0x9a8010e0u; /* csel x0,x7,x0,ne */
+    create[7] = 0xaa1c03e1u; /* mov x1,x28 */
+    create[8] = 0x72a00fa2u; /* movk w2,#0x7d,lsl #16 */
+    create[9] = encode_bl(
+        (uintptr_t)&create[9],
+        (uintptr_t)(contract_image + CONTRACT_CLONE_OFF));
+
+    clone[0] = 0x927cec21u; /* and x1,x1,#-16 */
+    clone[1] = 0xa9bf0c20u; /* stp x0,x3,[x1,#-16]! */
+    clone[2] = 0x2a0203e0u; /* mov w0,w2 */
+    clone[3] = 0xaa0403e2u; /* mov x2,x4 */
+    clone[4] = 0xaa0503e3u; /* mov x3,x5 */
+    clone[5] = 0xaa0603e4u; /* mov x4,x6: ctid */
+    clone[6] = 0xd2801b88u; /* mov x8,#SYS_clone */
+    clone[7] = 0xd4000001u; /* svc #0 */
+
+    if (!decode_aarch64_musl_clone_ctid(
+            &contract_obj, (const uint8_t *)create,
+            10 * sizeof(*create), 27, 200, 32, &decoded) ||
+        decoded != expected)
+        return 0;
+
+    saved = create[4];
+    create[4] = encode_add_imm(4, 27, 36);
+    if (decode_aarch64_musl_clone_ctid(
+            &contract_obj, (const uint8_t *)create,
+            10 * sizeof(*create), 27, 200, 32, &decoded))
+        return 0;
+    create[4] = saved;
+
+    saved = clone[5];
+    clone[5] = 0xaa0703e4u; /* wrapper no longer maps X6 to kernel ctid */
+    if (decode_aarch64_musl_clone_ctid(
+            &contract_obj, (const uint8_t *)create,
+            10 * sizeof(*create), 27, 200, 32, &decoded))
+        return 0;
+    clone[5] = saved;
+
+    saved = create[3];
+    create[3] = encode_add_imm(6, 6, (expected & 0xfff) + 1);
+    if (decode_aarch64_musl_clone_ctid(
+            &contract_obj, (const uint8_t *)create,
+            10 * sizeof(*create), 27, 200, 32, &decoded))
+        return 0;
+    create[3] = saved;
+
+    contract_phdr.p_flags &= ~PF_W;
+    if (decode_aarch64_musl_clone_ctid(
+            &contract_obj, (const uint8_t *)create,
+            10 * sizeof(*create), 27, 200, 32, &decoded))
+        return 0;
+    contract_phdr.p_flags |= PF_W;
     return 1;
 }
 
@@ -371,6 +907,25 @@ int main(void)
         0x7100085f, /* cmp   w2, #2 */
         0x54000081, /* b.ne  ... */
         0x8802fc23, /* stlxr w2, w3, [x1] */
+    };
+
+    /* Alpine 3.14/3.16 (musl 1.2.2/1.2.3): GCC lays the retrying
+     * exclusive store after the non-joinable tail-call path.  The B.EQ
+     * reaches the store only for JOINABLE (2), and CBNZ retries at LDAXR
+     * until DETACHED (3) is committed. */
+    static const uint32_t old_forward_store[] = {
+        0x9100a002, /* add   x2, x0, #0x28 */
+        0x52800061, /* mov   w1, #3 */
+        0x885ffc43, /* ldaxr w3, [x2] */
+        0x7100087f, /* cmp   w3, #2 */
+        0x54000080, /* b.eq  forward store */
+        0xd5033bbf, /* dmb   ish */
+        0xd2800001, /* mov   x1, #0 */
+        0x14000020, /* b     outside this pthread_detach body */
+        0x8803fc41, /* stlxr w3, w1, [x2] */
+        0x35ffff23, /* cbnz  w3, back to ldaxr */
+        0x52800000, /* mov   w0, #0 */
+        0xd65f03c0, /* ret */
     };
 
     /* Debian 13: stack protector and PAC/BTI hardening put the exclusive
@@ -464,6 +1019,8 @@ int main(void)
         sizeof(preserved_arg) / sizeof(preserved_arg[0])];
     uint32_t hardened_prefix_mutated[
         sizeof(ubuntu_pac_bti) / sizeof(ubuntu_pac_bti[0])];
+    uint32_t old_forward_mutated[
+        sizeof(old_forward_store) / sizeof(old_forward_store[0])];
     uint32_t direct_mutated[3];
 
     if (!expect_detach_layout(
@@ -471,6 +1028,10 @@ int main(void)
             sizeof(direct_store) / sizeof(direct_store[0]), 1, 0) ||
         !expect_detach_layout("compact", compact,
                               sizeof(compact) / sizeof(compact[0]), 1, 2) ||
+        !expect_detach_layout(
+            "old forward store", old_forward_store,
+            sizeof(old_forward_store) / sizeof(old_forward_store[0]), 1,
+            2) ||
         !expect_detach_layout("hardened", hardened,
                               sizeof(hardened) / sizeof(hardened[0]), 1, 2) ||
         !expect_detach_layout("Ubuntu PAC", ubuntu_pac,
@@ -489,6 +1050,9 @@ int main(void)
             sizeof(direct_store) / sizeof(direct_store[0])) ||
         !expect_prefixes_rejected(
             "compact", compact, sizeof(compact) / sizeof(compact[0])) ||
+        !expect_prefixes_rejected(
+            "old forward store", old_forward_store,
+            sizeof(old_forward_store) / sizeof(old_forward_store[0])) ||
         !expect_prefixes_rejected(
             "hardened", hardened,
             sizeof(hardened) / sizeof(hardened[0])) ||
@@ -511,6 +1075,78 @@ int main(void)
         !expect_gpr_writes("BTI c", 0xd503245f, 0) ||
         !expect_gpr_writes("BTI j", 0xd503249f, 0) ||
         !expect_gpr_writes("BTI jc", 0xd50324df, 0))
+        return 1;
+
+    memcpy(old_forward_mutated, old_forward_store,
+           sizeof(old_forward_mutated));
+    old_forward_mutated[3] = 0x7100047f; /* cmp w3, #1 */
+    if (!expect_detach_layout(
+            "old forward store wrong initial state", old_forward_mutated,
+            sizeof(old_forward_mutated) / sizeof(old_forward_mutated[0]),
+            0, -1))
+        return 1;
+
+    memcpy(old_forward_mutated, old_forward_store,
+           sizeof(old_forward_mutated));
+    old_forward_mutated[4] = 0x540000a0; /* b.eq after the store */
+    if (!expect_detach_layout(
+            "old forward store wrong branch target", old_forward_mutated,
+            sizeof(old_forward_mutated) / sizeof(old_forward_mutated[0]),
+            0, -1))
+        return 1;
+
+    memcpy(old_forward_mutated, old_forward_store,
+           sizeof(old_forward_mutated));
+    old_forward_mutated[7] = 0xd503201f; /* non-joinable path falls through */
+    if (!expect_detach_layout(
+            "old forward store missing tail exit", old_forward_mutated,
+            sizeof(old_forward_mutated) / sizeof(old_forward_mutated[0]),
+            0, -1))
+        return 1;
+
+    memcpy(old_forward_mutated, old_forward_store,
+           sizeof(old_forward_mutated));
+    old_forward_mutated[7] = 0x14000001; /* non-joinable path reaches store */
+    if (!expect_detach_layout(
+            "old forward store tail reaches store", old_forward_mutated,
+            sizeof(old_forward_mutated) / sizeof(old_forward_mutated[0]),
+            0, -1))
+        return 1;
+
+    memcpy(old_forward_mutated, old_forward_store,
+           sizeof(old_forward_mutated));
+    old_forward_mutated[9] = 0x34ffff23; /* cbz instead of retry-on-failure */
+    if (!expect_detach_layout(
+            "old forward store wrong retry sense", old_forward_mutated,
+            sizeof(old_forward_mutated) / sizeof(old_forward_mutated[0]),
+            0, -1))
+        return 1;
+
+    memcpy(old_forward_mutated, old_forward_store,
+           sizeof(old_forward_mutated));
+    old_forward_mutated[9] = 0x35ffff43; /* retry at cmp, not ldaxr */
+    if (!expect_detach_layout(
+            "old forward store wrong retry target", old_forward_mutated,
+            sizeof(old_forward_mutated) / sizeof(old_forward_mutated[0]),
+            0, -1))
+        return 1;
+
+    memcpy(old_forward_mutated, old_forward_store,
+           sizeof(old_forward_mutated));
+    old_forward_mutated[1] = 0x52800081; /* mov w1, #4 */
+    if (!expect_detach_layout(
+            "old forward store wrong detached value", old_forward_mutated,
+            sizeof(old_forward_mutated) / sizeof(old_forward_mutated[0]),
+            0, -1))
+        return 1;
+
+    memcpy(old_forward_mutated, old_forward_store,
+           sizeof(old_forward_mutated));
+    old_forward_mutated[8] = 0x8803fc61; /* store through x3, not x2 */
+    if (!expect_detach_layout(
+            "old forward store wrong address", old_forward_mutated,
+            sizeof(old_forward_mutated) / sizeof(old_forward_mutated[0]),
+            0, -1))
         return 1;
 
     memcpy(hardened_prefix_mutated, ubuntu_pac_bti,
@@ -682,6 +1318,11 @@ int main(void)
 
     if (!test_target_contract_decoders()) {
         fprintf(stderr, "AArch64 musl target contract decoder failed\n");
+        return 1;
+    }
+
+    if (!test_clone_ctid_decoder()) {
+        fprintf(stderr, "AArch64 musl clone ctid decoder failed\n");
         return 1;
     }
 

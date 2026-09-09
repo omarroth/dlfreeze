@@ -7,8 +7,113 @@
 #define DLFREEZE_RELOCATION_SNAPSHOT_GATE 1
 #define DLFREEZE_EXACT_OBJECT_LOOKUP_GATE 1
 
+#include <sys/wait.h>
+
 /* Exercise the loader's private section-table fallback in its real source. */
 #include "../src/loader.c"
+
+static void gate_emit_linux_dirent(unsigned char *record, uint64_t ino,
+                                   int64_t off, uint16_t reclen,
+                                   uint8_t type, const char *name,
+                                   size_t name_length)
+{
+    memcpy(record + offsetof(struct ldr_linux_dirent64, d_ino),
+           &ino, sizeof(ino));
+    memcpy(record + offsetof(struct ldr_linux_dirent64, d_off),
+           &off, sizeof(off));
+    memcpy(record + offsetof(struct ldr_linux_dirent64, d_reclen),
+           &reclen, sizeof(reclen));
+    memcpy(record + offsetof(struct ldr_linux_dirent64, d_type),
+           &type, sizeof(type));
+    if (name)
+        memcpy(record + offsetof(struct ldr_linux_dirent64, d_name),
+               name, name_length);
+}
+
+static int gate_vfs_dirent_parser(void)
+{
+    unsigned char storage[2 * sizeof(struct dirent) + 16];
+    unsigned char *buffer = storage + 1; /* deliberately unaligned */
+    const size_t name_offset =
+        offsetof(struct ldr_linux_dirent64, d_name);
+    struct dirent result;
+    size_t position;
+    uint16_t reclen;
+
+    memset(storage, 0, sizeof(storage));
+    gate_emit_linux_dirent(buffer, UINT64_C(17), INT64_C(-9), 24,
+                           DT_REG, "one", 4);
+    gate_emit_linux_dirent(buffer + 24, UINT64_C(23), INT64_C(51), 24,
+                           DT_DIR, "two", 4);
+    position = 0;
+    if (vfs_parse_linux_dirent64(buffer, 48, &position, &result) != 1 ||
+        position != 24 || result.d_ino != (ino_t)17 ||
+        result.d_off != (off_t)-9 || result.d_reclen != 24 ||
+        result.d_type != DT_REG ||
+        strcmp(result.d_name, "one") != 0 ||
+        vfs_parse_linux_dirent64(buffer, 48, &position, &result) != 1 ||
+        position != 48 || result.d_ino != (ino_t)23 ||
+        result.d_off != (off_t)51 || result.d_reclen != 24 ||
+        result.d_type != DT_DIR ||
+        strcmp(result.d_name, "two") != 0 ||
+        vfs_parse_linux_dirent64(buffer, 48, &position, &result) != 0)
+        return 0;
+
+    /* Fixed-prefix truncation, undersized/unaligned/overlong records, and a
+     * missing bounded NUL must all reject without consuming bytes. */
+    position = 0;
+    if (vfs_parse_linux_dirent64(buffer, name_offset, &position,
+                                 &result) != -1 ||
+        position != 0 || loader_errno_value() != EIO)
+        return 0;
+    reclen = 0;
+    memcpy(buffer + offsetof(struct ldr_linux_dirent64, d_reclen),
+           &reclen, sizeof(reclen));
+    if (vfs_parse_linux_dirent64(buffer, 24, &position, &result) != -1 ||
+        position != 0)
+        return 0;
+    reclen = 25;
+    memcpy(buffer + offsetof(struct ldr_linux_dirent64, d_reclen),
+           &reclen, sizeof(reclen));
+    if (vfs_parse_linux_dirent64(buffer, 32, &position, &result) != -1 ||
+        position != 0)
+        return 0;
+    reclen = 32;
+    memcpy(buffer + offsetof(struct ldr_linux_dirent64, d_reclen),
+           &reclen, sizeof(reclen));
+    if (vfs_parse_linux_dirent64(buffer, 24, &position, &result) != -1 ||
+        position != 0)
+        return 0;
+    memset(buffer + name_offset, 'x', 5);
+    reclen = 24;
+    memcpy(buffer + offsetof(struct ldr_linux_dirent64, d_reclen),
+           &reclen, sizeof(reclen));
+    if (vfs_parse_linux_dirent64(buffer, 24, &position, &result) != -1 ||
+        position != 0)
+        return 0;
+
+    /* Repairing the same buffered record proves an error left retryable
+     * state, rather than moving past an untrusted d_reclen. */
+    memcpy(buffer + name_offset, "ok", 3);
+    if (vfs_parse_linux_dirent64(buffer, 24, &position, &result) != 1 ||
+        position != 24 || strcmp(result.d_name, "ok") != 0)
+        return 0;
+
+    /* Names which cannot fit the target libc's public dirent are rejected,
+     * never silently truncated into a different directory entry. */
+    memset(buffer, 0, sizeof(storage) - 1);
+    reclen = (uint16_t)((name_offset + sizeof(result.d_name) + 1 + 7) &
+                         ~(size_t)7);
+    gate_emit_linux_dirent(buffer, 1, 1, reclen, DT_REG, NULL, 0);
+    memset(buffer + name_offset, 'n', sizeof(result.d_name));
+    buffer[name_offset + sizeof(result.d_name)] = '\0';
+    position = 0;
+    if (vfs_parse_linux_dirent64(
+            buffer, reclen, &position, &result) != -1 ||
+        position != 0 || loader_errno_value() != EOVERFLOW)
+        return 0;
+    return 1;
+}
 
 static unsigned int gate_pthread_atfork_calls;
 static unsigned int gate_register_atfork_calls;
@@ -60,7 +165,7 @@ static int gate_map_embedded_elf_eof(void)
     const size_t entry_size = 256;
     const size_t container_size = 2 * 4096;
     const size_t reservation_size = 5 * 4096;
-    FILE *container = NULL;
+    int container_fd = -1;
     uint8_t *source = MAP_FAILED;
     uint8_t *target = MAP_FAILED;
     struct dlfrz_entry entry = {0};
@@ -75,11 +180,15 @@ static int gate_map_embedded_elf_eof(void)
 
     if (g_page_size != 4096)
         return 0;
-    container = tmpfile();
-    if (!container || ftruncate(fileno(container), container_size) < 0)
+    /* tmpfile() is required to use the implementation's fixed P_tmpdir and
+     * ignores the test runner's TMPDIR.  A full or quota-limited host /tmp
+     * would then raise SIGBUS while faulting this MAP_SHARED fixture.  Keep
+     * the file-backed boundary test self-contained in a Linux memfd. */
+    container_fd = memfd_create("dlfreeze-embedded-eof-gate", MFD_CLOEXEC);
+    if (container_fd < 0 || ftruncate(container_fd, container_size) < 0)
         goto out;
     source = mmap(NULL, container_size, PROT_READ | PROT_WRITE,
-                  MAP_SHARED, fileno(container), 0);
+                  MAP_SHARED, container_fd, 0);
     if (source == MAP_FAILED)
         goto out;
     memset(source, 0, container_size);
@@ -90,15 +199,18 @@ static int gate_map_embedded_elf_eof(void)
     phdr = (Elf64_Phdr *)(source + 4096 + sizeof(*ehdr));
     memcpy(ehdr->e_ident, ELFMAG, SELFMAG);
     ehdr->e_phoff = sizeof(*ehdr);
-    ehdr->e_phnum = 1;
+    ehdr->e_phnum = 2;
     ehdr->e_phentsize = sizeof(*phdr);
-    phdr->p_type = PT_LOAD;
-    phdr->p_flags = PF_R | PF_W;
-    phdr->p_offset = 0;
-    phdr->p_vaddr = 0;
-    phdr->p_filesz = entry_size;
-    phdr->p_memsz = entry_size;
-    phdr->p_align = 4096;
+    phdr[0].p_type = PT_LOAD;
+    phdr[0].p_flags = PF_R | PF_W;
+    phdr[0].p_offset = 0;
+    phdr[0].p_vaddr = 0;
+    phdr[0].p_filesz = entry_size;
+    phdr[0].p_memsz = entry_size;
+    phdr[0].p_align = 4096;
+    memset(&phdr[1], 0, sizeof(phdr[1]));
+    phdr[1].p_type = PT_GNU_STACK;
+    phdr[1].p_flags = PF_R | PF_W;
 
     target = mmap(NULL, reservation_size, PROT_NONE,
                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -110,13 +222,13 @@ static int gate_map_embedded_elf_eof(void)
     meta.vaddr_lo = 0;
     meta.vaddr_hi = entry_size;
     meta.phdr_off = sizeof(*ehdr);
-    meta.phdr_num = 1;
+    meta.phdr_num = 2;
     meta.phdr_entsz = sizeof(*phdr);
     meta.flags = DLFRZ_FLAG_SHLIB;
     object.runtime_reservation = target;
     object.runtime_reservation_size = reservation_size;
 
-    if (map_object(source, 0, fileno(container), 0, &meta, &entry,
+    if (map_object(source, 0, container_fd, 0, &meta, &entry,
                    &object, 1) < 0 ||
         memcmp(target, source + 4096, entry_size) != 0)
         goto out;
@@ -130,7 +242,7 @@ static int gate_map_embedded_elf_eof(void)
     public_phdr = (Elf64_Phdr *)(target + sizeof(*ehdr));
     if (object.public_phdr != public_phdr || object.phdr == public_phdr ||
         object.runtime_phdr_mapping != object.phdr ||
-        object.runtime_phdr_mapping_size != sizeof(*phdr))
+        object.runtime_phdr_mapping_size != 2 * sizeof(*phdr))
         goto out;
     public_phdr->p_flags = PF_R;
     public_phdr->p_memsz = 4096;
@@ -148,10 +260,10 @@ static int gate_map_embedded_elf_eof(void)
     g_all_objs[0].visible = 1;
     g_nobj = 1;
     identity.expected = public_phdr;
-    identity.expected_count = 1;
+    identity.expected_count = 2;
     if (my_dl_iterate_phdr_locked(gate_capture_public_phdr, &identity) != 0 ||
         identity.matches != 1 || identity.invalid ||
-        my_dlinfo(&g_all_objs[0], DLFRZ_RTLD_DI_PHDR, &dlinfo_phdr) != 1 ||
+        my_dlinfo(&g_all_objs[0], DLFRZ_RTLD_DI_PHDR, &dlinfo_phdr) != 2 ||
         dlinfo_phdr != public_phdr ||
         loaded_obj_public_phdr(&g_all_objs[0]) != public_phdr)
         goto out;
@@ -168,10 +280,187 @@ out:
         munmap(target, reservation_size);
     if (source != MAP_FAILED)
         munmap(source, container_size);
-    if (container)
-        fclose(container);
+    if (container_fd >= 0)
+        close(container_fd);
     return result;
 }
+
+#if defined(__aarch64__)
+static void gate_aarch64_bti_sigill(int signal_number)
+{
+    (void)signal_number;
+    _exit(86);
+}
+
+static int gate_aarch64_bti_call(uintptr_t address, int expected_status)
+{
+    pid_t child = fork();
+    int status;
+
+    if (child < 0)
+        return 0;
+    if (child == 0) {
+        void (*function)(void) = (void (*)(void))address;
+
+        if (signal(SIGILL, gate_aarch64_bti_sigill) == SIG_ERR)
+            _exit(87);
+        function();
+        _exit(0);
+    }
+    if (waitpid(child, &status, 0) != child)
+        return 0;
+    return WIFEXITED(status) && WEXITSTATUS(status) == expected_status;
+}
+
+/* Exercise the real map_object transition, not only the protection-mask
+ * helper.  On a BTI-capable kernel, an indirect branch to BTI C succeeds
+ * while an adjacent unguarded landing in the same marked PF_X mapping raises
+ * SIGILL.  On a non-BTI kernel, force the mapping decision and prove that an
+ * unsupported PROT_BTI transition fails without retaining its reservation. */
+static int gate_aarch64_bti_map_object(void)
+{
+    uint64_t page = get_auxval(environ, AT_PAGESZ);
+    uintptr_t hwcap2 = get_auxval(environ, AT_HWCAP2);
+    uint64_t saved_page_size = g_page_size;
+    uintptr_t saved_hwcap2 = g_kernel_hwcap2;
+    uint8_t *source = MAP_FAILED;
+    uint8_t *target = MAP_FAILED;
+    struct dlfrz_entry entry = {0};
+    struct dlfrz_lib_meta meta = {0};
+    struct loaded_obj object = {0};
+    Elf64_Ehdr *ehdr;
+    Elf64_Phdr *phdr;
+    Elf64_Nhdr note_header = {
+        4, 16, DLFRZ_NT_GNU_PROPERTY_TYPE_0
+    };
+    uint32_t property_type =
+        DLFRZ_GNU_PROPERTY_AARCH64_FEATURE_1_AND;
+    uint32_t property_size = sizeof(uint32_t);
+    uint32_t property_value =
+        DLFRZ_GNU_PROPERTY_AARCH64_FEATURE_1_BTI;
+    uint32_t bti_c = UINT32_C(0xd503245f);
+    uint32_t ret = UINT32_C(0xd65f03c0);
+    const size_t property_offset = 256;
+    const size_t unguarded_offset = 512;
+    const size_t guarded_offset = 516;
+    int target_mapping_live = 0;
+    int have_bti =
+        (hwcap2 & DLFRZ_AARCH64_HWCAP2_BTI) != 0;
+    int result = 0;
+
+    if (page < 4096 || page > 65536 || (page & (page - 1)) != 0 ||
+        page > SIZE_MAX / 5)
+        return 0;
+    source = mmap(NULL, (size_t)page, PROT_READ | PROT_WRITE,
+                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    target = mmap(NULL, (size_t)(5 * page), PROT_NONE,
+                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (source == MAP_FAILED || target == MAP_FAILED)
+        goto out;
+    target_mapping_live = 1;
+    memset(source, 0, (size_t)page);
+
+    ehdr = (Elf64_Ehdr *)(void *)source;
+    phdr = (Elf64_Phdr *)(void *)(source + sizeof(*ehdr));
+    memcpy(ehdr->e_ident, ELFMAG, SELFMAG);
+    ehdr->e_ident[EI_CLASS] = ELFCLASS64;
+    ehdr->e_ident[EI_DATA] = ELFDATA2LSB;
+    ehdr->e_ident[EI_VERSION] = EV_CURRENT;
+    ehdr->e_type = ET_DYN;
+    ehdr->e_machine = EM_AARCH64;
+    ehdr->e_version = EV_CURRENT;
+    ehdr->e_ehsize = sizeof(*ehdr);
+    ehdr->e_phoff = sizeof(*ehdr);
+    ehdr->e_phentsize = sizeof(*phdr);
+    ehdr->e_phnum = 3;
+
+    phdr[0].p_type = PT_LOAD;
+    phdr[0].p_flags = PF_R | PF_X;
+    phdr[0].p_filesz = page;
+    phdr[0].p_memsz = page;
+    phdr[0].p_align = page;
+    phdr[1].p_type = PT_GNU_PROPERTY;
+    phdr[1].p_flags = PF_R;
+    phdr[1].p_offset = property_offset;
+    phdr[1].p_vaddr = property_offset;
+    phdr[1].p_filesz = 32;
+    phdr[1].p_memsz = 32;
+    phdr[1].p_align = 8;
+    phdr[2].p_type = PT_GNU_STACK;
+    phdr[2].p_flags = PF_R | PF_W;
+
+    memcpy(source + property_offset, &note_header, sizeof(note_header));
+    memcpy(source + property_offset + sizeof(note_header), "GNU\0", 4);
+    memcpy(source + property_offset + 16,
+           &property_type, sizeof(property_type));
+    memcpy(source + property_offset + 20,
+           &property_size, sizeof(property_size));
+    memcpy(source + property_offset + 24,
+           &property_value, sizeof(property_value));
+    memcpy(source + unguarded_offset, &ret, sizeof(ret));
+    memcpy(source + guarded_offset, &bti_c, sizeof(bti_c));
+    memcpy(source + guarded_offset + sizeof(bti_c), &ret, sizeof(ret));
+
+    entry.data_size = page;
+    meta.base_addr = (uintptr_t)target;
+    meta.vaddr_hi = page;
+    meta.phdr_off = sizeof(*ehdr);
+    meta.phdr_num = 3;
+    meta.phdr_entsz = sizeof(*phdr);
+    meta.flags = LDR_FLAG_SHLIB;
+    g_page_size = page;
+    /* The non-BTI branch deliberately asks the kernel for the unsupported
+     * protection so map_object's rollback path is exercised. */
+    g_kernel_hwcap2 = hwcap2 | DLFRZ_AARCH64_HWCAP2_BTI;
+
+    if (munmap(target, (size_t)(5 * page)) < 0)
+        goto out;
+    target_mapping_live = 0;
+
+    if (!have_bti) {
+        void *probe;
+
+        if (map_object(source, 0, -1, 0, &meta, &entry, &object, 0) == 0 ||
+            object.runtime_reservation || object.runtime_phdr_mapping)
+            goto out;
+        probe = mmap(target, (size_t)(5 * page), PROT_NONE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+                     -1, 0);
+        if (probe != target) {
+            if (probe != MAP_FAILED)
+                munmap(probe, (size_t)(5 * page));
+            goto out;
+        }
+        munmap(probe, (size_t)(5 * page));
+        result = 1;
+        goto out;
+    }
+
+    if (map_object(source, 0, -1, 0, &meta, &entry, &object, 0) < 0 ||
+        revalidate_loaded_gnu_properties(&object) < 0 ||
+        !object.gnu_property_feature_1_seen ||
+        object.gnu_property_feature_1 != property_value ||
+        !gate_aarch64_bti_call(
+            (uintptr_t)target + guarded_offset, 0) ||
+        !gate_aarch64_bti_call(
+            (uintptr_t)target + unguarded_offset, 86))
+        goto out;
+    result = 1;
+
+out:
+    if (object.runtime_reservation || object.runtime_phdr_mapping) {
+        dl_release_runtime_mapping(&object);
+        target = MAP_FAILED;
+    }
+    if (target_mapping_live)
+        munmap(target, (size_t)(5 * page));
+    if (source != MAP_FAILED)
+        munmap(source, (size_t)page);
+    g_page_size = saved_page_size;
+    g_kernel_hwcap2 = saved_hwcap2;
+    return result;
+}
+#endif
 
 static int gate_partial_relro_page(void)
 {
@@ -270,20 +559,21 @@ static int gate_prelinked_unresolved_symbol_values(void)
     relocation.r_info = ELF64_R_INFO(1, ARCH_RELOC_GLOB_DAT);
     if (apply_prelinked_runtime_reloc(
             &object, &object, 1, &relocation,
-            RELOC_PASS_ORDINARY) < 0 || *slot != 0)
+            LOADED_RELA_DYNAMIC, RELOC_PASS_ORDINARY, 0) < 0 || *slot != 0)
         return 0;
     *slot = UINT64_C(0xfeedface);
     relocation.r_info = ELF64_R_INFO(1, ARCH_RELOC_JUMP_SLOT);
     if (apply_prelinked_runtime_reloc(
             &object, &object, 1, &relocation,
-            RELOC_PASS_ORDINARY) < 0 || *slot != 0)
+            LOADED_RELA_DYNAMIC, RELOC_PASS_ORDINARY, 0) < 0 || *slot != 0)
         return 0;
     *slot = UINT64_C(0xfeedface);
     relocation.r_info = ELF64_R_INFO(1, ARCH_RELOC_ABS);
     relocation.r_addend = 0x123;
     if (apply_prelinked_runtime_reloc(
             &object, &object, 1, &relocation,
-            RELOC_PASS_ORDINARY) < 0 || *slot != 0x123)
+            LOADED_RELA_DYNAMIC, RELOC_PASS_ORDINARY, 0) < 0 ||
+        *slot != 0x123)
         return 0;
 
     /* STN_UNDEF is still a real relocation operand: GLOB_DAT/JUMP_SLOT
@@ -293,20 +583,21 @@ static int gate_prelinked_unresolved_symbol_values(void)
     relocation.r_addend = 0;
     if (apply_prelinked_runtime_reloc(
             &object, &object, 1, &relocation,
-            RELOC_PASS_ORDINARY) < 0 || *slot != 0)
+            LOADED_RELA_DYNAMIC, RELOC_PASS_ORDINARY, 0) < 0 || *slot != 0)
         return 0;
     *slot = UINT64_C(0xfeedface);
     relocation.r_info = ELF64_R_INFO(0, ARCH_RELOC_JUMP_SLOT);
     if (apply_prelinked_runtime_reloc(
             &object, &object, 1, &relocation,
-            RELOC_PASS_ORDINARY) < 0 || *slot != 0)
+            LOADED_RELA_DYNAMIC, RELOC_PASS_ORDINARY, 0) < 0 || *slot != 0)
         return 0;
     *slot = UINT64_C(0xfeedface);
     relocation.r_info = ELF64_R_INFO(0, ARCH_RELOC_ABS);
     relocation.r_addend = 0x345;
     if (apply_prelinked_runtime_reloc(
             &object, &object, 1, &relocation,
-            RELOC_PASS_ORDINARY) < 0 || *slot != 0x345)
+            LOADED_RELA_DYNAMIC, RELOC_PASS_ORDINARY, 0) < 0 ||
+        *slot != 0x345)
         return 0;
     return 1;
 }
@@ -342,7 +633,7 @@ static int gate_prelinked_zero_fill_relative(void)
     relocation.r_addend = 0x123;
     if (apply_prelinked_runtime_reloc(
             &object, &object, 1, &relocation,
-            RELOC_PASS_ORDINARY) < 0 ||
+            LOADED_RELA_DYNAMIC, RELOC_PASS_ORDINARY, 0) < 0 ||
         *zero_fill_slot != (uint64_t)(uintptr_t)image + 0x123)
         return 0;
 
@@ -382,7 +673,7 @@ static int gate_unaligned_scalar_relocations(void)
     memset(image + 257, 0, sizeof(uint64_t));
     if (apply_prelinked_runtime_reloc(
             &object, &object, 1, &relocation,
-            RELOC_PASS_ORDINARY) < 0)
+            LOADED_RELA_DYNAMIC, RELOC_PASS_ORDINARY, 0) < 0)
         return 0;
     memcpy(&first, image + 257, sizeof(first));
     if (first != expected)
@@ -671,6 +962,74 @@ static int gate_control_table_alignment(void)
     return parse_dynamic(&object, &meta) < 0;
 }
 
+static int gate_aarch64_dynamic_semantics(void)
+{
+#if defined(__aarch64__)
+    _Alignas(16) uint8_t image[256] = {0};
+    Elf64_Phdr phdr[2] = {{0}};
+    Elf64_Dyn *dynamic = (Elf64_Dyn *)(void *)(image + 128);
+    struct dlfrz_lib_meta meta = {0};
+    static const uint64_t unsupported[] = {
+        DLFRZ_DT_AARCH64_PAC_PLT,
+        DLFRZ_DT_AARCH64_AUTH_SYM,
+        DLFRZ_DT_AARCH64_MEMTAG_MODE,
+        DLFRZ_DT_AARCH64_MEMTAG_HEAP,
+        DLFRZ_DT_AARCH64_MEMTAG_STACK,
+        DLFRZ_DT_AARCH64_MEMTAG_GLOBALS,
+        DLFRZ_DT_AARCH64_MEMTAG_GLOBALSSZ,
+        DLFRZ_DT_AARCH64_AUTH_RELRSZ,
+        DLFRZ_DT_AARCH64_AUTH_RELR,
+        DLFRZ_DT_AARCH64_AUTH_RELRENT,
+    };
+    static const uint64_t harmless[] = {
+        DLFRZ_DT_AARCH64_BTI_PLT,
+        DLFRZ_DT_AARCH64_VARIANT_PCS,
+    };
+
+    phdr[0].p_type = PT_LOAD;
+    phdr[0].p_flags = PF_R | PF_W;
+    phdr[0].p_filesz = sizeof(image);
+    phdr[0].p_memsz = sizeof(image);
+    phdr[1].p_type = PT_DYNAMIC;
+    phdr[1].p_vaddr = 128;
+    phdr[1].p_filesz = 2 * sizeof(*dynamic);
+    phdr[1].p_memsz = phdr[1].p_filesz;
+
+    for (size_t i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); i++) {
+        struct loaded_obj object = {0};
+
+        memset(dynamic, 0, 2 * sizeof(*dynamic));
+        dynamic[0].d_tag = (Elf64_Sxword)unsupported[i];
+        /* Exercise zero-payload PAC_PLT and MemtagABI entries as well as the
+         * fail-closed presence contract for authenticated tables. */
+        dynamic[0].d_un.d_val = 0;
+        object.base = (uintptr_t)image;
+        object.elf = image;
+        object.elf_size = sizeof(image);
+        object.phdr = phdr;
+        object.phdr_num = 2;
+        if (parse_dynamic(&object, &meta) == 0)
+            return 0;
+    }
+
+    for (size_t i = 0; i < sizeof(harmless) / sizeof(harmless[0]); i++) {
+        struct loaded_obj object = {0};
+
+        memset(dynamic, 0, 2 * sizeof(*dynamic));
+        dynamic[0].d_tag = (Elf64_Sxword)harmless[i];
+        dynamic[0].d_un.d_val = 0;
+        object.base = (uintptr_t)image;
+        object.elf = image;
+        object.elf_size = sizeof(image);
+        object.phdr = phdr;
+        object.phdr_num = 2;
+        if (parse_dynamic(&object, &meta) < 0)
+            return 0;
+    }
+#endif
+    return 1;
+}
+
 static int gate_gnu_hash_chain_stays_file_backed(void)
 {
     _Alignas(8) uint8_t image[64] = {0};
@@ -746,12 +1105,22 @@ static int gate_origin_token_grammars(void)
 
 static int gate_system_preload_policy(void)
 {
-    char path[] = "/tmp/dlfreeze-system-preload-gate.XXXXXX";
+    const char *tmpdir = getenv("TMPDIR");
+    char path[PATH_MAX];
     static const char whitespace[] = " \t\r\n\v\f";
     static const char entry[] = "/tmp/libdlfreeze-preload-gate.so\n";
-    int fd = mkstemp(path);
+    int path_length;
+    int fd;
     int result = 0;
 
+    if (!tmpdir || !tmpdir[0])
+        tmpdir = "/tmp";
+    path_length = snprintf(
+        path, sizeof(path), "%s%sdlfreeze-system-preload-gate.XXXXXX",
+        tmpdir, tmpdir[strlen(tmpdir) - 1] == '/' ? "" : "/");
+    if (path_length < 0 || (size_t)path_length >= sizeof(path))
+        return 0;
+    fd = mkstemp(path);
     if (fd < 0)
         return 0;
     if (write(fd, whitespace, sizeof(whitespace) - 1) !=
@@ -1014,6 +1383,309 @@ out:
     return result;
 }
 
+#if defined(__x86_64__)
+static int gate_x86_glibc_initial_thread_lifetime_decoder(void)
+{
+    static const unsigned char completion_template[] = {
+        0xf3, 0x0f, 0x1e, 0xfa,             /* endbr64 */
+        0x8b, 0x87, 0x28, 0x06, 0x00, 0x00, /* mov 0x628(%rdi),%eax */
+        0x85, 0xc0,                         /* test %eax,%eax */
+        0x74, 0x0a,                         /* je */
+        0xb8, 0x10, 0x00, 0x00, 0x00,       /* mov $EBUSY,%eax */
+        0xc3,
+        0x0f, 0x1f, 0x40, 0x00,
+        0x31, 0xc0,
+        0xc3
+    };
+    static const unsigned char detach_template[] = {
+        0xf3, 0x0f, 0x1e, 0xfa,             /* endbr64 */
+        0x8b, 0x87, 0x28, 0x06, 0x00, 0x00, /* mov 0x628(%rdi),%eax */
+        0x48, 0x8d, 0x97, 0x28, 0x06, 0x00, 0x00,
+        0x83, 0xf8, 0x02,                   /* cmp $JOINABLE,%eax */
+        0x75, 0x12,
+        0xb9, 0x03, 0x00, 0x00, 0x00,       /* mov $DETACHED,%ecx */
+        0xf0, 0x0f, 0xb1, 0x0a,             /* lock cmpxchg %ecx,(%rdx) */
+        0x75, 0xf0,
+        0x31, 0xc0,
+        0xc3,
+        0x0f, 0x1f, 0x40, 0x00,
+        0x83, 0xf8, 0x03,                   /* cmp $DETACHED,%eax */
+        0x74, 0x02,
+        0x31, 0xc0,
+        0xc3
+    };
+    unsigned char completion[sizeof(completion_template)];
+    unsigned char detach[sizeof(detach_template)];
+    size_t offset;
+    uint32_t initial;
+
+    memcpy(completion, completion_template, sizeof(completion));
+    memcpy(detach, detach_template, sizeof(detach));
+    if (!glibc_x86_completion_word(
+            completion, sizeof(completion), &offset) || offset != 0x628 ||
+        !glibc_x86_live_state(
+            detach, sizeof(detach), offset, &initial) || initial != 2)
+        return 0;
+
+    /* Each independent part of the semantic chain is authoritative: field
+     * identity, zero-completion branch, live-state value, atomic transition,
+     * and the later detached-state distinction. */
+    completion[10] = UINT8_C(0x90);
+    if (glibc_x86_completion_word(
+            completion, sizeof(completion), &offset))
+        return 0;
+    memcpy(completion, completion_template, sizeof(completion));
+    completion[12] = UINT8_C(0x90);
+    if (glibc_x86_completion_word(
+            completion, sizeof(completion), &offset))
+        return 0;
+
+    memcpy(detach, detach_template, sizeof(detach));
+    detach[13] = UINT8_C(0x29); /* LEA names a different field. */
+    if (glibc_x86_live_state(
+            detach, sizeof(detach), 0x628, &initial))
+        return 0;
+    memcpy(detach, detach_template, sizeof(detach));
+    detach[19] = 0; /* EXITED is never the initial live state. */
+    if (glibc_x86_live_state(
+            detach, sizeof(detach), 0x628, &initial))
+        return 0;
+    memcpy(detach, detach_template, sizeof(detach));
+    detach[23] = 2; /* Desired and initial states must differ. */
+    if (glibc_x86_live_state(
+            detach, sizeof(detach), 0x628, &initial))
+        return 0;
+    memcpy(detach, detach_template, sizeof(detach));
+    detach[27] = UINT8_C(0x90); /* No atomic state transition. */
+    if (glibc_x86_live_state(
+            detach, sizeof(detach), 0x628, &initial))
+        return 0;
+    memcpy(detach, detach_template, sizeof(detach));
+    detach[42] = 4; /* No detached-state failure-path witness. */
+    return !glibc_x86_live_state(
+        detach, sizeof(detach), 0x628, &initial);
+}
+
+static int gate_x86_cet_rip_displacement(unsigned char *destination,
+                                         uint64_t instruction_end,
+                                         uint64_t target)
+{
+    int64_t difference;
+    int32_t displacement;
+
+    if (!destination)
+        return 0;
+    if (target >= instruction_end) {
+        uint64_t magnitude = target - instruction_end;
+
+        if (magnitude > INT32_MAX)
+            return 0;
+        difference = (int64_t)magnitude;
+    } else {
+        uint64_t magnitude = instruction_end - target;
+
+        if (magnitude > (uint64_t)INT32_MAX + 1)
+            return 0;
+        difference = -(int64_t)magnitude;
+    }
+    displacement = (int32_t)difference;
+    memcpy(destination, &displacement, sizeof(displacement));
+    return 1;
+}
+
+static int gate_x86_cet_emit_direct_consumer(
+    unsigned char *segment, size_t segment_size, size_t entry,
+    uint64_t segment_vaddr, uint64_t active_ecx_vaddr,
+    uint64_t feature_vaddr)
+{
+    size_t test = entry + 4;
+    size_t store = test + 9;
+
+    if (!segment || entry > segment_size ||
+        19 > segment_size - entry ||
+        segment_vaddr > UINT64_MAX - test - 7 ||
+        segment_vaddr > UINT64_MAX - store - 6)
+        return 0;
+    memcpy(segment + entry, "\xf3\x0f\x1e\xfa", 4); /* ENDBR64 */
+    segment[test] = UINT8_C(0xf6);
+    segment[test + 1] = UINT8_C(0x05);
+    if (!gate_x86_cet_rip_displacement(
+            segment + test + 2, segment_vaddr + test + 7,
+            active_ecx_vaddr))
+        return 0;
+    segment[test + 6] = UINT8_C(0x80);
+    segment[test + 7] = UINT8_C(0x74); /* conditional fallthrough */
+    segment[test + 8] = 0;
+    segment[store] = UINT8_C(0x89); /* mov %eax,feature(%rip) */
+    segment[store + 1] = UINT8_C(0x05);
+    if (!gate_x86_cet_rip_displacement(
+            segment + store + 2, segment_vaddr + store + 6,
+            feature_vaddr))
+        return 0;
+    segment[store + 6] = UINT8_C(0xc3);
+    return 1;
+}
+
+static size_t gate_x86_cet_scan(const unsigned char *segment,
+                                size_t segment_size,
+                                uint64_t segment_vaddr,
+                                uint64_t active_ecx_vaddr,
+                                uint64_t feature_vaddr)
+{
+    unsigned char image[512] = {0};
+    Elf64_Ehdr *ehdr = (Elf64_Ehdr *)(void *)image;
+    Elf64_Phdr *phdr =
+        (Elf64_Phdr *)(void *)(image + sizeof(Elf64_Ehdr));
+    const size_t segment_offset = 256;
+
+    if (!segment || segment_size > sizeof(image) - segment_offset)
+        return 0;
+    ehdr->e_phoff = sizeof(*ehdr);
+    ehdr->e_phentsize = sizeof(*phdr);
+    ehdr->e_phnum = 1;
+    phdr->p_type = PT_LOAD;
+    phdr->p_flags = PF_R | PF_X;
+    phdr->p_offset = segment_offset;
+    phdr->p_vaddr = segment_vaddr;
+    phdr->p_filesz = segment_size;
+    phdr->p_memsz = segment_size;
+    memcpy(image + segment_offset, segment, segment_size);
+    return x86_cet_active_consumer_scan(
+        image, sizeof(image), ehdr, active_ecx_vaddr, feature_vaddr,
+        0, 0, NULL);
+}
+
+static int gate_x86_cet_contract_and_policy(void)
+{
+    const uint32_t shstk =
+        DLFRZ_GNU_PROPERTY_X86_FEATURE_1_SHSTK;
+    const uint32_t active_shstk = UINT32_C(1) << 7;
+    const uint64_t code_vaddr = UINT64_C(0x1000);
+    const uint64_t active_ecx_vaddr = UINT64_C(0x3000);
+    const uint64_t feature_vaddr = UINT64_C(0x4000);
+    struct dlfrz_glibc_x86_cpu_layout layout;
+    unsigned char code[192];
+    size_t semantic_end = 0;
+
+    /* The admitted target object layout independently fixes active.ecx at
+     * 5*u32 + CPUID_INDEX_7*8*u32 + active[0] + ECX == byte 76. */
+    if (!dlfrz_glibc_x86_cpu_layout_profile(
+            DLFRZ_GLIBC_X86_2_37_OR_2_40_LEGACY, 39, &layout) ||
+        !dlfrz_glibc_x86_cpu_object_profile_complete(&layout) ||
+        layout.preferred != 20 + (int)layout.feature_count * 32 ||
+        X86_CPUF_BASIC_SIZE +
+                X86_CPUF_CPUID7_INDEX * X86_CPUF_FEATURE_SIZE +
+                X86_CPUF_ACTIVE_OFFSET + X86_CPUF_ECX_OFFSET != 76)
+        return 0;
+    layout.preferred++;
+    if (dlfrz_glibc_x86_cpu_object_profile_complete(&layout))
+        return 0;
+
+    /* Startup intent comes from the initialized target usable bit, not raw
+     * CPUID.  The zero-active case models current post-2025 glibc builds
+     * whose target initializer intentionally leaves CET disabled. */
+    if (x86_cet_startup_request(
+            active_shstk, shstk, shstk, X86_CET_ELF_PROPERTY) != shstk ||
+        x86_cet_startup_request(
+            0, shstk, shstk, X86_CET_ELF_PROPERTY) != 0 ||
+        x86_cet_startup_request(
+            active_shstk, 0, shstk, X86_CET_ELF_PROPERTY) != 0 ||
+        x86_cet_startup_request(
+            active_shstk, shstk, 0, X86_CET_ALWAYS_ON) != shstk ||
+        x86_cet_startup_request(
+            active_shstk, shstk, shstk, X86_CET_ALWAYS_OFF) != 0 ||
+        x86_cet_startup_request(
+            active_shstk, shstk, 0, X86_CET_PERMISSIVE) != 0)
+        return 0;
+
+    /* Match glibc's late-object policy: strict legacy loads reject, while
+     * permissive single-thread loads first disable and publish actual state.
+     * Once SHSTK is off, later legacy objects are harmless. */
+    if (x86_cet_late_object_action(
+            0, X86_CET_ELF_PROPERTY, 1, 0, 0) !=
+            X86_CET_LATE_ADMIT ||
+        x86_cet_late_object_action(
+            shstk, X86_CET_ELF_PROPERTY, 0, 1, shstk) !=
+            X86_CET_LATE_ADMIT ||
+        x86_cet_late_object_action(
+            shstk, X86_CET_ELF_PROPERTY, 0, 0, 0) !=
+            X86_CET_LATE_REJECT ||
+        x86_cet_late_object_action(
+            shstk, X86_CET_ALWAYS_ON, 1, 0, 0) !=
+            X86_CET_LATE_ADMIT ||
+        x86_cet_late_object_action(
+            shstk, X86_CET_PERMISSIVE, 0, 0, 0) !=
+            X86_CET_LATE_DISABLE ||
+        x86_cet_late_object_action(
+            shstk, X86_CET_PERMISSIVE, 1, 0, 0) !=
+            X86_CET_LATE_REJECT)
+        return 0;
+
+    memset(code, UINT8_C(0x90), sizeof(code));
+    if (!gate_x86_cet_emit_direct_consumer(
+            code, sizeof(code), 0, code_vaddr,
+            active_ecx_vaddr, feature_vaddr) ||
+        gate_x86_cet_scan(
+            code, sizeof(code), code_vaddr,
+            active_ecx_vaddr, feature_vaddr) != 1 ||
+        !x86_cet_active_consumer_at(
+            code + 4, sizeof(code) - 4, code_vaddr + 4,
+            active_ecx_vaddr, &semantic_end) ||
+        semantic_end != 7)
+        return 0;
+
+    /* A mask mutation destroys the semantic witness. */
+    code[10] = UINT8_C(0x40);
+    if (gate_x86_cet_scan(
+            code, sizeof(code), code_vaddr,
+            active_ecx_vaddr, feature_vaddr) != 0)
+        return 0;
+    code[10] = UINT8_C(0x80);
+
+    /* A byte-looking match inside a movabs immediate is not an instruction
+     * reachable from its ENDBR64 landing pad. */
+    memset(code, UINT8_C(0x90), sizeof(code));
+    memcpy(code, "\xf3\x0f\x1e\xfa\x48\xb8", 6);
+    code[6] = UINT8_C(0xf6);
+    code[7] = UINT8_C(0x05);
+    if (!gate_x86_cet_rip_displacement(
+            code + 8, code_vaddr + 6 + 7, active_ecx_vaddr))
+        return 0;
+    code[12] = UINT8_C(0x80);
+    if (gate_x86_cet_scan(
+            code, sizeof(code), code_vaddr,
+            active_ecx_vaddr, 0) != 0)
+        return 0;
+
+    /* The load-and representation is accepted only while the destination
+     * register reaches the exact mask without an intervening clobber. */
+    memset(code, UINT8_C(0x90), sizeof(code));
+    memcpy(code, "\xf3\x0f\x1e\xfa\x8b\x05", 6);
+    if (!gate_x86_cet_rip_displacement(
+            code + 6, code_vaddr + 10, active_ecx_vaddr))
+        return 0;
+    memcpy(code + 10, "\x31\xc0\x81\xe0\x80\0\0\0", 8);
+    if (gate_x86_cet_scan(
+            code, sizeof(code), code_vaddr,
+            active_ecx_vaddr, 0) != 0)
+        return 0;
+
+    /* Contract selection requires one unique rooted witness. */
+    memset(code, UINT8_C(0x90), sizeof(code));
+    if (!gate_x86_cet_emit_direct_consumer(
+            code, sizeof(code), 0, code_vaddr,
+            active_ecx_vaddr, feature_vaddr) ||
+        !gate_x86_cet_emit_direct_consumer(
+            code, sizeof(code), 64, code_vaddr,
+            active_ecx_vaddr, feature_vaddr) ||
+        gate_x86_cet_scan(
+            code, sizeof(code), code_vaddr,
+            active_ecx_vaddr, feature_vaddr) != 2)
+        return 0;
+    return 1;
+}
+#endif
+
 int main(void)
 {
     enum { IMAGE_SIZE = 512, SECTION_STRIDE = sizeof(Elf64_Shdr) + 8 };
@@ -1037,12 +1709,14 @@ int main(void)
         Elf64_auxv_t auxiliary[2];
     } initial_stack = {0};
     uint64_t page_size = 0;
-    Elf64_Phdr property_phdr[2] = {{0}};
-    uint8_t property_note[32] = {0};
-    Elf64_Nhdr property_header = {4, 16, NT_GNU_PROPERTY_TYPE_0};
+    Elf64_Phdr property_phdr[3] = {{0}};
+    uint8_t property_note[48] = {0};
+    Elf64_Nhdr property_header = {4, 32, NT_GNU_PROPERTY_TYPE_0};
     uint32_t property_type;
     uint32_t property_size = 4;
     uint32_t property_value = 1;
+    uint64_t property_stack_size = UINT64_C(2) * 1024 * 1024;
+    const uint64_t property_stack_limit = UINT64_C(4) * 1024 * 1024;
     uint8_t service_image[1024] = {0};
     Elf64_Sym *service_symbols = (Elf64_Sym *)(service_image + 64);
     char *service_strings = (char *)(service_image + 192);
@@ -1052,9 +1726,13 @@ int main(void)
     Elf64_Phdr service_load = {0};
     struct loaded_obj service_object = {0};
     enum libc_function_resolution service_resolution;
+
     void *service_address;
     const uint8_t *service_code = NULL;
     size_t service_code_length = 0;
+
+    if (!gate_vfs_dirent_parser())
+        return 115;
 
     memcpy(ehdr->e_ident, ELFMAG, SELFMAG);
     ehdr->e_ident[EI_CLASS] = ELFCLASS64;
@@ -1193,10 +1871,17 @@ int main(void)
     /* Exercise the maximum compile-time population, including VFS entries. */
     memset(g_special_tab, 0, sizeof(g_special_tab));
     g_vfs_count = 1;
+    /* Runtime activation also includes traced ELF paths; table publication
+     * follows the admitted activation flag, not the DATA count alone. */
+    g_vfs_overrides_active = 1;
     g_fake_rtld_global = &fake_rtld_global;
     g_fake_rtld_global_ro = &fake_rtld_global_ro;
     if (build_special_table() < 0)
         return 3;
+    if (lookup_special("__tls_get_addr",
+                       gnu_hash_calc("__tls_get_addr")) !=
+        (uint64_t)(uintptr_t)stub_tls_get_addr_glibc)
+        return 112;
     for (const struct stub_sym *entry = g_overrides; entry->name; entry++) {
         if (!lookup_special(entry->name, gnu_hash_calc(entry->name)))
             return 4;
@@ -1209,6 +1894,17 @@ int main(void)
         if (!lookup_special(entry->name, gnu_hash_calc(entry->name)))
             return 6;
     }
+    g_special_tab_ready = 0;
+    g_is_musl_runtime = 1;
+    if (build_special_table() < 0 ||
+        lookup_special("__tls_get_addr",
+                       gnu_hash_calc("__tls_get_addr")) !=
+            (uint64_t)(uintptr_t)stub_tls_get_addr_musl)
+        return 113;
+    g_special_tab_ready = 0;
+    g_is_musl_runtime = 0;
+    if (build_special_table() < 0)
+        return 114;
     initial_stack.auxiliary[0].a_type = AT_PAGESZ;
     initial_stack.auxiliary[0].a_un.a_val = 4096;
     initial_stack.auxiliary[1].a_type = AT_NULL;
@@ -1228,57 +1924,139 @@ int main(void)
 
     memcpy(property_note, &property_header, sizeof(property_header));
     memcpy(property_note + sizeof(property_header), "GNU\0", 4);
+    property_type = DLFRZ_GNU_PROPERTY_STACK_SIZE;
+    property_size = sizeof(property_stack_size);
+    memcpy(property_note + 16, &property_type, sizeof(property_type));
+    memcpy(property_note + 20, &property_size, sizeof(property_size));
+    memcpy(property_note + 24,
+           &property_stack_size, sizeof(property_stack_size));
 #if defined(__x86_64__)
     property_type = DLFRZ_GNU_PROPERTY_X86_FEATURE_1_AND;
 #else
     property_type = DLFRZ_GNU_PROPERTY_AARCH64_FEATURE_1_AND;
 #endif
-    memcpy(property_note + 16, &property_type, sizeof(property_type));
-    memcpy(property_note + 20, &property_size, sizeof(property_size));
-    memcpy(property_note + 24, &property_value, sizeof(property_value));
+    property_size = sizeof(property_value);
+    memcpy(property_note + 32, &property_type, sizeof(property_type));
+    memcpy(property_note + 36, &property_size, sizeof(property_size));
+    memcpy(property_note + 40, &property_value, sizeof(property_value));
     memcpy(image + 256, property_note, sizeof(property_note));
     property_phdr[0].p_type = PT_LOAD;
     property_phdr[0].p_flags = PF_R;
     property_phdr[0].p_filesz = sizeof(image);
     property_phdr[0].p_memsz = sizeof(image);
     property_phdr[1].p_type = PT_GNU_PROPERTY;
+    property_phdr[1].p_offset = 256;
     property_phdr[1].p_vaddr = 256;
     property_phdr[1].p_filesz = sizeof(property_note);
     property_phdr[1].p_memsz = sizeof(property_note);
+    property_phdr[2].p_type = PT_GNU_STACK;
+    property_phdr[2].p_flags = PF_R | PF_W;
+    property_phdr[2].p_memsz = property_stack_limit;
     object.base = (uintptr_t)image;
     object.elf = image;
     object.elf_size = sizeof(image);
     object.phdr = property_phdr;
-    object.phdr_num = 2;
+    object.phdr_num = 3;
     if (parse_loaded_gnu_properties(&object) != 0 ||
         !object.gnu_property_feature_1_seen ||
-        object.gnu_property_feature_1 != property_value)
+        object.gnu_property_feature_1 != property_value ||
+        !object.gnu_property_stack_size_seen ||
+        object.gnu_property_stack_size != property_stack_size)
         return 11;
+
+    /* The initial mapped-note values are admission authority.  A later
+     * change which remains individually valid and below PT_GNU_STACK must
+     * still fail revalidation instead of silently changing runtime policy. */
+    property_stack_size += 1024 * 1024;
+    memcpy(image + 256 + 24,
+           &property_stack_size, sizeof(property_stack_size));
+    if (revalidate_loaded_gnu_properties(&object) == 0)
+        return 116;
+    property_stack_size -= 1024 * 1024;
+    memcpy(image + 256 + 24,
+           &property_stack_size, sizeof(property_stack_size));
+    if (parse_loaded_gnu_properties(&object) != 0)
+        return 117;
+    object.gnu_property_stack_size_seen = 0;
+    if (revalidate_loaded_gnu_properties(&object) == 0)
+        return 118;
+    if (parse_loaded_gnu_properties(&object) != 0)
+        return 119;
+    property_phdr[2].p_memsz = property_stack_size - 1;
+    if (parse_loaded_gnu_properties(&object) == 0)
+        return 120;
+    property_phdr[2].p_memsz = property_stack_limit;
+    if (parse_loaded_gnu_properties(&object) != 0)
+        return 121;
+
     property_value = UINT32_C(0x80000000);
-    memcpy(image + 256 + 24, &property_value, sizeof(property_value));
+    memcpy(image + 256 + 40, &property_value, sizeof(property_value));
     if (parse_loaded_gnu_properties(&object) == 0)
         return 12;
     property_value = 0;
     property_type = UINT32_C(0xc1234567);
-    memcpy(image + 256 + 16, &property_type, sizeof(property_type));
-    memcpy(image + 256 + 24, &property_value, sizeof(property_value));
+    memcpy(image + 256 + 32, &property_type, sizeof(property_type));
+    memcpy(image + 256 + 40, &property_value, sizeof(property_value));
     if (parse_loaded_gnu_properties(&object) == 0)
         return 13;
 #if defined(__aarch64__)
     {
-        struct loaded_obj gcs_object = {0};
-        const uintptr_t gcs_capability = (uintptr_t)1 << 32;
+        struct loaded_obj feature_object = {0};
+        struct dlfrz_gnu_property_profile feature_profile = {
+            .feature_1 = DLFRZ_GNU_PROPERTY_AARCH64_FEATURE_1_BTI |
+                DLFRZ_GNU_PROPERTY_AARCH64_FEATURE_1_PAC |
+                DLFRZ_GNU_PROPERTY_AARCH64_FEATURE_1_GCS,
+            .feature_1_seen = 1
+        };
+        Elf64_Phdr executable = {
+            .p_type = PT_LOAD,
+            .p_flags = PF_R | PF_X,
+        };
+        Elf64_Phdr readable = {
+            .p_type = PT_LOAD,
+            .p_flags = PF_R,
+        };
+        uintptr_t saved_hwcap2 = g_kernel_hwcap2;
 
-        gcs_object.visible = 1;
-        gcs_object.gnu_property_feature_1_seen = 1;
-        gcs_object.gnu_property_feature_1 =
-            DLFRZ_GNU_PROPERTY_AARCH64_FEATURE_1_GCS;
+        feature_object.visible = 1;
+        feature_object.gnu_property_feature_1_seen = 1;
+        feature_object.gnu_property_feature_1 = feature_profile.feature_1;
+        /* FEATURE_1 describes object compatibility.  PAC needs no loader
+         * transition, GCS remains at its kernel exec default, and BTI is
+         * enforced on this object's executable mappings below. */
         if (!startup_gnu_properties_admitted(
-                &gcs_object, 1, gcs_capability, 0))
+                &feature_object, 1,
+                DLFRZ_AARCH64_HWCAP_GCS,
+                DLFRZ_AARCH64_HWCAP2_BTI) ||
+            !startup_gnu_properties_admitted(
+                &feature_object, 1, 0, 0) ||
+            !late_gnu_properties_admitted(&feature_object))
             return 101;
-        if (startup_gnu_properties_admitted(
-                &gcs_object, 1, 0, gcs_capability))
+
+        g_kernel_hwcap2 = 0;
+        if (phdr_prot_with_gnu_property(
+                &executable, &feature_profile) !=
+                (PROT_READ | PROT_EXEC))
             return 102;
+        g_kernel_hwcap2 = DLFRZ_AARCH64_HWCAP2_BTI;
+        if (phdr_prot_with_gnu_property(
+                &executable, &feature_profile) !=
+                (PROT_READ | PROT_EXEC | PROT_BTI) ||
+            phdr_prot_with_gnu_property(
+                &readable, &feature_profile) != PROT_READ) {
+            g_kernel_hwcap2 = saved_hwcap2;
+            return 109;
+        }
+        feature_profile.feature_1 =
+            DLFRZ_GNU_PROPERTY_AARCH64_FEATURE_1_PAC |
+            DLFRZ_GNU_PROPERTY_AARCH64_FEATURE_1_GCS;
+        if (phdr_prot_with_gnu_property(
+                &executable, &feature_profile) !=
+                (PROT_READ | PROT_EXEC)) {
+            g_kernel_hwcap2 = saved_hwcap2;
+            return 110;
+        }
+        g_kernel_hwcap2 = saved_hwcap2;
     }
 #endif
 
@@ -1470,6 +2248,10 @@ int main(void)
      * through the container into the following payload entry. */
     if (!gate_map_embedded_elf_eof())
         return 28;
+#if defined(__aarch64__)
+    if (!gate_aarch64_bti_map_object())
+        return 111;
+#endif
     if (!gate_partial_relro_page())
         return 29;
     if (!gate_prelinked_unresolved_symbol_values())
@@ -1482,6 +2264,8 @@ int main(void)
         return 40;
     if (!gate_control_table_alignment())
         return 33;
+    if (!gate_aarch64_dynamic_semantics())
+        return 41;
     if (!gate_gnu_hash_chain_stays_file_backed())
         return 38;
     if (!gate_origin_token_grammars())
@@ -1504,5 +2288,11 @@ int main(void)
         return 36;
     if (!gate_gnu_unique_registry())
         return 37;
+#if defined(__x86_64__)
+    if (!gate_x86_glibc_initial_thread_lifetime_decoder())
+        return 115;
+    if (!gate_x86_cet_contract_and_policy())
+        return 108;
+#endif
     return 0;
 }

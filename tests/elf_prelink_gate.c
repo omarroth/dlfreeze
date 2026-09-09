@@ -154,6 +154,12 @@ static int mutate(struct elf_image *image, const char *mode)
         if (tag == 0)
             return 64;
         entry = dynamic_tag(image, DT_DEBUG);
+        /* Shared objects normally omit DT_DEBUG.  DT_RELACOUNT is only a
+         * relocation-loop optimization, so replacing it leaves a valid
+         * native-loader control while allowing lazy-DSO admission tests to
+         * exercise the same unsupported semantic tags. */
+        if (!entry)
+            entry = dynamic_tag(image, DT_RELACOUNT);
         if (!entry)
             return 77;
         entry->d_tag = (Elf64_Sxword)tag;

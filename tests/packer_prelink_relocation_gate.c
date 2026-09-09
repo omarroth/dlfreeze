@@ -18,6 +18,30 @@ enum {
     TEST_DATA_OFFSET = 512
 };
 
+static FILE *test_tmpfile(void)
+{
+    const char *directory = getenv("TMPDIR");
+    char path[PATH_MAX];
+    FILE *file;
+    int fd;
+    int length;
+
+    if (!directory || !directory[0])
+        directory = "/tmp";
+    length = snprintf(path, sizeof(path), "%s/%s", directory,
+                      "dlfreeze-prelink-gate.XXXXXX");
+    if (length < 0 || (size_t)length >= sizeof(path))
+        return NULL;
+    fd = mkstemp(path);
+    if (fd < 0)
+        return NULL;
+    unlink(path);
+    file = fdopen(fd, "w+b");
+    if (!file)
+        close(fd);
+    return file;
+}
+
 static void initialize_object(struct prelink_obj *obj,
                               unsigned char image[TEST_IMAGE_SIZE],
                               Elf64_Phdr *phdrs, uint16_t phdr_num)
@@ -740,7 +764,7 @@ static int section_and_property_control_gate(void)
     sections[2].sh_size = 32;
     entry.data_size = sizeof(image);
 
-    file = tmpfile();
+    file = test_tmpfile();
     if (!file || fwrite(image, 1, sizeof(image), file) != sizeof(image) ||
         fflush(file) != 0 ||
         !pl_collect_object_control_ranges(
@@ -814,6 +838,89 @@ out:
     pl_control_authority_release(&obj);
     pl_relocation_sources_release(&obj);
     return valid && g_pl_relocation_snapshot_live_allocations == 0;
+}
+
+static int aarch64_dynamic_semantics_gate(void)
+{
+#if defined(__aarch64__)
+    _Alignas(Elf64_Dyn) unsigned char image[TEST_IMAGE_SIZE];
+    struct prelink_obj obj;
+    Elf64_Phdr phdrs[2];
+    Elf64_Dyn *dynamic = (Elf64_Dyn *)(void *)(image + 256);
+    static const uint64_t unsupported[] = {
+        DLFRZ_DT_AARCH64_PAC_PLT,
+        DLFRZ_DT_AARCH64_AUTH_SYM,
+        DLFRZ_DT_AARCH64_MEMTAG_MODE,
+        DLFRZ_DT_AARCH64_MEMTAG_HEAP,
+        DLFRZ_DT_AARCH64_MEMTAG_STACK,
+        DLFRZ_DT_AARCH64_MEMTAG_GLOBALS,
+        DLFRZ_DT_AARCH64_MEMTAG_GLOBALSSZ,
+        DLFRZ_DT_AARCH64_AUTH_RELRSZ,
+        DLFRZ_DT_AARCH64_AUTH_RELR,
+        DLFRZ_DT_AARCH64_AUTH_RELRENT,
+    };
+    static const uint64_t harmless[] = {
+        DLFRZ_DT_AARCH64_BTI_PLT,
+        DLFRZ_DT_AARCH64_VARIANT_PCS,
+    };
+
+    for (size_t i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); i++) {
+        struct pl_control_range_builder builder = {0};
+        int admission;
+
+        memset(image, 0, sizeof(image));
+        initialize_object(&obj, image, phdrs, 2);
+        initialize_load(&phdrs[0], PF_R | PF_W, 0, 0, sizeof(image));
+        phdrs[1].p_type = PT_DYNAMIC;
+        phdrs[1].p_flags = PF_R | PF_W;
+        phdrs[1].p_offset = 256;
+        phdrs[1].p_vaddr = 256;
+        phdrs[1].p_filesz = 2 * sizeof(*dynamic);
+        phdrs[1].p_memsz = phdrs[1].p_filesz;
+        phdrs[1].p_align = _Alignof(Elf64_Dyn);
+        dynamic[0].d_tag = (Elf64_Sxword)unsupported[i];
+        /* PAC_PLT and the MemtagABI presence/mode tags can carry zero while
+         * still requesting loader behavior, so admission is tag-driven. */
+        dynamic[0].d_un.d_val = 0;
+        dynamic[1].d_tag = DT_NULL;
+        admission = pl_parse_dynamic(
+            &obj, obj.base, obj.phdr_base, obj.phdr_num, obj.phdr_entsz,
+            &builder);
+        pl_control_range_builder_release(&builder);
+        pl_control_authority_release(&obj);
+        pl_relocation_sources_release(&obj);
+        if (admission != PL_ADMISSION_UNSUPPORTED)
+            return 0;
+    }
+
+    for (size_t i = 0; i < sizeof(harmless) / sizeof(harmless[0]); i++) {
+        struct pl_control_range_builder builder = {0};
+        int admission;
+
+        memset(image, 0, sizeof(image));
+        initialize_object(&obj, image, phdrs, 2);
+        initialize_load(&phdrs[0], PF_R | PF_W, 0, 0, sizeof(image));
+        phdrs[1].p_type = PT_DYNAMIC;
+        phdrs[1].p_flags = PF_R | PF_W;
+        phdrs[1].p_offset = 256;
+        phdrs[1].p_vaddr = 256;
+        phdrs[1].p_filesz = 2 * sizeof(*dynamic);
+        phdrs[1].p_memsz = phdrs[1].p_filesz;
+        phdrs[1].p_align = _Alignof(Elf64_Dyn);
+        dynamic[0].d_tag = (Elf64_Sxword)harmless[i];
+        dynamic[0].d_un.d_val = 0;
+        dynamic[1].d_tag = DT_NULL;
+        admission = pl_parse_dynamic(
+            &obj, obj.base, obj.phdr_base, obj.phdr_num, obj.phdr_entsz,
+            &builder);
+        pl_control_range_builder_release(&builder);
+        pl_control_authority_release(&obj);
+        pl_relocation_sources_release(&obj);
+        if (admission != PL_ADMISSION_OK)
+            return 0;
+    }
+#endif
+    return 1;
 }
 
 static void initialize_dynamic_string_fixture(
@@ -941,7 +1048,7 @@ static int section_string_table_gate(void)
 
     memcpy(strings + 1, "overlap", sizeof("overlap"));
     memcpy(strings + 16, "unused", sizeof("unused"));
-    file = tmpfile();
+    file = test_tmpfile();
     if (!file || fwrite(strings, 1, sizeof(strings), file) !=
                      sizeof(strings) || fflush(file) != 0)
         goto out;
@@ -986,6 +1093,116 @@ out:
     return valid;
 }
 
+static int lazy_source_selection_gate(void)
+{
+    struct dlfrz_entry entries[6];
+
+    memset(entries, 0, sizeof(entries));
+    for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); i++)
+        entries[i].data_size = 4096;
+
+    entries[0].data_offset = 100;
+    entries[0].flags = DLFRZ_FLAG_INTERP;
+    entries[1].data_offset = 100;
+    entries[1].flags = DLFRZ_FLAG_SHLIB | DLFRZ_FLAG_DLOPEN;
+    entries[2].data_offset = 100;
+    entries[2].flags = DLFRZ_FLAG_SHLIB | DLFRZ_FLAG_DLOPEN;
+
+    entries[3].data_offset = 200;
+    entries[3].flags = DLFRZ_FLAG_SHLIB | DLFRZ_FLAG_DLOPEN |
+                       DLFRZ_FLAG_DLOPEN_EARLY;
+
+    entries[4].data_offset = 300;
+    entries[4].flags = DLFRZ_FLAG_SHLIB;
+    entries[5].data_offset = 300;
+    entries[5].flags = DLFRZ_FLAG_SHLIB | DLFRZ_FLAG_DLOPEN;
+
+    return prelink_lazy_admission_required(entries, 6, 1) &&
+           !prelink_lazy_admission_required(entries, 6, 2) &&
+           prelink_lazy_admission_required(entries, 6, 3) &&
+           !prelink_lazy_admission_required(entries, 6, 4) &&
+           !prelink_lazy_admission_required(entries, 6, 5);
+}
+
+static int all_source_selection_gate(void)
+{
+    struct dlfrz_entry entries[6];
+
+    memset(entries, 0, sizeof(entries));
+    for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); i++)
+        entries[i].data_size = 4096;
+
+    entries[0].data_offset = 100;
+    entries[0].flags = DLFRZ_FLAG_INTERP;
+    entries[1].data_offset = 100;
+    entries[1].flags = DLFRZ_FLAG_SHLIB | DLFRZ_FLAG_DLOPEN;
+    entries[2].data_offset = 100;
+    entries[2].flags = DLFRZ_FLAG_SHLIB | DLFRZ_FLAG_DLOPEN;
+    entries[3].data_offset = 200;
+    entries[3].flags = DLFRZ_FLAG_SHLIB | DLFRZ_FLAG_DLOPEN_EARLY;
+    entries[4].data_offset = 300;
+    entries[4].flags = DLFRZ_FLAG_SHLIB;
+    entries[5].data_offset = 300;
+    entries[5].flags = DLFRZ_FLAG_SHLIB | DLFRZ_FLAG_DLOPEN;
+
+    return !prelink_source_admission_required(entries, 6, 0) &&
+           prelink_source_admission_required(entries, 6, 1) &&
+           !prelink_source_admission_required(entries, 6, 2) &&
+           prelink_source_admission_required(entries, 6, 3) &&
+           prelink_source_admission_required(entries, 6, 4) &&
+           !prelink_source_admission_required(entries, 6, 5);
+}
+
+static int lazy_relocation_validation_gate(void)
+{
+    _Alignas(Elf64_Rela) unsigned char image[TEST_IMAGE_SIZE];
+    struct prelink_obj obj;
+    Elf64_Phdr phdr;
+    Elf64_Rela *rela;
+    Elf64_Relr *relr;
+    uint64_t before = UINT64_C(0x6a5b4c3d2e1f0011);
+    uint64_t after;
+
+    memset(image, 0, sizeof(image));
+    initialize_object(&obj, image, &phdr, 1);
+    initialize_load(&phdr, PF_R | PF_W | PF_X, 0, 0, sizeof(image));
+    rela = (Elf64_Rela *)(void *)(image + TEST_RELA_OFFSET);
+    relr = (Elf64_Relr *)(void *)(image + TEST_JMPREL_OFFSET);
+    obj.rela = rela;
+    obj.rela_count = 1;
+    obj.relr = relr;
+    obj.relr_count = 1;
+    memcpy(image + TEST_DATA_OFFSET, &before, sizeof(before));
+
+    rela[0].r_offset = TEST_DATA_OFFSET;
+    rela[0].r_info = ELF64_R_INFO(0, ARCH_RELOC_RELATIVE);
+    rela[0].r_addend = 37;
+    relr[0] = TEST_DATA_OFFSET + sizeof(uint64_t);
+    if (pl_validate_runtime_rela(&obj, obj.rela, obj.rela_count) !=
+            PL_ADMISSION_OK ||
+        pl_validate_runtime_relr(&obj) != PL_ADMISSION_OK)
+        return 0;
+    memcpy(&after, image + TEST_DATA_OFFSET, sizeof(after));
+    if (after != before)
+        return 0;
+
+    rela[0].r_info = ELF64_R_INFO(0, UINT32_C(0x7fffffff));
+    if (pl_validate_runtime_rela(&obj, obj.rela, obj.rela_count) !=
+        PL_ADMISSION_UNSUPPORTED)
+        return 0;
+    rela[0].r_info = ELF64_R_INFO(0, ARCH_RELOC_RELATIVE);
+    rela[0].r_offset = TEST_IMAGE_SIZE;
+    if (pl_validate_runtime_rela(&obj, obj.rela, obj.rela_count) !=
+        PL_ADMISSION_INVALID)
+        return 0;
+
+    relr[0] = 3;
+    if (pl_validate_runtime_relr(&obj) != PL_ADMISSION_INVALID)
+        return 0;
+    memcpy(&after, image + TEST_DATA_OFFSET, sizeof(after));
+    return after == before;
+}
+
 int main(void)
 {
     if (!overlap_component_alias_gate()) return 1;
@@ -1002,5 +1219,9 @@ int main(void)
     if (!dynamic_mapped_and_serialized_gate()) return 12;
     if (!dynamic_string_table_gate()) return 13;
     if (!section_string_table_gate()) return 14;
+    if (!lazy_source_selection_gate()) return 15;
+    if (!lazy_relocation_validation_gate()) return 16;
+    if (!aarch64_dynamic_semantics_gate()) return 17;
+    if (!all_source_selection_gate()) return 18;
     return 0;
 }

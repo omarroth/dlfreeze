@@ -3158,8 +3158,23 @@ int dep_resolve(const char *exe_path, struct dep_list *deps)
         return -1;
     }
 
-    if (!info.is_dynamic) {
-        fprintf(stderr, "dlfreeze: %s is not dynamically linked\n", real);
+    /* PT_DYNAMIC is not required for an executable: a fully static target
+     * has an empty dependency closure and is replayed by the extraction
+     * runtime through an ordinary kernel exec.  An interpreter-bearing image
+     * without PT_DYNAMIC is not that contract, and DT_NEEDED without
+     * PT_INTERP provides no loader search ABI that we can reproduce. */
+    if (!info.is_dynamic && info.interp && info.interp[0]) {
+        fprintf(stderr,
+                "dlfreeze: target has an ELF interpreter but no dynamic "
+                "segment\n");
+        elf_info_free(&info);
+        free(origin); free(real);
+        return -1;
+    }
+    if ((!info.interp || !info.interp[0]) && info.needed_count != 0) {
+        fprintf(stderr,
+                "dlfreeze: target has DT_NEEDED entries but no ELF "
+                "interpreter\n");
         elf_info_free(&info);
         free(origin); free(real);
         return -1;
@@ -3195,7 +3210,15 @@ int dep_resolve(const char *exe_path, struct dep_list *deps)
                                       &deps->interp_snapshot,
                                       gnu_cache_path,
                                       &deps->gnu_release_minor);
-        if (deps->runtime_family == DEP_RUNTIME_UNKNOWN) {
+        /* Dependency-free targets do not need dlfreeze to reproduce an
+         * unknown interpreter's search ABI.  They remain extraction-only,
+         * and the manifest records that the interpreter may be entered only
+         * by the kernel through the original PT_INTERP pathname.  Requiring
+         * the interpreter itself to have an empty DT_NEEDED closure avoids
+         * silently omitting dependencies which only that unknown loader
+         * knows how to locate. */
+        if (deps->runtime_family == DEP_RUNTIME_UNKNOWN &&
+            (info.needed_count != 0 || interp_info.needed_count != 0)) {
             fprintf(stderr,
                     "dlfreeze: unsupported target dynamic-linker search ABI: %s\n",
                     deps->interp_path);
@@ -4442,6 +4465,7 @@ int dep_mark_dlopen_early_closures(struct dep_list *deps)
 {
     unsigned char *closure;
     struct closure_queue_item *queue;
+    int *first_early_root;
 
     if (!deps || deps->count < 0)
         return -1;
@@ -4449,11 +4473,16 @@ int dep_mark_dlopen_early_closures(struct dep_list *deps)
         return 0;
     closure = calloc((size_t)deps->count, sizeof(*closure));
     queue = calloc((size_t)deps->count, sizeof(*queue));
-    if (!closure || !queue) {
+    first_early_root = calloc((size_t)deps->count,
+                              sizeof(*first_early_root));
+    if (!closure || !queue || !first_early_root) {
         free(closure);
         free(queue);
+        free(first_early_root);
         return -1;
     }
+    for (int i = 0; i < deps->count; i++)
+        first_early_root[i] = -1;
 
     for (int root = 0; root < deps->count; root++) {
         int needs_early = 0;
@@ -4467,18 +4496,38 @@ int dep_mark_dlopen_early_closures(struct dep_list *deps)
                                    &needs_early) < 0) {
             free(closure);
             free(queue);
+            free(first_early_root);
             return -1;
         }
 
         if (needs_early) {
-            for (int i = 0; i < deps->count; i++)
-                if (closure[i] && deps->libs[i].from_dlopen)
+            for (int i = 0; i < deps->count; i++) {
+                if (!closure[i] || !deps->libs[i].from_dlopen)
+                    continue;
+                /* A promoted object must be relocated before its static TLS
+                 * template is copied.  If two independently loadable roots
+                 * reach it, the native lookup scope depends on which root is
+                 * opened first.  Manifest order is not authority for that
+                 * runtime choice, so direct loading cannot represent this
+                 * closure without deferring all scope-sensitive relocation
+                 * and TLS-template publication. */
+                if (first_early_root[i] >= 0 &&
+                    first_early_root[i] != root) {
+                    free(closure);
+                    free(queue);
+                    free(first_early_root);
+                    return 1;
+                }
+                first_early_root[i] = root;
+                if (deps->libs[i].from_dlopen)
                     deps->libs[i].dlopen_early = 1;
+            }
         }
     }
 
     free(closure);
     free(queue);
+    free(first_early_root);
     return 0;
 }
 

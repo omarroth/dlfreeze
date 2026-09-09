@@ -3,6 +3,7 @@
 #endif
 
 #include <sys/sysmacros.h>
+#include <sys/wait.h>
 
 #define DLFREEZE_FILEBACK_GATE 1
 #include "../src/loader.c"
@@ -13,12 +14,58 @@ enum gate_mutation {
     GATE_SOURCE_COW_PAGE_TAIL,
     GATE_SOURCE_COW_PARTIAL_PREFIX,
     GATE_SOURCE_COW_PARTIAL_BOUNDARY,
+    GATE_STACK_EXECUTABLE,
+    GATE_FILEBACK_MAP_FAILURE,
+    GATE_FILEBACK_RESTORE_FAILURE,
 };
+
+static FILE *gate_temporary_file(void)
+{
+    const char *directory = getenv("TMPDIR");
+    char path[PATH_MAX];
+    int fd;
+    FILE *file;
+
+    if (!directory || directory[0] != '/')
+        directory = "/tmp";
+    if (snprintf(path, sizeof(path),
+                 "%s/dlfreeze-loader-gate.XXXXXX", directory) >=
+        (int)sizeof(path)) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    fd = mkstemp(path);
+    if (fd < 0)
+        return NULL;
+    if (unlink(path) < 0) {
+        int saved_errno = errno;
+
+        close(fd);
+        errno = saved_errno;
+        return NULL;
+    }
+    file = fdopen(fd, "w+b");
+    if (!file) {
+        int saved_errno = errno;
+
+        close(fd);
+        errno = saved_errno;
+    }
+    return file;
+}
 
 static void reset_fileback_counters(void)
 {
     g_fileback_map_attempts = 0;
     g_fileback_map_accepts = 0;
+    g_fileback_forced_map_errno = 0;
+    g_fileback_forced_restore_errno = 0;
+    g_mremap_attempts = 0;
+    g_mremap_accepts = 0;
+    g_mremap_forced_errno = 0;
+    g_mremap_force_attempt = 0;
+    g_executable_probe_forced_munmap_errno = 0;
+    g_startup_mremap_disabled = 0;
 }
 
 static int gate_mapping_permissions(const void *address,
@@ -126,7 +173,7 @@ static int gate_map_case(const char *label, enum gate_mutation mutation,
     segment_file_size = page / 2;
     tail_mutation = 3 * page / 4;
     reservation_size = 5 * page;
-    container = tmpfile();
+    container = gate_temporary_file();
     if (!container || ftruncate(fileno(container), container_size) < 0)
         goto out;
     container_map = mmap(NULL, container_size, PROT_READ | PROT_WRITE,
@@ -141,16 +188,20 @@ static int gate_map_case(const char *label, enum gate_mutation mutation,
     memcpy(ehdr->e_ident, ELFMAG, SELFMAG);
     ehdr->e_type = ET_DYN;
     ehdr->e_phoff = sizeof(*ehdr);
-    ehdr->e_phnum = 1;
+    ehdr->e_phnum = 2;
     ehdr->e_phentsize = sizeof(*phdr);
-    memset(phdr, 0, sizeof(*phdr));
-    phdr->p_type = PT_LOAD;
-    phdr->p_flags = flags;
-    phdr->p_offset = 0;
-    phdr->p_vaddr = 0;
-    phdr->p_filesz = segment_file_size;
-    phdr->p_memsz = page;
-    phdr->p_align = page;
+    memset(phdr, 0, 2 * sizeof(*phdr));
+    phdr[0].p_type = PT_LOAD;
+    phdr[0].p_flags = flags;
+    phdr[0].p_offset = 0;
+    phdr[0].p_vaddr = 0;
+    phdr[0].p_filesz = segment_file_size;
+    phdr[0].p_memsz = page;
+    phdr[0].p_align = page;
+    phdr[1].p_type = PT_GNU_STACK;
+    phdr[1].p_flags = PF_R | PF_W;
+    if (mutation == GATE_STACK_EXECUTABLE)
+        phdr[1].p_flags |= PF_X;
     if (msync(container_map, container_size, MS_SYNC) < 0 ||
         munmap(container_map, container_size) < 0)
         goto out;
@@ -176,7 +227,7 @@ static int gate_map_case(const char *label, enum gate_mutation mutation,
     meta.base_addr = (uint64_t)(uintptr_t)reservation;
     meta.vaddr_lo = 0;
     meta.vaddr_hi = page;
-    meta.phdr_num = 1;
+    meta.phdr_num = 2;
     meta.phdr_entsz = sizeof(Elf64_Phdr);
     meta.flags = LDR_FLAG_SHLIB;
     object.runtime_reservation = reservation;
@@ -190,6 +241,12 @@ static int gate_map_case(const char *label, enum gate_mutation mutation,
     }
 
     reset_fileback_counters();
+    if (mutation == GATE_FILEBACK_MAP_FAILURE)
+        g_fileback_forced_map_errno = EIO;
+    else if (mutation == GATE_FILEBACK_RESTORE_FAILURE) {
+        g_fileback_forced_map_errno = EIO;
+        g_fileback_forced_restore_errno = ENOMEM;
+    }
     map_result = map_object(source, payload_file_offset, fileno(container),
                             source_flags,
                             &meta, &entry, &object, 1);
@@ -325,7 +382,7 @@ static int gate_partial_eof_case(const char *label,
     bss_byte = page_delta + segment_file_size + page / 8;
     next_entry_byte = entry_size + 16;
 
-    container = tmpfile();
+    container = gate_temporary_file();
     if (!container || ftruncate(fileno(container), container_size) < 0)
         goto out;
     container_map = mmap(NULL, container_size, PROT_READ | PROT_WRITE,
@@ -345,16 +402,18 @@ static int gate_partial_eof_case(const char *label,
     memcpy(ehdr->e_ident, ELFMAG, SELFMAG);
     ehdr->e_type = ET_DYN;
     ehdr->e_phoff = sizeof(*ehdr);
-    ehdr->e_phnum = 1;
+    ehdr->e_phnum = 2;
     ehdr->e_phentsize = sizeof(*phdr);
-    memset(phdr, 0, sizeof(*phdr));
-    phdr->p_type = PT_LOAD;
-    phdr->p_flags = flags;
-    phdr->p_offset = page_delta;
-    phdr->p_vaddr = page_delta;
-    phdr->p_filesz = segment_file_size;
-    phdr->p_memsz = segment_memory_size;
-    phdr->p_align = page;
+    memset(phdr, 0, 2 * sizeof(*phdr));
+    phdr[0].p_type = PT_LOAD;
+    phdr[0].p_flags = flags;
+    phdr[0].p_offset = page_delta;
+    phdr[0].p_vaddr = page_delta;
+    phdr[0].p_filesz = segment_file_size;
+    phdr[0].p_memsz = segment_memory_size;
+    phdr[0].p_align = page;
+    phdr[1].p_type = PT_GNU_STACK;
+    phdr[1].p_flags = PF_R | PF_W;
     if (msync(container_map, container_size, MS_SYNC) < 0 ||
         munmap(container_map, container_size) < 0)
         goto out;
@@ -380,7 +439,7 @@ static int gate_partial_eof_case(const char *label,
     meta.base_addr = (uint64_t)(uintptr_t)reservation;
     meta.vaddr_lo = page_delta;
     meta.vaddr_hi = page_delta + segment_memory_size;
-    meta.phdr_num = 1;
+    meta.phdr_num = 2;
     meta.phdr_entsz = sizeof(Elf64_Phdr);
     meta.flags = LDR_FLAG_SHLIB;
     object.runtime_reservation = reservation;
@@ -492,7 +551,7 @@ static int gate_lazy_exact_case(const char *label, uint32_t phdr_flags,
     data_byte = page / 3;
     tail_byte = 3 * page / 4;
 
-    container = tmpfile();
+    container = gate_temporary_file();
     if (!container || ftruncate(fileno(container), container_size) < 0)
         goto out;
     original_fd = fileno(container);
@@ -508,14 +567,16 @@ static int gate_lazy_exact_case(const char *label, uint32_t phdr_flags,
     memcpy(ehdr->e_ident, ELFMAG, SELFMAG);
     ehdr->e_type = ET_DYN;
     ehdr->e_phoff = sizeof(*ehdr);
-    ehdr->e_phnum = 1;
+    ehdr->e_phnum = 2;
     ehdr->e_phentsize = sizeof(*phdr);
-    memset(phdr, 0, sizeof(*phdr));
-    phdr->p_type = PT_LOAD;
-    phdr->p_flags = phdr_flags;
-    phdr->p_filesz = page / 2;
-    phdr->p_memsz = page;
-    phdr->p_align = page;
+    memset(phdr, 0, 2 * sizeof(*phdr));
+    phdr[0].p_type = PT_LOAD;
+    phdr[0].p_flags = phdr_flags;
+    phdr[0].p_filesz = page / 2;
+    phdr[0].p_memsz = page;
+    phdr[0].p_align = page;
+    phdr[1].p_type = PT_GNU_STACK;
+    phdr[1].p_flags = PF_R | PF_W;
     if (msync(container_map, container_size, MS_SYNC) < 0 ||
         munmap(container_map, container_size) < 0)
         goto out;
@@ -547,7 +608,7 @@ static int gate_lazy_exact_case(const char *label, uint32_t phdr_flags,
     meta.base_addr = (uint64_t)(uintptr_t)hole;
     meta.vaddr_lo = 0;
     meta.vaddr_hi = page;
-    meta.phdr_num = 1;
+    meta.phdr_num = 2;
     meta.phdr_entsz = sizeof(Elf64_Phdr);
     meta.flags = LDR_FLAG_SHLIB;
     if (phdr_flags & PF_R) {
@@ -621,6 +682,153 @@ out:
     return ok;
 }
 
+/* Exercise both fdless success and the first-syscall refusal transaction.
+ * The latter must rebuild the destination, disable later attempts, and copy
+ * both segments without damaging the retained source mapping. */
+static int gate_mremap_case(const char *label, int forced_errno,
+                            size_t force_attempt,
+                            size_t expected_attempts,
+                            size_t expected_accepts,
+                            int expected_first_fileback,
+                            int expected_second_fileback)
+{
+    long page_value = sysconf(_SC_PAGESIZE);
+    size_t page;
+    size_t container_size;
+    size_t reservation_size;
+    FILE *container = NULL;
+    unsigned char *populate = MAP_FAILED;
+    unsigned char *source = MAP_FAILED;
+    unsigned char *reservation = MAP_FAILED;
+    struct dlfrz_entry entry = {0};
+    struct dlfrz_lib_meta meta = {0};
+    struct loaded_obj object = {0};
+    Elf64_Ehdr *ehdr;
+    Elf64_Phdr *phdr;
+    struct stat status;
+    int map_result;
+    int ok = 0;
+
+    if (page_value <= 0 || (uint64_t)page_value > SIZE_MAX)
+        return 0;
+    page = (size_t)page_value;
+    if ((page & (page - 1)) != 0 || page < 1024)
+        return 0;
+    g_page_size = page;
+    container_size = 2 * page;
+    reservation_size = 7 * page;
+    container = gate_temporary_file();
+    if (!container || ftruncate(fileno(container), container_size) < 0)
+        goto out;
+    populate = mmap(NULL, container_size, PROT_READ | PROT_WRITE,
+                    MAP_SHARED, fileno(container), 0);
+    if (populate == MAP_FAILED)
+        goto out;
+    memset(populate, 0x5a, page);
+    memset(populate + page, 0x5b, page);
+    ehdr = (Elf64_Ehdr *)populate;
+    phdr = (Elf64_Phdr *)(populate + sizeof(*ehdr));
+    memset(ehdr, 0, sizeof(*ehdr));
+    memcpy(ehdr->e_ident, ELFMAG, SELFMAG);
+    ehdr->e_type = ET_DYN;
+    ehdr->e_phoff = sizeof(*ehdr);
+    ehdr->e_phnum = 3;
+    ehdr->e_phentsize = sizeof(*phdr);
+    memset(phdr, 0, 3 * sizeof(*phdr));
+    phdr[0].p_type = PT_LOAD;
+    phdr[0].p_flags = PF_R;
+    phdr[0].p_filesz = page;
+    phdr[0].p_memsz = page;
+    phdr[0].p_align = page;
+    phdr[1].p_type = PT_LOAD;
+    phdr[1].p_flags = PF_R | PF_W;
+    phdr[1].p_offset = page;
+    phdr[1].p_vaddr = 2 * page;
+    phdr[1].p_filesz = page / 2;
+    phdr[1].p_memsz = page;
+    phdr[1].p_align = page;
+    phdr[2].p_type = PT_GNU_STACK;
+    phdr[2].p_flags = PF_R | PF_W;
+    if (msync(populate, container_size, MS_SYNC) < 0 ||
+        munmap(populate, container_size) < 0)
+        goto out;
+    populate = MAP_FAILED;
+    source = mmap(NULL, container_size, PROT_READ, MAP_PRIVATE,
+                  fileno(container), 0);
+    if (source == MAP_FAILED || fstat(fileno(container), &status) < 0)
+        goto out;
+    if (fclose(container) < 0)
+        goto out;
+    container = NULL;
+
+    reservation = mmap(NULL, reservation_size, PROT_NONE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (reservation == MAP_FAILED)
+        goto out;
+    entry.data_size = container_size;
+    entry.flags = LDR_FLAG_SHLIB;
+    meta.base_addr = (uint64_t)(uintptr_t)reservation;
+    meta.vaddr_hi = 3 * page;
+    meta.phdr_off = sizeof(*ehdr);
+    meta.phdr_num = 3;
+    meta.phdr_entsz = sizeof(*phdr);
+    meta.flags = LDR_FLAG_SHLIB;
+    object.runtime_reservation = reservation;
+    object.runtime_reservation_size = reservation_size;
+
+    reset_fileback_counters();
+    g_mremap_forced_errno = forced_errno;
+    g_mremap_force_attempt = force_attempt;
+    map_result = map_object(
+        source, 0, -1, DLFRZ_SOURCE_MREMAP_DONTUNMAP,
+        &meta, &entry, &object, 1);
+    g_mremap_forced_errno = 0;
+    g_mremap_force_attempt = 0;
+    if (map_result < 0 ||
+        g_mremap_attempts != expected_attempts ||
+        g_mremap_accepts != expected_accepts ||
+        g_fileback_map_attempts != 0 || g_fileback_map_accepts != 0) {
+        fprintf(stderr,
+                "%s: result=%d mremap=%zu/%zu fileback=%zu/%zu\n",
+                label, map_result, g_mremap_accepts, g_mremap_attempts,
+                g_fileback_map_accepts, g_fileback_map_attempts);
+        goto out;
+    }
+    if (!!gate_mapping_file_identity(reservation, &status, 0) !=
+            !!expected_first_fileback ||
+        !!gate_mapping_file_identity(
+            reservation + 2 * page, &status, page) !=
+            !!expected_second_fileback) {
+        fprintf(stderr, "%s: target provenance differs\n", label);
+        goto out;
+    }
+    if (reservation[page / 2] != source[page / 2] ||
+        reservation[2 * page + page / 3] != source[page + page / 3] ||
+        reservation[2 * page + 3 * page / 4] != 0 ||
+        source[page + 3 * page / 4] != 0x5b) {
+        fprintf(stderr, "%s: source, file bytes, or BSS tail differ\n",
+                label);
+        goto out;
+    }
+    ok = 1;
+
+out:
+    g_mremap_forced_errno = 0;
+    g_mremap_force_attempt = 0;
+    if (object.runtime_phdr_mapping && object.runtime_phdr_mapping_size)
+        (void)munmap(object.runtime_phdr_mapping,
+                     object.runtime_phdr_mapping_size);
+    if (reservation != MAP_FAILED)
+        (void)munmap(reservation, reservation_size);
+    if (source != MAP_FAILED)
+        (void)munmap(source, container_size);
+    if (populate != MAP_FAILED)
+        (void)munmap(populate, container_size);
+    if (container)
+        fclose(container);
+    return ok;
+}
+
 
 static int gate_fd_lifecycle(void)
 {
@@ -629,10 +837,15 @@ static int gate_fd_lifecycle(void)
     if (fd < 0)
         return 0;
     g_frozen_srcfd = fd;
+    g_frozen_source_flags = DLFRZ_SOURCE_EXACT_CLEAN_FILE |
+                            DLFRZ_SOURCE_MREMAP_DONTUNMAP;
+    g_startup_mremap_disabled = 0;
     if (g_frozen_srcfd != fd)
         return 0;
     release_frozen_source_fd_after_tls();
-    if (g_frozen_srcfd != -1)
+    if (g_frozen_srcfd != -1 ||
+        (g_frozen_source_flags & DLFRZ_SOURCE_MREMAP_DONTUNMAP) != 0 ||
+        !g_startup_mremap_disabled)
         return 0;
     errno = 0;
     if (fcntl(fd, F_GETFD) != -1 || errno != EBADF)
@@ -643,8 +856,13 @@ static int gate_fd_lifecycle(void)
 static int gate_source_contract(void)
 {
     return loader_source_contract_is_valid(-1, 0) &&
+           loader_source_contract_is_valid(
+               -1, DLFRZ_SOURCE_MREMAP_DONTUNMAP) &&
            loader_source_contract_is_valid(7,
                DLFRZ_SOURCE_EXACT_CLEAN_FILE) &&
+           loader_source_contract_is_valid(
+               7, DLFRZ_SOURCE_EXACT_CLEAN_FILE |
+                  DLFRZ_SOURCE_MREMAP_DONTUNMAP) &&
            !loader_source_contract_is_valid(
                -1, DLFRZ_SOURCE_EXACT_CLEAN_FILE) &&
            !loader_source_contract_is_valid(7, 1U << 31) &&
@@ -652,10 +870,299 @@ static int gate_source_contract(void)
                7, DLFRZ_SOURCE_EXACT_CLEAN_FILE | (1U << 31));
 }
 
+static int gate_forced_probe_cleanup_child(int fd, int runtime_probe)
+{
+    pid_t child = fork();
+    int status;
+
+    if (child < 0)
+        return 0;
+    if (child == 0) {
+        struct dlfrz_gnu_property_profile profile = {0};
+        Elf64_Phdr phdr = {0};
+
+        g_loader_diagnostics_suppressed = 1;
+        g_executable_probe_forced_munmap_errno = EACCES;
+        if (runtime_probe) {
+            phdr.p_type = PT_LOAD;
+            phdr.p_flags = PF_R | PF_X;
+            phdr.p_filesz = 1;
+            phdr.p_memsz = 1;
+            (void)runtime_probe_file_mapping_policy(fd, &phdr, &profile);
+        } else {
+            (void)vfs_validate_executable_backing(fd, 1, 0555);
+        }
+        _exit(99);
+    }
+    do {
+        if (waitpid(child, &status, 0) >= 0)
+            break;
+    } while (errno == EINTR);
+    return WIFEXITED(status) && WEXITSTATUS(status) == 127;
+}
+
+static int gate_executable_probe_cleanup_is_terminal(void)
+{
+    struct dlfrz_gnu_property_profile profile = {0};
+    Elf64_Phdr phdr = {0};
+    int fd = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
+    int ok;
+
+    if (fd < 0)
+        return 0;
+    phdr.p_type = PT_LOAD;
+    phdr.p_flags = PF_R | PF_X;
+    phdr.p_filesz = 1;
+    phdr.p_memsz = 1;
+    g_executable_probe_forced_munmap_errno = 0;
+    ok = vfs_validate_executable_backing(fd, 1, 0555) == 0 &&
+         runtime_probe_file_mapping_policy(fd, &phdr, &profile) == 0 &&
+         gate_forced_probe_cleanup_child(fd, 0) &&
+         gate_forced_probe_cleanup_child(fd, 1);
+    close(fd);
+    return ok;
+}
+
+static unsigned int gate_vfs_temp_seen_stages;
+static int gate_vfs_temp_hook_failed;
+static mode_t gate_vfs_temp_final_mode;
+static int gate_vfs_temp_replace_private;
+static struct stat gate_vfs_temp_renamed_writer_status;
+static const char gate_vfs_temp_renamed_leaf[] =
+    ".dlfreeze-renamed-writer";
+
+static void gate_vfs_temp_stage(
+    int dirfd, const char *leaf, int writer_fd, int served_fd,
+    enum vfs_temp_gate_stage stage)
+{
+    struct stat path_status;
+    struct stat served_status;
+    struct stat writer_status;
+    mode_t expected_mode = stage == VFS_TEMP_GATE_UNLINKED_FINAL ?
+        gate_vfs_temp_final_mode : (S_IRUSR | S_IWUSR);
+    unsigned int bit = 1U << (unsigned int)stage;
+    int path_error = 0;
+    int path_result;
+
+    errno = 0;
+    path_result = fstatat(
+        dirfd, leaf, &path_status, AT_SYMLINK_NOFOLLOW);
+    if (path_result < 0)
+        path_error = errno;
+    if ((gate_vfs_temp_seen_stages & bit) != 0 ||
+        fstat(writer_fd, &writer_status) < 0 ||
+        fstat(served_fd, &served_status) < 0 ||
+        !vfs_stat_identity_equal(&writer_status, &served_status) ||
+        (writer_status.st_mode & 07777) != expected_mode ||
+        (served_status.st_mode & 07777) != expected_mode) {
+        gate_vfs_temp_hook_failed = 1;
+    } else if (stage == VFS_TEMP_GATE_PRIVATE_NAME) {
+        if (path_result < 0 ||
+            !vfs_stat_identity_equal(&writer_status, &path_status) ||
+            (path_status.st_mode & 07777) != expected_mode)
+            gate_vfs_temp_hook_failed = 1;
+        if (gate_vfs_temp_replace_private &&
+            !gate_vfs_temp_hook_failed) {
+            int replacement_fd;
+
+            gate_vfs_temp_renamed_writer_status = writer_status;
+            if (renameat(dirfd, leaf, dirfd,
+                         gate_vfs_temp_renamed_leaf) < 0) {
+                gate_vfs_temp_hook_failed = 1;
+            } else {
+                replacement_fd = openat(
+                    dirfd, leaf,
+                    O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                    S_IRUSR | S_IWUSR);
+                if (replacement_fd < 0) {
+                    gate_vfs_temp_hook_failed = 1;
+                } else {
+                    if (fchmod(replacement_fd,
+                               S_IRUSR | S_IWUSR) < 0)
+                        gate_vfs_temp_hook_failed = 1;
+                    close(replacement_fd);
+                }
+            }
+        }
+    } else if (path_result == 0 || path_error != ENOENT ||
+               writer_status.st_nlink != 0 ||
+               served_status.st_nlink != 0) {
+        gate_vfs_temp_hook_failed = 1;
+    }
+    gate_vfs_temp_seen_stages |= bit;
+}
+
+static int gate_vfs_temp_directory(char path[PATH_MAX])
+{
+    const char *candidates[] = { getenv("TMPDIR"), "/dev/shm", "/tmp" };
+
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]);
+         i++) {
+        int length;
+
+        if (!candidates[i] || candidates[i][0] != '/')
+            continue;
+        length = snprintf(path, PATH_MAX,
+                          "%s/dlfreeze-vfs-private-XXXXXX",
+                          candidates[i]);
+        if (length <= 0 || length >= PATH_MAX)
+            continue;
+        if (mkdtemp(path))
+            return 1;
+    }
+    return 0;
+}
+
+static int gate_vfs_temp_one(const char *directory, mode_t mode)
+{
+    static const unsigned char bytes[] = "\177ELFprivate-fallback";
+    struct stat status;
+    unsigned char copy[sizeof(bytes) - 1];
+    void *mapping = MAP_FAILED;
+    int fd = -1;
+    int ok = 0;
+
+    gate_vfs_temp_seen_stages = 0;
+    gate_vfs_temp_hook_failed = 0;
+    gate_vfs_temp_final_mode = mode;
+    g_vfs_temp_stage_hook = gate_vfs_temp_stage;
+    fd = vfs_serve_bytes_temp_dir(
+        directory, bytes, sizeof(bytes) - 1,
+        O_RDONLY | O_CLOEXEC, mode);
+    g_vfs_temp_stage_hook = NULL;
+    if (fd < 0 || gate_vfs_temp_hook_failed ||
+        gate_vfs_temp_seen_stages !=
+            ((1U << VFS_TEMP_GATE_PRIVATE_NAME) |
+             (1U << VFS_TEMP_GATE_UNLINKED_PRIVATE) |
+             (1U << VFS_TEMP_GATE_UNLINKED_FINAL)) ||
+        fstat(fd, &status) < 0 ||
+        (status.st_mode & 07777) != mode ||
+        pread(fd, copy, sizeof(copy), 0) != (ssize_t)sizeof(copy) ||
+        memcmp(copy, bytes, sizeof(copy)) != 0)
+        goto out;
+    if ((mode & 0111) != 0) {
+        mapping = mmap(NULL, 1, PROT_READ | PROT_EXEC,
+                       MAP_PRIVATE, fd, 0);
+        if (mapping == MAP_FAILED)
+            goto out;
+    }
+    ok = 1;
+
+out:
+    if (mapping != MAP_FAILED)
+        munmap(mapping, 1);
+    if (fd >= 0)
+        close(fd);
+    return ok;
+}
+
+static int gate_vfs_temp_publication(void)
+{
+    static const unsigned char bytes[] = "private-fallback";
+    char directory[PATH_MAX];
+    char renamed_path[PATH_MAX];
+    struct stat renamed_status;
+    int failed_fd;
+    int renamed_length = -1;
+
+    if (!gate_vfs_temp_directory(directory))
+        return 0;
+    renamed_length = snprintf(
+        renamed_path, sizeof(renamed_path), "%s/%s",
+        directory, gate_vfs_temp_renamed_leaf);
+    if (renamed_length <= 0 ||
+        (size_t)renamed_length >= sizeof(renamed_path))
+        goto fail;
+    if (g_page_size == 0) {
+        long page = sysconf(_SC_PAGESIZE);
+
+        if (page <= 0 || (uint64_t)page > SIZE_MAX)
+            goto fail;
+        g_page_size = (size_t)page;
+    }
+    g_vfs_hash_key[0] = UINT64_C(0x79a35b40cf1268ed);
+    g_vfs_hash_key[1] = UINT64_C(0x1c8ef462a73590bd);
+    g_vfs_hash_key_ready = 1;
+    g_vfs_temp_nonce = 0;
+
+    /* Creation needs only write/search permission.  The fallback must not
+     * add an unrelated directory-read requirement when opening its dirfd. */
+    if (chmod(directory, 0300) < 0)
+        goto fail;
+    if (!gate_vfs_temp_one(directory, 0444) ||
+        !gate_vfs_temp_one(directory, 0555))
+        goto fail;
+
+    gate_vfs_temp_seen_stages = 0;
+    gate_vfs_temp_hook_failed = 0;
+    gate_vfs_temp_final_mode = 0444;
+    g_vfs_temp_stage_hook = gate_vfs_temp_stage;
+    g_vfs_temp_forced_unlink_errno = EACCES;
+    g_loader_errno = 0;
+    failed_fd = vfs_serve_bytes_temp_dir(
+        directory, bytes, sizeof(bytes) - 1,
+        O_RDONLY | O_CLOEXEC, 0444);
+    g_vfs_temp_stage_hook = NULL;
+    g_vfs_temp_forced_unlink_errno = 0;
+    if (failed_fd >= 0) {
+        close(failed_fd);
+        goto fail;
+    }
+    if (loader_errno_value() != EACCES || gate_vfs_temp_hook_failed ||
+        gate_vfs_temp_seen_stages !=
+            (1U << VFS_TEMP_GATE_PRIVATE_NAME))
+        goto fail;
+
+    /* Replacing the private pathname immediately before unlink must not make
+     * the original inode public under its renamed alias.  The fallback must
+     * fail before raising permissions and scrub that surviving inode to 000. */
+    gate_vfs_temp_seen_stages = 0;
+    gate_vfs_temp_hook_failed = 0;
+    gate_vfs_temp_final_mode = 0555;
+    gate_vfs_temp_replace_private = 1;
+    g_vfs_temp_stage_hook = gate_vfs_temp_stage;
+    g_loader_errno = 0;
+    failed_fd = vfs_serve_bytes_temp_dir(
+        directory, bytes, sizeof(bytes) - 1,
+        O_RDONLY | O_CLOEXEC, 0555);
+    g_vfs_temp_stage_hook = NULL;
+    gate_vfs_temp_replace_private = 0;
+    if (failed_fd >= 0) {
+        close(failed_fd);
+        goto fail;
+    }
+    if (loader_errno_value() != EIO || gate_vfs_temp_hook_failed ||
+        gate_vfs_temp_seen_stages !=
+            (1U << VFS_TEMP_GATE_PRIVATE_NAME) ||
+        stat(renamed_path, &renamed_status) < 0 ||
+        !vfs_stat_identity_equal(
+            &gate_vfs_temp_renamed_writer_status, &renamed_status) ||
+        renamed_status.st_nlink != 1 ||
+        (renamed_status.st_mode & 07777) != 0 ||
+        unlink(renamed_path) < 0)
+        goto fail;
+    if (chmod(directory, 0700) < 0)
+        goto fail;
+    return rmdir(directory) == 0;
+
+fail:
+    g_vfs_temp_stage_hook = NULL;
+    g_vfs_temp_forced_unlink_errno = 0;
+    gate_vfs_temp_replace_private = 0;
+    if (renamed_length > 0 &&
+        (size_t)renamed_length < sizeof(renamed_path))
+        (void)unlink(renamed_path);
+    (void)chmod(directory, 0700);
+    (void)rmdir(directory);
+    return 0;
+}
+
 int main(void)
 {
     if (!gate_source_contract())
         return 1;
+    if (!gate_executable_probe_cleanup_is_terminal())
+        return 24;
     if (!gate_map_case("clean nonzero-mem_foff file map",
                        GATE_SOURCE_CLEAN, 0, PF_R | PF_W, 0,
                        1, 0, 0, "rw-p"))
@@ -706,6 +1213,16 @@ int main(void)
                        DLFRZ_SOURCE_EXACT_CLEAN_FILE,
                        0, 0, 1, 1, 1, "---p"))
         return 12;
+    if (!gate_map_case("failed MAP_FIXED restores anonymous copy target",
+                       GATE_FILEBACK_MAP_FAILURE,
+                       DLFRZ_SOURCE_EXACT_CLEAN_FILE,
+                       PF_R | PF_W, 0, 1, 1, 0, "rw-p"))
+        return 22;
+    if (!gate_map_case("failed MAP_FIXED restoration fails closed",
+                       GATE_FILEBACK_RESTORE_FAILURE,
+                       DLFRZ_SOURCE_EXACT_CLEAN_FILE,
+                       PF_R | PF_W, 0, 0, 1, 0, NULL))
+        return 23;
     if (!gate_lazy_exact_case("lazy exact fd-independent copy",
                               PF_R | PF_W, "rw-p"))
         return 13;
@@ -713,7 +1230,22 @@ int main(void)
         return 14;
     if (!gate_lazy_exact_case("lazy exact PF_NONE copy", 0, "---p"))
         return 15;
-    if (!gate_fd_lifecycle())
+    if (!gate_mremap_case("fdless mapped-payload transfer", 0, 0,
+                          2, 2, 1, 1))
         return 16;
+    if (!gate_mremap_case("first mremap refusal copies all ranges", EPERM, 1,
+                          1, 0, 0, 0))
+        return 17;
+    if (!gate_mremap_case("later mremap refusal preserves prior transfer",
+                          EPERM, 2, 2, 1, 1, 0))
+        return 18;
+    if (!gate_fd_lifecycle())
+        return 19;
+    if (!gate_map_case("executable PT_GNU_STACK is rejected",
+                       GATE_STACK_EXECUTABLE, 0, PF_R | PF_W, 0,
+                       0, 0, 0, NULL))
+        return 20;
+    if (!gate_vfs_temp_publication())
+        return 21;
     return 0;
 }

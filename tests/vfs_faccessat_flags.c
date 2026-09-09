@@ -107,13 +107,12 @@ static int check_enosys(const char *regular, const char *dangling)
     if (faccessat(AT_FDCWD, regular, F_OK, 0) != 0)
         return 20;
 
-    errno = 0;
-    if (faccessat(AT_FDCWD, regular, R_OK, AT_EACCESS) != -1 ||
-        errno != EOPNOTSUPP)
+    /* On ENOSYS the interposer must delegate to the admitted target libc,
+     * whose compatibility path preserves both effective-ID and nofollow
+     * semantics on the supported glibc and musl runtimes. */
+    if (faccessat(AT_FDCWD, regular, R_OK, AT_EACCESS) != 0)
         return 21;
-    errno = 0;
-    if (faccessat(AT_FDCWD, dangling, F_OK, AT_SYMLINK_NOFOLLOW) != -1 ||
-        errno != EOPNOTSUPP)
+    if (faccessat(AT_FDCWD, dangling, F_OK, AT_SYMLINK_NOFOLLOW) != 0)
         return 22;
     return 0;
 }

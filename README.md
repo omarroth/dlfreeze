@@ -1,12 +1,14 @@
 # dlfreeze
 
-Bundle a dynamically linked 64-bit Linux program, its ELF interpreter, and its
-shared-library dependency graph into one executable.
+Bundle a 64-bit Linux ELF program into one executable.  Dynamically linked
+targets include their ELF interpreter and shared-library dependency graph;
+fully static targets are preserved as a one-entry extraction artifact.
 
-`dlfreeze` provides two runtime strategies: extraction through an ELF
-interpreter (the default) and an experimental in-process loader (`-d`). Dynamic
-libraries and data discovered only at runtime must be traced for
-self-containment; otherwise loading may fail or fall back to files on the host.
+`dlfreeze` prefers its experimental in-process loader by default and retains
+extraction through an ELF interpreter as a compatibility fallback. Use `-x`
+to force extraction instead. Dynamic libraries and data discovered only at
+runtime must be traced for self-containment; otherwise loading may fail or
+fall back to files on the host.
 
 The implementation is application-agnostic. It does not select behavior from
 an executable name or contain Python-, Ruby-, Zig-, or OpenSSL-specific loader
@@ -18,18 +20,29 @@ the strict direct-loader contract is exercised by generic C fixtures.
 | Area | Supported contract |
 |---|---|
 | Architecture | Little-endian ELF64 x86_64 and AArch64; source and target must match |
-| Default extraction | Bundles the interpreter and libraries when no runtime DATA is captured; may use a byte-identical installed interpreter, otherwise invokes the bundled copy |
-| Direct load (`-d`) | Target-validated musl 1.2.2–1.2.6 and admitted glibc 2.34–2.44 shapes with an SSP-disabled static bootstrap capability; static musl and static glibc are the tested bootstrap implementations. Other targets and unvalidated startup entry points use extraction only when the artifact has no captured DATA |
+| Default direct preference | Emits direct-loader metadata for target-validated musl 1.2.2–1.2.6 and admitted glibc 2.34–2.44 shapes with an SSP-disabled static bootstrap capability; static musl and static glibc are the tested bootstrap implementations. Other targets and unvalidated startup entry points retain extraction only when the manifest permits it |
+| Forced extraction (`-x`) | Bundles the interpreter and libraries without direct metadata; may use a byte-identical installed interpreter, otherwise invokes the bundled copy when that loader family has a validated command-line ABI |
+| Dependency-free alternate loaders | An unrecognized `PT_INTERP` is admitted only when both it and the main executable have no `DT_NEEDED` entries. It runs through the kernel and the original byte-identical interpreter pathname; dlfreeze never guesses how to invoke it as a command-line launcher |
+| Fully static targets | ELF images with neither `PT_INTERP` nor `DT_NEEDED` are bundled without a libc-specific runtime contract and executed through the kernel extraction path |
 | `dlopen()` dependencies | Capture with `-t` by exercising relevant paths; uncaptured libraries may use an explicit host-disk fallback |
-| Runtime data | Capture selected paths with `-d -t -f`; captured-file artifacts are direct-only and never use extraction fallback |
+| Runtime data | Capture selected paths with `-t -f`; captured-file artifacts are direct-only and never use extraction fallback |
 
-Extraction is the compatibility path. Direct loading depends on private libc
-details and should be treated as experimental even on the tested runtimes.
+Direct loading is the preferred path, but depends on private libc details and
+should be treated as experimental even on the tested runtimes. Extraction is
+the compatibility path and can be selected explicitly with `-x`.
 Glibc releases older than 2.34 remain recognizable for dependency resolution
 and extraction compatibility, but are not direct-loaded because their private
 rtld/GLRO and x86 CPU-feature layouts predate the validated direct contract.
 AArch64 payloads are aligned for kernels with pages up to 64 KiB, and direct
 mode preserves `AT_PAGESZ`; native non-4-KiB testing is still recommended.
+Portability means running the captured program/runtime on another compatible
+Linux host of the same architecture, not emulating a different CPU or kernel.
+The bundled code's instruction-set and syscall requirements still apply.
+Capture optional library and data paths that the program will need: a host-disk
+fallback is not a guarantee that a foreign host's libraries are ABI-compatible
+with the bundled runtime. Cross-host CI replays the same generic direct
+artifact, including constructor-time cold binding, after removing its source
+library and data files.
 The direct loader enforces segment permissions and GNU RELRO, validates and
 uses both GNU and SysV dynamic symbol hashes, and resolves GNU symbol versions.
 Its admitted-target regression suite covers preinit/init/fini, `atexit`,
@@ -47,6 +60,13 @@ child-side snapshot. A child created by a raw fork syscall while an outer
 loader operation owns that lock must unwind the inherited operation before
 re-entering the loader; an earlier nested re-entry fails closed because raw
 syscalls bypass the registered atfork repair contract.
+Constructors run after graph/TLS publication. They reserve ordinary loader
+operations while releasing the physical namespace lock for lazy symbol
+binding, including first calls and IFUNC result publication from other
+threads. Nested constructors and surviving fork callback stacks retain that
+reservation. This does not make arbitrary cross-thread constructor cycles
+safe: a constructor must still avoid waiting for another thread to finish a
+competing `dlopen()` or other ordinary loader operation.
 Loader-owned errno, finalization, pthread-key, atfork, allocation, and VFS
 fallthrough services bind directly to complete, executable function definitions
 in the structurally selected target libc. Executable or preload interposers
@@ -75,17 +95,27 @@ with `dlerror()` rather than consuming a private loader handle as a native
 `link_map`. A target that reaches glibc's separate private
 `RTLD_DI_SERINFO` hook is terminated with status 127 because its opaque output
 ABI cannot be completed safely.
+Public loader and VFS replacement entry addresses are provider-virtualized for
+`dladdr()` and `dladdr1()`: an exact public entry pointer reports the target
+libc provider identity and a coherent synthetic symbol address. Only the exact
+entry pointer has that semantic identity; other bootstrap PCs report the
+introspection-only direct-loader ELF object which owns their unwind metadata
+and remains outside target symbol lookup.
 The direct loader honors `RTLD_LOCAL`, `RTLD_GLOBAL` promotion, and
 `RTLD_NOLOAD` visibility checks. Musl's `RTLD_LAZY` contract is eager, so it is
-replayed directly. On GNU runtimes, successful `RTLD_LAZY` requests for an
-already-visible object and requests where `RTLD_NOW` takes precedence can be
-replayed directly. A traced pure-lazy request that first loads an object, a
-failed traced loader call, or a startup lazy PLT import which needs native lazy
-binding selects extraction when the manifest permits it; strict/direct-only
-execution refuses it before target code runs. Remaining admitted relocations
-are resolved eagerly. In particular, a resolved GNU IFUNC behind a lazy PLT
-slot may run during direct startup even if the application never calls that
-slot; exact native lazy-binding timing is outside the direct-mode contract.
+replayed directly. On GNU runtimes, admitted startup PLT imports and runtime
+`RTLD_LAZY` loads use the direct loader's architecture-specific lazy resolver.
+This preserves first-call binding and GNU IFUNC timing and once-state for both
+filesystem-loaded objects and traced dormant objects. A later `RTLD_NOW` open
+preflights the complete remaining lazy closure before changing it; a failed
+promotion leaves the existing lazy handle usable, and `RTLD_NOW` takes
+precedence when both binding bits are supplied. Nonstandard PLT/GOT protocols
+fail closed. A NOW promotion which races an in-flight lazy IFUNC on another
+thread also fails coherently instead of waiting while holding the loader lock.
+A failed traced loader call still selects extraction because it supplies no
+successful object identity to replay. A runtime-only early refusal can use the
+explicit supervised fallback described below; ordinary direct execution
+refuses it before target code runs.
 `RTLD_NODELETE` is implicit. Unknown mode bits and `RTLD_DEEPBIND` fail closed.
 Glibc also has a separate private module-loader interface used by facilities
 such as external gconv converters and NSS backends. Direct mode does not create
@@ -198,20 +228,52 @@ fail closed, but the target executable and DSOs do not receive normal
 per-execution ASLR. Do not treat direct-mode artifacts as hardened executables.
 Prelinked objects retain extraction-safe relocation bytes: RELR is replayed at
 runtime, while only explicit-addend, file-backed RELA relative results may be
-persisted. Consequently, prelinked and ordinary clean artifacts can remain
-supervised until application handoff and select extraction after an early
-loader refusal. The supervisor never retries after target resolvers or other
-target code can run. Captured-DATA manifests and exact pathful or otherwise
-unreproducible dynamic-load identities remain direct-only; their loader enters
-in the original process and preserves the caller-assigned PID.
+persisted. Direct artifacts enter the loader in the original process by
+default, preserving the caller-assigned PID and process-associated state which
+survives `execve()` but not `fork()`, including POSIX record-lock ownership.
+Setting `DLFREEZE_SUPERVISED_FALLBACK=1` explicitly opts a clean,
+extraction-representable artifact into a speculative child attempt: an early
+loader refusal may then retry through extraction. This changes process identity
+and leaves inherited POSIX record locks owned by the supervisor rather than the
+application child. `DLFREEZE_NO_FORK=1` overrides that opt-in and also disables
+the bootstrap's disposable startup page-transfer proof; direct mode then uses
+its portable anonymous-copy path without making either optional bootstrap
+`clone`/`wait4` boundary. This setting does not suppress a process-isolated
+probe which a validated target runtime itself requires: GNU x86-64 direct
+startup currently computes the target `ld.so` CPU-feature state in a contained
+clone before invoking target code. Inherited seccomp policies must therefore
+allow that required target-runtime probe or return an ordinary error; a policy
+which kills or traps it cannot be recovered in-process. The supervisor never
+retries after target resolvers or other target code can run.
+Captured-DATA manifests and exact pathful or otherwise unreproducible
+dynamic-load identities remain direct-only and ignore the supervisor opt-in.
+
+For sufficiently large startup images, the existing disposable page-transfer
+probe also checks an optional fork-detection page. When the kernel and
+authenticated procfs confirm `MADV_WIPEONFORK` support, the runtime loader lock
+uses the target's architectural thread pointer for ownership, avoiding a
+`gettid` syscall on ordinary loader and VFS operations. This adds no probe
+process. Small images, unavailable capabilities, and `DLFREEZE_NO_FORK=1`
+retain kernel-TID ownership; the optimization is not required for direct
+loading.
 
 Captured files are served by the direct loader's in-process VFS. Consequently,
-`-f` requires both `-t` and `-d`, and packing fails if the target runtime cannot
-be loaded directly. The bootstrap never converts a captured-file artifact into
-an extraction-mode run. Serving a captured regular file with genuine
-read-only or `O_PATH` descriptor semantics requires reopening its sealed memfd
-through `/proc/self/fd`; the open fails closed if procfs is unavailable rather
-than exposing the writable construction descriptor. An ordinary child program
+`-f` requires `-t`, is incompatible with forced extraction (`-x`), and packing
+fails if the target runtime cannot be loaded directly. The bootstrap never
+converts a captured-file artifact into an extraction-mode run. Serving a
+captured regular file with genuine read-only or `O_PATH` descriptor semantics
+normally reopens its sealed memfd through `/proc/self/fd`. When memfd, sealing,
+or that procfs reopen is unavailable for a recognized capability reason, the
+loader instead creates a collision-resistant file in its immutable startup
+temporary-directory set, reopens and validates an independent descriptor, and
+unlinks the name while its private construction descriptor is still open.
+Executable backing is accepted only after an actual executable mapping probe;
+descriptor or integrity mismatches still fail closed. Captured regular files
+retain their validated mtime and ctime, and libc `stat`, `fstat`, and
+`fstatat(..., AT_EMPTY_PATH)` observe the same immutable metadata across
+loader-interposed descriptor duplication and close operations. As with the
+other captured-file hooks, raw syscalls and `statx` are outside this
+interposition contract. An ordinary child program
 started with `exec` does not
 inherit this VFS: dlfreeze does not materialize captured compiler/linker inputs
 under `/tmp` or inject paths into `LIBRARY_PATH`. Likewise, `/proc/self/exe` is
@@ -270,6 +332,13 @@ target is running and is removed afterward, so extraction mode is not intended
 for targets that daemonize descendants which outlive the target.
 When no byte-identical system interpreter is available, invoking the bundled
 interpreter is necessarily observable through `argv[0]` and `/proc/self/exe`.
+That fallback is limited to recognized loader families. An unrecognized,
+dependency-free interpreter has no generic command-line ABI, so its artifact
+fails closed if the original `PT_INTERP` pathname is missing, non-executable,
+or no longer byte-identical. The runtime compares stable file revisions, but
+Linux resolves the literal interpreter pathname again during `execve()`; a
+writer able to replace that pathname retains the same final pathname race as
+an ordinary execution of the original program.
 Artifacts fail closed when the kernel reports `AT_SECURE` (for example after a
 set-user-ID or set-group-ID transition). Extraction depends on loader
 environment controls that secure execution ignores, and the direct loader does
@@ -292,7 +361,7 @@ Freeze an application while tracing runtime-loaded libraries and selected
 resource files:
 
 ```bash
-./build/dlfreeze -d -t -f '/usr/share/myapp/*' -o myapp.frozen -- myapp --self-test
+./build/dlfreeze -t -f '/usr/share/myapp/*' -o myapp.frozen -- myapp --self-test
 ./myapp.frozen --self-test
 ```
 
@@ -303,24 +372,28 @@ modules used to start a REPL, without any Python-specific loader behavior:
 
 ```bash
 stdlib=$(python3 -I -c 'import sysconfig; print(sysconfig.get_path("stdlib"))')
-./build/dlfreeze -d -t -f "$stdlib/*" -o python-repl.frozen -- python3 -I -q
+./build/dlfreeze -t -f "$stdlib/*" -o python-repl.frozen -- python3 -I -q
 # A trace-time prompt appears here. Exit it after exercising desired paths.
 ./python-repl.frozen -I -q
 ```
 
 ## How it works
 
-1. **Dependency resolution** — BFS walk over `DT_NEEDED` entries, with ABI validation, content-based target-libc identification, bounded GNU legacy/compatibility/version-1.1 cache lookup, exact musl prefix/path-file replacement semantics, and target-specific `$ORIGIN`/`DT_RPATH`/`DT_RUNPATH` ordering. No distribution library directories are guessed; missing or incompatible required libraries, cache misses that require private GNU defaults, and unknown loader search ABIs are fatal.
+1. **Dependency resolution** — For interpreter-bearing targets, a BFS walk over `DT_NEEDED` entries applies ABI validation, content-based target-libc identification, bounded GNU legacy/compatibility/version-1.1 cache lookup, exact musl prefix/path-file replacement semantics, and target-specific `$ORIGIN`/`DT_RPATH`/`DT_RUNPATH` ordering. A fully static target has an empty closure. An unknown interpreter is extraction-only and admitted solely when both it and the main executable have empty `DT_NEEDED` closures, so no unknown search policy is inferred. No distribution library directories are guessed; missing or incompatible required libraries, cache misses that require private GNU defaults, and other unknown loader search ABIs are fatal.
 2. **Dynamic-load tracing** (`-t`) — Runs the program under an `LD_PRELOAD` shim that records successful and failed `dlopen()`/`dlmopen()` calls, including their modes and resolved object identities.
 3. **Packing** — Concatenates the statically-linked bootstrap stub, every collected object (page-aligned), a string table, a manifest, and a 64-byte footer (`DLFREEZ` magic) into a single ELF.
-4. **Runtime — extraction mode (default)** — For artifacts without captured DATA, the bootstrap extracts files to a tmpdir. It uses normal kernel `PT_INTERP` startup when the installed interpreter is byte-identical, otherwise it invokes the bundled interpreter.
-5. **Runtime — direct-load mode** (`-d`) — For admitted glibc 2.34–2.44 and target-validated musl 1.2.2–1.2.6 shapes, the bootstrap invokes an in-process ELF loader that maps segments, resolves relocations, builds runtime state, and serves captured DATA. Unsupported runtimes use extraction only when no DATA was captured.
+4. **Runtime — direct load (default)** — For admitted glibc 2.34–2.44 and target-validated musl 1.2.2–1.2.6 shapes, the bootstrap invokes an in-process ELF loader in the original process; it maps segments, resolves relocations, builds runtime state, and serves captured DATA. An extraction-representable manifest uses early runtime fallback only when `DLFREEZE_SUPERVISED_FALLBACK=1` explicitly enables the speculative supervisor, and never retries after target code runs.
+5. **Runtime — extraction compatibility** (`-x`, a fully static target, or an unsupported default target) — The bootstrap extracts files to a private tmpdir. It executes a static target directly, uses normal kernel `PT_INTERP` startup when the installed interpreter is byte-identical, and otherwise invokes a recognized bundled interpreter. A dependency-free unknown interpreter requires the byte-identical original path and is never invoked through a guessed loader CLI. Captured DATA and path identities which extraction cannot reproduce remain direct-only.
 
 The bootstrap and direct loader are copied into each frozen executable when it
 is packed. Rebuilding `dlfreeze` does not update existing artifacts; regenerate
 an artifact to pick up loader fixes and startup-performance improvements.
 
-Frozen binaries are compatible with UPX and should mostly work with other packing tools: the payload lives in a `PT_LOAD` segment so compressors preserve it, and a `DLFRZLDR` sentinel in `.data` lets the bootstrap find the payload in virtual memory if the footer is no longer at EOF.
+The artifact format exposes a generic mapped-payload ABI for post-link tools:
+the payload lives in a `PT_LOAD` segment, and a `DLFRZLDR` descriptor in
+`.data` lets the bootstrap find it in memory when the footer is no longer at
+EOF. UPX is one tested consumer of that ABI; the runtime does not select a
+code path by compressor name.
 
 ## Usage
 
@@ -329,9 +402,10 @@ dlfreeze [options] [--] <executable> [args...]
 
 Options:
   -o <path>   Output file  (default: <name>.frozen)
-  -d          Request experimental direct-load mode (required with -f)
+  -d          Prefer direct-load mode (the default)
+  -x          Force extraction mode instead of direct loading
   -t          Trace runtime loading by running the program (TTY preserved)
-  -f <glob>   Embed data files matching glob (requires -d -t, repeatable)
+  -f <glob>   Embed data files matching glob (requires -t, repeatable)
   -v          Verbose
   -h          Help
 ```
@@ -344,7 +418,8 @@ semantics.
 
 ## Building
 
-Requires Linux and a compiler capable of producing static executables.
+Requires Linux, a compiler capable of producing static executables, and
+`readelf` or `llvm-readelf` to verify the bootstrap's final GNU properties.
 `musl-gcc` remains preferred for a smaller bootstrap, while a static system
 glibc compiler is supported as well. Automatic `musl-gcc` selection requires
 its target architecture to match `CC`; cross builds can set `STATIC_CC`
@@ -355,7 +430,7 @@ than re-entering bootstrap TLS.
 
 ```bash
 make            # also builds native- and static-bootstrap-ABI preload helpers
-make test       # runs the suite; -d cases are strict (no hidden extraction fallback)
+make test       # runs the suite; direct cases are strict (no hidden extraction fallback)
 make bench      # startup benchmarks (requires perf)
 make clean
 ```

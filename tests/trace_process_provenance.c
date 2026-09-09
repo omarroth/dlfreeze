@@ -8,6 +8,15 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+/* execveat is a Linux syscall but not every libc exposes a public wrapper.
+ * A weak reference lets the same fixture exercise an interposed/native libc
+ * entry point when one exists without making that optional API a link-time
+ * requirement. */
+#if defined(AT_FDCWD)
+extern int execveat(int, const char *, char *const[], char *const[], int)
+    __attribute__((weak));
+#endif
+
 static int load_value(const char *path, int expected)
 {
     void *handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
@@ -124,9 +133,10 @@ int main(int argc, char **argv)
             (errno != EACCES && errno != ENOEXEC))
             return 3;
 #ifdef AT_FDCWD
-        EXPECT_ENOENT(execveat(AT_FDCWD,
-                               "/dlfreeze-no-such-executable",
-                               child_argv, environ, 0));
+        if (execveat)
+            EXPECT_ENOENT(execveat(AT_FDCWD,
+                                   "/dlfreeze-no-such-executable",
+                                   child_argv, environ, 0));
 #endif
 #undef EXPECT_ENOENT
         close(executable);

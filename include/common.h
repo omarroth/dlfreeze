@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 #define DLFRZ_MAGIC    "DLFREEZ"   /* 7 chars + NUL = 8 bytes */
-#define DLFRZ_VERSION  5
+#define DLFRZ_VERSION  6
 
 /* The direct loader uses fixed-capacity startup object state.  The packer
  * must never emit direct metadata whose ELF closure exceeds this contract. */
@@ -25,6 +25,7 @@
 #define DLFRZ_FLAG_DLOPEN_PATHFUL 0x1000 /* exact traced request contains '/'           */
 #define DLFRZ_FLAG_NEEDED_PATHFUL 0x2000 /* manifest name is an exact pathful DT_NEEDED */
 #define DLFRZ_FLAG_DATA_DIRECTORY 0x4000 /* captured directory identity, not a file      */
+#define DLFRZ_FLAG_INTERP_KERNEL_ONLY 0x8000 /* PT_INTERP has no validated launcher ABI  */
 
 /* A traced request is an alias of an ELF object, not a statement about when
  * that object enters the process.  In particular, a startup DT_NEEDED object
@@ -45,7 +46,8 @@ static inline int dlfrz_manifest_entry_flags_canonical(
                                  DLFRZ_FLAG_DATA_NEGATIVE |
                                  DLFRZ_FLAG_DLOPEN_PATHFUL |
                                  DLFRZ_FLAG_NEEDED_PATHFUL |
-                                 DLFRZ_FLAG_DATA_DIRECTORY;
+                                 DLFRZ_FLAG_DATA_DIRECTORY |
+                                 DLFRZ_FLAG_INTERP_KERNEL_ONLY;
     const uint32_t kind = flags & (DLFRZ_FLAG_MAIN_EXE |
                                    DLFRZ_FLAG_INTERP |
                                    DLFRZ_FLAG_SHLIB |
@@ -67,6 +69,8 @@ static inline int dlfrz_manifest_entry_flags_canonical(
             (flags & DLFRZ_FLAG_SHLIB)) &&
            (!(flags & DLFRZ_FLAG_NEEDED_PATHFUL) ||
             (flags & DLFRZ_FLAG_SHLIB)) &&
+           (!(flags & DLFRZ_FLAG_INTERP_KERNEL_ONLY) ||
+            kind == DLFRZ_FLAG_INTERP) &&
            (!data_state || (flags & DLFRZ_FLAG_DATA)) &&
            (!data_state || !(data_state & (data_state - 1))) &&
            (!request || (flags & DLFRZ_FLAG_SHLIB)) &&
@@ -85,7 +89,38 @@ struct dlfrz_entry {
      * main/data entries canonical while separating DSO lookup identity from
      * introspection and $ORIGIN ownership. */
     uint32_t logical_name_offset;
+    /* A regular captured DATA entry retains the exact revision timestamps
+     * which were already admitted by the trace/pack transaction.  The VFS
+     * publishes these through both pathname and descriptor metadata.  Other
+     * entry kinds use the canonical all-zero representation. */
+    int64_t  captured_mtime_sec;
+    int64_t  captured_ctime_sec;
+    uint32_t captured_mtime_nsec;
+    uint32_t captured_ctime_nsec;
 };
+
+#define DLFRZ_MANIFEST_ENTRY_SIZE 56U
+_Static_assert(sizeof(struct dlfrz_entry) == DLFRZ_MANIFEST_ENTRY_SIZE,
+               "frozen manifest entry ABI changed");
+
+static inline int dlfrz_manifest_entry_timestamps_canonical(
+    const struct dlfrz_entry *entry)
+{
+    uint32_t data_state;
+
+    if (!entry)
+        return 0;
+    data_state = entry->flags & (DLFRZ_FLAG_DATA_VIRTUAL |
+                                 DLFRZ_FLAG_DATA_NEGATIVE |
+                                 DLFRZ_FLAG_DATA_DIRECTORY);
+    if ((entry->flags & DLFRZ_FLAG_DATA) != 0 && data_state == 0)
+        return entry->captured_mtime_nsec <= 999999999U &&
+               entry->captured_ctime_nsec <= 999999999U;
+    return entry->captured_mtime_sec == 0 &&
+           entry->captured_ctime_sec == 0 &&
+           entry->captured_mtime_nsec == 0 &&
+           entry->captured_ctime_nsec == 0;
+}
 
 struct dlfrz_footer {
     char     magic[8];
@@ -100,9 +135,9 @@ struct dlfrz_footer {
 /*
  * Loader-info sentinel — lives in the bootstrap's .data section.
  * The packer patches payload_vaddr / payload_filesz after writing the frozen
- * binary.  At runtime the bootstrap checks these fields; when UPX (or a
- * similar tool) has compressed the binary, the footer at EOF may be damaged,
- * but this struct is inside a PT_LOAD segment and survives decompression.
+ * binary.  At runtime the bootstrap checks these fields; when a compressor or
+ * other post-link tool has changed the bytes at EOF, this structure remains
+ * discoverable because it is inside a mapped PT_LOAD segment.
  */
 #define DLFRZ_LOADER_MAGIC "DLFRZLDR"
 

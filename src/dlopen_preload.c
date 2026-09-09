@@ -252,6 +252,8 @@ static void write_file_failure(const char *reason);
 static int write_initial_map_evidence(void);
 static void abandon_trace_collection(const char *reason);
 static void trace_write_failure(void) __attribute__((noreturn));
+static int absolute_link_map_name(const char *name, const char *lookup_cwd,
+                                  char logical[PATH_MAX]);
 
 /* Fork descendants inherit the claimed open file description and contribute
  * explicitly pid-tagged records.  An exec closes it; a newly initialized
@@ -1964,6 +1966,117 @@ out:
     return result;
 }
 
+/* Recover a file-backed loader identity when a libc cannot publish a usable
+ * in-image program-header pointer.  In particular, musl deliberately leaves
+ * dlpi_phdr NULL when the legal ELF program-header table is outside every
+ * PT_LOAD.  A pathname alone is not authority: require its current stat
+ * identity to occur in /proc/self/maps, require every matching mapped path
+ * to name that same regular-file revision, and recheck the caller-visible
+ * name after the scan. */
+static int snapshot_mapped_name(
+    const char *logical, struct mapped_file_identity *identity,
+    char source[PATH_MAX], struct file_trace_snapshot *snapshot)
+{
+    char read_buffer[4096];
+    char line[PATH_MAX + 256];
+    struct file_trace_snapshot initial_snapshot;
+    struct stat initial_status;
+    size_t line_length = 0;
+    int fd = -1;
+    int found = 0;
+    int result = 0;
+
+    if (!logical || logical[0] != '/' || !identity || !source ||
+        !snapshot || raw_fstatat(AT_FDCWD, logical, &initial_status, 0) < 0 ||
+        !S_ISREG(initial_status.st_mode))
+        return 0;
+    identity->device = (uint64_t)initial_status.st_dev;
+    identity->inode = (uint64_t)initial_status.st_ino;
+    file_trace_snapshot_from_stat(&initial_snapshot, &initial_status);
+
+    fd = raw_openat(AT_FDCWD, "/proc/self/maps",
+                    O_RDONLY | O_CLOEXEC | O_NOFOLLOW, 0);
+    if (fd < 0)
+        return 0;
+    for (;;) {
+        ssize_t count;
+
+        do {
+            count = syscall(SYS_read, fd, read_buffer, sizeof(read_buffer));
+        } while (count < 0 && errno == EINTR);
+        if (count < 0)
+            goto out;
+        if (count == 0) {
+            if (line_length != 0)
+                goto out;
+            break;
+        }
+        for (ssize_t index = 0; index < count; index++) {
+            struct mapped_file_identity mapped_identity;
+            char mapped_source[PATH_MAX];
+            const char *cursor;
+            uint64_t start;
+            int mapped;
+
+            if (read_buffer[index] != '\n') {
+                if (line_length + 1 >= sizeof(line))
+                    goto out;
+                line[line_length++] = read_buffer[index];
+                continue;
+            }
+            line[line_length] = '\0';
+            line_length = 0;
+            cursor = line;
+            if (!parse_maps_unsigned(&cursor, 16, '-', &start) ||
+                start > UINTPTR_MAX)
+                goto out;
+            mapped = parse_maps_line_for_address(
+                line, (uintptr_t)start, &mapped_identity,
+                mapped_source, sizeof(mapped_source));
+            if (mapped < 0)
+                goto out;
+            if (mapped == 0 ||
+                mapped_identity.device != identity->device ||
+                mapped_identity.inode != identity->inode)
+                continue;
+            {
+                struct stat mapped_status;
+
+                if (raw_fstatat(AT_FDCWD, mapped_source,
+                                &mapped_status, 0) < 0 ||
+                    !S_ISREG(mapped_status.st_mode) ||
+                    (uint64_t)mapped_status.st_dev != identity->device ||
+                    (uint64_t)mapped_status.st_ino != identity->inode ||
+                    !file_trace_snapshot_matches_stat(
+                        &initial_snapshot, &mapped_status))
+                    goto out;
+            }
+            if (!found) {
+                size_t length;
+
+                if (!bounded_string_length(
+                        mapped_source, sizeof(mapped_source), &length))
+                    goto out;
+                memcpy(source, mapped_source, length + 1);
+                found = 1;
+            }
+        }
+    }
+    if (found) {
+        struct stat final_status;
+
+        if (raw_fstatat(AT_FDCWD, logical, &final_status, 0) < 0 ||
+            !file_trace_snapshot_matches_stat(
+                &initial_snapshot, &final_status))
+            goto out;
+        *snapshot = initial_snapshot;
+        result = 1;
+    }
+out:
+    (void)syscall(SYS_close, fd);
+    return result;
+}
+
 static void mapped_identity_set_free(struct mapped_identity_set *set)
 {
     if (!set)
@@ -2068,8 +2181,25 @@ static int phdr_contains_address(const struct dl_phdr_info *info,
     return 0;
 }
 
+static int dlpi_identity_name(const struct dl_phdr_info *info,
+                              const char *lookup_cwd,
+                              char logical[PATH_MAX])
+{
+    if (!info)
+        return 0;
+    /* The base-namespace main executable has the conventional empty
+     * dlpi_name.  procfs provides its race-resistant kernel-held identity;
+     * snapshot_mapped_name still requires that identity in the map table. */
+    if (!info->dlpi_name || !info->dlpi_name[0]) {
+        memcpy(logical, "/proc/self/exe", sizeof("/proc/self/exe"));
+        return 1;
+    }
+    return absolute_link_map_name(info->dlpi_name, lookup_cwd, logical);
+}
+
 struct capture_mapped_set_context {
     struct mapped_identity_set *set;
+    const char *lookup_cwd;
     int failed;
 };
 
@@ -2078,12 +2208,24 @@ static int capture_mapped_set_callback(struct dl_phdr_info *info, size_t size,
 {
     struct capture_mapped_set_context *context = opaque;
     struct mapped_file_identity identity;
+    struct file_trace_snapshot snapshot;
+    char logical[PATH_MAX];
     char path[PATH_MAX];
+    uintptr_t address;
     int mapped;
 
     (void)size;
-    mapped = mapped_identity_for_address(
-        phdr_probe_address(info), &identity, path, sizeof(path));
+    address = phdr_probe_address(info);
+    if (address) {
+        mapped = mapped_identity_for_address(
+            address, &identity, path, sizeof(path));
+    } else if (dlpi_identity_name(info, context->lookup_cwd, logical) &&
+               snapshot_mapped_name(
+                   logical, &identity, path, &snapshot)) {
+        mapped = 1;
+    } else {
+        mapped = -1;
+    }
     if (mapped < 0) {
         context->failed = 1;
         return 1;
@@ -2095,9 +2237,10 @@ static int capture_mapped_set_callback(struct dl_phdr_info *info, size_t size,
     return 0;
 }
 
-static int capture_mapped_identity_set(struct mapped_identity_set *set)
+static int capture_mapped_identity_set(struct mapped_identity_set *set,
+                                       const char *lookup_cwd)
 {
-    struct capture_mapped_set_context context = {set, 0};
+    struct capture_mapped_set_context context = {set, lookup_cwd, 0};
 
     if (!set)
         return 0;
@@ -2409,6 +2552,7 @@ static int initial_evidence_callback(struct dl_phdr_info *info, size_t size,
     struct initial_evidence_context *context = opaque;
     struct mapped_file_identity identity;
     struct file_trace_snapshot snapshot;
+    char logical[PATH_MAX];
     char source[PATH_MAX];
     uintptr_t address = phdr_probe_address(info);
     int mapped;
@@ -2420,12 +2564,21 @@ static int initial_evidence_callback(struct dl_phdr_info *info, size_t size,
     if (phdr_contains_address(
             info, (uintptr_t)(void *)&write_initial_map_evidence))
         return 0;
-    mapped = mapped_identity_for_address(
-        address, &identity, source, sizeof(source));
+    if (address) {
+        mapped = mapped_identity_for_address(
+            address, &identity, source, sizeof(source));
+    } else if (dlpi_identity_name(info, NULL, logical) &&
+               snapshot_mapped_name(
+                   logical, &identity, source, &snapshot)) {
+        mapped = 1;
+    } else {
+        mapped = -1;
+    }
     if (mapped == 0)
         return 0;
-    if (mapped < 0 || !snapshot_mapped_address(
-                          address, &identity, source, &snapshot)) {
+    if (mapped < 0 ||
+        (address && !snapshot_mapped_address(
+                        address, &identity, source, &snapshot))) {
         context->failed = 1;
         return 1;
     }
@@ -2932,11 +3085,22 @@ static int write_new_base_evidence_callback(
     char logical[PATH_MAX];
     char source[PATH_MAX];
     uintptr_t address = phdr_probe_address(info);
+    int snapshotted = 0;
     int mapped;
 
     (void)size;
-    mapped = mapped_identity_for_address(
-        address, &identity, source, sizeof(source));
+    if (address) {
+        mapped = mapped_identity_for_address(
+            address, &identity, source, sizeof(source));
+    } else if (dlpi_identity_name(
+                   info, context->lookup_cwd, logical) &&
+               snapshot_mapped_name(
+                   logical, &identity, source, &snapshot)) {
+        mapped = 1;
+        snapshotted = 1;
+    } else {
+        mapped = -1;
+    }
     if (mapped == 0)
         return 0;
     if (mapped < 0) {
@@ -2947,13 +3111,12 @@ static int write_new_base_evidence_callback(
          identity.inode == context->root_identity->inode) ||
         mapped_identity_set_contains(context->before, &identity))
         return 0;
-    if (!snapshot_mapped_address(
-            address, &identity, source, &snapshot)) {
+    if (!snapshotted && !snapshot_mapped_address(
+                            address, &identity, source, &snapshot)) {
         context->failed = 1;
         return 1;
     }
-    if (!absolute_link_map_name(
-            info->dlpi_name, context->lookup_cwd, logical))
+    if (!dlpi_identity_name(info, context->lookup_cwd, logical))
         memcpy(logical, source, strlen(source) + 1);
     write_mapped_object_record(
         'R', context->attempt, logical, source, &snapshot);
@@ -3341,7 +3504,7 @@ void *dlopen(const char *filename, int flags)
         int saved_errno = errno;
 
         g_trace_depth++;
-        baseline_valid = capture_mapped_identity_set(&before);
+        baseline_valid = capture_mapped_identity_set(&before, lookup_cwd);
         g_trace_depth--;
         errno = saved_errno;
     }
@@ -3460,7 +3623,7 @@ void *dlmopen(Lmid_t namespace_id, const char *filename, int flags)
         int saved_errno = errno;
 
         g_trace_depth++;
-        baseline_valid = capture_mapped_identity_set(&before);
+        baseline_valid = capture_mapped_identity_set(&before, lookup_cwd);
         g_trace_depth--;
         errno = saved_errno;
     }
@@ -4565,7 +4728,9 @@ static void fallback_closefrom(unsigned int first, int preserve_trace_fds)
     size_t retained_count = 0;
     int directory_fd;
     int enumeration_failed = 0;
+#if defined(SYS_close_range)
     int made_call = 0;
+#endif
 
     if (preserve_trace_fds) {
         trace_fd_state_lock();

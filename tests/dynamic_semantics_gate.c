@@ -47,6 +47,17 @@ int main(void)
         UINT64_C(0x6ffffef6), /* DT_TLSDESC_PLT */
         UINT64_C(0x6ffffef7), /* DT_TLSDESC_GOT */
         UINT64_C(0x6abc1234), /* Unassigned OS/vendor tag */
+#if defined(__x86_64__)
+        /* The first two AArch64 numeric assignments are valid x86-64 PLT
+         * metadata.  Architecture scoping must win over the shared number. */
+        DLFRZ_DT_AARCH64_BTI_PLT,
+        DLFRZ_DT_AARCH64_PAC_PLT,
+#elif defined(__aarch64__)
+        /* These AArch64 tags describe compatible PLT shape/calling
+         * convention and do not themselves request a missing transition. */
+        DLFRZ_DT_AARCH64_BTI_PLT,
+        DLFRZ_DT_AARCH64_VARIANT_PCS,
+#endif
     };
 
     for (size_t i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); i++) {
@@ -67,6 +78,38 @@ int main(void)
             return 1;
         }
     }
+
+#if defined(__aarch64__)
+    {
+        static const uint64_t presence_unsupported[] = {
+            DLFRZ_DT_AARCH64_PAC_PLT,
+            DLFRZ_DT_AARCH64_AUTH_SYM,
+            DLFRZ_DT_AARCH64_MEMTAG_MODE,
+            DLFRZ_DT_AARCH64_MEMTAG_HEAP,
+            DLFRZ_DT_AARCH64_MEMTAG_STACK,
+            DLFRZ_DT_AARCH64_MEMTAG_GLOBALS,
+            DLFRZ_DT_AARCH64_MEMTAG_GLOBALSSZ,
+            DLFRZ_DT_AARCH64_AUTH_RELRSZ,
+            DLFRZ_DT_AARCH64_AUTH_RELR,
+            DLFRZ_DT_AARCH64_AUTH_RELRENT,
+        };
+
+        for (size_t i = 0;
+             i < sizeof(presence_unsupported) /
+                     sizeof(presence_unsupported[0]);
+             i++) {
+            if (!dlfrz_dynamic_tag_requires_unsupported_semantics(
+                    (int64_t)presence_unsupported[i], 0) ||
+                !dlfrz_dynamic_tag_requires_unsupported_semantics(
+                    (int64_t)presence_unsupported[i], UINT64_MAX)) {
+                fprintf(stderr,
+                        "bad presence-tag classification: 0x%llx\n",
+                        (unsigned long long)presence_unsupported[i]);
+                return 1;
+            }
+        }
+    }
+#endif
 
     {
         const uint64_t supported_flags =

@@ -441,10 +441,18 @@ static int patch_tunable_accessor(uint8_t *elf, size_t elf_size, int mode)
 
 static int patch_rtld_global_size(uint8_t *elf, size_t elf_size)
 {
+    struct dlfrz_glibc_rtld_identity original_identity;
     Elf64_Ehdr *ehdr;
     Elf64_Shdr *shdrs;
 
-    if (elf_size < sizeof(Elf64_Ehdr))
+    if (!dlfrz_glibc_rtld_identity(
+            elf, elf_size, &original_identity) ||
+        dlfrz_glibc_layout_lookup(
+            original_identity.machine,
+            original_identity.global_ro_size,
+            original_identity.global_size) ==
+            DLFRZ_GLIBC_LAYOUT_UNKNOWN ||
+        elf_size < sizeof(Elf64_Ehdr))
         return -1;
     ehdr = (Elf64_Ehdr *)elf;
     if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0 ||
@@ -493,8 +501,43 @@ static int patch_rtld_global_size(uint8_t *elf, size_t elf_size)
             if (remain > sizeof("_rtld_global") - 1 &&
                 memcmp(name, "_rtld_global", sizeof("_rtld_global") - 1) == 0 &&
                 name[sizeof("_rtld_global") - 1] == '\0') {
-                syms[j].st_size += 16;
-                return 0;
+                uint64_t original_size = syms[j].st_size;
+
+                if (original_size != original_identity.global_size)
+                    return -1;
+                /* Public symbol extents can have exact, validated aliases
+                 * for one private layout.  Select and prove an actually
+                 * unadmitted extent instead of assuming a fixed delta is
+                 * unknown on every distribution build. */
+                for (uint64_t delta = 1; delta <= UINT64_C(4096);
+                     delta++) {
+                    struct dlfrz_glibc_rtld_identity mutated_identity;
+                    uint64_t candidate;
+
+                    if (original_size > UINT64_MAX - delta)
+                        break;
+                    candidate = original_size + delta;
+                    syms[j].st_size = candidate;
+                    if (dlfrz_glibc_rtld_identity(
+                            elf, elf_size, &mutated_identity) &&
+                        mutated_identity.machine ==
+                            original_identity.machine &&
+                        mutated_identity.global_ro_vaddr ==
+                            original_identity.global_ro_vaddr &&
+                        mutated_identity.global_ro_size ==
+                            original_identity.global_ro_size &&
+                        mutated_identity.global_vaddr ==
+                            original_identity.global_vaddr &&
+                        mutated_identity.global_size == candidate &&
+                        dlfrz_glibc_layout_lookup(
+                            mutated_identity.machine,
+                            mutated_identity.global_ro_size,
+                            mutated_identity.global_size) ==
+                            DLFRZ_GLIBC_LAYOUT_UNKNOWN)
+                        return 0;
+                }
+                syms[j].st_size = original_size;
+                return -1;
             }
         }
     }
@@ -3028,6 +3071,142 @@ static int dlfcn_internal_members_selftest(void)
     return 1;
 }
 
+static uint64_t dlfcn_internal_fuzz_next(uint64_t *state)
+{
+    uint64_t value = *state;
+
+    value ^= value << 13;
+    value ^= value >> 7;
+    value ^= value << 17;
+    *state = value;
+    return value;
+}
+
+/* Differentially pin the reverse-anchored hidden-member scan to the four
+ * deliberately simple single-slot reference traversals.  Random surrounding
+ * bytes exercise false anchors; alternating SIB/non-SIB hook loads covers
+ * both x86 displacement positions, and 0x8888 makes consecutive displacement
+ * bytes equal so one instruction cannot be counted twice. */
+static int dlfcn_internal_members_differential_selftest(void)
+{
+    enum { IMAGE_SIZE = 1536 };
+    unsigned char x86[IMAGE_SIZE];
+    uint32_t aarch64[IMAGE_SIZE / sizeof(uint32_t)];
+    size_t matches[DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U];
+    size_t hooks[DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U];
+    size_t slots[DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U];
+    uint64_t random = UINT64_C(0x68f2214b1a36c975);
+
+    for (unsigned int iteration = 0; iteration < 256U; iteration++) {
+        const uint64_t code_vaddr = UINT64_C(0x1000);
+        const uint64_t glro_got_vaddr = UINT64_C(0x2000);
+        size_t root = 32U +
+            (size_t)(dlfcn_internal_fuzz_next(&random) % 128U);
+        size_t hook = root + 7U;
+        int hook_offset = (iteration & 7U) == 0 ? 0x8888 : 904;
+        int32_t root_displacement = (int32_t)(
+            glro_got_vaddr - (code_vaddr + root + 7U));
+        size_t cursor;
+
+        for (size_t i = 0; i < sizeof(x86); i++)
+            x86[i] = (unsigned char)dlfcn_internal_fuzz_next(&random);
+        x86[root] = 0x48;
+        x86[root + 1U] = 0x8b;
+        x86[root + 2U] = 0x05;
+        memcpy(x86 + root + 3U, &root_displacement,
+               sizeof(root_displacement));
+        x86[hook] = 0x48;
+        x86[hook + 1U] = 0x8b;
+        if (iteration & 1U) {
+            x86[hook + 2U] = 0x84;
+            x86[hook + 3U] = 0x20;
+            memcpy(x86 + hook + 4U, &hook_offset,
+                   sizeof(int32_t));
+            cursor = hook + 8U;
+        } else {
+            x86[hook + 2U] = 0x80;
+            memcpy(x86 + hook + 3U, &hook_offset,
+                   sizeof(int32_t));
+            cursor = hook + 7U;
+        }
+        for (unsigned int internal = 0;
+             internal < DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U;
+             internal++) {
+            int32_t slot_displacement =
+                (int32_t)((9U + internal) * sizeof(uint64_t));
+
+            x86[cursor] = 0xff;
+            x86[cursor + 1U] = 0x90;
+            memcpy(x86 + cursor + 2U, &slot_displacement,
+                   sizeof(slot_displacement));
+            cursor += 6U;
+        }
+        if (!dlfrz_glibc_x86_dlfcn_internal_matches(
+                x86, sizeof(x86), code_vaddr, glro_got_vaddr,
+                hook_offset, matches, hooks, slots))
+            return 0;
+        for (unsigned int internal = 0;
+             internal < DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U;
+             internal++) {
+            size_t expected_hook = SIZE_MAX;
+            size_t expected_slot = SIZE_MAX;
+            size_t expected = dlfrz_glibc_x86_dlfcn_member_matches(
+                x86, sizeof(x86), code_vaddr, glro_got_vaddr,
+                hook_offset, 9U + internal, 1024U,
+                &expected_hook, &expected_slot);
+
+            if (matches[internal] != expected ||
+                (expected == 1U &&
+                 (hooks[internal] != expected_hook ||
+                  slots[internal] != expected_slot)))
+                return 0;
+        }
+
+        for (size_t i = 0;
+             i < sizeof(aarch64) / sizeof(aarch64[0]); i++)
+            aarch64[i] =
+                (uint32_t)dlfcn_internal_fuzz_next(&random);
+        root = 32U + 4U *
+            (size_t)(dlfcn_internal_fuzz_next(&random) % 32U);
+        hook = root + 2U * sizeof(uint32_t);
+        aarch64[root / sizeof(uint32_t)] = UINT32_C(0xb0000000);
+        aarch64[root / sizeof(uint32_t) + 1U] =
+            UINT32_C(0xf9400002);
+        aarch64[root / sizeof(uint32_t) + 2U] =
+            UINT32_C(0xf941c443);
+        cursor = root / sizeof(uint32_t) + 3U;
+        for (unsigned int internal = 0;
+             internal < DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U;
+             internal++) {
+            aarch64[cursor++] = UINT32_C(0xf9400061) |
+                ((UINT32_C(9) + internal) << 10);
+            aarch64[cursor++] = UINT32_C(0xd63f0020);
+        }
+        if (!dlfrz_glibc_aarch64_dlfcn_internal_matches(
+                (const unsigned char *)aarch64, sizeof(aarch64),
+                code_vaddr, glro_got_vaddr, 904,
+                matches, hooks, slots))
+            return 0;
+        for (unsigned int internal = 0;
+             internal < DLFRZ_GLIBC_DLFCN_HOOK_SLOTS - 9U;
+             internal++) {
+            size_t expected_hook = SIZE_MAX;
+            size_t expected_slot = SIZE_MAX;
+            size_t expected = dlfrz_glibc_aarch64_dlfcn_member_matches(
+                (const unsigned char *)aarch64, sizeof(aarch64),
+                code_vaddr, glro_got_vaddr, 904, 9U + internal, 1024U,
+                &expected_hook, &expected_slot);
+
+            if (matches[internal] != expected ||
+                (expected == 1U &&
+                 (hooks[internal] != expected_hook ||
+                  slots[internal] != expected_slot)))
+                return 0;
+        }
+    }
+    return 1;
+}
+
 static int dlfcn_public_name_inventory_selftest(void)
 {
     static const unsigned char strings[] =
@@ -4172,6 +4351,7 @@ static int selftest(void)
         !dlfcn_consumer_sequence_selftest() ||
         !dlfcn_member_slot_selftest() ||
         !dlfcn_internal_members_selftest() ||
+        !dlfcn_internal_members_differential_selftest() ||
         !dlfcn_public_name_inventory_selftest() ||
         !x86_cpu_layout_profile_selftest() ||
         !x86_rip_write_width_selftest() ||
@@ -4215,6 +4395,10 @@ static int selftest(void)
         dlfrz_glibc_layout_lookup(EM_AARCH64, 400, 2272) !=
             DLFRZ_GLIBC_AARCH64_2_43 ||
         dlfrz_glibc_layout_lookup(EM_AARCH64, 400, 2288) !=
+            DLFRZ_GLIBC_AARCH64_2_44 ||
+        dlfrz_glibc_layout_lookup(EM_AARCH64, 400, 2287) !=
+            DLFRZ_GLIBC_LAYOUT_UNKNOWN ||
+        dlfrz_glibc_layout_lookup(EM_AARCH64, 400, 2289) !=
             DLFRZ_GLIBC_LAYOUT_UNKNOWN ||
         dlfrz_glibc_stable_release_minor(stable, sizeof(stable) - 1) != 43 ||
         dlfrz_glibc_stable_release_minor(development,
@@ -4267,6 +4451,12 @@ static int selftest(void)
             DLFRZ_GLIBC_X86_2_44, 43) ||
         dlfrz_glibc_layout_release_is_supported(
             DLFRZ_GLIBC_X86_2_44, 45) ||
+        !dlfrz_glibc_layout_release_is_supported(
+            DLFRZ_GLIBC_AARCH64_2_44, 44) ||
+        dlfrz_glibc_layout_release_is_supported(
+            DLFRZ_GLIBC_AARCH64_2_44, 43) ||
+        dlfrz_glibc_layout_release_is_supported(
+            DLFRZ_GLIBC_AARCH64_2_44, 45) ||
         dlfrz_glibc_legacy_rtld_active_offset(
             DLFRZ_GLIBC_X86_2_34, 34) != 736 ||
         dlfrz_glibc_legacy_rtld_active_offset(
@@ -4298,6 +4488,8 @@ static int selftest(void)
         dlfrz_glibc_dlfcn_hook_offset(
             DLFRZ_GLIBC_AARCH64_2_41, 41) != 680 ||
         dlfrz_glibc_dlfcn_hook_offset(
+            DLFRZ_GLIBC_AARCH64_2_44, 44) != 376 ||
+        dlfrz_glibc_dlfcn_hook_offset(
             DLFRZ_GLIBC_X86_2_29, 33) != -1 ||
         dlfrz_glibc_dlfcn_hook_offset(
             DLFRZ_GLIBC_X86_2_40, 44) != -1 ||
@@ -4313,12 +4505,16 @@ static int selftest(void)
             DLFRZ_GLIBC_AARCH64_2_35, 36) != 656 ||
         dlfrz_glibc_find_object_offset(
             DLFRZ_GLIBC_AARCH64_2_35_LARGE, 35) != 664 ||
+        dlfrz_glibc_find_object_offset(
+            DLFRZ_GLIBC_AARCH64_2_44, 44) != 360 ||
         dlfrz_glibc_direct_thread_layout_is_supported(
             DLFRZ_GLIBC_AARCH64_2_31) ||
         !dlfrz_glibc_direct_thread_layout_is_supported(
             DLFRZ_GLIBC_AARCH64_2_35) ||
         !dlfrz_glibc_direct_thread_layout_is_supported(
             DLFRZ_GLIBC_AARCH64_2_41) ||
+        !dlfrz_glibc_direct_thread_layout_is_supported(
+            DLFRZ_GLIBC_AARCH64_2_44) ||
         dlfrz_glibc_direct_thread_layout_is_supported(
             DLFRZ_GLIBC_AARCH64_2_27) ||
         dlfrz_glibc_direct_thread_layout_is_supported(
@@ -4346,6 +4542,9 @@ static int selftest(void)
         !dlfrz_glibc_glro_reloc_profile_matches(
             DLFRZ_GLIBC_AARCH64_2_41,
             600, 608, 624, 632, 640, 648) ||
+        !dlfrz_glibc_glro_reloc_profile_matches(
+            DLFRZ_GLIBC_AARCH64_2_44,
+            288, 296, 312, 320, 328, 336) ||
         !dlfrz_glibc_glro_reloc_profile_matches(
             DLFRZ_GLIBC_X86_2_44,
             816, 824, 840, 848, 856, 864) ||

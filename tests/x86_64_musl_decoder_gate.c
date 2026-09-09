@@ -16,10 +16,13 @@ enum {
     INIT_OFF = 0x400,
     INIT_TLS_OFF = 0x1000,
     INIT_SSP_OFF = 0x1200,
+    INIT_SSP_CALL_OFF = 0x1400,
     COPY_TLS_OFF = 0x1800,
+    CLONE_OFF = 0x1c00,
     CREATE_OFF = 0x2000,
     EXIT_OFF = 0x2800,
     LIBC_OFF = 0x3000,
+    THREAD_LIST_LOCK_OFF = 0x3200,
     GUARD_GOT_OFF = 0x3080,
     DYNSYM_OFF = 0x3800,
     DYNSTR_OFF = 0x3900,
@@ -116,6 +119,7 @@ static void build_init_contract(void)
     uint8_t *init = image + INIT_OFF;
     uint8_t *ssp = image + INIT_SSP_OFF;
 
+    memset(ssp, 0x90, 160);
     set_rel32(start, (uintptr_t)(image + INIT_OFF));
     start[5] = 0xc3;
     set_rel32(init + 16, (uintptr_t)(image + INIT_TLS_OFF));
@@ -128,6 +132,95 @@ static void build_init_contract(void)
     memcpy(ssp + 14, "\x64\x48\x8b\x04\x25\0\0\0\0", 9);
     memcpy(ssp + 23, "\x48\x89\x50\x28", 4);
     ssp[27] = 0xc3;
+}
+
+static void build_old_init_contract(void)
+{
+    uint8_t *ssp = image + INIT_SSP_OFF;
+    uint32_t multiplier = UINT32_C(1103515245);
+
+    build_init_contract();
+    memset(ssp, 0x90, 160);
+    memcpy(ssp, "\x48\x8b\x1d\0\0\0\0", 7); /* guard GOT -> rbx */
+    set_rip_disp32(ssp, 7, (uintptr_t)(image + GUARD_GOT_OFF));
+    memcpy(ssp + 7, "\x48\x69\xc3", 3);       /* guard * fallback */
+    memcpy(ssp + 10, &multiplier, sizeof(multiplier));
+    memcpy(ssp + 14, "\x48\x89\x03", 3);     /* fallback -> guard */
+    memcpy(ssp + 17, "\x48\x8b\x13", 3);     /* value = *guard */
+    memcpy(ssp + 20, "\x64\x48\x8b\x04\x25\0\0\0\0", 9);
+    memcpy(ssp + 29, "\x48\x89\x50\x28", 4);
+    ssp[33] = 0xc3;
+}
+
+/* Alpine's GCC-built musl 1.2.5 keeps the relocation-proven guard address
+ * in callee-saved RBX across memcpy instead of spilling it to the stack. */
+static void build_live_call_init_contract(void)
+{
+    uint8_t *ssp = image + INIT_SSP_OFF;
+
+    build_init_contract();
+    memset(ssp, 0x90, 160);
+    memcpy(ssp, "\x48\x8b\x1d\0\0\0\0", 7); /* guard GOT -> rbx */
+    set_rip_disp32(ssp, 7, (uintptr_t)(image + GUARD_GOT_OFF));
+    memcpy(ssp + 7, "\x48\x89\xfe", 3);       /* rdi -> rsi */
+    memcpy(ssp + 10, "\xba\x08\0\0\0", 5);  /* copy eight bytes */
+    memcpy(ssp + 15, "\x48\x89\xdf", 3);     /* guard -> rdi */
+    set_rel32(ssp + 18, (uintptr_t)(image + INIT_SSP_CALL_OFF));
+    memcpy(ssp + 23, "\xc6\x43\x01\0", 4);  /* guard[1] = 0 */
+    memcpy(ssp + 27, "\x48\x8b\x13", 3);     /* value = *guard */
+    memcpy(ssp + 30, "\x64\x48\x8b\x04\x25\0\0\0\0", 9);
+    memcpy(ssp + 39, "\x48\x89\x50\x28", 4);
+    ssp[43] = 0xc3;
+    image[INIT_SSP_CALL_OFF] = 0xc3;
+}
+
+static void build_branched_old_init_contract(void)
+{
+    uint8_t *ssp = image + INIT_SSP_OFF;
+    uint32_t multiplier = UINT32_C(1103515245);
+
+    build_init_contract();
+    memset(ssp, 0x90, 160);
+    memcpy(ssp, "\x48\x85\xff\x53", 4);      /* test entropy; push rbx */
+    memcpy(ssp + 4, "\x48\x8b\x1d\0\0\0\0", 7);
+    set_rip_disp32(ssp + 4, 7,
+                   (uintptr_t)(image + GUARD_GOT_OFF));
+    memcpy(ssp + 11, "\x74\x12", 2);         /* fallback at +31 */
+    memcpy(ssp + 13, "\x48\x89\xfe", 3);    /* entropy -> source */
+    memcpy(ssp + 16, "\xba\x08\0\0\0", 5);
+    memcpy(ssp + 21, "\x48\x89\xdf", 3);    /* guard -> destination */
+    set_rel32(ssp + 24, (uintptr_t)(image + INIT_SSP_CALL_OFF));
+    memcpy(ssp + 29, "\xeb\x0a", 2);         /* common copy at +41 */
+    memcpy(ssp + 31, "\x48\x69\xc3", 3);
+    memcpy(ssp + 34, &multiplier, sizeof(multiplier));
+    memcpy(ssp + 38, "\x48\x89\x03", 3);
+    memcpy(ssp + 41, "\x48\x8b\x13", 3);
+    memcpy(ssp + 44, "\x64\x48\x8b\x04\x25\0\0\0\0", 9);
+    memcpy(ssp + 53, "\x48\x89\x50\x28", 4);
+    memcpy(ssp + 57, "\x5b\xc3", 2);
+    image[INIT_SSP_CALL_OFF] = 0xc3;
+}
+
+static void build_frame_spill_init_contract(void)
+{
+    uint8_t *ssp = image + INIT_SSP_OFF;
+
+    build_init_contract();
+    memset(ssp, 0x90, 160);
+    memcpy(ssp, "\x55\x48\x89\xe5\x48\x83\xec\x10", 8);
+    memcpy(ssp + 8, "\x48\x85\xff\x74\x3b", 5);
+    memcpy(ssp + 13, "\x48\x8b\x0d\0\0\0\0", 7);
+    set_rip_disp32(ssp + 13, 7,
+                   (uintptr_t)(image + GUARD_GOT_OFF));
+    memcpy(ssp + 20, "\x48\x89\xfe\xba\x08\0\0\0", 8);
+    memcpy(ssp + 28, "\x48\x89\x4d\xf8\x48\x89\xcf\x67", 8);
+    set_rel32(ssp + 36, (uintptr_t)(image + INIT_SSP_CALL_OFF));
+    memcpy(ssp + 41, "\x48\x8b\x4d\xf8\xc6\x41\x01\0", 8);
+    memcpy(ssp + 49, "\x48\x8b\x11", 3);
+    memcpy(ssp + 52, "\x64\x48\x8b\x04\x25\0\0\0\0", 9);
+    memcpy(ssp + 61, "\x48\x89\x50\x28\xc9\xc3", 6);
+    ssp[72] = 0xc3;
+    image[INIT_SSP_CALL_OFF] = 0xc3;
 }
 
 static int test_init_contract(void)
@@ -160,6 +253,33 @@ static int test_init_contract(void)
         return 0;
     image[INIT_SSP_OFF + 9] = saved;
 
+    /* The clear must execute before the guard value is loaded.  A decoder
+     * that merely collects both instructions from the function would admit
+     * this reordered stream and install the uncleared value in the TCB. */
+    build_init_contract();
+    memset(image + INIT_SSP_OFF + 7, 0x90, 4);
+    memcpy(image + INIT_SSP_OFF + 28, "\xc6\x41\x01\0", 4);
+    image[INIT_SSP_OFF + 32] = 0xc3;
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0;
+
+    /* Register provenance and basic-block reachability are part of the
+     * contract as well: neither a clobber nor a branch may separate the
+     * clear from the value load. */
+    build_init_contract();
+    memmove(image + INIT_SSP_OFF + 14,
+            image + INIT_SSP_OFF + 11, 17);
+    memcpy(image + INIT_SSP_OFF + 11, "\x48\x31\xc9", 3);
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0;
+    build_init_contract();
+    memmove(image + INIT_SSP_OFF + 13,
+            image + INIT_SSP_OFF + 11, 17);
+    memcpy(image + INIT_SSP_OFF + 11, "\xeb\0", 2);
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0;
+    build_init_contract();
+
     guard_relocation.r_info = ELF64_R_INFO(1, ARCH_RELOC_GLOB_DAT);
     if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
         return 0;
@@ -175,6 +295,196 @@ static int test_init_contract(void)
     if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
         return 0;
     phdr.p_filesz = sizeof(image);
+
+    build_old_init_contract();
+    if (!decode_x86_64_musl_init_libc(&obj, &decoded, &canary) ||
+        decoded != (uintptr_t)(image + INIT_OFF) || canary != 40)
+        return 0;
+
+    saved = image[INIT_SSP_OFF + 10];
+    image[INIT_SSP_OFF + 10] ^= 1; /* wrong fallback multiplier */
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0;
+    image[INIT_SSP_OFF + 10] = saved;
+
+    saved = image[INIT_SSP_OFF + 16];
+    image[INIT_SSP_OFF + 16] = 0x0b; /* fallback stored elsewhere */
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0;
+    image[INIT_SSP_OFF + 16] = saved;
+
+    saved = image[INIT_SSP_OFF + 31];
+    image[INIT_SSP_OFF + 31] = 0x48; /* TCB store has wrong source */
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0;
+    image[INIT_SSP_OFF + 31] = saved;
+
+    /* Two reachable stores with incompatible offsets remain ambiguous. */
+    memcpy(image + INIT_SSP_OFF + 33, "\x48\x89\x50\x30", 4);
+    image[INIT_SSP_OFF + 37] = 0xc3;
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0; /* conflicting canary offsets are ambiguous */
+    image[INIT_SSP_OFF + 33] = 0xc3;
+    memset(image + INIT_SSP_OFF + 34, 0x90, 4);
+
+    build_live_call_init_contract();
+    if (!decode_x86_64_musl_init_libc(&obj, &decoded, &canary) ||
+        decoded != (uintptr_t)(image + INIT_OFF) || canary != 40)
+        return 0;
+
+    /* A call cannot preserve a guard address held in a volatile register. */
+    image[INIT_SSP_OFF + 2] = 0x0d;  /* guard GOT -> rcx */
+    image[INIT_SSP_OFF + 17] = 0xcf; /* rcx -> rdi */
+    image[INIT_SSP_OFF + 24] = 0x41; /* guard[1] via rcx */
+    image[INIT_SSP_OFF + 29] = 0x11; /* value via rcx */
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0;
+
+    /* An explicit write to the otherwise callee-saved guard is fatal. */
+    build_live_call_init_contract();
+    memcpy(image + INIT_SSP_OFF + 7, "\x48\x89\xfb", 3);
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0;
+
+    /* Indirect calls provide no target provenance. */
+    build_live_call_init_contract();
+    memcpy(image + INIT_SSP_OFF + 18, "\xff\xd0\x90\x90\x90", 5);
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0;
+
+    /* Nor may the direct target escape the validated libc mapping. */
+    build_live_call_init_contract();
+    set_rel32(image + INIT_SSP_OFF + 18,
+              (uintptr_t)image + IMAGE_SIZE + 0x100);
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0;
+
+    /* Exactly one call is admitted on the proven path. */
+    build_live_call_init_contract();
+    memmove(image + INIT_SSP_OFF + 28,
+            image + INIT_SSP_OFF + 23, 21);
+    set_rel32(image + INIT_SSP_OFF + 23,
+              (uintptr_t)(image + INIT_SSP_CALL_OFF));
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0;
+
+    build_branched_old_init_contract();
+    if (!decode_x86_64_musl_init_libc(&obj, &decoded, &canary) ||
+        decoded != (uintptr_t)(image + INIT_OFF) || canary != 40)
+        return 0;
+
+    /* The conditional edge must land exactly on the fallback multiply. */
+    image[INIT_SSP_OFF + 12]--;
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0;
+
+    build_branched_old_init_contract();
+    image[INIT_SSP_OFF + 12] = 0xfe; /* backward conditional edge */
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0;
+
+    /* The entropy and fallback arms must converge at one exact join. */
+    build_branched_old_init_contract();
+    image[INIT_SSP_OFF + 30]--;
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0;
+
+    /* A call does not preserve a guard address held in volatile RCX. */
+    build_branched_old_init_contract();
+    image[INIT_SSP_OFF + 6] = 0x0d;
+    image[INIT_SSP_OFF + 23] = 0xcf;
+    image[INIT_SSP_OFF + 33] = 0xc1;
+    image[INIT_SSP_OFF + 40] = 0x01;
+    image[INIT_SSP_OFF + 43] = 0x11;
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0;
+
+    build_branched_old_init_contract();
+    memcpy(image + INIT_SSP_OFF + 13, "\x48\x89\xfb", 3);
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0; /* guard clobber before the call */
+
+    build_branched_old_init_contract();
+    memset(image + INIT_SSP_OFF + 24, 0x90, 5);
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0; /* missing entropy-copy call */
+
+    build_branched_old_init_contract();
+    memcpy(image + INIT_SSP_OFF + 24, "\xff\xd0\x90\x90\x90", 5);
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0; /* indirect call has no target proof */
+
+    build_branched_old_init_contract();
+    set_rel32(image + INIT_SSP_OFF + 24,
+              (uintptr_t)image + IMAGE_SIZE + 0x100);
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0; /* direct call escapes the libc mapping */
+
+    build_branched_old_init_contract();
+    set_rel32(image + INIT_SSP_OFF + 13,
+              (uintptr_t)(image + INIT_SSP_CALL_OFF));
+    memset(image + INIT_SSP_OFF + 18, 0x90, 3);
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0; /* two calls make the entropy arm ambiguous */
+
+    build_branched_old_init_contract();
+    image[INIT_SSP_OFF + 34] ^= 1;
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0; /* wrong fallback multiplier */
+
+    build_branched_old_init_contract();
+    image[INIT_SSP_OFF + 40] = 0x0b;
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0; /* fallback result stored through another base */
+
+    build_branched_old_init_contract();
+    memcpy(image + INIT_SSP_OFF + 57, "\x48\x89\x50\x30", 4);
+    image[INIT_SSP_OFF + 61] = 0xc3;
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0; /* common copy has two incompatible TCB fields */
+
+    build_frame_spill_init_contract();
+    if (!decode_x86_64_musl_init_libc(&obj, &decoded, &canary) ||
+        canary != 40)
+        return 0;
+    image[INIT_SSP_OFF + 64] = 48;
+    if (!decode_x86_64_musl_init_libc(&obj, &decoded, &canary) ||
+        canary != 48)
+        return 0;
+
+    build_frame_spill_init_contract();
+    image[INIT_SSP_OFF + 7] = 4;
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0; /* spill lies beyond the allocated caller frame */
+    build_frame_spill_init_contract();
+    image[INIT_SSP_OFF + 7] = 8;
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0; /* slot fits, but the call-site stack is misaligned */
+    build_frame_spill_init_contract();
+    memcpy(image + INIT_SSP_OFF + 20, "\x48\x89\xfd", 3);
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0; /* RBP no longer identifies the allocated spill frame */
+    build_frame_spill_init_contract();
+    memcpy(image + INIT_SSP_OFF + 20, "\x48\x89\xfc", 3);
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0; /* RSP no longer leaves the saved pointer above the call */
+    build_frame_spill_init_contract();
+    image[INIT_SSP_OFF + 44] = 0xf0;
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0; /* reload does not identify the saved pointer */
+    build_frame_spill_init_contract();
+    image[INIT_SSP_OFF + 34] = 0xef;
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0; /* call destination is the frame pointer */
+    build_frame_spill_init_contract();
+    image[INIT_SSP_OFF + 12] = 1;
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0; /* conditional edge splits the proven guard load */
+    build_frame_spill_init_contract();
+    set_rel32(image + INIT_SSP_OFF + 36,
+              (uintptr_t)image + IMAGE_SIZE + 0x100);
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0; /* direct call escapes the admitted target object */
     return 1;
 }
 
@@ -302,6 +612,7 @@ static int test_pthread_geometry(void)
     uintptr_t tls_size = 0;
     uintptr_t tls_align = 0;
     uintptr_t tls_cnt = 0;
+    uintptr_t thread_list_lock = 0;
     uint8_t saved;
     size_t cursor = 0;
 
@@ -322,6 +633,30 @@ static int test_pthread_geometry(void)
     memcpy(create + cursor, "\x0f\x11\x43\x10", 4); cursor += 4;
     memcpy(create + cursor, "\x48\x89\x58\x10", 4); cursor += 4;
     memcpy(create + cursor, "\x48\x89\x58\x18", 4);
+    /* Old GCC spells list initialization as a separately loaded peer field;
+     * it must not become a third inherited scalar-field candidate. */
+    memcpy(create + 80, "\x49\x8b\x46\x18", 4);
+    memcpy(create + 84, "\x48\x89\x43\x18", 4);
+
+    /* pthread_create passes the new TCB as TLS, new->tid as ptid, and the
+     * hidden thread-list lock as __clone's seventh (stack) ctid argument. */
+    memcpy(create + 112, "\x49\x89\xd9", 3); /* rbx -> r9 */
+    memcpy(create + 115, "\xba\0\x0f\x7d\0", 5);
+    memcpy(create + 120, "\x48\x83\xec\x08", 4);
+    memcpy(create + 124, "\x4c\x8d\x43\x30", 4);
+    memcpy(create + 128, "\x48\x8d\x05\0\0\0\0", 7);
+    set_rip_disp32(create + 128, 7,
+                   (uintptr_t)(image + THREAD_LIST_LOCK_OFF));
+    create[135] = 0x50;
+    memcpy(create + 136, "\x31\xc0", 2);
+    set_rel32(create + 138, (uintptr_t)(image + CLONE_OFF));
+
+    memcpy(image + CLONE_OFF,
+           "\x31\xc0\xb0\x38\x49\x89\xfb\x48\x89\xd7"
+           "\x4c\x89\xc2\x4d\x89\xc8\x4c\x8b\x54\x24\x08"
+           "\x4d\x89\xd9\x48\x83\xe6\xf0\x48\x83\xee\x08"
+           "\x48\x89\x0e\x0f\x05",
+           37);
 
     memcpy(exit_code,
            "\x64\x48\x8b\x1c\x25\0\0\0\0", 9);
@@ -334,20 +669,63 @@ static int test_pthread_geometry(void)
 
     if (!decode_x86_64_musl_pthread_geometry(
             &obj, create, 512, exit_code, 256,
-            (uintptr_t)(image + LIBC_OFF), 40, &copy_tls, &pthread_size,
-            &prev, &next, &sysinfo, &robust, &tls_head, &tls_size,
+            (uintptr_t)(image + LIBC_OFF), 40, 48,
+            &copy_tls, &pthread_size, &prev, &next, &sysinfo, &robust,
+            &thread_list_lock, &tls_head, &tls_size,
             &tls_align, &tls_cnt) ||
         copy_tls != (uintptr_t)(image + COPY_TLS_OFF) ||
         pthread_size != 200 || prev != 16 || next != 24 ||
-        sysinfo != 32 || robust != 136)
+        sysinfo != 32 || robust != 136 ||
+        thread_list_lock != (uintptr_t)(image + THREAD_LIST_LOCK_OFF))
         return 0;
+
+    saved = create[135];
+    create[135] = 0x53; /* push rbx, not the RIP-derived ctid address */
+    if (decode_x86_64_musl_pthread_geometry(
+            &obj, create, 512, exit_code, 256,
+            (uintptr_t)(image + LIBC_OFF), 40, 48,
+            &copy_tls, &pthread_size, &prev, &next, &sysinfo, &robust,
+            &thread_list_lock, &tls_head, &tls_size,
+            &tls_align, &tls_cnt))
+        return 0;
+    create[135] = saved;
+
+    if (decode_x86_64_musl_pthread_geometry(
+            &obj, create, 512, exit_code, 256,
+            (uintptr_t)(image + LIBC_OFF), 40, 52,
+            &copy_tls, &pthread_size, &prev, &next, &sysinfo, &robust,
+            &thread_list_lock, &tls_head, &tls_size,
+            &tls_align, &tls_cnt))
+        return 0; /* clone ptid must use the independently decoded tid */
+
+    saved = image[CLONE_OFF + 35];
+    image[CLONE_OFF + 35] = 0x90; /* no syscall: not musl's clone wrapper */
+    if (decode_x86_64_musl_pthread_geometry(
+            &obj, create, 512, exit_code, 256,
+            (uintptr_t)(image + LIBC_OFF), 40, 48,
+            &copy_tls, &pthread_size, &prev, &next, &sysinfo, &robust,
+            &thread_list_lock, &tls_head, &tls_size,
+            &tls_align, &tls_cnt))
+        return 0;
+    image[CLONE_OFF + 35] = saved;
+
+    phdr.p_flags &= ~PF_W;
+    if (decode_x86_64_musl_pthread_geometry(
+            &obj, create, 512, exit_code, 256,
+            (uintptr_t)(image + LIBC_OFF), 40, 48,
+            &copy_tls, &pthread_size, &prev, &next, &sysinfo, &robust,
+            &thread_list_lock, &tls_head, &tls_size,
+            &tls_align, &tls_cnt))
+        return 0;
+    phdr.p_flags |= PF_W;
 
     saved = create[7];
     create[7] = 0xc1; /* copy_tls result no longer feeds the used new pointer */
     if (decode_x86_64_musl_pthread_geometry(
             &obj, create, 512, exit_code, 256,
-            (uintptr_t)(image + LIBC_OFF), 40, &copy_tls, &pthread_size,
-            &prev, &next, &sysinfo, &robust, &tls_head, &tls_size,
+            (uintptr_t)(image + LIBC_OFF), 40, 48,
+            &copy_tls, &pthread_size, &prev, &next, &sysinfo, &robust,
+            &thread_list_lock, &tls_head, &tls_size,
             &tls_align, &tls_cnt))
         return 0;
     create[7] = saved;
@@ -356,11 +734,134 @@ static int test_pthread_geometry(void)
     exit_code[20] = 0x18; /* unlink writes the wrong peer field */
     if (decode_x86_64_musl_pthread_geometry(
             &obj, create, 512, exit_code, 256,
-            (uintptr_t)(image + LIBC_OFF), 40, &copy_tls, &pthread_size,
-            &prev, &next, &sysinfo, &robust, &tls_head, &tls_size,
+            (uintptr_t)(image + LIBC_OFF), 40, 48,
+            &copy_tls, &pthread_size, &prev, &next, &sysinfo, &robust,
+            &thread_list_lock, &tls_head, &tls_size,
             &tls_align, &tls_cnt))
         return 0;
     exit_code[20] = saved;
+
+    saved = create[83];
+    create[83] = 0x30; /* an unrelated third inherited scalar field */
+    create[87] = 0x30;
+    if (decode_x86_64_musl_pthread_geometry(
+            &obj, create, 512, exit_code, 256,
+            (uintptr_t)(image + LIBC_OFF), 40, 48,
+            &copy_tls, &pthread_size, &prev, &next, &sysinfo, &robust,
+            &thread_list_lock, &tls_head, &tls_size,
+            &tls_align, &tls_cnt))
+        return 0;
+    create[83] = saved;
+    create[87] = saved;
+
+    /* Older GCC orders the two reciprocal unlink stores in the opposite
+     * direction and reloads the first peer between them. */
+    memcpy(exit_code + 9, "\x48\x8b\x53\x10", 4);
+    memcpy(exit_code + 13, "\x48\x8b\x43\x18", 4);
+    memcpy(exit_code + 17, "\x48\x89\x50\x10", 4);
+    memcpy(exit_code + 21, "\x48\x8b\x53\x10", 4);
+    memcpy(exit_code + 25, "\x48\x89\x42\x18", 4);
+    if (!decode_x86_64_musl_pthread_geometry(
+            &obj, create, 512, exit_code, 256,
+            (uintptr_t)(image + LIBC_OFF), 40, 48,
+            &copy_tls, &pthread_size, &prev, &next, &sysinfo, &robust,
+            &thread_list_lock, &tls_head, &tls_size,
+            &tls_align, &tls_cnt) || prev != 16 || next != 24)
+        return 0;
+    saved = exit_code[20];
+    exit_code[20] = 0x18;
+    if (decode_x86_64_musl_pthread_geometry(
+            &obj, create, 512, exit_code, 256,
+            (uintptr_t)(image + LIBC_OFF), 40, 48,
+            &copy_tls, &pthread_size, &prev, &next, &sysinfo, &robust,
+            &thread_list_lock, &tls_head, &tls_size,
+            &tls_align, &tls_cnt))
+        return 0;
+    exit_code[20] = saved;
+
+    /* Reciprocal stores may be emitted in either order, but they must share
+     * one branch-free data-flow chain. */
+    memcpy(exit_code + 9, "\x48\x8b\x53\x10", 4);
+    memcpy(exit_code + 13, "\x48\x8b\x43\x18", 4);
+    memcpy(exit_code + 17, "\x48\x89\x50\x10", 4);
+    memmove(exit_code + 23, exit_code + 21, 8);
+    memcpy(exit_code + 21, "\xeb\0", 2);
+    if (decode_x86_64_musl_pthread_geometry(
+            &obj, create, 512, exit_code, 256,
+            (uintptr_t)(image + LIBC_OFF), 40, 48,
+            &copy_tls, &pthread_size, &prev, &next, &sysinfo, &robust,
+            &thread_list_lock, &tls_head, &tls_size,
+            &tls_align, &tls_cnt))
+        return 0;
+
+    memset(exit_code + 9, 0x90, 32);
+    memcpy(exit_code + 9, "\x48\x8b\x53\x10", 4);
+    memcpy(exit_code + 13, "\x48\x8b\x43\x18", 4);
+    memcpy(exit_code + 17, "\x48\x89\x50\x10", 4);
+    memcpy(exit_code + 21, "\x48\x8b\x53\x10", 4);
+    memcpy(exit_code + 25, "\x48\x89\x42\x18", 4);
+    memmove(exit_code + 20, exit_code + 17, 12);
+    memcpy(exit_code + 17, "\x48\x31\xc0", 3);
+    if (decode_x86_64_musl_pthread_geometry(
+            &obj, create, 512, exit_code, 256,
+            (uintptr_t)(image + LIBC_OFF), 40, 48,
+            &copy_tls, &pthread_size, &prev, &next, &sysinfo, &robust,
+            &thread_list_lock, &tls_head, &tls_size,
+            &tls_align, &tls_cnt))
+        return 0;
+
+    /* Alpine's GCC-built musl 1.2.5 prepares a vector self-link between the
+     * two scalar peer loads and reciprocal unlink stores.  The vector-only
+     * operations must leave the scalar pointer provenance intact. */
+    memset(exit_code + 9, 0x90, 48);
+    memcpy(exit_code + 9, "\x48\x8b\x53\x18", 4);
+    memcpy(exit_code + 13, "\x48\x8b\x43\x10", 4);
+    memcpy(exit_code + 17, "\x66\x48\x0f\x6e\xc3", 5);
+    memcpy(exit_code + 22, "\x66\x48\x0f\x6e\xe0", 5);
+    memcpy(exit_code + 27, "\x66\x0f\x6c\xc4", 4);
+    memcpy(exit_code + 31, "\x48\x89\x42\x10", 4);
+    memcpy(exit_code + 35, "\x48\x8b\x53\x18", 4);
+    memcpy(exit_code + 39, "\x48\x89\x50\x18", 4);
+    memcpy(exit_code + 43, "\x0f\x11\x43\x10", 4);
+    memcpy(exit_code + 48, "\x48\x8b\x83\x88\0\0\0", 7);
+    if (!decode_x86_64_musl_pthread_geometry(
+            &obj, create, 512, exit_code, 256,
+            (uintptr_t)(image + LIBC_OFF), 40, 48,
+            &copy_tls, &pthread_size, &prev, &next, &sysinfo, &robust,
+            &thread_list_lock, &tls_head, &tls_size,
+            &tls_align, &tls_cnt) || prev != 16 || next != 24)
+        return 0;
+
+    /* Register-only SIMD is intentional: memory data flow is not part of
+     * the proven list update. */
+    exit_code[30] = 0x00; /* PUNPCKLQDQ (%rax),xmm0 */
+    if (decode_x86_64_musl_pthread_geometry(
+            &obj, create, 512, exit_code, 256,
+            (uintptr_t)(image + LIBC_OFF), 40, 48,
+            &copy_tls, &pthread_size, &prev, &next, &sysinfo, &robust,
+            &thread_list_lock, &tls_head, &tls_size,
+            &tls_align, &tls_cnt))
+        return 0;
+    exit_code[30] = 0xc4;
+
+    memcpy(exit_code + 27, "\xeb\x02\x90\x90", 4);
+    if (decode_x86_64_musl_pthread_geometry(
+            &obj, create, 512, exit_code, 256,
+            (uintptr_t)(image + LIBC_OFF), 40, 48,
+            &copy_tls, &pthread_size, &prev, &next, &sysinfo, &robust,
+            &thread_list_lock, &tls_head, &tls_size,
+            &tls_align, &tls_cnt))
+        return 0;
+    memcpy(exit_code + 27, "\x66\x0f\x6c\xc4", 4);
+
+    memcpy(exit_code + 22, "\x48\x31\xc0\x90\x90", 5);
+    if (decode_x86_64_musl_pthread_geometry(
+            &obj, create, 512, exit_code, 256,
+            (uintptr_t)(image + LIBC_OFF), 40, 48,
+            &copy_tls, &pthread_size, &prev, &next, &sysinfo, &robust,
+            &thread_list_lock, &tls_head, &tls_size,
+            &tls_align, &tls_cnt))
+        return 0;
     return 1;
 }
 

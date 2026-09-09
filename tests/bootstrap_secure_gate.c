@@ -497,6 +497,15 @@ static int direct_interp_shlib_alias_gate(void)
     entries[0].flags = DLFRZ_FLAG_INTERP;
     metas[0].flags = DLFRZ_FLAG_INTERP;
 
+    /* An interpreter without a validated command-line ABI is deliberately
+     * extraction-only even if hostile input attaches otherwise valid direct
+     * metadata to it. */
+    entries[0].flags |= DLFRZ_FLAG_INTERP_KERNEL_ONLY;
+    if (direct_metadata_is_valid((const uint8_t *)&image, 0, metas,
+                                 entries, 3, 2))
+        return 0;
+    entries[0].flags = DLFRZ_FLAG_INTERP;
+
     saved_interp_meta = metas[0];
     entries[0].flags = DLFRZ_FLAG_DATA;
     memset(&metas[0], 0, sizeof(metas[0]));
@@ -682,6 +691,11 @@ int main(void)
     if (classify_extraction_fallback(0, 0, 0, 1) !=
         EXTRACTION_REFUSE_LOGICAL_NAME)
         return 12;
+    if (!dlfrz_manifest_entry_flags_canonical(
+            DLFRZ_FLAG_INTERP | DLFRZ_FLAG_INTERP_KERNEL_ONLY, 0, 0) ||
+        dlfrz_manifest_entry_flags_canonical(
+            DLFRZ_FLAG_MAIN_EXE | DLFRZ_FLAG_INTERP_KERNEL_ONLY, 0, 0))
+        return 21;
     {
         struct dlfrz_entry alias_entries[2] = {{0}};
 

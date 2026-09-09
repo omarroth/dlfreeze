@@ -212,6 +212,10 @@ if [ "${1:-}" = --selftest-capability-classifier ]; then
     cross_build_classifier_selftest
     exit $?
 fi
+if [ "$#" -ne 0 ]; then
+    echo "Usage: $0 [--selftest-capability-classifier]" >&2
+    exit 2
+fi
 
 # Return 0 when a compressed artifact was created and smoke-tested, 1 when
 # UPX cannot compress this ELF (best-effort coverage), and 2 when UPX produced
@@ -508,12 +512,20 @@ EOF
         rm -f "$contract_artifact" "$contract_expected" "$contract_upx"
         mkdir -p "$contract_root"
         cat > "$contract_lib_src" <<'EOF'
+#include <unistd.h>
+extern void dlfreeze_contract_constructor_hold(int (*call)(void));
 static __thread int contract_tls = 40;
 static int constructor_ready;
+
+static int contract_cold_call(void)
+{
+    return getuid() == (uid_t)-1 ? -1 : 42;
+}
 
 __attribute__((constructor))
 static void contract_constructor(void)
 {
+    dlfreeze_contract_constructor_hold(contract_cold_call);
     constructor_ready = 1;
 }
 
@@ -525,8 +537,13 @@ EOF
         cat > "$contract_main_src" <<'EOF'
 #include <dlfcn.h>
 #include <pthread.h>
+#include <sched.h>
+#include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 #ifndef CONTRACT_ASSET
 #error CONTRACT_ASSET is required
@@ -536,10 +553,36 @@ EOF
 #endif
 
 static __thread int main_tls = 20;
+static _Atomic int constructor_waiting;
+static _Atomic int worker_finished;
+static int (*constructor_call)(void);
+
+void dlfreeze_contract_constructor_hold(int (*call)(void))
+{
+    struct timespec start, now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &start))
+        _Exit(10);
+    constructor_call = call;
+    atomic_store_explicit(&constructor_waiting, 1, memory_order_release);
+    while (!atomic_load_explicit(&worker_finished, memory_order_acquire)) {
+        if (clock_gettime(CLOCK_MONOTONIC, &now) ||
+            now.tv_sec - start.tv_sec >= 10)
+            _Exit(11);
+        sched_yield();
+    }
+}
 
 static void *contract_worker(void *unused)
 {
     (void)unused;
+    while (!atomic_load_explicit(&constructor_waiting, memory_order_acquire))
+        sched_yield();
+    /* These main/plugin PLT calls must progress while dlopen's constructor
+     * is waiting. The exact same artifact is replayed on every CI host. */
+    if (getppid() <= 0 || constructor_call() != 42)
+        return (void *)3;
+    atomic_store_explicit(&worker_finished, 1, memory_order_release);
     if (main_tls != 20)
         return (void *)1;
     main_tls = 21;
@@ -561,14 +604,15 @@ int main(void)
     fclose(stream);
     asset[strcspn(asset, "\r\n")] = '\0';
 
-    handle = dlopen(CONTRACT_LIBRARY, RTLD_NOW | RTLD_LOCAL);
+    if (pthread_create(&thread, NULL, contract_worker, NULL) != 0)
+        return 5;
+    handle = dlopen(CONTRACT_LIBRARY, RTLD_LAZY | RTLD_LOCAL);
     if (!handle)
         return 3;
     value = (int (*)(void))dlsym(handle, "dlfreeze_contract_value");
     if (!value || value() != 42)
         return 4;
-    if (pthread_create(&thread, NULL, contract_worker, NULL) != 0 ||
-        pthread_join(thread, &worker_result) != 0 || worker_result != NULL ||
+    if (pthread_join(thread, &worker_result) != 0 || worker_result != NULL ||
         main_tls != 20)
         return 5;
     puts(asset);
@@ -577,10 +621,10 @@ int main(void)
 }
 EOF
         printf '%s\n' 'generic-direct-contract-ok' > "$contract_asset"
-        if ! "$contract_cc" -shared -fPIC \
+        if ! "$contract_cc" -shared -fPIC -Wl,-z,lazy \
                 -Wl,-soname,libdlfreeze_contract.so \
                 -o "$contract_lib" "$contract_lib_src" ||
-           ! "$contract_cc" -pthread -o "$contract_main" \
+           ! "$contract_cc" -pthread -rdynamic -Wl,-z,lazy -o "$contract_main" \
                 "-DCONTRACT_ASSET=\"$contract_asset\"" \
                 "-DCONTRACT_LIBRARY=\"$contract_lib\"" \
                 "$contract_main_src" -ldl; then

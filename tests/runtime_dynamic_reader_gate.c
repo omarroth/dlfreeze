@@ -3,8 +3,13 @@
 #include <time.h>
 #include <sys/wait.h>
 
+#ifndef MADV_WIPEONFORK
+#define MADV_WIPEONFORK 18
+#endif
+
 #define DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE 1
 #define DLFREEZE_MEMCHR_COMPLEXITY_GATE 1
+#define DLFREEZE_RUNTIME_LOCK_SIGNAL_GATE 1
 #include "../src/loader.c"
 
 static const void *reference_memchr_exact(const void *memory, int value,
@@ -64,6 +69,7 @@ static int loader_memchr_gate(void)
     g_ldr_memchr_byte_loads = 0;
     g_ldr_memchr_vector_loads = 0;
     g_ldr_memchr_vector_batch_iterations = 0;
+    g_ldr_memchr_vector_batch_reductions = 0;
     g_ldr_memchr_batch_iterations = 0;
     g_ldr_memchr_single_word_iterations = 0;
     if (ldr_memchr(page, 0xaa, complexity_length) != NULL ||
@@ -72,10 +78,41 @@ static int loader_memchr_gate(void)
         g_ldr_memchr_vector_batch_iterations !=
             complexity_length /
                 (LDR_MEMCHR_VECTOR_BATCH * LDR_MEMCHR_VECTOR_BYTES) ||
+        g_ldr_memchr_vector_batch_reductions !=
+            complexity_length /
+                (LDR_MEMCHR_VECTOR_BATCH * LDR_MEMCHR_VECTOR_BYTES) ||
         g_ldr_memchr_word_loads != 0 ||
         g_ldr_memchr_byte_loads != 0 ||
         g_ldr_memchr_batch_iterations != 0 ||
         g_ldr_memchr_single_word_iterations != 0)
+        goto out;
+
+    /* Every possible first-match position in one aggregate vector batch must
+     * retain exact address order.  Multiple matches also prove that a later
+     * equality vector cannot be selected ahead of an earlier one. */
+    for (size_t position = 0;
+         position < LDR_MEMCHR_VECTOR_BATCH * LDR_MEMCHR_VECTOR_BYTES;
+         position++) {
+        ldr_memset(page, 0x55,
+                   LDR_MEMCHR_VECTOR_BATCH * LDR_MEMCHR_VECTOR_BYTES);
+        page[position] = 0xaa;
+        if (ldr_memchr(
+                page, 0xaa,
+                LDR_MEMCHR_VECTOR_BATCH * LDR_MEMCHR_VECTOR_BYTES) !=
+            page + position)
+            goto out;
+    }
+    ldr_memset(page, 0x55,
+               2U * LDR_MEMCHR_VECTOR_BATCH * LDR_MEMCHR_VECTOR_BYTES);
+    page[4] = 0xaa;
+    page[16] = 0xaa;
+    page[31] = 0xaa;
+    page[63] = 0xaa;
+    page[70] = 0xaa;
+    if (ldr_memchr(
+            page, 0xaa,
+            2U * LDR_MEMCHR_VECTOR_BATCH * LDR_MEMCHR_VECTOR_BYTES) !=
+        page + 4)
         goto out;
 
     for (size_t alignment = 0;
@@ -177,6 +214,58 @@ static void initialize_headers(Elf64_Phdr phdrs[2], uint64_t size)
     phdrs[0].p_filesz = size;
     phdrs[1].p_type = PT_TLS;
     phdrs[1].p_memsz = 1;
+}
+
+static int resolver_tls_template_overlap_gate(void)
+{
+    struct loaded_obj object = {0};
+    Elf64_Phdr tls = {0};
+
+    tls.p_type = PT_TLS;
+    tls.p_vaddr = UINT64_C(0x1000);
+    tls.p_filesz = UINT64_C(0x20);
+    tls.p_memsz = UINT64_C(0x8000);
+    object.phdr = &tls;
+    object.phdr_num = 1;
+
+    if (!relocation_destination_overlaps_tls_template(
+            &object, UINT64_C(0x1000), 1) ||
+        !relocation_destination_overlaps_tls_template(
+            &object, UINT64_C(0x101f), 2) ||
+        relocation_destination_overlaps_tls_template(
+            &object, UINT64_C(0x1020), 1) ||
+        relocation_destination_overlaps_tls_template(
+            &object, UINT64_C(0x1800), sizeof(uint64_t)))
+        return 0;
+
+    /* A pure .tbss template has no object-image bytes to mutate.  Its
+     * conceptual address extent may overlap a real writable section. */
+    tls.p_filesz = 0;
+    if (relocation_destination_overlaps_tls_template(
+            &object, UINT64_C(0x1000), sizeof(uint64_t)) ||
+        relocation_destination_overlaps_tls_template(
+            &object, UINT64_C(0x1800), sizeof(uint64_t)))
+        return 0;
+
+    /* Exercise the post-setup path, which uses the admitted TLS record. */
+    object.phdr = NULL;
+    object.phdr_num = 0;
+    object.tls.vaddr = UINT64_C(0x1000);
+    object.tls.filesz = UINT64_C(0x20);
+    object.tls.memsz = UINT64_C(0x8000);
+    if (!relocation_destination_overlaps_tls_template(
+            &object, UINT64_C(0x1018), sizeof(uint64_t)) ||
+        relocation_destination_overlaps_tls_template(
+            &object, UINT64_C(0x1800), sizeof(uint64_t)) ||
+        !relocation_destination_overlaps_tls_template(
+            &object, UINT64_MAX, sizeof(uint64_t)) ||
+        relocation_destination_overlaps_tls_template(
+            &object, UINT64_MAX, 0))
+        return 0;
+
+    object.tls.filesz = 0;
+    return !relocation_destination_overlaps_tls_template(
+        &object, UINT64_C(0x1800), sizeof(uint64_t));
 }
 
 static int large_table_gate(void)
@@ -299,6 +388,7 @@ static int runtime_file_revision_gate(void)
     struct stat unchanged;
     struct stat truncated;
     Elf64_Phdr ph = {0};
+    const struct dlfrz_gnu_property_profile property_profile = {0};
     uint64_t saved_page_size = g_page_size;
     long page_size = sysconf(_SC_PAGESIZE);
     int fd;
@@ -317,13 +407,13 @@ static int runtime_file_revision_gate(void)
     ph.p_flags = PF_R;
     if (fstat(fd, &before) < 0 || fstat(fd, &unchanged) < 0 ||
         !runtime_file_revision_matches(&before, &unchanged) ||
-        runtime_probe_file_mapping_policy(fd, &ph) < 0)
+        runtime_probe_file_mapping_policy(fd, &ph, &property_profile) < 0)
         goto out;
 
     /* The policy probe must reject an unrepresentable file offset without
      * constructing or touching a source-file mapping. */
     ph.p_offset = UINT64_MAX;
-    if (runtime_probe_file_mapping_policy(fd, &ph) == 0)
+    if (runtime_probe_file_mapping_policy(fd, &ph, &property_profile) == 0)
         goto out;
     ph.p_offset = 0;
 
@@ -1058,6 +1148,10 @@ enum exact_name_string_offset {
 struct exact_name_fixture {
     struct loaded_obj object;
     Elf64_Phdr loads[4];
+    struct {
+        uint16_t page_slots[DL_VERSION_PAGE_COUNT];
+        struct loaded_version_entry entries[DL_VERSION_PAGE_ENTRIES];
+    } version_index;
     uint8_t *image;
     size_t image_size;
     char *strings;
@@ -1196,6 +1290,11 @@ static int exact_name_fixture_init(struct exact_name_fixture *fixture,
     fixture->object.dynsym_admitted_count = EXACT_NAME_SYMBOL_COUNT;
     fixture->object.versym = fixture->versions;
     fixture->object.versym_admitted_count = EXACT_NAME_SYMBOL_COUNT;
+    fixture->version_index.page_slots[0] = 1;
+    fixture->version_index.entries[2].definition_name = EXACT_NAME_NOISE;
+    fixture->version_index.entries[2].flags = DL_VERSION_ENTRY_DEFINED;
+    fixture->object.version_index =
+        (struct loaded_version_index *)&fixture->version_index;
     fixture->object.gnu_hash = gnu;
     if (vfs_seed_hash_key(key_bytes) < 0 ||
         build_loaded_symbol_name_keys(&fixture->object) < 0 ||
@@ -1829,9 +1928,11 @@ static int symbol_lookup_complexity_gate(void)
     object.version_index = version_index;
     g_version_key_admission_visits = 0;
     g_symbol_name_radix_sorts = 0;
+    g_versym_value_reads = 0;
     if (vfs_seed_hash_key(key) < 0 ||
         build_loaded_symbol_name_keys(&object) < 0 ||
         g_symbol_name_radix_sorts != 1 ||
+        g_versym_value_reads != symbols_count ||
         g_version_key_admission_visits !=
             2 * (version_page_count * DL_VERSION_PAGE_ENTRIES - 2) ||
         !symbol_lookup_query_init(miss, &miss_query) ||
@@ -2230,12 +2331,8 @@ static int version_index_gate(void)
             goto release;
     }
     versions[0] = 30001;
-    {
-        const char *version = NULL;
-
-        if (symbol_version_name(&object, 0, &version) != -1)
-            goto release;
-    }
+    if (loaded_symbol_version_is_admitted(&object, 0))
+        goto release;
     result = 1;
 
 release:
@@ -3087,6 +3184,194 @@ out:
 }
 
 static volatile uint32_t runtime_lock_gate_acquired;
+static volatile uint32_t runtime_lock_gate_signal_boundary;
+static volatile uint32_t runtime_lock_gate_signal_count;
+static volatile uint32_t runtime_lock_gate_signal_failed;
+static volatile uint32_t runtime_lock_gate_waiter_mask_failed;
+static volatile long runtime_lock_gate_fork_result;
+static volatile long runtime_lock_gate_nested_fork_result;
+
+static void runtime_lock_gate_signal_handler(int signal_number)
+{
+    runtime_loader_lock_token token;
+    uint32_t boundary = runtime_atomic_load32(
+        &runtime_lock_gate_signal_boundary);
+    uintptr_t owner_before = runtime_atomic_load_pointer(
+        &g_runtime_loader_lock.owner);
+    uintptr_t identity = runtime_atomic_load32(
+        &g_runtime_loader_lock.identity_mode) ==
+            RUNTIME_LOCK_IDENTITY_TARGET_TP
+        ? arch_get_tp()
+        : (uintptr_t)runtime_loader_kernel_id(SYS_gettid);
+
+    (void)signal_number;
+    token = runtime_loader_lock_acquire();
+    if (token != identity ||
+        runtime_atomic_load_pointer(&g_runtime_loader_lock.owner) !=
+            identity ||
+        (boundary == RUNTIME_UNLOCK_GATE_AFTER_OWNER_RELEASE
+             ? (owner_before != 0 ||
+                runtime_atomic_load32(
+                    &g_runtime_loader_lock.nested) != 0)
+             : (owner_before != identity ||
+                runtime_atomic_load32(
+                    &g_runtime_loader_lock.nested) != 1)))
+        runtime_atomic_store32(&runtime_lock_gate_signal_failed, 1);
+    runtime_loader_lock_release(token);
+    (void)runtime_atomic_fetch_add32(
+        &runtime_lock_gate_signal_count, 1);
+}
+
+static void runtime_lock_gate_unlock_boundary(unsigned int boundary)
+{
+    void (*hook)(unsigned int) = g_runtime_loader_unlock_gate_hook;
+
+    /* The signal's own final release may cross the same instrumented point
+     * when it acquired a fresh root.  Disable only the gate hook while the
+     * synchronous handler runs, then restore it for the interrupted release. */
+    g_runtime_loader_unlock_gate_hook = NULL;
+    runtime_atomic_store32(&runtime_lock_gate_signal_boundary, boundary);
+    if (raise(SIGUSR1) != 0)
+        runtime_atomic_store32(&runtime_lock_gate_signal_failed, 1);
+    g_runtime_loader_unlock_gate_hook = hook;
+}
+
+static int runtime_lock_gate_signal_boundaries(void)
+{
+    struct sigaction signal_action;
+    struct sigaction old_signal_action;
+    runtime_loader_lock_token outer_token;
+
+    memset(&signal_action, 0, sizeof(signal_action));
+    signal_action.sa_handler = runtime_lock_gate_signal_handler;
+    sigemptyset(&signal_action.sa_mask);
+    if (sigaction(SIGUSR1, &signal_action, &old_signal_action) != 0)
+        return 0;
+    runtime_atomic_store32(&runtime_lock_gate_signal_count, 0);
+    runtime_atomic_store32(&runtime_lock_gate_signal_failed, 0);
+    g_runtime_loader_unlock_gate_hook =
+        runtime_lock_gate_unlock_boundary;
+    outer_token = runtime_loader_lock_acquire();
+    runtime_loader_lock_release(outer_token);
+    g_runtime_loader_unlock_gate_hook = NULL;
+    return sigaction(SIGUSR1, &old_signal_action, NULL) == 0 &&
+        runtime_atomic_load32(&runtime_lock_gate_signal_count) == 3 &&
+        runtime_atomic_load32(&runtime_lock_gate_signal_failed) == 0 &&
+        runtime_atomic_load_pointer(&g_runtime_loader_lock.owner) == 0 &&
+        runtime_atomic_load32(&g_runtime_loader_lock.nested) == 0;
+}
+
+static void runtime_lock_gate_release_registered_waiter(void)
+{
+    uint64_t current_signals = 0;
+
+    g_runtime_loader_waiter_registered_gate_hook = NULL;
+    if (arch_raw_syscall4(
+            SYS_rt_sigprocmask, SIG_SETMASK, 0,
+            (long)&current_signals, sizeof(current_signals)) < 0 ||
+        (current_signals &
+         (UINT64_C(1) << (unsigned int)(SIGUSR1 - 1))) == 0)
+        runtime_atomic_store32(
+            &runtime_lock_gate_waiter_mask_failed, 1);
+    runtime_atomic_store_pointer(&g_runtime_loader_lock.owner, 0);
+}
+
+static void runtime_lock_gate_fork_before_owner_cas(void)
+{
+    long child;
+
+    g_runtime_loader_before_owner_cas_gate_hook = NULL;
+    child = arch_raw_syscall5(SYS_clone, SIGCHLD, 0, 0, 0, 0);
+    runtime_lock_gate_fork_result = raw_syscall_failed(child) ? -1 : child;
+}
+
+static void runtime_lock_gate_registered_fork_before_owner_cas(void)
+{
+    pid_t child;
+
+    g_runtime_loader_before_owner_cas_gate_hook = NULL;
+    child = fork();
+    runtime_lock_gate_fork_result = child;
+}
+
+static void runtime_lock_gate_fork_after_published_identity(void)
+{
+    pid_t child;
+
+    g_runtime_loader_published_identity_gate_hook = NULL;
+    child = fork();
+    runtime_lock_gate_nested_fork_result = child;
+}
+
+static void runtime_lock_gate_fork_after_owner_cas(void)
+{
+    pid_t child;
+
+    g_runtime_loader_after_owner_cas_gate_hook = NULL;
+    child = fork();
+    runtime_lock_gate_fork_result = child;
+    if (child == 0)
+        g_runtime_loader_published_identity_gate_hook =
+            runtime_lock_gate_fork_after_published_identity;
+}
+
+static int runtime_lock_gate_interrupted_acquire(void)
+{
+    runtime_loader_lock_token token;
+    uint32_t tid = runtime_loader_kernel_id(SYS_gettid);
+    uintptr_t forged_owner = tid == UINT32_MAX
+        ? (uintptr_t)tid - 1 : (uintptr_t)tid + 1;
+    int status;
+
+    /* The contended registration/owner-check/unregister region must block a
+     * same-thread fork signal.  Release the modeled competing owner from the
+     * exact post-registration hook and verify that mask directly. */
+    runtime_loader_lock_initialize();
+    runtime_atomic_store_pointer(
+        &g_runtime_loader_lock.owner, forged_owner);
+    runtime_atomic_store32(&runtime_lock_gate_waiter_mask_failed, 0);
+    g_runtime_loader_waiter_registered_gate_hook =
+        runtime_lock_gate_release_registered_waiter;
+    token = runtime_loader_lock_acquire();
+    g_runtime_loader_waiter_registered_gate_hook = NULL;
+    if (token != tid ||
+        runtime_atomic_load32(&g_runtime_loader_lock.waiters) != 0 ||
+        runtime_atomic_load32(
+            &runtime_lock_gate_waiter_mask_failed) != 0)
+        return 0;
+    runtime_loader_lock_release(token);
+
+    /* Fork exactly after the final mode recheck and before owner CAS.  The
+     * child must roll back the stale parent-TID publication, repair its PID
+     * cache, and return a token naming its actual kernel TID. */
+    runtime_loader_lock_initialize();
+    runtime_lock_gate_fork_result = -1;
+    g_runtime_loader_before_owner_cas_gate_hook =
+        runtime_lock_gate_fork_before_owner_cas;
+    token = runtime_loader_lock_acquire();
+    g_runtime_loader_before_owner_cas_gate_hook = NULL;
+    if (runtime_lock_gate_fork_result == 0) {
+        uint32_t child_tid = runtime_loader_kernel_id(SYS_gettid);
+
+        if (token != child_tid ||
+            runtime_atomic_load_pointer(
+                &g_runtime_loader_lock.owner) != child_tid ||
+            runtime_atomic_load32(
+                &g_runtime_loader_lock.process_id) !=
+                (uint32_t)arch_raw_syscall0(SYS_getpid))
+            loader_exit(1);
+        runtime_loader_lock_release(token);
+        loader_exit(0);
+    }
+    if (runtime_lock_gate_fork_result <= 0) {
+        runtime_loader_lock_release(token);
+        return 0;
+    }
+    runtime_loader_lock_release(token);
+    return waitpid((pid_t)runtime_lock_gate_fork_result, &status, 0) ==
+            (pid_t)runtime_lock_gate_fork_result &&
+        WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
 
 static void *runtime_lock_gate_waiter(void *unused)
 {
@@ -3104,7 +3389,6 @@ static int runtime_loader_lock_gate(void)
     struct timespec contention_start;
     struct timespec contention_now;
     pthread_t waiter;
-    uint64_t state;
     uint64_t wakes_before;
     uint32_t process_id;
     uint32_t tid;
@@ -3119,6 +3403,19 @@ static int runtime_loader_lock_gate(void)
     runtime_atomic_store64(&g_runtime_loader_futex_wakes, 0);
     runtime_atomic_store64(&g_runtime_loader_futex_woken, 0);
     runtime_atomic_store64(&g_runtime_loader_tid_revalidations, 0);
+    runtime_atomic_store64(&g_runtime_loader_identity_syscalls, 0);
+    runtime_atomic_store64(
+        &g_runtime_loader_tp_identity_initializations, 0);
+
+    /* Deterministically deliver a same-thread signal at every final-release
+     * boundary.  A handler before the owner CAS is one recursive level and
+     * must fully unwind before release resumes; a handler after the CAS owns
+     * a new root.  Both leave the lock free after the interrupted release. */
+    if (!runtime_lock_gate_signal_boundaries())
+        return 0;
+    if (!runtime_lock_gate_interrupted_acquire())
+        return 0;
+    runtime_loader_lock_initialize();
 
     /* Recursive acquisition must preserve ownership and still perform no
      * futex operation when no other thread has attempted the lock. */
@@ -3126,25 +3423,26 @@ static int runtime_loader_lock_gate(void)
     for (unsigned int i = 0; i < 256; i++) {
         outer_token = runtime_loader_lock_acquire();
         inner_token = runtime_loader_lock_acquire();
-        state = runtime_atomic_load64(&g_runtime_loader_lock.state);
         if (outer_token != tid || inner_token != tid ||
-            RUNTIME_LOCK_OWNER(state) != tid ||
-            RUNTIME_LOCK_DEPTH(state) != 2 ||
-            RUNTIME_LOCK_CONTENTION(state))
+            runtime_atomic_load_pointer(
+                &g_runtime_loader_lock.owner) != tid ||
+            runtime_atomic_load32(&g_runtime_loader_lock.nested) != 1 ||
+            runtime_atomic_load32(&g_runtime_loader_lock.waiters) != 0)
             return 0;
         runtime_loader_lock_release(inner_token);
         runtime_loader_lock_release(outer_token);
     }
-    if (runtime_atomic_load64(&g_runtime_loader_lock.state) != 0 ||
+    if (runtime_atomic_load_pointer(&g_runtime_loader_lock.owner) != 0 ||
+        runtime_atomic_load32(&g_runtime_loader_lock.nested) != 0 ||
         runtime_atomic_load64(&g_runtime_loader_futex_waits) != 0 ||
         runtime_atomic_load64(&g_runtime_loader_futex_wakes) != 0 ||
         runtime_atomic_load64(&g_runtime_loader_tid_revalidations) != 0)
         return 0;
 
-    /* Hold the lock until a second thread atomically publishes the sticky
-     * bit.  It may be preempted immediately before FUTEX_WAIT, so require
-     * only a wait attempt, a matching wake attempt, and eventual joined
-     * progress; both a queued wake and the legitimate EAGAIN race pass. */
+    /* Hold the lock until a second thread atomically publishes its waiter
+     * count.  Unlock may then win before either the ownership recheck or
+     * FUTEX_WAIT: both a queued wake and a completely avoided syscall are
+     * correct, provided the waiter makes progress and cleans its record. */
     runtime_atomic_store32(&runtime_lock_gate_acquired, 0);
     outer_token = runtime_loader_lock_acquire();
     if (pthread_create(&waiter, NULL, runtime_lock_gate_waiter, NULL) != 0) {
@@ -3157,8 +3455,7 @@ static int runtime_loader_lock_gate(void)
         return 0;
     }
     for (;;) {
-        state = runtime_atomic_load64(&g_runtime_loader_lock.state);
-        if (RUNTIME_LOCK_CONTENTION(state)) {
+        if (runtime_atomic_load32(&g_runtime_loader_lock.waiters) != 0) {
             saw_contention = 1;
             break;
         }
@@ -3171,12 +3468,9 @@ static int runtime_loader_lock_gate(void)
     if (pthread_join(waiter, NULL) != 0 || !saw_contention ||
         runtime_atomic_load32(&runtime_lock_gate_acquired) != 1)
         return 0;
-    state = runtime_atomic_load64(&g_runtime_loader_lock.state);
-    if (RUNTIME_LOCK_OWNER(state) != 0 ||
-        RUNTIME_LOCK_DEPTH(state) != 0 ||
-        !RUNTIME_LOCK_CONTENTION(state) ||
-        runtime_atomic_load64(&g_runtime_loader_futex_waits) == 0 ||
-        runtime_atomic_load64(&g_runtime_loader_futex_wakes) == 0)
+    if (runtime_atomic_load_pointer(&g_runtime_loader_lock.owner) != 0 ||
+        runtime_atomic_load32(&g_runtime_loader_lock.nested) != 0 ||
+        runtime_atomic_load32(&g_runtime_loader_lock.waiters) != 0)
         return 0;
 
     /* The child callback drops only the prepare recursion level, assigns
@@ -3189,45 +3483,41 @@ static int runtime_loader_lock_gate(void)
     runtime_loader_atfork_child();
     process_id = (uint32_t)arch_raw_syscall0(SYS_getpid);
     tid = (uint32_t)arch_raw_syscall0(SYS_gettid);
-    state = runtime_atomic_load64(&g_runtime_loader_lock.state);
-    if (RUNTIME_LOCK_OWNER(state) != tid ||
-        RUNTIME_LOCK_DEPTH(state) != 1 ||
-        RUNTIME_LOCK_CONTENTION(state) ||
+    if (runtime_atomic_load_pointer(&g_runtime_loader_lock.owner) != tid ||
+        runtime_atomic_load32(&g_runtime_loader_lock.nested) != 0 ||
+        runtime_atomic_load32(&g_runtime_loader_lock.waiters) != 0 ||
         runtime_atomic_load32(&g_runtime_loader_lock.process_id) !=
             process_id) {
         runtime_loader_lock_initialize();
         return 0;
     }
     runtime_loader_lock_release(outer_token);
-    if (runtime_atomic_load64(&g_runtime_loader_lock.state) != 0 ||
+    if (runtime_atomic_load_pointer(&g_runtime_loader_lock.owner) != 0 ||
         runtime_atomic_load64(&g_runtime_loader_futex_wakes) !=
             wakes_before)
         return 0;
 
     /* Raw-fork recovery uses the PID mismatch as an independent reset and
-     * must likewise discard a sticky bit inherited from the old process. */
-    runtime_atomic_store64(
-        &g_runtime_loader_lock.state, RUNTIME_LOCK_CONTENDED);
+     * must discard waiter metadata inherited from the old process. */
+    runtime_atomic_store32(&g_runtime_loader_lock.waiters, 1);
     runtime_atomic_store32(
         &g_runtime_loader_lock.process_id, process_id + 1);
     outer_token = runtime_loader_lock_acquire();
-    state = runtime_atomic_load64(&g_runtime_loader_lock.state);
-    if (RUNTIME_LOCK_OWNER(state) != tid ||
-        RUNTIME_LOCK_DEPTH(state) != 1 ||
-        RUNTIME_LOCK_CONTENTION(state)) {
+    if (runtime_atomic_load_pointer(&g_runtime_loader_lock.owner) != tid ||
+        runtime_atomic_load32(&g_runtime_loader_lock.nested) != 0 ||
+        runtime_atomic_load32(&g_runtime_loader_lock.waiters) != 0) {
         runtime_loader_lock_initialize();
         return 0;
     }
     runtime_loader_lock_release(outer_token);
-    if (runtime_atomic_load64(&g_runtime_loader_lock.state) != 0 ||
+    if (runtime_atomic_load_pointer(&g_runtime_loader_lock.owner) != 0 ||
         runtime_atomic_load64(&g_runtime_loader_futex_wakes) !=
             wakes_before)
         return 0;
 
     /* A real child without the loader's atfork repair may safely discard an
-     * unlocked sticky bit: no owner or waiter survives in the copied VM. */
-    runtime_atomic_store64(
-        &g_runtime_loader_lock.state, RUNTIME_LOCK_CONTENDED);
+     * unlocked waiter record: no owner or waiter survives in the copied VM. */
+    runtime_atomic_store32(&g_runtime_loader_lock.waiters, 1);
     runtime_atomic_store32(
         &g_runtime_loader_lock.process_id, process_id);
     child = fork();
@@ -3237,17 +3527,17 @@ static int runtime_loader_lock_gate(void)
         uint32_t child_tid = runtime_loader_kernel_id(SYS_gettid);
         uint32_t child_process_id = runtime_loader_kernel_id(SYS_getpid);
 
-        state = runtime_atomic_load64(&g_runtime_loader_lock.state);
         if (child_token != child_tid ||
-            RUNTIME_LOCK_OWNER(state) != child_tid ||
-            RUNTIME_LOCK_DEPTH(state) != 1 ||
-            RUNTIME_LOCK_CONTENTION(state) ||
+            runtime_atomic_load_pointer(
+                &g_runtime_loader_lock.owner) != child_tid ||
+            runtime_atomic_load32(&g_runtime_loader_lock.nested) != 0 ||
+            runtime_atomic_load32(&g_runtime_loader_lock.waiters) != 0 ||
             runtime_atomic_load32(&g_runtime_loader_lock.process_id) !=
                 child_process_id)
             loader_exit(1);
         runtime_loader_lock_release(child_token);
-        loader_exit(runtime_atomic_load64(
-                        &g_runtime_loader_lock.state) == 0 ? 0 : 1);
+        loader_exit(runtime_atomic_load_pointer(
+                        &g_runtime_loader_lock.owner) == 0 ? 0 : 1);
     }
     if (child < 0 || waitpid(child, &status, 0) != child ||
         !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
@@ -3286,10 +3576,10 @@ static int runtime_loader_lock_gate(void)
         runtime_loader_lock_release(outer_token);
         child_token = runtime_loader_lock_acquire();
         child_tid = runtime_loader_kernel_id(SYS_gettid);
-        state = runtime_atomic_load64(&g_runtime_loader_lock.state);
         if (child_token != child_tid ||
-            RUNTIME_LOCK_OWNER(state) != child_tid ||
-            RUNTIME_LOCK_DEPTH(state) != 1)
+            runtime_atomic_load_pointer(
+                &g_runtime_loader_lock.owner) != child_tid ||
+            runtime_atomic_load32(&g_runtime_loader_lock.nested) != 0)
             loader_exit(1);
         runtime_loader_lock_release(child_token);
         loader_exit(0);
@@ -3310,21 +3600,51 @@ static int runtime_loader_lock_gate(void)
                        runtime_loader_atfork_parent,
                        runtime_loader_atfork_child) != 0)
         return 0;
+
+    /* A registered fork can complete just before the interrupted owner CAS.
+     * Its child callback has advanced the generation while leaving owner
+     * free; the stale parent-TID publication must still be rolled back. */
+    runtime_lock_gate_fork_result = -1;
+    g_runtime_loader_before_owner_cas_gate_hook =
+        runtime_lock_gate_registered_fork_before_owner_cas;
+    outer_token = runtime_loader_lock_acquire();
+    g_runtime_loader_before_owner_cas_gate_hook = NULL;
+    if (runtime_lock_gate_fork_result == 0) {
+        uint32_t child_tid = runtime_loader_kernel_id(SYS_gettid);
+
+        if (outer_token != child_tid ||
+            runtime_atomic_load_pointer(
+                &g_runtime_loader_lock.owner) != child_tid)
+            loader_exit(1);
+        runtime_loader_lock_release(outer_token);
+        loader_exit(0);
+    }
+    if (runtime_lock_gate_fork_result < 0) {
+        runtime_loader_lock_release(outer_token);
+        return 0;
+    }
+    runtime_loader_lock_release(outer_token);
+    if (waitpid((pid_t)runtime_lock_gate_fork_result, &status, 0) !=
+            (pid_t)runtime_lock_gate_fork_result ||
+        !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        return 0;
+
     outer_token = runtime_loader_lock_acquire();
     child = fork();
     if (child == 0) {
         uint32_t child_tid = runtime_loader_kernel_id(SYS_gettid);
 
-        state = runtime_atomic_load64(&g_runtime_loader_lock.state);
-        if (RUNTIME_LOCK_OWNER(state) != child_tid ||
-            RUNTIME_LOCK_DEPTH(state) != 1 ||
-            RUNTIME_LOCK_CONTENTION(state))
+        if (runtime_atomic_load_pointer(
+                &g_runtime_loader_lock.owner) != child_tid ||
+            runtime_atomic_load32(&g_runtime_loader_lock.nested) != 0 ||
+            runtime_atomic_load32(&g_runtime_loader_lock.waiters) != 0)
             loader_exit(1);
         runtime_loader_lock_release(outer_token);
-        loader_exit(runtime_atomic_load64(
-                        &g_runtime_loader_tid_revalidations) == 1 &&
-                    runtime_atomic_load64(
-                        &g_runtime_loader_lock.state) == 0 ? 0 : 1);
+        loader_exit(
+            runtime_atomic_load64(
+                &g_runtime_loader_tid_revalidations) == 1 &&
+            runtime_atomic_load_pointer(
+                &g_runtime_loader_lock.owner) == 0 ? 0 : 1);
     }
     if (child < 0) {
         runtime_loader_lock_release(outer_token);
@@ -3333,8 +3653,48 @@ static int runtime_loader_lock_gate(void)
     runtime_loader_lock_release(outer_token);
     if (waitpid(child, &status, 0) != child ||
         !WIFEXITED(status) || WEXITSTATUS(status) != 0 ||
-        runtime_atomic_load64(&g_runtime_loader_lock.state) != 0 ||
+        runtime_atomic_load_pointer(&g_runtime_loader_lock.owner) != 0 ||
         runtime_atomic_load64(&g_runtime_loader_tid_revalidations) != 0)
+        return 0;
+
+    /* Fork exactly after root ownership is published, then fork its child
+     * between the validation identity and owner reads.  Each registered
+     * child callback carries the root under its new TID.  A stable retry must
+     * neither combine the two child identities nor reject the rewritten
+     * acquisition. */
+    runtime_lock_gate_fork_result = -1;
+    runtime_lock_gate_nested_fork_result = -1;
+    g_runtime_loader_after_owner_cas_gate_hook =
+        runtime_lock_gate_fork_after_owner_cas;
+    outer_token = runtime_loader_lock_acquire();
+    g_runtime_loader_after_owner_cas_gate_hook = NULL;
+    if (runtime_lock_gate_fork_result == 0) {
+        uint32_t child_tid = runtime_loader_kernel_id(SYS_gettid);
+        long nested_child = runtime_lock_gate_nested_fork_result;
+        int nested_status;
+
+        if (outer_token != child_tid ||
+            runtime_atomic_load_pointer(
+                &g_runtime_loader_lock.owner) != child_tid ||
+            nested_child < 0)
+            loader_exit(1);
+        runtime_loader_lock_release(outer_token);
+        if (nested_child == 0)
+            loader_exit(0);
+        if (waitpid((pid_t)nested_child, &nested_status, 0) !=
+                (pid_t)nested_child ||
+            !WIFEXITED(nested_status) || WEXITSTATUS(nested_status) != 0)
+            loader_exit(1);
+        loader_exit(0);
+    }
+    if (runtime_lock_gate_fork_result < 0) {
+        runtime_loader_lock_release(outer_token);
+        return 0;
+    }
+    runtime_loader_lock_release(outer_token);
+    if (waitpid((pid_t)runtime_lock_gate_fork_result, &status, 0) !=
+            (pid_t)runtime_lock_gate_fork_result ||
+        !WIFEXITED(status) || WEXITSTATUS(status) != 0)
         return 0;
 
     /* A token acquired before a pthread_atfork child repair carries the
@@ -3342,13 +3702,231 @@ static int runtime_loader_lock_gate(void)
      * revalidate the current kernel TID, while ordinary paired releases
      * above must never pay that syscall. */
     outer_token = runtime_loader_lock_acquire();
-    runtime_loader_lock_release(outer_token == UINT32_MAX
+    runtime_loader_lock_release(outer_token == UINTPTR_MAX
                                     ? outer_token - 1
                                     : outer_token + 1);
-    return runtime_atomic_load64(&g_runtime_loader_lock.state) == 0 &&
+    return runtime_atomic_load_pointer(&g_runtime_loader_lock.owner) == 0 &&
+           runtime_atomic_load32(&g_runtime_loader_lock.nested) == 0 &&
            runtime_atomic_load64(&g_runtime_loader_futex_wakes) ==
                wakes_before &&
            runtime_atomic_load64(&g_runtime_loader_tid_revalidations) == 1;
+}
+
+static pid_t runtime_lock_gate_raw_fork(void)
+{
+    long child = arch_raw_syscall5(SYS_clone, SIGCHLD, 0, 0, 0, 0);
+
+    if (raw_syscall_failed(child) || child > INT_MAX)
+        return -1;
+    return (pid_t)child;
+}
+
+static int runtime_loader_tp_lock_gate(void)
+{
+    long page_size_long = sysconf(_SC_PAGESIZE);
+    volatile uint32_t *cookie;
+    runtime_loader_lock_token outer_token;
+    uint64_t identity_syscalls;
+    uintptr_t tp;
+    pthread_t waiter;
+    pid_t child;
+    int status;
+
+    if (page_size_long <= 0)
+        return 0;
+    cookie = mmap(NULL, (size_t)page_size_long,
+                  PROT_READ | PROT_WRITE,
+                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (cookie == MAP_FAILED)
+        return 0;
+    if (madvise((void *)cookie, (size_t)page_size_long,
+                MADV_WIPEONFORK) != 0) {
+        (void)munmap((void *)cookie, (size_t)page_size_long);
+        return 0;
+    }
+    *cookie = DLFRZ_RUNTIME_FORK_COOKIE;
+    g_runtime_loader_fork_cookie = cookie;
+    g_target_tls_active = 1;
+    runtime_atomic_store64(&g_runtime_loader_identity_syscalls, 0);
+    runtime_atomic_store64(
+        &g_runtime_loader_tp_identity_initializations, 0);
+    runtime_loader_lock_initialize();
+    tp = arch_get_tp();
+    if (tp == 0 ||
+        runtime_atomic_load32(&g_runtime_loader_lock.identity_mode) !=
+            RUNTIME_LOCK_IDENTITY_TARGET_TP ||
+        runtime_atomic_load64(
+            &g_runtime_loader_tp_identity_initializations) != 1)
+        goto fail;
+    if (!runtime_lock_gate_signal_boundaries())
+        goto fail;
+
+    /* The steady-state lock may call neither gettid nor a target-libc
+     * identity helper.  Exercise both outer and recursive acquisitions. */
+    identity_syscalls = runtime_atomic_load64(
+        &g_runtime_loader_identity_syscalls);
+    for (unsigned int i = 0; i < 4096; i++) {
+        runtime_loader_lock_token inner_token;
+
+        outer_token = runtime_loader_lock_acquire();
+        inner_token = runtime_loader_lock_acquire();
+        if (outer_token != tp || inner_token != tp ||
+            runtime_atomic_load_pointer(
+                &g_runtime_loader_lock.owner) != tp ||
+            runtime_atomic_load32(&g_runtime_loader_lock.nested) != 1)
+            goto fail_locked;
+        runtime_loader_lock_release(inner_token);
+        runtime_loader_lock_release(outer_token);
+    }
+    if (runtime_atomic_load64(&g_runtime_loader_identity_syscalls) !=
+            identity_syscalls ||
+        runtime_atomic_load_pointer(&g_runtime_loader_lock.owner) != 0)
+        goto fail;
+
+    /* A target thread has a distinct architectural TP, so contention must
+     * take the futex path rather than being mistaken for recursion. */
+    runtime_atomic_store32(&runtime_lock_gate_acquired, 0);
+    outer_token = runtime_loader_lock_acquire();
+    if (pthread_create(&waiter, NULL, runtime_lock_gate_waiter, NULL) != 0) {
+        runtime_loader_lock_release(outer_token);
+        goto fail;
+    }
+    for (unsigned int spin = 0;
+         spin < 1000000 &&
+         runtime_atomic_load32(&g_runtime_loader_lock.waiters) == 0;
+         spin++)
+        sched_yield();
+    if (runtime_atomic_load32(&g_runtime_loader_lock.waiters) == 0) {
+        runtime_loader_lock_release(outer_token);
+        (void)pthread_join(waiter, NULL);
+        goto fail;
+    }
+    runtime_loader_lock_release(outer_token);
+    if (pthread_join(waiter, NULL) != 0 ||
+        runtime_atomic_load32(&runtime_lock_gate_acquired) != 1 ||
+        runtime_atomic_load64(&g_runtime_loader_identity_syscalls) !=
+            identity_syscalls)
+        goto fail;
+
+    /* A raw child with an unlocked snapshot repairs the wiped cookie and
+     * process metadata once, then continues in TP mode. */
+    child = runtime_lock_gate_raw_fork();
+    if (child == 0) {
+        runtime_loader_lock_token child_token =
+            runtime_loader_lock_acquire();
+
+        if (child_token != arch_get_tp() ||
+            runtime_atomic_load32(cookie) !=
+                DLFRZ_RUNTIME_FORK_COOKIE ||
+            runtime_atomic_load32(
+                &g_runtime_loader_lock.process_id) !=
+                (uint32_t)arch_raw_syscall0(SYS_getpid))
+            loader_exit(1);
+        runtime_loader_lock_release(child_token);
+        loader_exit(0);
+    }
+    if (child < 0 || waitpid(child, &status, 0) != child ||
+        !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        goto fail;
+
+    /* TP survives fork for the calling thread.  That exact equality proves
+     * a live owner belongs to the surviving thread, so a nested child call
+     * may continue and unwind the carried outer operation safely. */
+    outer_token = runtime_loader_lock_acquire();
+    child = runtime_lock_gate_raw_fork();
+    if (child == 0) {
+        runtime_loader_lock_token inner_token =
+            runtime_loader_lock_acquire();
+        runtime_loader_lock_token fresh_token;
+
+        if (inner_token != arch_get_tp() ||
+            runtime_atomic_load32(&g_runtime_loader_lock.nested) != 1 ||
+            runtime_atomic_load32(cookie) !=
+                DLFRZ_RUNTIME_FORK_COOKIE)
+            loader_exit(1);
+        runtime_loader_lock_release(inner_token);
+        runtime_loader_lock_release(outer_token);
+        fresh_token = runtime_loader_lock_acquire();
+        if (fresh_token != arch_get_tp())
+            loader_exit(1);
+        runtime_loader_lock_release(fresh_token);
+        loader_exit(0);
+    }
+    if (child < 0) {
+        runtime_loader_lock_release(outer_token);
+        goto fail;
+    }
+    runtime_loader_lock_release(outer_token);
+    if (waitpid(child, &status, 0) != child ||
+        !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        goto fail;
+
+    /* Conversely, a live owner which differs from the surviving TP belongs
+     * to a vanished thread and must not be repaired. */
+    child = runtime_lock_gate_raw_fork();
+    if (child == 0) {
+        uintptr_t forged_owner = arch_get_tp() ^ (uintptr_t)0x1000U;
+
+        if (forged_owner == 0 || forged_owner == arch_get_tp())
+            loader_exit(1);
+        runtime_atomic_store_pointer(
+            &g_runtime_loader_lock.owner, forged_owner);
+        (void)runtime_loader_lock_acquire();
+        loader_exit(1);
+    }
+    if (child < 0 || waitpid(child, &status, 0) != child ||
+        !WIFEXITED(status) || WEXITSTATUS(status) != 127)
+        goto fail;
+
+    /* The already-registered atfork callbacks rearm the wiped page and keep
+     * an outer recursion level owned by the child's TP. */
+    outer_token = runtime_loader_lock_acquire();
+    child = fork();
+    if (child == 0) {
+        if (runtime_atomic_load_pointer(
+                &g_runtime_loader_lock.owner) != arch_get_tp() ||
+            runtime_atomic_load32(&g_runtime_loader_lock.nested) != 0 ||
+            runtime_atomic_load32(cookie) !=
+                DLFRZ_RUNTIME_FORK_COOKIE)
+            loader_exit(1);
+        runtime_loader_lock_release(outer_token);
+        loader_exit(0);
+    }
+    if (child < 0) {
+        runtime_loader_lock_release(outer_token);
+        goto fail;
+    }
+    runtime_loader_lock_release(outer_token);
+    if (waitpid(child, &status, 0) != child ||
+        !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        goto fail;
+
+    /* Missing bootstrap proof must leave the old TID mode intact even when
+     * target TLS itself is already active. */
+    g_runtime_loader_fork_cookie = NULL;
+    runtime_loader_lock_initialize();
+    if (runtime_atomic_load32(&g_runtime_loader_lock.identity_mode) !=
+        RUNTIME_LOCK_IDENTITY_TID)
+        goto fail_unmapped;
+    outer_token = runtime_loader_lock_acquire();
+    if (outer_token != (uintptr_t)runtime_loader_kernel_id(SYS_gettid)) {
+        runtime_loader_lock_release(outer_token);
+        goto fail_unmapped;
+    }
+    runtime_loader_lock_release(outer_token);
+    g_target_tls_active = 0;
+    (void)munmap((void *)cookie, (size_t)page_size_long);
+    return 1;
+
+fail_locked:
+    runtime_loader_lock_release(outer_token);
+fail:
+    g_runtime_loader_fork_cookie = NULL;
+fail_unmapped:
+    g_target_tls_active = 0;
+    (void)munmap((void *)cookie, (size_t)page_size_long);
+    runtime_loader_lock_initialize();
+    return 0;
 }
 
 static int published_tls_fast_path_gate(void)
@@ -3551,9 +4129,226 @@ static int runtime_loader_kernel_id_gate(void)
            id == UINT32_MAX;
 }
 
+struct completed_plt_gate_context {
+    volatile uint32_t returned;
+    uintptr_t target;
+};
+
+static void *completed_plt_gate_worker(void *argument)
+{
+    struct completed_plt_gate_context *context = argument;
+
+    context->target = lazy_plt_fixup(
+        &g_all_objs[0].public_link_map, 0, 0);
+    runtime_atomic_store32(&context->returned, 1);
+    return NULL;
+}
+
+static int completed_plt_gate_wait(volatile uint32_t *word)
+{
+    struct timespec start, now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0)
+        return 0;
+    while (runtime_atomic_load32(word) == 0) {
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 ||
+            now.tv_sec - start.tv_sec >= 3)
+            return 0;
+        sched_yield();
+    }
+    return 1;
+}
+
+static int completed_startup_plt_gate(void)
+{
+    struct lazy_plt_resolution resolution = {.initial = 1};
+    struct completed_plt_gate_context context = {0};
+    struct startup_lazy_plt_dispatch *dispatch =
+        &g_startup_lazy_plt_dispatch[0];
+    runtime_loader_lock_token token;
+    pthread_t worker;
+    size_t index;
+    uint64_t slot = 0;
+    void *saved_mapping = g_startup_lazy_plt_resolution_mapping;
+    size_t saved_mapping_size = g_startup_lazy_plt_resolution_mapping_size;
+    int ok;
+
+    g_target_tls_active = 0;
+    g_runtime_loader_fork_cookie = NULL;
+    runtime_loader_lock_initialize();
+    runtime_atomic_store32(&g_runtime_loader_phase,
+                           RUNTIME_LOADER_PHASE_RUNNING);
+    dispatch->resolutions = &resolution;
+    dispatch->count = 1;
+    dispatch->first_slot = 0x1000;
+    runtime_atomic_store32(&g_startup_lazy_plt_dispatch_count, 1);
+    index = 0;
+    if (startup_lazy_plt_resolution(
+            (void *)((uintptr_t)&g_all_objs[0].public_link_map + 1),
+            &index, 0) ||
+        startup_lazy_plt_resolution(
+            &g_all_objs[1].public_link_map, &index, 0))
+        return 0;
+    index = 1;
+    if (startup_lazy_plt_resolution(
+            &g_all_objs[0].public_link_map, &index, 0))
+        return 0;
+    index = 0;
+    resolution.initial = 0;
+    if (startup_lazy_plt_resolution(
+            &g_all_objs[0].public_link_map, &index, 0))
+        return 0;
+    resolution.initial = 1;
+#if defined(__aarch64__)
+    index = SIZE_MAX;
+    if (startup_lazy_plt_resolution(
+            &g_all_objs[0].public_link_map, &index, 0x1001))
+        return 0;
+    index = SIZE_MAX;
+    if (startup_lazy_plt_resolution(
+            &g_all_objs[0].public_link_map, &index, 0x1000) != &resolution ||
+        index != 0)
+        return 0;
+#endif
+
+    token = runtime_loader_lock_acquire();
+    g_startup_lazy_plt_resolution_mapping = &resolution;
+    g_startup_lazy_plt_resolution_mapping_size = sizeof(resolution);
+    if (pthread_create(&worker, NULL, completed_plt_gate_worker, &context))
+        return 0;
+    ok = completed_plt_gate_wait(&g_runtime_loader_lock.waiters);
+    /* Publish the same irreversible result as a real lazy resolver, while
+     * intentionally retaining the namespace lock. The waiting caller must
+     * make progress before this owner can release its constructor hold. */
+    (void)lazy_plt_resolution_publish(&resolution, &slot, 0x12345);
+    ok = completed_plt_gate_wait(&context.returned) && ok;
+    ok = ok && context.target == 0x12345 &&
+        runtime_atomic_load_pointer(&g_runtime_loader_lock.owner) == token &&
+        runtime_atomic_load32(&g_runtime_loader_lock.waiters) == 0 &&
+        runtime_atomic_load32(&g_runtime_loader_lock.nested) == 0;
+    runtime_loader_lock_release(token);
+    if (pthread_join(worker, NULL) != 0)
+        ok = 0;
+    /* A completed weak binding may legitimately be zero; DONE, not target,
+     * must distinguish the result from an unresolved slot. */
+    runtime_atomic_store64(&resolution.state, 0);
+    runtime_atomic_store64(&resolution.target, 0);
+    runtime_atomic_store64(&resolution.state, LAZY_PLT_RESOLUTION_DONE);
+    if (lazy_plt_fixup(&g_all_objs[0].public_link_map, 0, 0) != 0)
+        ok = 0;
+    runtime_atomic_store32(&g_startup_lazy_plt_dispatch_count, 0);
+    dispatch->resolutions = NULL;
+    g_startup_lazy_plt_resolution_mapping = saved_mapping;
+    g_startup_lazy_plt_resolution_mapping_size = saved_mapping_size;
+    runtime_atomic_store32(&g_runtime_loader_phase,
+                           RUNTIME_LOADER_PHASE_RESET);
+    return ok;
+}
+
+static void *callback_lookup_gate_worker(void *argument)
+{
+    volatile uint32_t *returned = argument;
+    runtime_loader_lock_token token =
+        runtime_loader_lock_acquire_or_complete(NULL, 1);
+
+    runtime_loader_lock_release(token);
+    runtime_atomic_store32(returned, 1);
+    return NULL;
+}
+
+static int callback_reservation_gate(void)
+{
+    long page_size = sysconf(_SC_PAGESIZE);
+    volatile uint32_t *cookie;
+
+    if (page_size <= 0)
+        return 0;
+    cookie = mmap(NULL, (size_t)page_size, PROT_READ | PROT_WRITE,
+                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (cookie == MAP_FAILED ||
+        madvise((void *)cookie, (size_t)page_size, MADV_WIPEONFORK))
+        return 0;
+    *cookie = DLFRZ_RUNTIME_FORK_COOKIE;
+    for (int fast = 0; fast < 2; fast++) {
+        struct runtime_loader_callback_scope outer, inner;
+        volatile uint32_t lookup_returned = 0;
+        pthread_t ordinary, lookup;
+        pid_t child;
+        int status;
+
+        g_target_tls_active = 1;
+        g_runtime_loader_fork_cookie = fast ? cookie : NULL;
+        runtime_loader_lock_initialize();
+        (void)runtime_loader_lock_acquire();
+        (void)runtime_loader_lock_acquire();
+        outer = runtime_loader_callback_begin();
+        (void)runtime_loader_lock_acquire();
+        inner = runtime_loader_callback_begin();
+        runtime_atomic_store32(&runtime_lock_gate_acquired, 0);
+        if (pthread_create(&ordinary, NULL, runtime_lock_gate_waiter, NULL) ||
+            !completed_plt_gate_wait(&g_runtime_loader_lock.waiters) ||
+            pthread_create(&lookup, NULL, callback_lookup_gate_worker,
+                           (void *)&lookup_returned) ||
+            !completed_plt_gate_wait(&lookup_returned) ||
+            pthread_join(lookup, NULL) ||
+            runtime_atomic_load32(&runtime_lock_gate_acquired) != 0)
+            return 0;
+
+        /* Both raw and registered fork must retain the surviving nested
+         * callback frames, including when the optional TP optimization is
+         * unavailable. A blocked ordinary waiter does not survive either. */
+        for (int registered = 0; registered < 2; registered++) {
+            if (registered)
+                runtime_loader_atfork_prepare();
+            child = runtime_lock_gate_raw_fork();
+            if (child == 0) {
+                if (registered)
+                    runtime_loader_atfork_child();
+                runtime_loader_callback_end(inner);
+                runtime_loader_lock_release_current();
+                runtime_loader_callback_end(outer);
+                if (runtime_atomic_load32(&g_runtime_loader_lock.nested) != 1)
+                    loader_exit(1);
+                runtime_loader_lock_release_current();
+                runtime_loader_lock_release_current();
+                loader_exit(runtime_atomic_load_pointer(
+                    &g_runtime_loader_lock.callback_owner) != 0);
+            }
+            if (registered)
+                runtime_loader_atfork_parent();
+            if (child < 0 || waitpid(child, &status, 0) != child ||
+                !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+                return 0;
+        }
+
+        runtime_loader_callback_end(inner);
+        runtime_loader_lock_release_current();
+        if (runtime_atomic_load_pointer(&g_runtime_loader_lock.callback_owner) !=
+                arch_get_tp() ||
+            runtime_atomic_load32(&runtime_lock_gate_acquired) != 0)
+            return 0;
+        runtime_loader_callback_end(outer);
+        if (runtime_atomic_load32(&g_runtime_loader_lock.nested) != 1)
+            return 0;
+        runtime_loader_lock_release_current();
+        runtime_loader_lock_release_current();
+        if (pthread_join(ordinary, NULL) ||
+            runtime_atomic_load32(&runtime_lock_gate_acquired) != 1 ||
+            runtime_atomic_load_pointer(&g_runtime_loader_lock.callback_owner) != 0 ||
+            runtime_atomic_load_pointer(&g_runtime_loader_lock.owner) != 0 ||
+            runtime_atomic_load32(&g_runtime_loader_lock.waiters) != 0)
+            return 0;
+    }
+    g_target_tls_active = 0;
+    g_runtime_loader_fork_cookie = NULL;
+    runtime_loader_lock_initialize();
+    return munmap((void *)cookie, (size_t)page_size) == 0;
+}
+
 int main(void)
 {
     if (!loader_memchr_gate()) return 15;
+    if (!resolver_tls_template_overlap_gate()) return 25;
     if (!large_table_gate()) return 1;
     if (!truncation_gate()) return 2;
     if (!runtime_file_revision_gate()) return 3;
@@ -3575,6 +4370,9 @@ int main(void)
     if (!published_tls_fast_path_gate()) return 14;
     if (!concurrent_tls_publication_gate()) return 24;
     if (!runtime_loader_lock_gate()) return 20;
+    if (!runtime_loader_tp_lock_gate()) return 26;
     if (!runtime_loader_kernel_id_gate()) return 23;
+    if (!completed_startup_plt_gate()) return 27;
+    if (!callback_reservation_gate()) return 28;
     return 0;
 }

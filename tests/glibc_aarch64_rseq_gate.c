@@ -199,13 +199,17 @@ static void reset_fixture(void)
      * both public-result arithmetic consumers. */
     getattr_code = (uint32_t *)(image + GETATTR_OFF);
     getattr_code[0] = encode_mov(19, 0);
-    getattr_code[1] = encode_ldr64(1, 19, 0x6d8);
-    getattr_code[2] = UINT32_C(0xb4000041); /* cbz x1,+8 */
-    getattr_code[3] = encode_ldr64(2, 19, 0x6e0);
-    getattr_code[4] = encode_ldr64(3, 19, 0x6e8);
-    getattr_code[5] = UINT32_C(0x8b020024); /* add x4,x1,x2 */
-    getattr_code[6] = UINT32_C(0xcb030045); /* sub x5,x2,x3 */
-    for (size_t i = 7; i < 15; i++)
+    /* Fedora 46 performs unrelated flag normalization with logical-immediate
+     * and conditional-select forms before consuming the stack fields. */
+    getattr_code[1] = UINT32_C(0x32000020); /* orr w0,w1,#1 */
+    getattr_code[2] = UINT32_C(0x1a810000); /* csel w0,w0,w1,eq */
+    getattr_code[3] = encode_ldr64(1, 19, 0x6d8);
+    getattr_code[4] = UINT32_C(0xb4000041); /* cbz x1,+8 */
+    getattr_code[5] = encode_ldr64(2, 19, 0x6e0);
+    getattr_code[6] = encode_ldr64(3, 19, 0x6e8);
+    getattr_code[7] = UINT32_C(0x8b020024); /* add x4,x1,x2 */
+    getattr_code[8] = UINT32_C(0xcb030045); /* sub x5,x2,x3 */
+    for (size_t i = 9; i < 15; i++)
         getattr_code[i] = UINT32_C(0xd503201f);
     getattr_code[15] = UINT32_C(0xd65f03c0);
 }
@@ -321,6 +325,7 @@ static int test_rseq_control_flow(void)
 
 static int test_file_backed_consumers(void)
 {
+    uint32_t *getattr_code;
     size_t pthread_size = 0;
     size_t stack_offset = 0;
 
@@ -338,6 +343,15 @@ static int test_file_backed_consumers(void)
         return 0;
     }
 
+    getattr_code = (uint32_t *)(image + GETATTR_OFF);
+    getattr_code[2] = UINT32_C(0x9a810013); /* csel x19,x0,x1,eq */
+    if (glibc_aarch64_getattr_stack_size_contract(
+            &obj, PTHREAD_SIZE, &stack_offset)) {
+        fprintf(stderr, "getattr base-register clobber was accepted\n");
+        return 0;
+    }
+    reset_fixture();
+
     phdr.p_filesz = ALLOCA_OFF + 19;
     if (glibc_aarch64_alloca_contract(
             &obj, &pthread_size, &stack_offset)) {
@@ -353,17 +367,172 @@ static int test_file_backed_consumers(void)
     return 1;
 }
 
+static void emit_initial_thread_completion(uint32_t *code, size_t offset)
+{
+    memset(code, 0, 8 * sizeof(*code));
+    code[0] = UINT32_C(0xd503233f); /* paciasp */
+    code[1] = UINT32_C(0xa9bf7bfd); /* stp x29,x30,[sp,#-16]! */
+    code[2] = encode_add_imm(2, 0, offset);
+    /* A function prologue may establish its frame after computing the
+     * private pthread address.  This exact Fedora 46 shape is safe because
+     * it does not overwrite X2 or cross a control-flow edge. */
+    code[3] = UINT32_C(0x910003fd); /* mov x29,sp */
+    code[4] = UINT32_C(0x88dffc42); /* ldar w2,[x2] */
+    code[5] = UINT32_C(0x34000042); /* cbz w2,+8 */
+    code[6] = UINT32_C(0xd503201f); /* nop */
+    code[7] = UINT32_C(0xd65f03c0); /* ret */
+}
+
+static int test_initial_thread_completion_word(void)
+{
+    uint32_t code[8];
+    size_t offset = 0;
+
+    emit_initial_thread_completion(code, 0x428);
+    if (!glibc_aarch64_completion_word(
+            (const uint8_t *)code, sizeof(code), &offset) ||
+        offset != 0x428) {
+        fprintf(stderr, "frame-setup completion witness was rejected\n");
+        return 0;
+    }
+
+    /* The permitted prologue gap is a provenance proof, not an arbitrary
+     * wildcard: overwriting the derived address must invalidate it. */
+    emit_initial_thread_completion(code, 0x428);
+    code[3] = encode_add_imm(2, 3, 0); /* mov x2,x3 */
+    if (glibc_aarch64_completion_word(
+            (const uint8_t *)code, sizeof(code), &offset)) {
+        fprintf(stderr, "address-clobbering completion gap was accepted\n");
+        return 0;
+    }
+
+    /* Nor may a match be assembled across a basic-block edge. */
+    emit_initial_thread_completion(code, 0x428);
+    code[3] = UINT32_C(0x14000001); /* b +4 */
+    if (glibc_aarch64_completion_word(
+            (const uint8_t *)code, sizeof(code), &offset)) {
+        fprintf(stderr, "branching completion gap was accepted\n");
+        return 0;
+    }
+    return 1;
+}
+
+static int tunable_scalar_stream_decodes(uint32_t *code, size_t count)
+{
+    return target_tunable_accessor_control_flow_safe(
+        &obj, (const unsigned char *)code,
+        count * sizeof(*code));
+}
+
+static int test_tunable_scalar_control_flow(void)
+{
+    uint32_t code[] = {
+        UINT32_C(0xd503245f), /* bti c */
+        UINT32_C(0x2a0003e5), /* mov w5,w0 */
+        UINT32_C(0xd37c7c03), /* ubfiz x3,x0,#4,#32 */
+        UINT32_C(0xd503233f), /* paciasp */
+        UINT32_C(0xcb204021), /* sub x1,x1,w0,uxtw */
+        UINT32_C(0x52800f03), /* mov w3,#120 */
+        UINT32_C(0x9ba11000), /* umaddl x0,w0,w1,x4 */
+        UINT32_C(0xd50323bf), /* autiasp */
+        UINT32_C(0xd65f03c0), /* ret */
+    };
+    uint32_t saved;
+
+    reset_fixture();
+    if (!tunable_scalar_stream_decodes(
+            code, sizeof(code) / sizeof(code[0]))) {
+        fprintf(stderr, "Fedora 46 tunable scalar stream was rejected\n");
+        return 0;
+    }
+
+    /* Each newly admitted arithmetic class still reports Rd precisely;
+     * overwriting callback argument X2 must fail closed. */
+    saved = code[4];
+    code[4] = (code[4] & ~UINT32_C(31)) | UINT32_C(2);
+    if (tunable_scalar_stream_decodes(
+            code, sizeof(code) / sizeof(code[0]))) {
+        fprintf(stderr, "extended arithmetic callback clobber accepted\n");
+        return 0;
+    }
+    code[4] = saved;
+
+    saved = code[5];
+    code[5] = (code[5] & ~UINT32_C(31)) | UINT32_C(2);
+    if (tunable_scalar_stream_decodes(
+            code, sizeof(code) / sizeof(code[0]))) {
+        fprintf(stderr, "wide-move callback clobber accepted\n");
+        return 0;
+    }
+    code[5] = saved;
+
+    saved = code[6];
+    code[6] = (code[6] & ~UINT32_C(31)) | UINT32_C(2);
+    if (tunable_scalar_stream_decodes(
+            code, sizeof(code) / sizeof(code[0]))) {
+        fprintf(stderr, "multiply-add callback clobber accepted\n");
+        return 0;
+    }
+    code[6] = saved;
+    if (!tunable_scalar_stream_decodes(
+            code, sizeof(code) / sizeof(code[0])))
+        return 0;
+
+    {
+        uint32_t callback_code[] = {
+            UINT32_C(0xd503245f), /* bti c */
+            UINT32_C(0xaa0203f0), /* mov x16,x2 */
+            UINT32_C(0x9ba11000), /* umaddl x0,w0,w1,x4 */
+            UINT32_C(0x91012000), /* add x0,x0,#0x48 */
+            UINT32_C(0xd61f0200), /* br x16 */
+        };
+
+        if (!tunable_scalar_stream_decodes(
+                callback_code,
+                sizeof(callback_code) / sizeof(callback_code[0]))) {
+            fprintf(stderr, "live callback gap was rejected\n");
+            return 0;
+        }
+
+        callback_code[2] = UINT32_C(0xd2800010); /* mov x16,#0 */
+        if (tunable_scalar_stream_decodes(
+                callback_code,
+                sizeof(callback_code) / sizeof(callback_code[0]))) {
+            fprintf(stderr, "callback-register clobber was accepted\n");
+            return 0;
+        }
+
+        callback_code[2] = UINT32_C(0x9ba11000);
+        callback_code[0] = UINT32_C(0x14000002); /* b to after MOV */
+        if (tunable_scalar_stream_decodes(
+                callback_code,
+                sizeof(callback_code) / sizeof(callback_code[0]))) {
+            fprintf(stderr, "callback-producer bypass was accepted\n");
+            return 0;
+        }
+    }
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && strcmp(argv[1], "--rseq") == 0)
         return test_rseq_control_flow() ? 0 : 1;
     if (argc == 2 && strcmp(argv[1], "--file-backed") == 0)
         return test_file_backed_consumers() ? 0 : 1;
+    if (argc == 2 && strcmp(argv[1], "--initial-thread") == 0)
+        return test_initial_thread_completion_word() ? 0 : 1;
+    if (argc == 2 && strcmp(argv[1], "--tunable") == 0)
+        return test_tunable_scalar_control_flow() ? 0 : 1;
     if (argc != 1) {
-        fprintf(stderr, "usage: %s [--rseq|--file-backed]\n", argv[0]);
+        fprintf(stderr,
+                "usage: %s [--rseq|--file-backed|--initial-thread|--tunable]\n",
+                argv[0]);
         return 2;
     }
-    if (!test_rseq_control_flow() || !test_file_backed_consumers())
+    if (!test_rseq_control_flow() || !test_file_backed_consumers() ||
+        !test_initial_thread_completion_word() ||
+        !test_tunable_scalar_control_flow())
         return 1;
     puts("glibc-aarch64-rseq-contract-ok");
     return 0;
