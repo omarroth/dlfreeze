@@ -24,6 +24,79 @@ static const void *reference_memchr_exact(const void *memory, int value,
     return NULL;
 }
 
+static int loader_memcmp_gate(void)
+{
+    long page_long = sysconf(_SC_PAGESIZE);
+    unsigned char *mapping;
+    unsigned char *left;
+    unsigned char *right;
+    size_t page;
+    int valid = 1;
+
+    if (page_long < 1024 || (uintmax_t)page_long > SIZE_MAX / 5U)
+        return 0;
+    page = (size_t)page_long;
+    mapping = mmap(NULL, 5U * page, PROT_NONE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapping == MAP_FAILED)
+        return 0;
+    left = mapping + page;
+    right = mapping + 3U * page;
+    if (mprotect(left, page, PROT_READ | PROT_WRITE) < 0 ||
+        mprotect(right, page, PROT_READ | PROT_WRITE) < 0) {
+        munmap(mapping, 5U * page);
+        return 0;
+    }
+    if (ldr_memcmp(mapping, NULL, 0) != 0 ||
+        ldr_memcmp(NULL, mapping, 0) != 0)
+        valid = 0;
+    for (size_t length = 1; length <= 260; length++) {
+        for (size_t alignment = 0; alignment < 16; alignment++) {
+            unsigned char *a = left + page - length;
+            unsigned char *b = right + alignment;
+            size_t positions[] = {0, 15, 16, 31, 32, 63, 64,
+                                  length / 2, length - 1};
+
+            ldr_memset(a, 0x80, length);
+            ldr_memset(b, 0x80, length);
+            if (ldr_memcmp(a, b, length) != 0 ||
+                ldr_memcmp(b, a, length) != 0 ||
+                ldr_memcmp(a, a, length) != 0)
+                valid = 0;
+            for (size_t i = 0; i < sizeof(positions) / sizeof(positions[0]); i++) {
+                size_t position = positions[i];
+
+                if (position >= length)
+                    continue;
+                b[position] = 0xff;
+                /* A later opposite mismatch must not change ordering. */
+                if (position + 1 < length)
+                    b[position + 1] = 0;
+                if (ldr_memcmp(a, b, length) >= 0 ||
+                    ldr_memcmp(b, a, length) <= 0)
+                    valid = 0;
+                b[position] = 0x7f;
+                if (ldr_memcmp(a, b, length) <= 0 ||
+                    ldr_memcmp(b, a, length) >= 0)
+                    valid = 0;
+                b[position] = 0x80;
+                if (position + 1 < length)
+                    b[position + 1] = 0x80;
+            }
+        }
+    }
+    ldr_memset(left, 0x55, page);
+    ldr_memset(right, 0x55, page);
+    if (ldr_memcmp(left, right, page) != 0)
+        valid = 0;
+    right[page - 1] = 0x54;
+    if (ldr_memcmp(left, right, page) <= 0 ||
+        ldr_memcmp(right, left, page) >= 0)
+        valid = 0;
+    munmap(mapping, 5U * page);
+    return valid;
+}
+
 static int loader_memchr_gate(void)
 {
     static const int edge_values[] = {
@@ -665,6 +738,86 @@ static int symbol_query_equivalence_gate(void)
 out:
     munmap(long_name, long_length + 1);
     return result;
+}
+
+static int symbol_name_span_gate(void)
+{
+    const size_t strings_size = 16384;
+    const size_t count = 7;
+    const size_t size = strings_size + count * sizeof(Elf64_Sym);
+    static const uint32_t offsets[] = {0, 8, 8, 64, 1023, 4095, 16383};
+    struct loaded_obj prototype = {0};
+    Elf64_Phdr phdr = {0};
+    unsigned char key[16] = {7, 6, 5, 4};
+    uint8_t *image = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    Elf64_Sym *symbols;
+    int valid = 1;
+
+    if (image == MAP_FAILED)
+        return 0;
+    if (vfs_seed_hash_key(key) < 0) {
+        munmap(image, size);
+        return 0;
+    }
+    memset(image, 'a', strings_size);
+    image[0] = image[63] = image[strings_size - 1] = 0;
+    symbols = (void *)(image + strings_size);
+    for (size_t i = 0; i < count; i++)
+        symbols[i].st_name = offsets[i];
+    phdr.p_type = PT_LOAD;
+    phdr.p_flags = PF_R;
+    phdr.p_filesz = phdr.p_memsz = size;
+    prototype.base = (uintptr_t)image;
+    prototype.phdr = &phdr;
+    prototype.phdr_num = 1;
+    prototype.dynstr = (const char *)image;
+    prototype.dynstr_size = strings_size;
+    prototype.dynsym = symbols;
+    prototype.dynsym_count = prototype.dynsym_admitted_count = count;
+
+    for (unsigned int minimum = 0; minimum <= 3; minimum += 3) {
+        struct loaded_obj object = prototype;
+
+        symbols[0].st_name = minimum;
+        g_symbol_name_admission_bytes = g_symbol_name_ref_boundaries = 0;
+        if (build_loaded_symbol_name_keys(&object) < 0) {
+            valid = 0;
+            break;
+        }
+        /* Long spans, duplicate references, suffix sharing, empty strings,
+         * and an unused prefix all retain exactly the ordinary query keys. */
+        if (g_symbol_name_ref_boundaries != 6 ||
+            g_symbol_name_admission_bytes != strings_size - minimum)
+            valid = 0;
+        for (size_t i = 0; i < count; i++) {
+            struct symbol_lookup_query expected;
+            const struct loaded_symbol_name_key *actual =
+                &object.symbol_name_keys[i];
+
+            if (!symbol_lookup_query_init(
+                    (const char *)image + symbols[i].st_name, &expected) ||
+                actual->length != expected.key.length ||
+                actual->fingerprint != expected.key.fingerprint ||
+                actual->gnu_hash != expected.gnu_hash ||
+                actual->dynstr_offset != symbols[i].st_name)
+                valid = 0;
+        }
+        munmap(object.runtime_symbol_name_mapping,
+               object.runtime_symbol_name_mapping_size);
+    }
+    {
+        struct loaded_obj object = prototype;
+
+        symbols[count - 1].st_name = strings_size;
+        if (build_loaded_symbol_name_keys(&object) >= 0) {
+            munmap(object.runtime_symbol_name_mapping,
+                   object.runtime_symbol_name_mapping_size);
+            valid = 0;
+        }
+    }
+    munmap(image, size);
+    return valid;
 }
 
 static int symbol_name_radix_sort_gate(void)
@@ -4429,6 +4582,7 @@ static int callback_reservation_gate(void)
 
 int main(void)
 {
+    if (!loader_memcmp_gate()) return 31;
     if (!loader_memchr_gate()) return 15;
     if (!resolver_tls_template_overlap_gate()) return 25;
     if (!large_table_gate()) return 1;
@@ -4440,6 +4594,7 @@ int main(void)
     if (!manifest_startup_owner_gate()) return 6;
     if (!symbol_query_equivalence_gate()) return 7;
     if (!symbol_name_radix_sort_gate()) return 19;
+    if (!symbol_name_span_gate()) return 30;
     if (!hash_view_cache_gate()) return 8;
     if (!mutable_dynsym_name_gate()) return 9;
     if (!mutable_versym_key_gate()) return 10;

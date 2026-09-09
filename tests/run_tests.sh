@@ -27175,6 +27175,7 @@ test_direct_runtime_parser_bounds() {
     pass "runtime immutable dynsym queries bind precomputed hashes to exact names"
     pass "runtime immutable exact-name index preserves live writable-table semantics"
     pass "runtime symbol-key radix sorting is bounded and stable"
+    pass "runtime symbol-key spans preserve suffixes and reference-bounded work"
     pass "runtime GNU/SysV/version collision chains use bounded keyed name checks"
     pass "runtime loader lock avoids uncontended wakes and preserves fork repair"
     pass "runtime loader TP ownership avoids steady-state identity syscalls"
@@ -27183,6 +27184,7 @@ test_direct_runtime_parser_bounds() {
     pass "constructor reservations allow cold lookup and preserve nested/fork ownership"
     pass "runtime populated TLS DTV hits avoid the loader lock"
     pass "loader memchr is exact-bounds across guard pages and alignments"
+    pass "loader memcmp preserves unsigned ordering and exact bounds on both operands"
 
     if ! gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -O2 -Iinclude \
             -ffunction-sections -fdata-sections -fno-stack-protector \

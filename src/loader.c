@@ -1029,21 +1029,6 @@ static void *ldr_memset(void *destination, int value, size_t length)
     return result;
 }
 
-static int ldr_memcmp(const void *left, const void *right, size_t length)
-{
-    const volatile unsigned char *a = left;
-    const volatile unsigned char *b = right;
-
-    while (length-- != 0) {
-        unsigned char av = *a++;
-        unsigned char bv = *b++;
-
-        if (av != bv)
-            return av < bv ? -1 : 1;
-    }
-    return 0;
-}
-
 #define LDR_MEMCHR_WORD_BATCH 4U
 #define LDR_MEMCHR_VECTOR_BYTES 16U
 #define LDR_MEMCHR_VECTOR_BATCH 4U
@@ -1130,6 +1115,59 @@ ldr_byte_vector_match_index(ldr_byte_vector equality)
             return i;
     return LDR_MEMCHR_VECTOR_BYTES;
 #endif
+}
+
+/* Read only complete, in-range vectors. A mismatch is resolved in address
+ * order, preserving unsigned-byte lexicographic ordering on both targets.
+ * Like the other loader primitives this must never dispatch through the
+ * bootstrap libc after the target thread pointer has been installed. */
+static int ldr_memcmp(const void *left, const void *right, size_t length)
+{
+    const volatile unsigned char *a = left;
+    const volatile unsigned char *b = right;
+
+    while (length >= 4U * LDR_MEMCHR_VECTOR_BYTES) {
+        ldr_byte_vector equal[4];
+        ldr_byte_vector all;
+
+        for (unsigned int i = 0; i < 4; i++)
+            equal[i] = ldr_byte_vector_equal(
+                ldr_byte_vector_load(a + i * LDR_MEMCHR_VECTOR_BYTES),
+                ldr_byte_vector_load(b + i * LDR_MEMCHR_VECTOR_BYTES));
+        all = equal[0] & equal[1] & equal[2] & equal[3];
+        if (ldr_byte_vector_has_match(~all)) {
+            for (unsigned int i = 0; i < 4; i++) {
+                size_t index = ldr_byte_vector_match_index(~equal[i]);
+
+                if (index < LDR_MEMCHR_VECTOR_BYTES) {
+                    index += i * LDR_MEMCHR_VECTOR_BYTES;
+                    return a[index] < b[index] ? -1 : 1;
+                }
+            }
+        }
+        a += 4U * LDR_MEMCHR_VECTOR_BYTES;
+        b += 4U * LDR_MEMCHR_VECTOR_BYTES;
+        length -= 4U * LDR_MEMCHR_VECTOR_BYTES;
+    }
+    while (length >= LDR_MEMCHR_VECTOR_BYTES) {
+        ldr_byte_vector equal = ldr_byte_vector_equal(
+            ldr_byte_vector_load(a), ldr_byte_vector_load(b));
+        size_t index = ldr_byte_vector_match_index(~equal);
+
+        if (index < LDR_MEMCHR_VECTOR_BYTES)
+            return a[index] < b[index] ? -1 : 1;
+        a += LDR_MEMCHR_VECTOR_BYTES;
+        b += LDR_MEMCHR_VECTOR_BYTES;
+        length -= LDR_MEMCHR_VECTOR_BYTES;
+    }
+    while (length-- != 0) {
+        unsigned char av = *a++;
+        unsigned char bv = *b++;
+
+        if (av != bv)
+            return av < bv ? -1 : 1;
+    }
+    return 0;
 }
 
 #ifdef DLFREEZE_MEMCHR_COMPLEXITY_GATE
@@ -20385,6 +20423,8 @@ static size_t g_symbol_query_forward_bytes;
 static size_t g_symbol_query_reverse_bytes;
 static size_t g_symbol_query_sysv_bytes;
 static size_t g_symbol_name_radix_sorts;
+static size_t g_symbol_name_admission_bytes;
+static size_t g_symbol_name_ref_boundaries;
 static size_t g_version_key_admission_visits;
 static size_t g_versym_value_reads;
 static size_t g_dladdr_gnu_chain_visits;
@@ -21616,38 +21656,52 @@ static int build_loaded_symbol_name_keys(struct loaded_obj *obj)
     }
 
     remaining = refs_count;
-    for (size_t position = obj->dynstr_size; position != 0;) {
-        uint8_t byte = (uint8_t)obj->dynstr[--position];
+    for (size_t position = obj->dynstr_size; remaining != 0;) {
+        size_t target = refs[remaining - 1].offset;
 
-        if (byte == 0) {
-            fingerprint = g_symbol_name_fingerprint_seed;
-            suffix_length = 0;
-            gnu_hash = UINT32_C(5381);
-            gnu_power = UINT32_C(1);
-        } else {
-            if (suffix_length == SIZE_MAX - 1)
-                goto out;
-            suffix_length++;
-            fingerprint =
-                (fingerprint ^ ((uint64_t)byte + UINT64_C(0x100))) *
-                g_symbol_name_fingerprint_multiplier;
-            /* For a suffix of length L, H = 5381*33^L + body.  Prepending
-             * byte c gives H' = H + (5381*32+c)*33^L modulo 2^32. */
-            gnu_hash += (UINT32_C(5381) * UINT32_C(32) + byte) *
-                        gnu_power;
-            gnu_power *= UINT32_C(33);
-        }
-        while (remaining != 0 && refs[remaining - 1].offset == position) {
+        /* Sorted references give the next publication boundary. Hash the
+         * entire intervening span without probing the reference array for
+         * every byte of a long symbol name. Overlapping suffixes still share
+         * exactly one reverse traversal and the same keyed recurrence. */
+        if (target >= position)
+            goto out;
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+        g_symbol_name_ref_boundaries++;
+#endif
+        do {
+            uint8_t byte = (uint8_t)obj->dynstr[--position];
+
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+            g_symbol_name_admission_bytes++;
+#endif
+            if (byte == 0) {
+                fingerprint = g_symbol_name_fingerprint_seed;
+                suffix_length = 0;
+                gnu_hash = UINT32_C(5381);
+                gnu_power = UINT32_C(1);
+            } else {
+                if (suffix_length == SIZE_MAX - 1)
+                    goto out;
+                suffix_length++;
+                fingerprint =
+                    (fingerprint ^ ((uint64_t)byte + UINT64_C(0x100))) *
+                    g_symbol_name_fingerprint_multiplier;
+                /* For a suffix of length L, H = 5381*33^L + body.
+                 * Prepending c adds (5381*32+c)*33^L modulo 2^32. */
+                gnu_hash += (UINT32_C(5381) * UINT32_C(32) + byte) *
+                            gnu_power;
+                gnu_power *= UINT32_C(33);
+            }
+        } while (position != target);
+        do {
             refs[remaining - 1].destination->fingerprint = fingerprint;
             refs[remaining - 1].destination->length = suffix_length;
             refs[remaining - 1].destination->gnu_hash = gnu_hash;
             refs[remaining - 1].destination->dynstr_offset =
                 (uint32_t)position;
             remaining--;
-        }
+        } while (remaining != 0 && refs[remaining - 1].offset == position);
     }
-    if (remaining != 0)
-        goto out;
     if (name_index) {
         size_t bucket_count =
             (size_t)name_index_bucket_mask + 1U;
