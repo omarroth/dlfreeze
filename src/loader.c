@@ -15951,6 +15951,7 @@ struct vfs_dir_entry {
     size_t data_end;
     size_t directory_end;
     size_t child_end;
+    int captured_data;
 };
 
 /* Keep lookup slots small: child ranges and parent identity belong to the
@@ -16572,6 +16573,10 @@ static int vfs_init_dirs(void)
                 path, vfs_is_directory_entry(&g_vfs_table[i])) < 0)
             goto fail;
     }
+    /* File capture owns these directory views.  ELF-only parents added below
+     * remain overlays so tracing libraries alone does not hide host data. */
+    for (size_t i = 0; i < g_vfs_dir_count; i++)
+        g_vfs_dirs[i].captured_data = 1;
     /* Also derive parent directories from frozen DLOPEN entries so that
     * directories whose only contents are dlopen-served .so files
     * report as existing.  Otherwise vfs_path_is_sealed_miss can make
@@ -17245,7 +17250,7 @@ static int remember_vfs_dirfd_locked(int fd, const char *path,
         set_loader_errno(ENOTDIR);
         return -1;
     }
-    path_backing = VFS_SYSCALL(
+    path_backing = !unique_backing && VFS_SYSCALL(
         SYS_newfstatat, AT_FDCWD, path, &path_status, 0) == 0 &&
         vfs_stat_identity_equal(&placeholder_status, &path_status);
     if ((unique_backing && placeholder_status.st_nlink != 0) ||
@@ -17808,10 +17813,10 @@ static void *vfs_opendir(const char *path)
 
     vfs_dbg_op("opendir", lookup_path, "enter");
 
-    /* A captured path does not seal its complete parent directory.  Merge a
-     * live host directory when available, while retaining a virtual-only
-     * stream when the original directory has disappeared. */
-    if (has_vfs) {
+    /* ELF-only overlays still need uncaptured host data.  Directories
+     * represented by file capture enumerate the frozen tree without probing
+     * the original path. */
+    if (has_vfs && !vfs_directory->captured_data) {
         fd = (int)VFS_SYSCALL(
             SYS_openat, AT_FDCWD, lookup_path,
             O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NONBLOCK, 0);
@@ -17912,6 +17917,7 @@ static void *vfs_fdopendir(int fd)
             struct stat path_status;
 
             h->real_directory =
+                h->vfs_directory && !h->vfs_directory->captured_data &&
                 VFS_SYSCALL(SYS_fstat, fd, &descriptor_status) == 0 &&
                 VFS_SYSCALL(SYS_newfstatat, AT_FDCWD, mapped,
                             &path_status, 0) == 0 &&
@@ -19285,7 +19291,7 @@ static int vfs_open_directory_placeholder(const char *lookup_path, int flags,
                                           int mode, const char *operation)
 {
     int fd;
-    int unique_backing = 0;
+    const struct vfs_dir_entry *directory = vfs_dir_lookup(lookup_path);
 
 #ifdef O_TMPFILE
     if ((flags & O_TMPFILE) == O_TMPFILE) {
@@ -19293,28 +19299,29 @@ static int vfs_open_directory_placeholder(const char *lookup_path, int flags,
         return -1;
     }
 #endif
-    /* Preserve a live host directory when it exists so uncaptured relative
-     * children retain kernel semantics.  Otherwise use a unique, unlinked
-     * directory inode; the registry remains authoritative for translating
-     * every VFS-relative operation. */
-    fd = (int)VFS_SYSCALL(
-        SYS_openat, AT_FDCWD, lookup_path, flags, mode);
-    if (fd >= 0 && remember_vfs_dirfd(fd, lookup_path, 0) == 0)
-        goto success;
-    if (fd >= 0) {
-        int saved_errno = loader_errno_value();
+    /* ELF-only overlays retain uncaptured host data without requiring -f. */
+    if (directory && !directory->captured_data) {
+        fd = (int)VFS_SYSCALL(
+            SYS_openat, AT_FDCWD, lookup_path, flags, mode);
+        if (fd >= 0) {
+            if (remember_vfs_dirfd(fd, lookup_path, 0) == 0)
+                return fd;
+            int saved_errno = loader_errno_value();
 
-        (void)VFS_SYSCALL(SYS_close, fd);
-        if (saved_errno != ESTALE) {
-            set_loader_errno(saved_errno);
-            return -1;
+            (void)VFS_SYSCALL(SYS_close, fd);
+            if (saved_errno != ESTALE) {
+                set_loader_errno(saved_errno);
+                return -1;
+            }
         }
     }
+    /* Never probe a captured-data directory.  The unique, unlinked backing
+     * supplies an fd identity only; relative public operations are translated
+     * through the registry, including explicit uncaptured-child fallbacks. */
     fd = vfs_open_unique_directory_placeholder(flags, mode);
-    unique_backing = 1;
     if (fd < 0)
         return -1;
-    if (remember_vfs_dirfd(fd, lookup_path, unique_backing) < 0) {
+    if (remember_vfs_dirfd(fd, lookup_path, 1) < 0) {
         int saved_errno = loader_errno_value();
 
         (void)VFS_SYSCALL(SYS_close, fd);
@@ -19322,7 +19329,6 @@ static int vfs_open_directory_placeholder(const char *lookup_path, int flags,
         return -1;
     }
 
-success:
     vfs_dbg_op(operation, lookup_path, "dir-virtual");
     return fd;
 }
@@ -19505,17 +19511,22 @@ static void *vfs_fopen(const char *path, const char *mode)
             set_loader_errno(ENOENT);
             return (void *)0;
         }
-        if (ve && is_write) {
+        int is_directory = !vfs_is_regular_entry(ve) &&
+            vfs_dir_exists(lookup_path);
+        if ((ve || is_directory) && is_write) {
             vfs_dbg_op("fopen", lookup_path, "write-refused");
             set_loader_errno(EROFS);
             return (void *)0;
         }
-        if (vfs_is_regular_entry(ve)) {
+        if (is_directory || vfs_is_regular_entry(ve)) {
             int fd;
             void *stream;
 
-            vfs_dbg_op("fopen", lookup_path, "file");
-            fd = vfs_serve_memfd(ve, lookup_path, open_flags);
+            vfs_dbg_op("fopen", lookup_path, is_directory ? "dir" : "file");
+            fd = is_directory
+                ? vfs_open_directory_placeholder(
+                      lookup_path, open_flags, 0, "fopen")
+                : vfs_serve_memfd(ve, lookup_path, open_flags);
             if (fd < 0)
                 return (void *)0;
             if (!g_real_fdopen) {

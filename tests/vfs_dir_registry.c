@@ -593,6 +593,14 @@ static int check_opendir_contract(const struct worker_args *args)
     }
     if (errno != ENOTDIR)
         return 0;
+    /* fopen's libc-internal open must not bypass captured directory identity. */
+    FILE *stream = fopen(args->directory, "r");
+    struct stat status;
+    if (!stream)
+        return 0;
+    int valid = fstat(fileno(stream), &status) == 0 && S_ISDIR(status.st_mode);
+    if (fclose(stream) != 0 || !valid)
+        return 0;
     return 1;
 }
 
@@ -779,7 +787,7 @@ static int check_invalid_virtual_seek(const struct worker_args *args)
             goto out;
     }
     if (errno == 0 && first == 1 && second == 1 && other == 1 &&
-        another == 1 && host_only == 1 && host_link == 1)
+        another == 1 && host_only == 0 && host_link == 0)
         ok = 1;
     else
         fprintf(stderr,

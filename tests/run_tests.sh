@@ -6383,6 +6383,33 @@ test_vfs_dir_handle_registry() {
     actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
     if [ "$rc" -eq 0 ] && [ "$actual" = "$expected" ]; then
         pass "VFS DIR handle registry"
+        local syscall_log="$root/directory-syscalls.log"
+        # Functional replay alone cannot detect optional host probes. Verify
+        # actual pathname syscalls where ptrace is available (not all QEMU or
+        # restricted-container configurations support it).
+        if command -v strace >/dev/null 2>&1 &&
+           run_with_timeout strace -f -qq -e trace=file -o "$syscall_log" \
+               true >/dev/null 2>&1; then
+            rc=0
+            capture_output actual env DLFREEZE_NO_FORK=1 \
+                strace -f -qq -s 4096 -e trace=file -o "$syscall_log" \
+                "$out" "$data" "$data/second.txt" "$root" frozen || rc=$?
+            actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+            if [ "$rc" -ne 0 ] || [ "$actual" != "$expected" ]; then
+                fail "captured directory syscall isolation" \
+                    "straced replay exit=$rc output=$actual"
+            elif grep -F -e "\"$data\"" -e "\"$data/other\"" \
+                    -e "\"$data/another\"" "$syscall_log" |
+                 grep -Ev 'execve(at)?\(' >/dev/null; then
+                fail "captured directory syscall isolation" \
+                    "runtime probed a captured host directory"
+                tail -n 30 "$syscall_log" || true
+            else
+                pass "captured directory APIs issue no original-path syscalls"
+            fi
+        else
+            skip "captured directory syscall isolation" "strace/ptrace unavailable"
+        fi
     else
         fail "VFS DIR handle registry" "exit=$rc output=$actual"
         tail -n 60 "$log" || true

@@ -1,7 +1,9 @@
 #include "dep_resolver.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 int main(int argc, char **argv)
 {
@@ -30,6 +32,22 @@ int main(int argc, char **argv)
     }
     if (dep_resolve(argv[1], &deps) < 0)
         return 1;
+    if (deps.interp_soname) {
+        char *provider = NULL;
+        struct stat original, auxiliary;
+        int resolved = dep_resolve_aux_dependency(
+            &deps, argv[1], deps.interp_soname, &provider);
+        int same = resolved == 1 && stat(deps.interp_path, &original) == 0 &&
+            stat(provider, &auxiliary) == 0 &&
+            original.st_dev == auxiliary.st_dev &&
+            original.st_ino == auxiliary.st_ino;
+
+        free(provider);
+        if (!same) {
+            fprintf(stderr, "auxiliary interpreter dependency changed identity\n");
+            goto out;
+        }
+    }
     if (dep_add_dlopen_libs(&deps, argv[2]) < 0)
         goto out;
     if (expected_lazy_semantics >= 0 &&

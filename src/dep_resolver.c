@@ -3385,7 +3385,7 @@ int dep_resolve_aux_dependency(struct dep_list *deps,
     const struct rpath_scope *inherited_rpath = NULL;
     enum library_lookup_result lookup_result;
     struct dep_file_snapshot snapshot;
-    int musl_self_dependency;
+    int interpreter_dependency;
     int result = -1;
 
     if (path_out)
@@ -3414,13 +3414,16 @@ int dep_resolve_aux_dependency(struct dep_list *deps,
         main_scope.origin = deps->main_origin;
         inherited_rpath = &main_scope;
     }
-    /* The musl interpreter is also its libc provider.  Its reserved self
-     * names bind to the already-loaded PT_INTERP object before filesystem
-     * search, including when that exact runtime was copied or renamed.  Keep
-     * auxiliary helper resolution consistent with the ordinary dependency
-     * walk instead of consulting a path file relative to the copied name. */
-    musl_self_dependency = musl_dependency_is_self(name, deps);
-    resolved = musl_self_dependency
+    /* Helper dependencies can name the already-loaded interpreter too.
+     * GNU helpers on AArch64 commonly import its versioned TLS accessor.
+     * Searching disk for that SONAME after PT_INTERP was copied would select
+     * a different inode and falsely reject an otherwise compatible helper.
+     * Bind only the explicit interpreter path/SONAME (or musl's reserved
+     * self names), never a guessed basename. */
+    interpreter_dependency = musl_dependency_is_self(name, deps) ||
+        (deps->runtime_family == DEP_RUNTIME_GNU &&
+         is_interpreter_dependency(name, deps));
+    resolved = interpreter_dependency
         ? validated_candidate(deps->interp_path, deps,
                               CANDIDATE_NON_GNU, &lookup_result,
                               NULL, &snapshot)

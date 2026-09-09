@@ -322,14 +322,20 @@ The captured-file VFS serves a followed symlink's contents under the traced
 request path; it does not reproduce the symlink object for `lstat()` or
 `readlink()`. Synthetic captured-directory descriptors are intended for
 enumeration and relative lookups. Their identity is propagated through
-`dup()`, `dup2()`, `dup3()`, and `fcntl(F_DUPFD*)`; `fchdir()` and descriptor
-metadata are not yet virtualized and can expose host working-directory or
-descriptor behavior. Avoid those operations in captured-directory workloads.
+`dup()`, `dup2()`, `dup3()`, and `fcntl(F_DUPFD*)`, and public descriptor
+metadata calls publish the virtual identity. `fchdir()` is not virtualized;
+avoid it on captured-directory descriptors.
 
-`-f` selects **observed paths**, not a closed filesystem scope: uncaptured
-siblings remain accessible and directory enumeration merges them with captured
-entries. Captured misses and regular files nevertheless retain their identity
-through `opendir()` even if a same-named host directory appears later. Original
+`-f` selects **observed paths**, not a closed filesystem scope: explicit
+accesses to uncaptured paths can still use the host. Data-captured directories,
+including parents derived from captured data files, enumerate only the frozen
+tree. Their `opendir`, `open`, `openat`, and `fopen` implementations do not
+probe a same-named host directory; descriptor operations use unique unlinked
+backing directories. Host-only modules/plugins are therefore not discovered
+by enumerating a data-captured directory. Directories derived only from embedded
+ELF libraries remain host overlays, preserving library-only tracing without
+`-f`. Captured misses and regular files retain their identity through `opendir()`
+even if a same-named host directory appears later. Original
 path strings (including `/usr/lib/...`) remain valid virtual names; their
 presence in an artifact is not itself evidence of a host read. Libc-internal
 file operations, such as locale-data reads, can bypass the public interposers

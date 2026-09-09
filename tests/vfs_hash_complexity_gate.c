@@ -360,6 +360,7 @@ static int sparse_directory_child_gate(void)
         EXPLICIT_DIR_INDEX,
         NESTED_INDEX,
         ELF_INDEX,
+        ELF_ONLY_INDEX,
         ENTRY_COUNT,
     };
     struct dlfrz_entry *entries = NULL;
@@ -443,6 +444,17 @@ static int sparse_directory_child_gate(void)
         entries[ELF_INDEX].dlopen_request_offset = (uint32_t)(offset + 128);
         metas[ELF_INDEX].flags = LDR_FLAG_SHLIB | LDR_FLAG_DLOPEN;
     }
+    {
+        size_t offset = (size_t)ELF_ONLY_INDEX * SPARSE_CHILD_STRIDE;
+
+        if (offset > UINT32_MAX)
+            goto out;
+        memcpy(strings + offset, "/elf-only/module.so",
+               sizeof("/elf-only/module.so"));
+        entries[ELF_ONLY_INDEX].flags = DLFRZ_FLAG_SHLIB | DLFRZ_FLAG_DLOPEN;
+        entries[ELF_ONLY_INDEX].name_offset = (uint32_t)offset;
+        metas[ELF_ONLY_INDEX].flags = LDR_FLAG_SHLIB | LDR_FLAG_DLOPEN;
+    }
 
     g_frozen_mem = &data;
     g_frozen_mem_foff = 0;
@@ -459,6 +471,12 @@ static int sparse_directory_child_gate(void)
     nested_directory = vfs_dir_lookup("/focus/sub");
     if (!focus || !data_entry || !virtual_entry || !explicit_directory ||
         !nested_directory || !g_frozen_elf_inodes)
+        goto out;
+    const struct vfs_dir_entry *elf_only = vfs_dir_lookup("/elf-only");
+    const struct vfs_dir_entry *root = vfs_dir_lookup("/");
+    if (!focus->captured_data || !explicit_directory->captured_data ||
+        !nested_directory->captured_data || !root || !root->captured_data ||
+        !elf_only || elf_only->captured_data)
         goto out;
     elf_inode = g_frozen_elf_inodes[ELF_INDEX];
 
