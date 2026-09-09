@@ -3324,6 +3324,43 @@ out:
 static void trace_missing_path(int dirfd, const char *path, int error,
                                const struct cwd_observation *observation)
 {
+    /* ENOTDIR from opendir/open(O_DIRECTORY) can describe an existing
+     * regular file, not a missing pathname.  Retain that immutable identity
+     * so replay rejects a host directory replacement with ENOTDIR too.
+     * A failed intermediate component still produces a negative lookup. */
+    if (error == ENOTDIR && !g_trace_depth && g_file_trace_fd >= 0) {
+        struct stat st;
+        struct file_trace_snapshot snapshot;
+        int saved_errno = errno;
+        int rc;
+
+        g_trace_depth++;
+        rc = raw_fstatat(dirfd, path, &st, 0);
+        g_trace_depth--;
+        if (rc == 0 && S_ISREG(st.st_mode)) {
+            file_trace_snapshot_from_stat(&snapshot, &st);
+            trace_path_kind(dirfd, path, 0, &snapshot, observation);
+            errno = saved_errno;
+            return;
+        }
+        if (rc == 0 || (errno != ENOENT && errno != ENOTDIR)) {
+            char request[PATH_MAX];
+
+            /* Special nodes and uncertain observations are not captured
+             * regular files.  Keep the request scope-aware, like successful
+             * unrepresentable opens, rather than poisoning unrelated -f
+             * scopes or recording a false missing-file identity. */
+            g_trace_depth++;
+            if (build_path(dirfd, path, observation, request, sizeof(request)))
+                write_file_unresolved('F', request);
+            else
+                write_file_failure("not-directory-request-cannot-be-made-absolute");
+            g_trace_depth--;
+            errno = saved_errno;
+            return;
+        }
+        errno = saved_errno;
+    }
     if (error == ENOENT || error == ENOTDIR)
         trace_failed_path(dirfd, path, observation);
 }

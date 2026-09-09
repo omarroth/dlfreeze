@@ -1735,6 +1735,10 @@ malformed_success_record:
     }
 
     fclose(tf);
+    if (npatterns > 0 && out->count == 0)
+        fprintf(stderr,
+                "dlfreeze: warning: capture patterns selected no data paths; "
+                "uncaptured file accesses still use the host\n");
     finish_captured_paths(out, verbose);
     return 0;
 }

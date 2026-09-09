@@ -6824,6 +6824,10 @@ static size_t loaded_rela_table_count(
     return 0;
 }
 
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+static size_t g_loaded_rela_reads;
+#endif
+
 static int loaded_rela_read(const struct loaded_obj *obj,
                             enum loaded_rela_table table,
                             size_t index, Elf64_Rela *relocation_out)
@@ -6844,6 +6848,9 @@ static int loaded_rela_read(const struct loaded_obj *obj,
     }
     if (!relocations || index >= count)
         return 0;
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+    g_loaded_rela_reads++;
+#endif
     memcpy(relocation_out,
            (const uint8_t *)relocations + index * sizeof(*relocation_out),
            sizeof(*relocation_out));
@@ -17781,6 +17788,21 @@ static void *vfs_opendir(const char *path)
     struct vfs_dir_handle *h;
     runtime_loader_lock_token lock_token;
 
+    /* Directory streams obey the same immutable identities as open/stat.
+     * In particular, a host directory appearing after a captured miss (or
+     * replacing a captured regular file) must never reach libc opendir. */
+    if (lookup_path && lookup_path[0] == '/') {
+        const struct vfs_entry *entry = vfs_lookup(lookup_path);
+
+        if (vfs_is_negative_entry(entry)) {
+            set_loader_errno(ENOENT);
+            return NULL;
+        }
+        if (vfs_is_regular_entry(entry) || frozen_elf_find(lookup_path) >= 0) {
+            set_loader_errno(ENOTDIR);
+            return NULL;
+        }
+    }
     if (!has_vfs && g_real_opendir)
         return g_real_opendir(path);
 
@@ -33454,18 +33476,12 @@ static int parse_dynamic(struct loaded_obj *obj,
     if (relacount > obj->rela_count)
         return -1;
     obj->rela_relative_count = (size_t)relacount;
-    for (size_t i = 0; i < obj->rela_relative_count; i++) {
-        Elf64_Rela relocation;
-
-        if (!loaded_rela_read(obj, LOADED_RELA_DYNAMIC, i, &relocation) ||
-            ELF64_R_TYPE(relocation.r_info) != ARCH_RELOC_RELATIVE ||
-            ELF64_R_SYM(relocation.r_info) != 0)
-            return -1;
-    }
 
     /* Relocation symbol indices are a second exact lower bound for dynsym.
      * GNU hash deliberately omits undefined imports on some linkers (notably
-     * AArch64 GNU ld), so hash chains alone can under-count the table. */
+     * AArch64 GNU ld), so hash chains alone can under-count the table.  Check
+     * DT_RELACOUNT in this same walk: rereading/copying the often-large
+     * relative prefix adds no evidence to the immutable authority. */
     {
         for (enum loaded_rela_table table = LOADED_RELA_DYNAMIC;
              table < LOADED_RELA_TABLE_COUNT; table++) {
@@ -33479,6 +33495,11 @@ static int parse_dynamic(struct loaded_obj *obj,
                     return -1;
                 sidx = ELF64_R_SYM(relocation.r_info);
                 if (sidx == UINT32_MAX)
+                    return -1;
+                if (table == LOADED_RELA_DYNAMIC &&
+                    i < obj->rela_relative_count &&
+                    (ELF64_R_TYPE(relocation.r_info) != ARCH_RELOC_RELATIVE ||
+                     sidx != 0))
                     return -1;
                 if (sidx + 1 > obj->dynsym_count)
                     obj->dynsym_count = sidx + 1;
@@ -33564,10 +33585,10 @@ static int parse_dynamic(struct loaded_obj *obj,
             span = (strtab - symtab) / sizeof(Elf64_Sym);
             if (span == 0 || span > UINT32_MAX)
                 return -1;
+            if (obj->dynsym_count > span)
+                return -1;
             if (!gnu_hash_addr && !sysv_hash_addr)
                 obj->dynsym_count = (uint32_t)span;
-            else if (obj->dynsym_count > span)
-                return -1;
         }
         if (obj->dynsym_count == 0)
             return -1;

@@ -5594,6 +5594,19 @@ C
             "packer failed for an unrelated reason"
     fi
 
+    # Quoting already protects a wildcard from the shell.  Escaping it as
+    # well selects a literal '*' filename; an empty capture must be visible.
+    rc=0
+    run_freeze "$DLFREEZE" -d -t -f "$root_abs/\*" \
+        -o "$no_direct_out" -- "$bin" "$resource" \
+        >"$no_direct_log" 2>&1 || rc=$?
+    if [ "$rc" -eq 0 ] && grep -Fq \
+            'capture patterns selected no data paths' "$no_direct_log"; then
+        pass "empty capture scope warning"
+    else
+        fail "empty capture scope warning" "exit=$rc or missing diagnostic"
+    fi
+
     freeze_require_default_direct "captured-file direct artifact" "$log" "$out" \
         -t -f "$root_abs/*" -- "$bin" "$resource" || freeze_rc=$?
     if [ "$freeze_rc" -eq 77 ]; then
@@ -6360,7 +6373,8 @@ test_vfs_dir_handle_registry() {
     rm -rf "$data"
     mkdir -p "$data"
     printf 'host replacement\n' >"$data/first.txt"
-    printf 'negative host sentinel\n' >"$data/proc"
+    # A captured miss and regular file must not become host directory streams.
+    mkdir -p "$data/proc" "$data/second.txt"
     printf 'uncaptured host sentinel\n' >"$data/host-only"
     ln -s /dev/null "$data/host-link"
     actual=""; rc=0
@@ -27126,6 +27140,7 @@ test_direct_runtime_parser_bounds() {
     fi
     pass "runtime PT_DYNAMIC reads are chunk-bounded"
     pass "runtime PT_DYNAMIC first-terminator and truncation semantics"
+    pass "runtime relocation admission reads each record once and checks symbol bounds"
     pass "runtime high-cardinality defined/needed versions use a paged index"
     pass "runtime version index rejects malformed chains and duplicate indices"
     pass "runtime startup source-owner indexing handles 65,535 aliases"

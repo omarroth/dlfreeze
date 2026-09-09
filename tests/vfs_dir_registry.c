@@ -553,6 +553,49 @@ out:
     return ok;
 }
 
+static int check_opendir_contract(const struct worker_args *args)
+{
+    const char *names[] = { "proc", "second.txt" };
+    const int errors[] = { ENOENT, ENOTDIR };
+
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        char path[PATH_MAX];
+        int length = snprintf(path, sizeof(path), "%s/%s",
+                              args->directory, names[i]);
+        DIR *directory;
+
+        if (length < 0 || (size_t)length >= sizeof(path))
+            return 0;
+        errno = 0;
+        directory = opendir(path);
+        if (directory) {
+            closedir(directory);
+            return 0;
+        }
+        if (errno != errors[i])
+            return 0;
+        errno = 0;
+        int descriptor = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (descriptor >= 0) {
+            close(descriptor);
+            return 0;
+        }
+        if (errno != errors[i])
+            return 0;
+    }
+    /* An unrepresentable, existing node outside the selected data scope
+     * must not invalidate the trace or become a false missing-file record. */
+    errno = 0;
+    DIR *special = opendir("/dev/null");
+    if (special) {
+        closedir(special);
+        return 0;
+    }
+    if (errno != ENOTDIR)
+        return 0;
+    return 1;
+}
+
 static int check_directory_duplication(const struct worker_args *args)
 {
     DIR *directory = NULL;
@@ -832,6 +875,7 @@ int main(int argc, char **argv)
     REQUIRE_DIRECTORY_CHECK(check_raw_regular_fd_reuse(&args));
     REQUIRE_DIRECTORY_CHECK(check_close_range_independence(&args));
     REQUIRE_DIRECTORY_CHECK(check_readlink_contract(&args));
+    REQUIRE_DIRECTORY_CHECK(check_opendir_contract(&args));
     REQUIRE_DIRECTORY_CHECK(check_virtual_dirfd_replacement(&args));
     REQUIRE_DIRECTORY_CHECK(check_raw_virtual_dirfd_replacement(&args));
     REQUIRE_DIRECTORY_CHECK(check_invalid_virtual_seek(&args));

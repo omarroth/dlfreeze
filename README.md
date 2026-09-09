@@ -325,6 +325,20 @@ enumeration and relative lookups. Their identity is propagated through
 `dup()`, `dup2()`, `dup3()`, and `fcntl(F_DUPFD*)`; `fchdir()` and descriptor
 metadata are not yet virtualized and can expose host working-directory or
 descriptor behavior. Avoid those operations in captured-directory workloads.
+
+`-f` selects **observed paths**, not a closed filesystem scope: uncaptured
+siblings remain accessible and directory enumeration merges them with captured
+entries. Captured misses and regular files nevertheless retain their identity
+through `opendir()` even if a same-named host directory appears later. Original
+path strings (including `/usr/lib/...`) remain valid virtual names; their
+presence in an artifact is not itself evidence of a host read. Libc-internal
+file operations, such as locale-data reads, can bypass the public interposers
+just as raw syscalls do. This VFS is not a filesystem sandbox.
+Quote wildcard patterns as `'/usr/*'`, without a backslash before `*` inside
+the quotes; `'/usr/\*'` selects a literal asterisk instead. A completed trace
+that selects no data paths prints a warning; it does not silently turn that
+pattern into a wildcard or promise self-contained file access.
+
 Extraction uses a securely admitted private directory below `TMPDIR`, with an
 equally checked `/tmp` fallback; the selected path must permit both file
 creation and execution. The directory remains available while the supervised

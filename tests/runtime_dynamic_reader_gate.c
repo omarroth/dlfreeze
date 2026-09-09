@@ -330,6 +330,88 @@ out:
     return result;
 }
 
+static int relocation_admission_single_pass_gate(void)
+{
+    enum { COUNT = 4096, DYNAMIC = 16, SYMTAB = 512, STRTAB = 608,
+           RELA = 1024, PLT = RELA + COUNT * sizeof(Elf64_Rela),
+           SIZE = PLT + 2 * sizeof(Elf64_Rela) };
+    struct dlfrz_lib_meta meta = { .flags = LDR_FLAG_SHLIB };
+    Elf64_Phdr phdrs[2] = {
+        { .p_type = PT_LOAD, .p_flags = PF_R,
+          .p_filesz = SIZE, .p_memsz = SIZE },
+        { .p_type = PT_DYNAMIC, .p_vaddr = DYNAMIC,
+          .p_filesz = 12 * sizeof(Elf64_Dyn),
+          .p_memsz = 12 * sizeof(Elf64_Dyn) }
+    };
+    struct loaded_obj object = {0};
+    uint8_t key[16] = {0};
+    unsigned char *image = calloc(1, SIZE);
+    int result = 0;
+
+    if (!image)
+        return 0;
+    if (vfs_seed_hash_key(key) < 0)
+        goto out;
+    Elf64_Dyn dynamic[] = {
+        { .d_tag = DT_SYMTAB, .d_un.d_ptr = SYMTAB },
+        { .d_tag = DT_STRTAB, .d_un.d_ptr = STRTAB },
+        { .d_tag = DT_STRSZ, .d_un.d_val = 1 },
+        { .d_tag = DT_SYMENT, .d_un.d_val = sizeof(Elf64_Sym) },
+        { .d_tag = DT_RELA, .d_un.d_ptr = RELA },
+        { .d_tag = DT_RELASZ, .d_un.d_val = COUNT * sizeof(Elf64_Rela) },
+        { .d_tag = DT_RELAENT, .d_un.d_val = sizeof(Elf64_Rela) },
+        { .d_tag = DT_RELACOUNT, .d_un.d_val = COUNT - 1 },
+        { .d_tag = DT_JMPREL, .d_un.d_ptr = PLT },
+        { .d_tag = DT_PLTRELSZ, .d_un.d_val = 2 * sizeof(Elf64_Rela) },
+        { .d_tag = DT_PLTREL, .d_un.d_val = DT_RELA },
+        { .d_tag = DT_NULL }
+    };
+    memcpy(image + DYNAMIC, dynamic, sizeof(dynamic));
+    Elf64_Rela *relocations = (Elf64_Rela *)(image + RELA);
+    Elf64_Rela *plt = (Elf64_Rela *)(image + PLT);
+    for (size_t i = 0; i < COUNT - 1; i++)
+        relocations[i].r_info = ELF64_R_INFO(0, ARCH_RELOC_RELATIVE);
+    relocations[COUNT - 1].r_info = ELF64_R_INFO(1, ARCH_RELOC_ABS);
+    plt[0].r_info = plt[1].r_info = ELF64_R_INFO(3, ARCH_RELOC_JUMP_SLOT);
+
+    for (int variant = 0; variant < 6; variant++) {
+        memset(&object, 0, sizeof(object));
+        object.base = (uintptr_t)image;
+        object.phdr = phdrs;
+        object.phdr_num = 2;
+        ((Elf64_Dyn *)(image + DYNAMIC))[7].d_un.d_val = COUNT - 1;
+        relocations[0].r_info = ELF64_R_INFO(0, ARCH_RELOC_RELATIVE);
+        plt[1].r_info = ELF64_R_INFO(3, ARCH_RELOC_JUMP_SLOT);
+        if (variant == 1)
+            relocations[0].r_info = ELF64_R_INFO(0, ARCH_RELOC_ABS);
+        if (variant == 2)
+            relocations[0].r_info = ELF64_R_INFO(1, ARCH_RELOC_RELATIVE);
+        if (variant == 3)
+            ((Elf64_Dyn *)(image + DYNAMIC))[7].d_un.d_val = COUNT + 1;
+        if (variant == 4)
+            plt[1].r_info = ELF64_R_INFO(UINT32_MAX, ARCH_RELOC_JUMP_SLOT);
+        if (variant == 5)
+            plt[1].r_info = ELF64_R_INFO(4, ARCH_RELOC_JUMP_SLOT);
+        g_loaded_rela_reads = 0;
+        int rc = parse_dynamic(&object, &meta);
+        int ok = variant == 0
+            ? rc == 0 && object.dynsym_count == 4 &&
+              g_loaded_rela_reads == COUNT + 2
+            : rc < 0;
+        if (!ok)
+            fprintf(stderr, "relocation admission variant=%d rc=%d "
+                    "symbols=%u reads=%zu\n", variant, rc,
+                    object.dynsym_count, g_loaded_rela_reads);
+        dl_release_runtime_mapping(&object);
+        if (!ok)
+            goto out;
+    }
+    result = 1;
+out:
+    free(image);
+    return result;
+}
+
 static int truncation_gate(void)
 {
     const size_t actual_size = 2 * sizeof(Elf64_Dyn) + 7;
@@ -4350,6 +4432,7 @@ int main(void)
     if (!loader_memchr_gate()) return 15;
     if (!resolver_tls_template_overlap_gate()) return 25;
     if (!large_table_gate()) return 1;
+    if (!relocation_admission_single_pass_gate()) return 29;
     if (!truncation_gate()) return 2;
     if (!runtime_file_revision_gate()) return 3;
     if (!version_index_gate()) return 4;
