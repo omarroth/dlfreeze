@@ -484,7 +484,11 @@ static int target_musl_shortname_provider(const struct dep_list *deps,
     if (!deps || deps->runtime_family != DEP_RUNTIME_MUSL || !name ||
         !name[0] || strchr(name, '/') || !path_out)
         return -1;
-    if (dlfrz_musl_reserved_soname(name) &&
+    /* The dependency resolver also binds the interpreter's explicit ELF
+     * SONAME to the combined libc object.  This is not its path basename:
+     * the latter can collide with an unrelated runtime's libc spelling. */
+    if ((dlfrz_musl_reserved_soname(name) ||
+         (deps->interp_soname && strcmp(name, deps->interp_soname) == 0)) &&
         target_provider_add(&provider, deps->interp_path) < 0)
         return -1;
     for (int i = 0; i < deps->count; i++) {
@@ -593,7 +597,7 @@ static int preload_target_score(const char *path, struct dep_list *deps,
                 goto out;
             }
             if (info.version_requirement_count == 0 &&
-                dlfrz_musl_reserved_soname(info.needed[i]))
+                paths_name_same_file(startup_provider, deps->interp_path))
                 native_musl_dependency = 1;
             score++;
             continue;

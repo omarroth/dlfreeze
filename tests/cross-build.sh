@@ -3,6 +3,9 @@
 # binaries.  Called inside Docker containers by the cross-platform CI workflow.
 set -eu
 
+# shellcheck source=tests/compiler-capabilities.sh
+. "$(dirname "$0")/compiler-capabilities.sh"
+
 TEST_RUN_TIMEOUT="${TEST_RUN_TIMEOUT:-30}"
 TEST_FREEZE_TIMEOUT="${TEST_FREEZE_TIMEOUT:-180}"
 TEST_SUITE_TIMEOUT="${TEST_SUITE_TIMEOUT:-1200}"
@@ -355,7 +358,7 @@ int main(void) { return 0; }
 EOF
 
     for probe_cc in gcc musl-gcc; do
-        probe_cc_path=$(command -v "$probe_cc" 2>/dev/null || true)
+        probe_cc_path=$(test_compiler_available "$probe_cc" || true)
         [ -n "$probe_cc_path" ] || continue
         probe_cc_path=$(readlink -f "$probe_cc_path")
         case " $probe_seen " in
@@ -444,7 +447,11 @@ build_generic_direct_contracts() {
     # shellcheck disable=SC2086
     set -- $contract_compilers
     for contract_cc do
-        contract_cc_path=$(command -v "$contract_cc" 2>/dev/null || true)
+        if [ -n "${DLFREEZE_CONTRACT_COMPILERS:-}" ]; then
+            contract_cc_path=$(command -v "$contract_cc" 2>/dev/null || true)
+        else
+            contract_cc_path=$(test_compiler_available "$contract_cc" || true)
+        fi
         [ -n "$contract_cc_path" ] || continue
         contract_cc_path=$(readlink -f "$contract_cc_path")
         case " $contract_seen_cc " in
@@ -849,7 +856,7 @@ fi
 echo ""
 echo "Toolchain:"
 gcc --version | head -1
-command -v musl-gcc >/dev/null 2>&1 && musl-gcc --version 2>&1 | head -1 || echo "musl-gcc: not found"
+test_compiler_available musl-gcc >/dev/null && musl-gcc --version 2>&1 | head -1 || echo "musl-gcc: unavailable"
 echo ""
 
 # ── Build dlfreeze from source ─────────────────────────────────────

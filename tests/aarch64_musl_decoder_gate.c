@@ -1126,6 +1126,62 @@ int main(void)
         sizeof(old_forward_store) / sizeof(old_forward_store[0])];
     uint32_t direct_mutated[3];
 
+    static const uint32_t rematerialized[] = {
+        0xaa0003e2, /* mov x2,x0: preserve the argument in a call-free prefix */
+        0x52800061, /* mov w1,#3 */
+        0x14000004, /* b load-address */
+        0x9100a043, /* add x3,x2,#40 */
+        0x8800fc61, /* stlxr w0,w1,[x3] */
+        0x340000a0, /* cbz w0,done */
+        0x9100a040, /* add x0,x2,#40 */
+        0x885ffc00, /* ldaxr w0,[x0] */
+        0x7100081f, /* cmp w0,#2 */
+        0x54ffff40, /* b.eq store-address */
+        0xd65f03c0, /* done */
+    };
+    uint32_t remat_mutated[sizeof(rematerialized) / sizeof(rematerialized[0])];
+    static const struct { size_t index; uint32_t instruction; } remat_bad[] = {
+        { 0, 0xaa0103e2 }, /* argument copied from X1, not X0 */
+        { 1, 0x52800041 }, /* detached value is 2, not 3 */
+        { 2, 0x14000005 }, /* entry skips address calculation */
+        { 3, 0x9100c043 }, /* store offset differs from load */
+        { 4, 0x8801fc61 }, /* status destroys the desired value */
+        { 4, 0x8800fc41 }, /* store uses thread pointer, not field address */
+        { 5, 0x34000020 }, /* success branches back into the loop */
+        { 6, 0x9100a060 }, /* load address has a different source */
+        { 8, 0x71000c1f }, /* wrong joinable state */
+        { 9, 0x54ffff60 }, /* retry skips store address calculation */
+    };
+    if (!expect_detach_layout("rematerialized atomic addresses", rematerialized,
+            sizeof(rematerialized) / sizeof(rematerialized[0]), 1, 2))
+        return 1;
+    for (size_t i = 0; i < sizeof(remat_bad) / sizeof(remat_bad[0]); i++) {
+        memcpy(remat_mutated, rematerialized, sizeof(rematerialized));
+        remat_mutated[remat_bad[i].index] = remat_bad[i].instruction;
+        if (!expect_detach_layout("invalid rematerialized atomic loop", remat_mutated,
+                sizeof(remat_mutated) / sizeof(remat_mutated[0]), 0, 0))
+            return 1;
+    }
+
+    uint32_t scheduled_result[] = { 0xa903d017, 0xaa0003f9 };
+    unsigned int result_reg = 31;
+    if (!aarch64_musl_call_result_register((const uint8_t *)scheduled_result,
+            sizeof(scheduled_result), 0, &result_reg) || result_reg != 25)
+        return 1; /* STP through the result before MOV must preserve it */
+    static const uint32_t invalid_gaps[] = {
+        0xaa0103e0, /* X0 clobbered */
+        0xa9400400, /* LDP X0,X1,[X0] destroys X0 */
+        0x14000001, /* branch across the gap */
+        0x94000001, /* another call */
+        0,          /* unknown instruction */
+    };
+    for (size_t i = 0; i < sizeof(invalid_gaps) / sizeof(invalid_gaps[0]); i++) {
+        scheduled_result[0] = invalid_gaps[i];
+        if (aarch64_musl_call_result_register((const uint8_t *)scheduled_result,
+                sizeof(scheduled_result), 0, &result_reg))
+            return 1;
+    }
+
     if (!expect_detach_layout(
             "direct store", direct_store,
             sizeof(direct_store) / sizeof(direct_store[0]), 1, 0) ||

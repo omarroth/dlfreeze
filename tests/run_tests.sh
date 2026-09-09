@@ -21,11 +21,27 @@ pass() { echo "${GRN}PASS${RST}: $1"; ((PASS++)) || true; }
 fail() { echo "${RED}FAIL${RST}: $1 — $2"; ((FAIL++)) || true; }
 skip() { echo "${YLW}SKIP${RST}: $1 — $2"; ((SKIP++)) || true; }
 
+# A private loader path replaces musl's system directories. Libcs with an
+# explicit SONAME need that dependency reachable there even for the native
+# control; the link must identify the fixture's copied interpreter itself.
+fixture_runtime_soname_link() {
+    local soname runtime
+    soname=$(LC_ALL=C readelf -Wd "$1" |
+        sed -n '/(SONAME)/s/.*\[\([^]]*\)\].*/\1/p') || return 1
+    [ -n "$soname" ] || return 0
+    case "$soname" in .|..|*/*) return 1 ;; esac
+    runtime=$(realpath "$1") || return 1
+    ln -s "$runtime" "$2/$soname"
+}
+
 TEST_RUN_TIMEOUT="${TEST_RUN_TIMEOUT:-30}"
 TEST_FREEZE_TIMEOUT="${TEST_FREEZE_TIMEOUT:-180}"
 TEST_TIMEOUT_KILL_AFTER="${TEST_TIMEOUT_KILL_AFTER:-5}"
 TEST_CC_RETRIES="${TEST_CC_RETRIES:-2}"
 TEST_REAL_GCC="${TEST_REAL_GCC:-$(command -v gcc || true)}"
+
+. tests/compiler-capabilities.sh
+test_compiler_available musl-gcc >/dev/null || true
 
 # Keep the public in-process default deterministic.  Tests of the optional
 # speculative supervisor opt in explicitly at the individual invocation.
@@ -489,8 +505,10 @@ C
         rm -rf "$runtime_root"
         return
     fi
+    # The helper maps the target at its assigned address. Keep the helper
+    # relocatable even with compilers whose default is a fixed-address EXEC.
     if ! TMPDIR="$runtime_root" \
-         gcc -std=c11 -O2 -g -Wall -Wextra -Werror -D_GNU_SOURCE \
+         gcc -std=c11 -O2 -g -Wall -Wextra -Werror -D_GNU_SOURCE -fPIE -pie \
             -DDLFREEZE_PACKER_TRANSACTION_GATE -Iinclude \
             -o "$helper" tests/packer_transaction_identity_gate.c \
             src/packer.c src/dep_resolver.c src/elf_parser.c; then
@@ -1824,8 +1842,8 @@ test_file_pattern_option_scaling() {
 # ===================================================================
 test_musl_hello_direct() {
     echo "--- musl hello direct-load ---"
-    if ! command -v musl-gcc &>/dev/null; then
-        skip "musl-hello-direct" "musl-gcc not installed"
+    if ! test_compiler_available musl-gcc &>/dev/null; then
+        skip "musl-hello-direct" "musl-gcc unavailable"
         return
     fi
 
@@ -2489,8 +2507,8 @@ C
 # ===================================================================
 test_musl_ctor_direct() {
     echo "--- musl ctor direct-load ---"
-    if ! command -v musl-gcc &>/dev/null; then
-        skip "musl-ctor-direct" "musl-gcc not installed"
+    if ! test_compiler_available musl-gcc &>/dev/null; then
+        skip "musl-ctor-direct" "musl-gcc unavailable"
         return
     fi
 
@@ -2563,8 +2581,8 @@ C
 # ===================================================================
 test_musl_copy_reloc_direct() {
     echo "--- musl copy-reloc direct-load ---"
-    if ! command -v musl-gcc &>/dev/null; then
-        skip "musl-copy-reloc-direct" "musl-gcc not installed"
+    if ! test_compiler_available musl-gcc &>/dev/null; then
+        skip "musl-copy-reloc-direct" "musl-gcc unavailable"
         return
     fi
 
@@ -2638,8 +2656,8 @@ C
 # ===================================================================
 test_musl_multibyte_direct() {
     echo "--- musl multibyte direct-load ---"
-    if ! command -v musl-gcc &>/dev/null; then
-        skip "musl-multibyte-direct" "musl-gcc not installed"
+    if ! test_compiler_available musl-gcc &>/dev/null; then
+        skip "musl-multibyte-direct" "musl-gcc unavailable"
         return
     fi
 
@@ -2710,8 +2728,8 @@ C
 # ===================================================================
 test_musl_shared_tls_direct() {
     echo "--- musl shared-tls direct-load ---"
-    if ! command -v musl-gcc &>/dev/null; then
-        skip "musl-shared-tls-direct" "musl-gcc not installed"
+    if ! test_compiler_available musl-gcc &>/dev/null; then
+        skip "musl-shared-tls-direct" "musl-gcc unavailable"
         return
     fi
 
@@ -2799,8 +2817,8 @@ C
 # ===================================================================
 test_musl_target_contract_direct() {
     echo "--- musl target-derived startup contract ---"
-    if ! command -v musl-gcc &>/dev/null; then
-        skip "musl-target-contract-direct" "musl-gcc not installed"
+    if ! test_compiler_available musl-gcc &>/dev/null; then
+        skip "musl-target-contract-direct" "musl-gcc unavailable"
         return
     fi
 
@@ -2879,8 +2897,8 @@ test_musl_default_stack_direct() {
 
     rm -rf "$root"
     mkdir -p "$root"
-    if ! command -v musl-gcc >/dev/null 2>&1; then
-        skip "musl startup PT_GNU_STACK replay" "musl-gcc not installed"
+    if ! test_compiler_available musl-gcc >/dev/null 2>&1; then
+        skip "musl startup PT_GNU_STACK replay" "musl-gcc unavailable"
         rm -rf "$root"
         return
     fi
@@ -3025,7 +3043,7 @@ C
            grep -E 'stack size:[[:space:]]*0x200000' >/dev/null &&
        "$mutator" "$mutant" &&
        ! LC_ALL=C readelf -lW "$mutant" 2>/dev/null |
-           grep -q GNU_PROPERTY &&
+           grep GNU_PROPERTY >/dev/null &&
        LC_ALL=C readelf -lW "$mutant" 2>/dev/null |
            grep -E 'GNU_STACK.*0x200000[[:space:]]+RW' >/dev/null; then
         _musl_stack_compare_case \
@@ -3053,6 +3071,16 @@ C
 # cover content which is genuinely unknown or stale.
 # ===================================================================
 test_renamed_runtime_identity() {
+    local identity_gate="$BUILD/preload_identity_gate"
+    if gcc -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
+           -ffunction-sections -fdata-sections -Wl,--gc-sections \
+           -o "$identity_gate" tests/preload_identity_gate.c &&
+       run_with_timeout "$identity_gate"; then
+        pass "preload explicit runtime identity and ambiguity"
+    else
+        fail "preload runtime identity gate" "compile or identity checks failed"
+    fi
+    rm -f "$identity_gate"
     echo "--- renamed runtime content identity ---"
     if ! command -v readelf &>/dev/null; then
         skip "renamed runtime content identity" "readelf not installed"
@@ -3081,7 +3109,7 @@ test_renamed_runtime_identity() {
 #include <stdio.h>
 int main(void) { puts("renamed runtime direct ok"); return 0; }
 C
-    if command -v musl-gcc >/dev/null 2>&1; then
+    if test_compiler_available musl-gcc >/dev/null 2>&1; then
         cc=musl-gcc
         # Deliberately collide with glibc's libc SONAME.  Interpreter
         # pathname basenames are not ELF runtime identities and must not make
@@ -3582,8 +3610,8 @@ test_loader_post_tls_import_gate() {
     local -a compilers=("$TEST_REAL_GCC")
     local cc object label imports
 
-    if command -v musl-gcc >/dev/null 2>&1 &&
-       [ "$(command -v musl-gcc)" != "$(command -v "$TEST_REAL_GCC")" ]; then
+    if test_compiler_available musl-gcc >/dev/null 2>&1 &&
+       [ "$(test_compiler_available musl-gcc)" != "$(command -v "$TEST_REAL_GCC")" ]; then
         compilers+=(musl-gcc)
     fi
     if command -v clang >/dev/null 2>&1 &&
@@ -3626,8 +3654,8 @@ test_packer_strict_alias_gate() {
     local -a compilers=("$TEST_REAL_GCC")
     local cc object label strict_warning version
 
-    if command -v musl-gcc >/dev/null 2>&1 &&
-       [ "$(command -v musl-gcc)" != "$(command -v "$TEST_REAL_GCC")" ]; then
+    if test_compiler_available musl-gcc >/dev/null 2>&1 &&
+       [ "$(test_compiler_available musl-gcc)" != "$(command -v "$TEST_REAL_GCC")" ]; then
         compilers+=(musl-gcc)
     fi
     if command -v clang >/dev/null 2>&1 &&
@@ -3796,7 +3824,7 @@ test_bootstrap_x86_isa_isolation() {
         skip "$reject_label" "make or readelf is unavailable"
         return
     fi
-    bootstrap_cc=$(command -v musl-gcc || true)
+    bootstrap_cc=$(test_compiler_available musl-gcc || true)
     if [ -z "$bootstrap_cc" ]; then
         bootstrap_cc="$TEST_REAL_GCC"
     fi
@@ -3991,7 +4019,7 @@ C
             first=$(LC_ALL=C "$objdump_tool" -d \
                     "$pad_obj" 2>/dev/null | awk -v symbol="$symbol" '
                 index($0, "<" symbol ">:") { found = 1; next }
-                found && !printed && /^[[:space:]]*[[:xdigit:]]+:/ {
+                found && !printed && /^[ \t]*[0-9a-fA-F]+:/ {
                     print
                     printed = 1
                 }
@@ -4260,8 +4288,8 @@ C
         fi
     fi
 
-    if ! command -v musl-gcc >/dev/null 2>&1; then
-        skip "$musl_label" "musl-gcc not installed"
+    if ! test_compiler_available musl-gcc >/dev/null 2>&1; then
+        skip "$musl_label" "musl-gcc unavailable"
         rm -rf "$root"
         return
     fi
@@ -4563,7 +4591,7 @@ C
                 "exit=$rc expected=$expect actual=$actual"
         fi
     fi
-    if command -v musl-gcc >/dev/null 2>&1; then
+    if test_compiler_available musl-gcc >/dev/null 2>&1; then
         expect=""; actual=""; freeze_rc=0; rc_e=0; rc=0
         if ! musl-gcc -Wall -Wextra -Werror -o "$musl_bin" "$src" \
                 -pthread; then
@@ -4724,7 +4752,7 @@ C
         fi
     fi
 
-    if command -v musl-gcc >/dev/null 2>&1; then
+    if test_compiler_available musl-gcc >/dev/null 2>&1; then
         expect=""; actual=""; freeze_rc=0; rc_e=0; rc=0
         if ! musl-gcc -Wall -Wextra -Werror -o "$musl_bin" "$src" \
                 -ldl; then
@@ -5533,7 +5561,7 @@ int main(int argc, char **argv) {
     return 0;
 }
 C
-    if command -v musl-gcc >/dev/null 2>&1; then
+    if test_compiler_available musl-gcc >/dev/null 2>&1; then
         if ! musl-gcc -o "$bin" "$src"; then
             fail "captured files require direct mode" \
                 "musl fixture compile failed"
@@ -5758,7 +5786,7 @@ int main(void) {
 }
 C
 
-    if command -v musl-gcc >/dev/null 2>&1; then
+    if test_compiler_available musl-gcc >/dev/null 2>&1; then
         cc=musl-gcc
     else
         cc=gcc
@@ -6053,7 +6081,7 @@ int main(int argc, char **argv) {
 }
 C
 
-    if command -v musl-gcc >/dev/null 2>&1; then
+    if test_compiler_available musl-gcc >/dev/null 2>&1; then
         if ! musl-gcc -o "$bin" "$src"; then
             fail "captured-file request identity" \
                 "musl fixture compile failed"
@@ -6205,7 +6233,7 @@ int main(int argc, char **argv) {
 }
 C
 
-    if command -v musl-gcc >/dev/null 2>&1; then
+    if test_compiler_available musl-gcc >/dev/null 2>&1; then
         if ! musl-gcc -Wall -Wextra -Werror -o "$bin" "$src"; then
             fail "explicit VFS directory kind" "musl fixture compile failed"
             rm -rf "$root"
@@ -7676,7 +7704,7 @@ C
                     "exit=$rc output=$actual"
             fi
 
-            bootstrap_cc=$(command -v musl-gcc 2>/dev/null || true)
+            bootstrap_cc=$(test_compiler_available musl-gcc 2>/dev/null || true)
             if [ -z "$bootstrap_cc" ]; then
                 bootstrap_cc="$TEST_REAL_GCC"
             fi
@@ -8055,7 +8083,7 @@ test_preload_helper_compile_matrix() {
         done
     fi
 
-    for compiler in "$TEST_REAL_GCC" "$(command -v musl-gcc 2>/dev/null || true)"; do
+    for compiler in "$TEST_REAL_GCC" "$(test_compiler_available musl-gcc 2>/dev/null || true)"; do
         [ -n "$compiler" ] || continue
         compiler_path=$(readlink -f "$compiler")
         case " $seen " in
@@ -8570,7 +8598,7 @@ MAP
     fi
 
     for compiler in gcc clang musl-gcc; do
-        command -v "$compiler" >/dev/null 2>&1 || continue
+        test_compiler_available "$compiler" >/dev/null 2>&1 || continue
         gate="$root/elf_version_gate-$compiler"
         if ! "$compiler" -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror \
                 -Iinclude -o "$gate" tests/elf_version_gate.c \
@@ -9450,7 +9478,7 @@ test_trace_constructor_fork_recovery() {
         rm -rf "$root"
         return
     fi
-    if readelf -d "$outer" | grep -Fq 'libatfork-nested.so'; then
+    if readelf -d "$outer" | grep -F 'libatfork-nested.so' >/dev/null; then
         fail "trace constructor-fork recovery" \
             "outer fixture has an application-specific startup dependency"
         rm -rf "$root"
@@ -9806,8 +9834,8 @@ test_trace_exec_headers_and_open_errors() {
     resource="$root/resource.txt"
     out="$root/parent.frozen"
     log="$root/parent.log"
-    if ! command -v musl-gcc >/dev/null 2>&1; then
-        skip "trace exec headers and open errors" "musl-gcc not installed"
+    if ! test_compiler_available musl-gcc >/dev/null 2>&1; then
+        skip "trace exec headers and open errors" "musl-gcc unavailable"
         return
     fi
 
@@ -9930,7 +9958,7 @@ int main(int argc, char **argv) {
 }
 C
     printf '%s\n' 'capture-filter-ok' > "$retained"
-    if command -v musl-gcc >/dev/null 2>&1; then
+    if test_compiler_available musl-gcc >/dev/null 2>&1; then
         if ! musl-gcc -o "$bin" "$src"; then
             fail "deleted out-of-scope trace file" "fixture compile failed"
             rm -rf "$root"
@@ -12283,8 +12311,8 @@ C
             cc=gcc
         else
             cc=musl-gcc
-            if ! command -v "$cc" >/dev/null 2>&1; then
-                skip "musl direct exit lifecycle" "musl-gcc not installed"
+            if ! test_compiler_available "$cc" >/dev/null 2>&1; then
+                skip "musl direct exit lifecycle" "musl-gcc unavailable"
                 continue
             fi
         fi
@@ -12552,8 +12580,8 @@ C
             cc=gcc
         else
             cc=musl-gcc
-            if ! command -v "$cc" >/dev/null 2>&1; then
-                skip "musl direct preinit order" "musl-gcc not installed"
+            if ! test_compiler_available "$cc" >/dev/null 2>&1; then
+                skip "musl direct preinit order" "musl-gcc unavailable"
                 continue
             fi
         fi
@@ -12664,7 +12692,7 @@ int main(void) {
 }
 C
 
-    if command -v musl-gcc >/dev/null 2>&1; then
+    if test_compiler_available musl-gcc >/dev/null 2>&1; then
         cc=musl-gcc
     fi
     if ! "$cc" -shared -fPIC -Wl,-soname,libctorprefix.so \
@@ -12780,7 +12808,7 @@ C
         rm -f "$helper" "$src"
         return
     fi
-    if command -v musl-gcc >/dev/null 2>&1; then
+    if test_compiler_available musl-gcc >/dev/null 2>&1; then
         if ! musl-gcc -fPIE -pie -o "$bin" "$src"; then
             fail "direct metadata validation" "musl compile failed"
             rm -f "$helper" "$src" "$bin"
@@ -13179,7 +13207,7 @@ int main(void) {
     return 0;
 }
 C
-    if command -v musl-gcc >/dev/null 2>&1; then
+    if test_compiler_available musl-gcc >/dev/null 2>&1; then
         cc=musl-gcc
     fi
     if ! gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -Iinclude \
@@ -14610,7 +14638,7 @@ test_dependency_search_semantics() {
     local slash_pack_log="$root/slash-pack.log" freeze_rc=0
     local slash_cc=gcc
 
-    if command -v musl-gcc >/dev/null 2>&1; then
+    if test_compiler_available musl-gcc >/dev/null 2>&1; then
         # The static-musl bootstrap can exercise strict direct replay even
         # when the host glibc layout is newer than the audited direct loader.
         slash_cc=musl-gcc
@@ -15142,9 +15170,9 @@ C
         fi
     fi
 
-    if ! command -v musl-gcc >/dev/null 2>&1; then
+    if ! test_compiler_available musl-gcc >/dev/null 2>&1; then
         skip "musl LD_LIBRARY_PATH-before-RPATH ordering" \
-            "musl-gcc not installed"
+            "musl-gcc unavailable"
     else
         local musl_root="$root/musl-order"
         local musl_rpath="$musl_root/rpath" musl_env="$musl_root/env"
@@ -15186,7 +15214,7 @@ C
     # prefix.  That configured list replaces the built-in system list, and
     # the directory containing the interpreter is not a separate search
     # stage.  Keep a same-SONAME decoy there to catch either shortcut.
-    if command -v musl-gcc >/dev/null 2>&1; then
+    if test_compiler_available musl-gcc >/dev/null 2>&1; then
         if ! command -v patchelf >/dev/null 2>&1; then
             skip "musl prefixed system path" "patchelf not installed"
         else
@@ -15219,6 +15247,7 @@ C
             if [ -z "$source_interp" ] || [ ! -f "$source_interp" ] ||
                [ "$musl_arch" = "$interp_base" ] || [ -z "$musl_arch" ] ||
                ! cp "$source_interp" "$custom_interp" ||
+               ! fixture_runtime_soname_link "$custom_interp" "$prefix_config" ||
                ! printf '%s\n' "$prefix_config" >"$path_file" ||
                ! musl-gcc -shared -fPIC -DDLFREEZE_CHOICE=33 \
                     -Wl,-soname,libdlfreeze_musl_prefix_choice.so \
@@ -15348,12 +15377,12 @@ test_first_opened_search_candidate() {
         return
     fi
     run_first_opened_candidate_case gcc gcc "$root/gcc" "$gate"
-    if command -v musl-gcc >/dev/null 2>&1; then
+    if test_compiler_available musl-gcc >/dev/null 2>&1; then
         run_first_opened_candidate_case \
             musl-gcc musl "$root/musl" "$gate"
     else
         skip "musl first-opened candidate semantics" \
-            "musl-gcc not installed"
+            "musl-gcc unavailable"
     fi
     rm -rf "$root"
 }
@@ -15529,13 +15558,13 @@ test_logical_load_path_identity() {
     run_logical_load_path_case gcc "$gcc_family" \
         "$root/${gcc_family,,}" "$gate"
     if [ "$gcc_family" = GNU ] && \
-       command -v musl-gcc >/dev/null 2>&1; then
+       test_compiler_available musl-gcc >/dev/null 2>&1; then
         run_logical_load_path_case musl-gcc musl "$root/musl" "$gate"
     elif [ "$gcc_family" = GNU ]; then
         skip "musl resolver logical load-path identity" \
-            "musl-gcc not installed"
+            "musl-gcc unavailable"
         skip "musl direct logical load-path identity" \
-            "musl-gcc not installed"
+            "musl-gcc unavailable"
     fi
     rm -rf "$root"
     rm -f "$gate"
@@ -16383,7 +16412,7 @@ int main(int argc, char **argv) {
     return 1;
 }
 C
-    if command -v musl-gcc >/dev/null 2>&1; then
+    if test_compiler_available musl-gcc >/dev/null 2>&1; then
         musl-gcc -o "$bin" "$src" || {
             fail "high-cardinality captured-file manifest" \
                 "musl fixture compile failed"
@@ -17438,7 +17467,7 @@ int main(int argc, char **argv) {
 C
     printf '%s\n' 'captured-data' > "$data"
 
-    if command -v musl-gcc >/dev/null 2>&1; then
+    if test_compiler_available musl-gcc >/dev/null 2>&1; then
         if ! musl-gcc -o "$bin" "$src"; then
             fail "VFS environment and kernel identity" \
                 "musl fixture compile failed"
@@ -17575,7 +17604,7 @@ C
 __attribute__((noreturn)) void opaque_start(void) { _exit(23); }
 C
 
-    if command -v musl-gcc >/dev/null 2>&1; then
+    if test_compiler_available musl-gcc >/dev/null 2>&1; then
         if ! musl-gcc -O2 -o "$pos_bin" "$pos_src" ||
            ! musl-gcc -O2 -nostartfiles -Wl,-e,opaque_start \
                 -o "$neg_bin" "$neg_src"; then
@@ -18739,9 +18768,9 @@ run_direct_small_stack_chain_runtime() {
 test_direct_small_stack_dlopen_chain() {
     echo "--- direct dlopen dependency chain on a small pthread stack ---"
     run_direct_small_stack_chain_runtime GNU "$TEST_REAL_GCC"
-    if command -v musl-gcc >/dev/null 2>&1; then
+    if test_compiler_available musl-gcc >/dev/null 2>&1; then
         run_direct_small_stack_chain_runtime musl \
-            "$(command -v musl-gcc)"
+            "$(test_compiler_available musl-gcc)"
     else
         skip "musl direct filesystem small-stack dlopen chain" \
             "musl-gcc is unavailable"
@@ -19671,11 +19700,11 @@ test_direct_dlopen_loaded_name_identity() {
     for family in gnu musl; do
         if [ "$family" = gnu ]; then
             compiler=gcc
-        elif command -v musl-gcc >/dev/null 2>&1; then
+        elif test_compiler_available musl-gcc >/dev/null 2>&1; then
             compiler=musl-gcc
         else
             skip "musl direct loaded-name identity" \
-                "musl-gcc not installed"
+                "musl-gcc unavailable"
             continue
         fi
         root="$BUILD/dlopen_loaded_name_$family"
@@ -19882,8 +19911,8 @@ test_musl_direct_runtime_search_semantics() {
         "$expanded_dir" "$origin_prefix_dir" "$first_dir" "$second_dir" \
         "$chain_mid" "$chain_private" "$token_child_dir" \
         "$token_right_dir" "$token_wrong_dir"
-    if ! command -v musl-gcc >/dev/null 2>&1; then
-        skip "musl direct runtime search semantics" "musl-gcc not installed"
+    if ! test_compiler_available musl-gcc >/dev/null 2>&1; then
+        skip "musl direct runtime search semantics" "musl-gcc unavailable"
         rm -rf "$root"
         return
     fi
@@ -20347,6 +20376,7 @@ C
         if [ -z "$source_interp" ] || [ ! -f "$source_interp" ] ||
            [ -z "$musl_arch" ] || [ "$musl_arch" = "$interp_base" ] ||
            ! cp "$source_interp" "$custom_interp" ||
+           ! fixture_runtime_soname_link "$custom_interp" "$configured" ||
            ! printf '%s\n' "$configured" >"$path_file" ||
            ! musl-gcc -shared -fPIC -DDLFREEZE_VALUE=55 \
                 -Wl,-soname,"$prefix_name" -o "$configured/$prefix_name" \
@@ -20538,7 +20568,7 @@ int main(int argc, char **argv) {
 }
 C
 
-    if command -v musl-gcc >/dev/null 2>&1; then
+    if test_compiler_available musl-gcc >/dev/null 2>&1; then
         if ! musl-gcc -shared -fPIC -DSNAPSHOT_VALUE=31 \
                 -Wl,-soname,"$lib_name" \
                 -o "$musl_initial/$lib_name" "$lib_src" ||
@@ -20597,7 +20627,7 @@ C
             fi
         fi
     else
-        skip "musl direct LD_LIBRARY_PATH snapshot" "musl-gcc not installed"
+        skip "musl direct LD_LIBRARY_PATH snapshot" "musl-gcc unavailable"
     fi
 
     libc_banner=$(ldd --version 2>&1 || true)
@@ -20684,11 +20714,11 @@ test_musl_dual_search_tags() {
     local top startup_main dlopen_main out log gate gate_log dynamic
     local native_start native_late actual rc=0 gate_rc=0 freeze_rc=0
 
-    if ! command -v musl-gcc >/dev/null 2>&1; then
+    if ! test_compiler_available musl-gcc >/dev/null 2>&1; then
         skip "musl dual search-tag resolver precedence" \
-            "musl-gcc not installed"
+            "musl-gcc unavailable"
         skip "musl direct dual search-tag precedence" \
-            "musl-gcc not installed"
+            "musl-gcc unavailable"
         return
     fi
     build_abs=$(realpath "$BUILD")
@@ -20862,8 +20892,8 @@ test_musl_direct_late_dlopen_ancestry() {
     local plugin_src child_src main_src plugin child main out log
     local expect actual rc=0 freeze_rc=0
 
-    if ! command -v musl-gcc >/dev/null 2>&1; then
-        skip "musl direct later dlopen ancestry" "musl-gcc not installed"
+    if ! test_compiler_available musl-gcc >/dev/null 2>&1; then
+        skip "musl direct later dlopen ancestry" "musl-gcc unavailable"
         return
     fi
     build_abs=$(realpath "$BUILD")
@@ -20977,8 +21007,8 @@ test_musl_direct_dlopen_head_scope() {
     local choice_actual missing_actual path_actual embedded_actual
     local rc=0 freeze_rc=0
 
-    if ! command -v musl-gcc >/dev/null 2>&1; then
-        skip "musl direct dlopen main/head scope" "musl-gcc not installed"
+    if ! test_compiler_available musl-gcc >/dev/null 2>&1; then
+        skip "musl direct dlopen main/head scope" "musl-gcc unavailable"
         return
     fi
     build_abs=$(realpath "$BUILD")
@@ -23450,7 +23480,7 @@ test_direct_dlopen_mode_contract() {
     rm -rf "$root"
     mkdir -p "$root"
     if [ -z "${DLFREEZE_TEST_LOCAL_SCOPE_CC:-}" ] &&
-       command -v musl-gcc >/dev/null 2>&1; then
+       test_compiler_available musl-gcc >/dev/null 2>&1; then
         cc=musl-gcc
     fi
 
@@ -23771,7 +23801,7 @@ C
         return
     fi
     if ! readelf -Wr "$lib" 2>/dev/null |
-            grep -q 'dlfrz_tx_gate_target'; then
+            grep 'dlfrz_tx_gate_target' >/dev/null; then
         fail "direct dlopen transaction atomicity" \
             "fixture has no relocation in its TLS initializer"
         rm -rf "$root"
@@ -24017,10 +24047,12 @@ C
         rm -rf "$root"
         return
     fi
+    # Drain readelf completely: grep -q can close early and turn a successful
+    # metadata match into SIGPIPE under the suite's pipefail setting.
     if ! readelf -Ws "$new" 2>/dev/null |
-            grep -Eq '[[:space:]]IFUNC[[:space:]].*dlfrz_selected$' ||
+            grep -E '[[:space:]]IFUNC[[:space:]].*dlfrz_selected$' >/dev/null ||
        ! readelf -Wl "$new" 2>/dev/null |
-            grep -q 'TLS'; then
+            grep 'TLS' >/dev/null; then
         fail "direct transaction IFUNC/TLS callback scope" \
             "fixture lacks IFUNC or PT_TLS"
         rm -rf "$root"
@@ -25602,7 +25634,7 @@ C
     if [ "$(LC_ALL=C readelf -Wr "$bin" 2>/dev/null | \
               grep -c 'JUMP_SLOT' || true)" -lt 2 ] ||
        LC_ALL=C readelf -d "$bin" 2>/dev/null |
-           grep -Eq '\(BIND_NOW\)|FLAGS[^[:cntrl:]]*NOW'; then
+           grep -E '\(BIND_NOW\)|FLAGS[^[:cntrl:]]*NOW' >/dev/null; then
         skip "$label" "linker did not retain two lazy JUMP_SLOT records"
         rm -rf "$root"
         return
@@ -26505,7 +26537,7 @@ test_direct_dlopen_local_caller_scope() {
 
     rm -rf "$root"
     mkdir -p "$root"
-    if command -v musl-gcc >/dev/null 2>&1; then
+    if test_compiler_available musl-gcc >/dev/null 2>&1; then
         cc=musl-gcc
     fi
 
@@ -27642,9 +27674,9 @@ run_direct_runtime_truncate_snapshot() {
 test_direct_runtime_truncate_snapshot() {
     echo "--- direct late-filesystem DSO immutable snapshot ---"
     run_direct_runtime_truncate_snapshot GNU "$TEST_REAL_GCC"
-    if command -v musl-gcc >/dev/null 2>&1; then
+    if test_compiler_available musl-gcc >/dev/null 2>&1; then
         run_direct_runtime_truncate_snapshot musl \
-            "$(command -v musl-gcc)"
+            "$(test_compiler_available musl-gcc)"
     else
         skip "musl late filesystem DSO snapshot" "musl-gcc unavailable"
     fi
@@ -27721,9 +27753,9 @@ run_direct_runtime_noexec_policy() {
 test_direct_runtime_noexec_policy() {
     echo "--- direct late-filesystem DSO mmap policy ---"
     run_direct_runtime_noexec_policy GNU "$TEST_REAL_GCC"
-    if command -v musl-gcc >/dev/null 2>&1; then
+    if test_compiler_available musl-gcc >/dev/null 2>&1; then
         run_direct_runtime_noexec_policy musl \
-            "$(command -v musl-gcc)"
+            "$(test_compiler_available musl-gcc)"
     else
         skip "musl late DSO noexec policy" "musl-gcc unavailable"
     fi
@@ -30059,7 +30091,7 @@ test_malformed_prelink_metadata() {
 
     rm -rf "$root"
     mkdir -p "$root"
-    if command -v musl-gcc >/dev/null 2>&1; then
+    if test_compiler_available musl-gcc >/dev/null 2>&1; then
         cc=musl-gcc
     else
         cc=gcc
@@ -31635,8 +31667,8 @@ test_musl_layout_gate() {
         fi
     fi
 
-    if ! command -v musl-gcc >/dev/null 2>&1; then
-        skip "musl layout integration gate" "musl-gcc not installed"
+    if ! test_compiler_available musl-gcc >/dev/null 2>&1; then
+        skip "musl layout integration gate" "musl-gcc unavailable"
         rm -f "$helper"
         return
     fi

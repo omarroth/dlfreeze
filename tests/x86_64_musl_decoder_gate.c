@@ -492,6 +492,21 @@ static int test_init_contract(void)
         return 0; /* the entropy arm must actually initialize the guard */
 
     build_frame_spill_init_contract();
+    /* The argument move may precede the frame spill (GCC with frame
+     * pointers), including when the fallback rejoins at the byte clear. */
+    memcpy(image + INIT_SSP_OFF + 28, "\x48\x89\xcf\x48\x89\x4d\xf8", 7);
+    if (!decode_x86_64_musl_init_libc(&obj, &decoded, &canary) || canary != 40)
+        return 0;
+    image[INIT_SSP_OFF + 30] = 0xd7;
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0; /* argument came from a different register */
+    build_frame_spill_init_contract();
+    memcpy(image + INIT_SSP_OFF + 28, "\x48\x89\xcf\x48\x89\x4d\xf8", 7);
+    image[INIT_SSP_OFF + 44] = 0xf0;
+    if (decode_x86_64_musl_init_libc(&obj, &decoded, &canary))
+        return 0; /* reload must use the saved slot */
+
+    build_frame_spill_init_contract();
     if (!decode_x86_64_musl_init_libc(&obj, &decoded, &canary) ||
         canary != 40)
         return 0;

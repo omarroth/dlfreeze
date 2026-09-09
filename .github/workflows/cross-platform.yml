@@ -193,10 +193,12 @@ jobs:
         run: |
           set -o pipefail
           sh tests/cross-run.sh --selftest-direct-contract-policy
+          # Require actual direct artifacts, but not universal direct support:
+          # older libc producers declare unsupported layouts and exercise
+          # extraction. Declared direct artifacts must still all pass replay.
           docker run --rm --platform linux/${{ matrix.arch }} \
             -v "$PWD":/work -w /work \
             -e DLFREEZE_REQUIRE_DIRECT_CONTRACTS=${{ (github.event_name != 'workflow_dispatch' || inputs.environment == 'all') && '1' || '0' }} \
-            -e DLFREEZE_REQUIRE_ALL_DIRECT_CONTRACTS=${{ (github.event_name != 'workflow_dispatch' || inputs.environment == 'all') && '1' || '0' }} \
             ${{ matrix.image }} \
             sh /work/tests/cross-run.sh 2>&1 | tee cross-run.log
 

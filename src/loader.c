@@ -7862,12 +7862,19 @@ static int x86_64_musl_frame_guard_reaches_clear(
         call = spill + 4;
         /* Move the saved guard pointer into memcpy's destination argument.
          * Register-only argument setup cannot overwrite the saved slot. */
-        if (call + 3 > clear ||
-            code[call] != (uint8_t)(0x48 | (guard_reg >= 8 ? 4 : 0)) ||
-            code[call + 1] != 0x89 ||
-            code[call + 2] != (uint8_t)(0xc7 | ((guard_reg & 7) << 3)))
+        if (call + 3 <= clear &&
+            code[call] == (uint8_t)(0x48 | (guard_reg >= 8 ? 4 : 0)) &&
+            code[call + 1] == 0x89 &&
+            code[call + 2] == (uint8_t)(0xc7 | ((guard_reg & 7) << 3))) {
+            call += 3;
+        } else if (spill < load_end + 3 ||
+                   code[spill - 3] != (uint8_t)(0x48 | (guard_reg >= 8 ? 4 : 0)) ||
+                   code[spill - 2] != 0x89 ||
+                   code[spill - 1] != (uint8_t)(0xc7 | ((guard_reg & 7) << 3))) {
+            /* Scheduling the argument move immediately before the spill
+             * is equivalent: the proven frame store cannot change RDI. */
             continue;
-        call += 3;
+        }
         /* Linkers may retain the address-size prefix when relaxing a GOT
          * call.  It does not change a relative near call in 64-bit mode. */
         if (call < clear && code[call] == 0x67)
@@ -11091,15 +11098,15 @@ static int aarch64_unconditional_branch(size_t pos, uint32_t insn,
 }
 
 /* Prove that source still contains pthread_detach's original X0 argument at
- * the exact use site.  Only direct copies to ABI callee-saved X19-X28 are
- * carried forward, and any later write invalidates that provenance. */
+ * the exact use site. Direct register copies survive only a fully decoded,
+ * call-free prefix; any later write invalidates that provenance. */
 static int aarch64_musl_arg0_at(const uint8_t *code, size_t use,
-                                unsigned int source)
+                                unsigned int source, int allow_volatile)
 {
     uint32_t valid = 1u;
 
-    if ((use & 3) != 0 || source == 31 ||
-        (source != 0 && (source < 19 || source > 28)))
+    if ((use & 3) != 0 || source >= 31 ||
+        (!allow_volatile && source != 0 && (source < 19 || source > 28)))
         return 0;
     for (size_t i = 0; i < use; i += 4) {
         uint32_t insn = read_u32_le(code + i);
@@ -11115,7 +11122,8 @@ static int aarch64_musl_arg0_at(const uint8_t *code, size_t use,
             (valid & 1u) != 0) {
             unsigned int destination = insn & 0x1f;
 
-            if (destination >= 19 && destination <= 28)
+            if (destination != 31 &&
+                (allow_volatile || (destination >= 19 && destination <= 28)))
                 copy_destination = destination;
         }
         if (!aarch64_musl_gpr_writes(insn, &writes))
@@ -11282,6 +11290,53 @@ static int decode_aarch64_musl_detach_offset(const uint8_t *code, size_t len,
                                              size_t *off_out,
                                              int *initial_out)
 {
+    /* A compiler may rematerialize &thread->detach_state independently at
+     * the exclusive load and store, and consume the load's address register
+     * as its result. Prove the complete small retry loop and both address
+     * calculations, rather than requiring identical physical registers. */
+    for (size_t b = 0; b + 32 <= len; b += 4) {
+        uint32_t store_add = read_u32_le(code + b + 4);
+        uint32_t store = read_u32_le(code + b + 8);
+        uint32_t load_add = read_u32_le(code + b + 16);
+        uint32_t load = read_u32_le(code + b + 20);
+        uint32_t compare = read_u32_le(code + b + 24);
+        unsigned int source = (store_add >> 5) & 31;
+        unsigned int store_base = store_add & 31;
+        unsigned int load_base = load_add & 31;
+        unsigned int value = store & 31;
+        unsigned int status = (store >> 16) & 31;
+        unsigned int loaded = load & 31;
+        unsigned int condition;
+        int64_t initial, retry, done;
+        size_t offset = (store_add >> 10) & 0xfff;
+
+        if ((store_add & 0xffc00000u) != 0x91000000u ||
+            (load_add & ~UINT32_C(31)) != (store_add & ~UINT32_C(31)) ||
+            source == 31 || store_base == 31 || load_base == 31 ||
+            value == 31 || status == 31 || loaded == 31 ||
+            source == value || status == value || loaded == value ||
+            offset >= MUSL_THREAD_PROBE_LIMIT ||
+            (store & 0xffe0fc00u) != 0x8800fc00u ||
+            ((store >> 5) & 31) != store_base ||
+            (load & 0xfffffc00u) != 0x885ffc00u ||
+            ((load >> 5) & 31) != load_base ||
+            compare != (UINT32_C(0x7100081f) | (loaded << 5)) ||
+            !aarch64_unconditional_branch(b, read_u32_le(code + b), &initial) ||
+            initial != (int64_t)b + 16 ||
+            !aarch64_cbz_branch(b + 12, read_u32_le(code + b + 12), status, &done) ||
+            done <= (int64_t)b + 28 || (uint64_t)done >= len ||
+            !aarch64_cond_branch(b + 28, read_u32_le(code + b + 28), &condition, &retry) ||
+            condition != 0 || retry != (int64_t)b + 4 ||
+            !aarch64_musl_arg0_at(code, b, source, 1) ||
+            !aarch64_musl_loop_value(code, b, b + 16, b + 28, value) ||
+            !aarch64_musl_registers_preserved(
+                code, b + 4, b + 32, (1u << source) | (1u << value)))
+            continue;
+        *off_out = offset;
+        *initial_out = 2;
+        return 1;
+    }
+
     for (size_t i = 0; i + 4 <= len; i += 4) {
         uint32_t mov = read_u32_le(code + i);
         unsigned int value_reg;
@@ -11296,7 +11351,7 @@ static int decode_aarch64_musl_detach_offset(const uint8_t *code, size_t len,
 
             if ((store & 0xffc00000u) != 0xb9000000u ||
                 base_reg == 31 || (store & 0x1f) != value_reg ||
-                !aarch64_musl_arg0_at(code, j, base_reg) ||
+                !aarch64_musl_arg0_at(code, j, base_reg, 0) ||
                 !aarch64_musl_constant_at(code, j, value_reg, 2))
                 continue;
             off = ((store >> 10) & 0xfff) * sizeof(uint32_t);
@@ -11319,7 +11374,7 @@ static int decode_aarch64_musl_detach_offset(const uint8_t *code, size_t len,
         source_reg = (add >> 5) & 0x1f;
         address_reg = add & 0x1f;
         if (address_reg == 31 ||
-            !aarch64_musl_arg0_at(code, i, source_reg))
+            !aarch64_musl_arg0_at(code, i, source_reg, 0))
             continue;
         off = (add >> 10) & 0xfff;
         if ((add >> 22) & 1)
@@ -12281,6 +12336,24 @@ static int decode_aarch64_musl_clone_ctid(
     return 1;
 }
 
+/* Recover a saved call result across bounded, decoded scheduling gaps.
+ * Stores through X0 do not change it; another call, branch, or write does. */
+static int aarch64_musl_call_result_register(
+    const uint8_t *code, size_t len, size_t ready, unsigned int *reg_out)
+{
+    for (size_t pos = ready; pos + 4 <= len && pos < ready + 20; pos += 4) {
+        uint32_t move = read_u32_le(code + pos);
+
+        if ((move & 0xffffffe0u) == 0xaa0003e0u && (move & 31) != 31 &&
+            aarch64_musl_no_control_flow(code, ready, pos) &&
+            aarch64_musl_registers_preserved(code, ready, pos, 1u)) {
+            *reg_out = move & 31;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int decode_aarch64_musl_pthread_geometry(
     const struct loaded_obj *libc_obj, const uint8_t *create,
     size_t create_len, const uint8_t *exit_code, size_t exit_len,
@@ -12324,23 +12397,24 @@ static int decode_aarch64_musl_pthread_geometry(
                 &candidate_dtv, tls_head_out, tls_size_out,
                 tls_align_out, tls_cnt_out))
             continue;
-        if (i + 8 > create_len)
+        if (!aarch64_musl_call_result_register(
+                create, create_len, i + 4, &new_reg))
             return 0;
-        uint32_t move = read_u32_le(create + i + 4);
-        if ((move & 0xffffffe0u) != 0xaa0003e0u)
-            return 0;
-        new_reg = move & 0x1f;
         copy_tls = target;
         pthread_size = candidate_size;
         dtv = candidate_dtv;
         copy_candidates++;
     }
-    if (copy_candidates != 1 || new_reg == 31)
+    if (copy_candidates != 1 || new_reg == 31) {
+        ldr_dbg_hex("[loader] musl contract: copy_tls candidates=", copy_candidates);
         return 0;
+    }
     if (!decode_aarch64_musl_clone_ctid(
             libc_obj, create, create_len, new_reg, pthread_size,
-            tid_offset, thread_list_lock_out))
+            tid_offset, thread_list_lock_out)) {
+        ldr_dbg("[loader] musl contract: clone child-TID decoder failed\n");
         return 0;
+    }
 
     for (size_t i = 0; i + 4 <= create_len; i += 4) {
         uint32_t insn = read_u32_le(create + i);
@@ -12469,8 +12543,14 @@ static int decode_aarch64_musl_pthread_geometry(
     if (!self_store || !robust_self_link || !canary_copy ||
         !sysinfo_copy || !locale_store || create_list < 2 ||
         exit_list < 2 || !exit_robust || prev == SIZE_MAX ||
-        next == SIZE_MAX || sysinfo == SIZE_MAX || robust == SIZE_MAX)
+        next == SIZE_MAX || sysinfo == SIZE_MAX || robust == SIZE_MAX) {
+        ldr_dbg_hex("[loader] musl contract: pthread evidence=",
+                    self_store | (robust_self_link << 1) | (canary_copy << 2) |
+                    (sysinfo_copy << 3) | (locale_store << 4) |
+                    ((create_list >= 2) << 5) | ((exit_list >= 2) << 6) |
+                    (exit_robust << 7));
         return 0;
+    }
     *copy_tls_out = copy_tls;
     *pthread_size_out = pthread_size;
     *dtv_out = dtv;
