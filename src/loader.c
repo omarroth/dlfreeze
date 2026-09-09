@@ -2169,11 +2169,11 @@ static int install_crash_handlers(struct crash_handler_state *state)
 
         if (guarded_sigaction(g_crash_signals[i], &sa,
                               &state->saved[i]) < 0) {
-            int saved_errno = errno;
-
+            /* This optional bootstrap-only operation reports availability,
+             * not errno.  Do not introduce a bootstrap errno dependency into
+             * the loader to preserve an error that no caller consumes. */
             if (restore_crash_handlers(state) < 0)
                 return -1;
-            errno = saved_errno;
             ldr_dbg("[loader] debug crash handlers unavailable\n");
             return 0;
         }
@@ -14870,6 +14870,7 @@ typedef void *(*fdopendir_fn)(int);
 typedef void *(*readdir_fn)(void *);
 typedef void *(*malloc_fn)(size_t);
 typedef char *(*realpath_fn)(const char *, char *);
+typedef char *(*realpath_chk_fn)(const char *, char *, size_t);
 typedef int (*closedir_fn)(void *);
 typedef int (*dirfd_fn)(void *);
 typedef void (*rewinddir_fn)(void *);
@@ -14886,6 +14887,7 @@ static fdopendir_fn g_real_fdopendir;
 static readdir_fn g_real_readdir;
 static malloc_fn g_real_malloc;
 static realpath_fn g_real_realpath;
+static realpath_chk_fn g_real_realpath_chk;
 static closedir_fn g_real_closedir;
 static dirfd_fn g_real_dirfd;
 static rewinddir_fn g_real_rewinddir;
@@ -19601,6 +19603,20 @@ static char *vfs_realpath(const char *path, char *resolved)
     return NULL;
 }
 
+/* Fortified callers have a distinct libc entry point.  Preserve its failure
+ * policy for undersized buffers through the exact target provider, while
+ * valid buffers must see the same captured namespace as plain realpath. */
+static char *vfs_realpath_chk(const char *path, char *resolved, size_t size)
+{
+    if (size < PATH_MAX) {
+        if (g_real_realpath_chk)
+            return g_real_realpath_chk(path, resolved, size);
+        ldr_err("target fortified realpath provider unavailable", NULL);
+        _exit(127);
+    }
+    return vfs_realpath(path, resolved);
+}
+
 static int vfs_lxstat(int ver, const char *path, struct stat *buf)
 {
     (void)ver;
@@ -22614,6 +22630,8 @@ static int initialize_target_libc_helpers(struct loaded_obj *objs, int nobj)
         libc_obj, "readdir", "readdir64");
     g_real_malloc = (malloc_fn)vfs_libc_function(libc_obj, "malloc", NULL);
     g_real_realpath = (realpath_fn)vfs_libc_function(libc_obj, "realpath", NULL);
+    g_real_realpath_chk = (realpath_chk_fn)vfs_libc_function(
+        libc_obj, "__realpath_chk", NULL);
     g_real_closedir = (closedir_fn)vfs_libc_function(
         libc_obj, "closedir", NULL);
     g_real_dirfd = (dirfd_fn)vfs_libc_function(libc_obj, "dirfd", NULL);
@@ -25233,14 +25251,16 @@ static int glibc_x86_private_instruction(
     opcode = code[p++];
 
     if (opcode >= UINT8_C(0x50) && opcode <= UINT8_C(0x57)) {
+        instruction->writes = UINT32_C(1) << 4;
         instruction->end = p;
-        return 1; /* PUSH reads its explicit register. */
+        return 1; /* PUSH also moves the architectural stack pointer. */
     }
     if (opcode >= UINT8_C(0x58) && opcode <= UINT8_C(0x5f)) {
         unsigned int destination =
             (opcode - UINT8_C(0x58)) | ((rex & 1U) ? 8U : 0U);
 
-        instruction->writes = UINT32_C(1) << destination;
+        instruction->writes = (UINT32_C(1) << destination) |
+                              (UINT32_C(1) << 4);
         instruction->end = p;
         return 1;
     }
@@ -25336,11 +25356,13 @@ static int glibc_x86_private_instruction(
     case 0x68:
         if (4U > length - p)
             return 0;
+        instruction->writes = UINT32_C(1) << 4;
         instruction->end = p + 4;
         return 1;
     case 0x6a:
         if (p >= length)
             return 0;
+        instruction->writes = UINT32_C(1) << 4;
         instruction->end = p + 1;
         return 1;
     default:
@@ -25604,6 +25626,8 @@ static int glibc_x86_private_instruction(
                 writes_rm = 0; /* CMP */
             if (opcode == UINT8_C(0x8f) && operation != 0U)
                 return 0;
+            if (opcode == UINT8_C(0x8f))
+                instruction->writes |= UINT32_C(1) << 4;
             if (opcode == UINT8_C(0xc6) && operation != 0U)
                 return 0;
             if (opcode == UINT8_C(0xc7) && operation != 0U)
@@ -25632,7 +25656,9 @@ static int glibc_x86_private_instruction(
                     instruction->writes |= GLIBC_X86_CALL_CLOBBERS;
                 } else if (operation == 4U || operation == 5U) {
                     instruction->flow = GLIBC_PRIVATE_FLOW_TERMINAL;
-                } else if (operation != 6U) {
+                } else if (operation == 6U) {
+                    instruction->writes |= UINT32_C(1) << 4;
+                } else {
                     return 0;
                 }
             }
@@ -25883,7 +25909,7 @@ static int glibc_x86_mov64_stack_slot(
         if (p >= length)
             return 0;
         sib = code[p++];
-        if (((sib >> 3) & 7U) != 4U || (sib & 7U) != 4U)
+        if (((sib >> 3) & 7U) != 4U || (sib & 7U) != 4U || (rex & 2U))
             return 0;
         base = 4;
     } else {
@@ -25921,13 +25947,13 @@ static int glibc_x86_direct_rtld_field(
         expected_offset, expected_width);
 }
 
-/* Return whether a decoded instruction can overwrite an eight-byte RBP slot.
- * This deliberately recognizes only direct frame addressing.  Indexed RBP
+/* Return whether a decoded instruction can overwrite an eight-byte frame slot.
+ * This deliberately recognizes only direct frame addressing.  Indexed frame
  * writes are conservatively treated as aliases; writes through other bases
  * cannot name a compiler-owned frame slot without undefined stack aliasing. */
-static int glibc_x86_writes_rbp_slot(
+static int glibc_x86_writes_stack_slot(
     const uint8_t *code, size_t length, size_t position,
-    int64_t slot_displacement)
+    unsigned int stack_base, int64_t slot_displacement)
 {
     size_t p = position;
     uint8_t rex = 0;
@@ -26044,11 +26070,11 @@ static int glibc_x86_writes_rbp_slot(
         sib_base = sib & 7U;
         if (mod == 0 && sib_base == 5U)
             return 0;
-        if (sib_base != 5U || (rex & 1U))
+        if (sib_base != stack_base || (rex & 1U))
             return 0;
-        if (((sib >> 3) & 7U) != 4U)
+        if (((sib >> 3) & 7U) != 4U || (rex & 2U))
             return 1;
-    } else if (rm != 5U || (rex & 1U) || mod == 0) {
+    } else if (rm != stack_base || (rex & 1U) || mod == 0) {
         return 0;
     }
     {
@@ -26080,7 +26106,7 @@ static int glibc_x86_writes_rbp_slot(
 
 static int glibc_x86_stack_slot_field_path(
     const uint8_t *code, size_t length, size_t start,
-    int64_t stack_displacement, size_t expected_offset,
+    unsigned int stack_base, int64_t stack_displacement, size_t expected_offset,
     size_t expected_width)
 {
     unsigned char seen[GLIBC_PRIVATE_CFG_LIMIT];
@@ -26111,7 +26137,7 @@ static int glibc_x86_stack_slot_field_path(
         if (glibc_x86_mov64_stack_slot(
                 code, length, position, 1, &reload_register,
                 &reload_base, &reload_displacement, &reload_length) &&
-            reload_base == 5U &&
+            reload_base == stack_base &&
             reload_displacement == stack_displacement &&
             position + reload_length == instruction.end &&
             glibc_private_register_field_path(
@@ -26120,9 +26146,9 @@ static int glibc_x86_stack_slot_field_path(
                 glibc_x86_private_instruction,
                 glibc_x86_private_field_at))
             return 1;
-        if ((instruction.writes & (UINT32_C(1) << 5)) ||
-            glibc_x86_writes_rbp_slot(
-                code, length, position, stack_displacement))
+        if ((instruction.writes & (UINT32_C(1) << stack_base)) ||
+            glibc_x86_writes_stack_slot(
+                code, length, position, stack_base, stack_displacement))
             continue;
         if (!glibc_private_enqueue_successors(
                 &instruction, length, queue,
@@ -26165,10 +26191,12 @@ static int glibc_x86_register_spill_field_path(
         if (glibc_x86_mov64_stack_slot(
                 code, length, position, 0, &stored_register,
                 &stack_base, &stack_displacement, &store_length) &&
-            stored_register == rtld_register && stack_base == 5U &&
+            stored_register == rtld_register &&
+            (stack_base == 5U ||
+             (stack_base == 4U && stack_displacement >= 0)) &&
             position + store_length == instruction.end &&
             glibc_x86_stack_slot_field_path(
-                code, length, instruction.end, stack_displacement,
+                code, length, instruction.end, stack_base, stack_displacement,
                 expected_offset, expected_width))
             return 1;
         if (instruction.writes & (UINT32_C(1) << rtld_register))
@@ -26182,8 +26210,9 @@ static int glibc_x86_register_spill_field_path(
 }
 
 /* pthread_create may keep the imported object in a callee-saved register or
- * spill it into its own RBP frame.  Both proofs begin at a reachable exact
- * GOT load and follow only decoded control-flow edges. */
+ * spill it into its own RBP or fixed-RSP frame.  Both proofs begin at a
+ * reachable exact GOT load and follow only decoded control-flow edges.
+ * RSP-relative proofs reject stack movement and red-zone slots. */
 static int glibc_x86_pthread_rtld_field(
     const uint8_t *code, size_t length, uint64_t function_vaddr,
     uint64_t got_vaddr, size_t expected_offset, size_t expected_width)
@@ -28302,6 +28331,7 @@ static const struct stub_sym g_vfs_overrides[] = {
     { "__openat_2",      (void *)vfs_openat_2       },
     { "__openat64_2",    (void *)vfs_openat_2       },
     { "realpath",        (void *)vfs_realpath       },
+    { "__realpath_chk",  (void *)vfs_realpath_chk   },
     { "stat",            (void *)vfs_stat           },
     { "stat64",          (void *)vfs_stat           },
     { "lstat",           (void *)vfs_lstat          },
@@ -47190,7 +47220,9 @@ static int loader_run_impl(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         select_musl_thread_layout(g_musl_layout);
     }
 
-    struct crash_handler_state startup_crash_handlers = {0};
+    struct crash_handler_state startup_crash_handlers;
+
+    ldr_memset(&startup_crash_handlers, 0, sizeof(startup_crash_handlers));
 
     /* A partial installation must never leak into the target process. */
     if (install_crash_handlers(&startup_crash_handlers) < 0) {

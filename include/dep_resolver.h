@@ -64,7 +64,7 @@ struct dep_list {
     int       target_ei_class;  /* required ELF class for dependencies */
     uint16_t  target_e_machine; /* required ELF machine for dependencies */
     enum dep_runtime_family runtime_family; /* target loader search ABI */
-    int gnu_release_minor; /* stable target glibc 2.x minor, or -1 */
+    int gnu_release_minor; /* stable target glibc 2.x minor, or -1 for unknown cache policy */
     /* At least one successful pure-RTLD_LAZY request names an identity outside
      * the immutable startup dependency graph.  V8 tags fork-descendant
      * records and tracks first observations per process; loader namespaces

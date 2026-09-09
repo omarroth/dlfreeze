@@ -5802,6 +5802,7 @@ dlfrz_musl_rtld_identity(const void *data, size_t elf_size)
     Elf64_Sym debug_addr;
     const char *soname;
     const char *expected_soname;
+    const char *interpreter_soname;
     uint64_t dlstart_size;
     uint64_t dls3_size;
 
@@ -5816,16 +5817,22 @@ dlfrz_musl_rtld_identity(const void *data, size_t elf_size)
             &view, "_dl_debug_addr", &debug_addr, NULL) != 1)
         return 0;
 
-    if (view.ehdr.e_machine == EM_X86_64)
+    if (view.ehdr.e_machine == EM_X86_64) {
         expected_soname = "libc.musl-x86_64.so.1";
-    else if (view.ehdr.e_machine == EM_AARCH64)
+        interpreter_soname = "ld-musl-x86_64.so.1";
+    } else if (view.ehdr.e_machine == EM_AARCH64) {
         expected_soname = "libc.musl-aarch64.so.1";
-    else
+        interpreter_soname = "ld-musl-aarch64.so.1";
+    } else {
         return 0;
+    }
     if (view.have_soname) {
         soname = (const char *)view.elf + view.dynstr_offset +
                  (size_t)view.soname_offset;
-        if (strcmp(soname, expected_soname) != 0)
+        /* The combined object can name either its libc or its interpreter
+         * ABI.  Neither spelling replaces the structural checks below. */
+        if (strcmp(soname, expected_soname) != 0 &&
+            strcmp(soname, interpreter_soname) != 0)
             return 0;
     }
 

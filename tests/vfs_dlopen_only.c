@@ -326,9 +326,16 @@ int main(int argc, char **argv)
         fclose(stream) != 0 ||
         memcmp(magic, "\177ELF", sizeof(magic)) != 0)
         return 10;
-    if (!realpath(argv[1], resolved) ||
-        strcmp(resolved, frozen ? argv[1] : argv[5]) != 0)
-        return 11;
+    {
+        char *canonical = realpath(argv[1], resolved);
+        const char *expected = frozen ? argv[1] : argv[5];
+
+        if (!canonical || strcmp(canonical, expected) != 0) {
+            fprintf(stderr, "realpath: expected=%s actual=%s errno=%d\n",
+                    expected, canonical ? canonical : "(null)", errno);
+            return 11;
+        }
+    }
 
     if (!check_positioned_directory(
             argv[2], plugin_name, sibling_name,

@@ -674,11 +674,17 @@ int main(void)
         goto out;
 
     entries[2].osversion = 1;
+    test_target_glibc_minor = -1;
     if (replace_file(fd, image, size) < 0 ||
         expect_lookup(cache_path, soname, required_id, GNU_CACHE_FOUND,
                       "/generic/libdlfreeze.so") < 0)
         goto out;
     entries[2].osversion = UINT32_MAX;
+    if (replace_file(fd, image, size) < 0 ||
+        expect_lookup(cache_path, soname, required_id,
+                      GNU_CACHE_UNSUPPORTED, NULL) < 0)
+        goto out;
+    test_target_glibc_minor = 35;
     if (replace_file(fd, image, size) < 0 ||
         expect_lookup(cache_path, soname, required_id,
                       GNU_CACHE_MISS, NULL) < 0)

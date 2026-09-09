@@ -241,14 +241,16 @@ static enum dep_runtime_family detect_interpreter_family(
                 int development = 0;
                 int minor = -1;
 
-                /* Cache behavior changes by target release.  A development
-                 * or unrecognized loader cannot safely inherit the packer's
-                 * host policy. */
+                /* Family recognition is not direct-loader ABI admission.
+                 * Older rtld builds lack a release banner, and development
+                 * loaders still implement the GNU search interface. Keep an
+                 * unknown cache-policy epoch until a lookup proves that the
+                 * old/new ABI-tag rules select the same generic entry. */
+                family = DEP_RUNTIME_GNU;
                 if (dlfrz_glibc_elf_release_profile(
                         image, image_size, &minor, &development) &&
                     !development && minor >= 0) {
                     *gnu_release_minor_out = minor;
-                    family = DEP_RUNTIME_GNU;
                 }
             }
         }
@@ -582,6 +584,7 @@ struct gnu_cache_extension {
 };
 
 enum gnu_cache_lookup_result {
+    GNU_CACHE_UNSUPPORTED = -4,
     GNU_CACHE_INTERNAL = -3,
     GNU_CACHE_MALFORMED = -2,
     GNU_CACHE_UNREADABLE = -1,
@@ -1471,7 +1474,8 @@ static int gnu_cache_key_is_representable(const char *key)
 /* Return GNU_CACHE_FOUND and an owned absolute pathname for a generic
  * exact-ABI entry, GNU_CACHE_MISS for a validated miss,
  * GNU_CACHE_UNREADABLE for an I/O failure, GNU_CACHE_MALFORMED for an
- * invalid image, and GNU_CACHE_INTERNAL for an allocation failure.  Named
+ * invalid image, GNU_CACHE_UNSUPPORTED for ambiguous target policy, and
+ * GNU_CACHE_INTERNAL for an allocation failure. Named
  * glibc-hwcaps selection depends on evolving loader-private CPU/tunable
  * state; selecting the cache's generic ABI-compatible entry is deterministic
  * and avoids freezing an object the target loader may not admit on replay. */
@@ -1490,7 +1494,7 @@ static int gnu_cache_lookup_path(struct dep_list *deps, const char *name,
     if (path_out)
         *path_out = NULL;
     if (!deps || !name || !name[0] || !path_out ||
-        deps->gnu_release_minor < 0 ||
+        deps->gnu_release_minor < -1 ||
         !gnu_cache_key_is_representable(name))
         return GNU_CACHE_MALFORMED;
     result = gnu_cache_index_initialize(deps);
@@ -1540,19 +1544,27 @@ static int gnu_cache_lookup_path(struct dep_list *deps, const char *name,
             break;
         if (strcmp(entry->key, name) != 0 || entry->flags != required_id)
             continue;
+        /* Non-generic entries cannot become the selected candidate under
+         * this contract, regardless of the target's ABI-tag epoch. */
+        if (entry->hwcap != 0)
+            continue;
         /* glibc compares the cached GNU ABI-tag requirement with the running
          * Linux version.  uname is the same stable kernel input used by its
          * fallback discovery path; if it cannot be represented, retain only
          * entries which declare no OS minimum. */
         if (deps->gnu_release_minor <= 35 && entry->osversion != 0 &&
             (!kernel_osversion_known ||
-             entry->osversion > kernel_osversion))
+             entry->osversion > kernel_osversion)) {
+            if (deps->gnu_release_minor < 0) {
+                /* Pre-2.36 loaders skip this entry; later ones select it.
+                 * Without a release identity neither selection is proven.
+                 * Do not turn this ambiguity into a miss or select another
+                 * library using the packer's own libc policy. */
+                result = GNU_CACHE_UNSUPPORTED;
+                goto out;
+            }
             continue;
-        /* Both legacy and named hardware-capability entries require loader
-         * CPU/tunable policy.  Pack-time resolution uses only the generic
-         * cache contract. */
-        if (entry->hwcap != 0)
-            continue;
+        }
         selected = entry->value;
         break;
     }
@@ -2478,6 +2490,8 @@ static char *find_library(const char *name,
                 *lookup_result = LIBRARY_LOOKUP_UNREADABLE;
             else if (cache_status == GNU_CACHE_MALFORMED)
                 *lookup_result = LIBRARY_LOOKUP_MALFORMED;
+            else if (cache_status == GNU_CACHE_UNSUPPORTED)
+                *lookup_result = LIBRARY_LOOKUP_UNSUPPORTED;
             else
                 *lookup_result = LIBRARY_LOOKUP_INTERNAL;
         }
@@ -2496,6 +2510,10 @@ static char *find_library(const char *name,
             fprintf(stderr,
                     "dlfreeze: GNU runtime cache lookup failed internally: %s\n",
                     deps->gnu_cache_path ? deps->gnu_cache_path : "(unknown)");
+        else if (cache_status == GNU_CACHE_UNSUPPORTED)
+            fprintf(stderr,
+                    "dlfreeze: target GNU cache ABI-tag policy is ambiguous: %s\n",
+                    name);
         else if (cache_status == GNU_CACHE_MISS)
             fprintf(stderr,
                     "dlfreeze: %s is absent from the GNU runtime cache; "

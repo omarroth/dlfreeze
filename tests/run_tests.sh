@@ -341,6 +341,7 @@ test_loader_fileback_gate() {
             -Wl,--gc-sections -o "$helper" \
             tests/loader_fileback_gate.c src/lazy_trampoline.S \
             -ldl -pthread &&
+       TMPDIR="$(cd "$BUILD" && pwd -P)" \
        run_with_timeout_seconds 12 "$helper"; then
         pass "loader startup fileback, lazy copy, and private VFS publication"
     else
@@ -433,9 +434,9 @@ test_packer_publish_fallback_gate() {
     echo "--- packer portable publication fallback gate ---"
     local runtime_root helper
 
-    runtime_root=$(mktemp -d /dev/shm/dlfreeze-publish-gate.XXXXXX) || {
+    runtime_root=$(mktemp -d "$(cd "$BUILD" && pwd -P)/dlfreeze-publish-gate.XXXXXX") || {
         fail "packer portable publication fallback gate" \
-            "cannot create isolated /dev/shm test directory"
+            "cannot create isolated build test directory"
         return
     }
     helper="$runtime_root/packer_publish_gate"
@@ -457,9 +458,9 @@ test_packer_transaction_identity_handoff_gate() {
     echo "--- packer transaction identity handoff gate ---"
     local runtime_root helper stage leaf ok=1
 
-    runtime_root=$(mktemp -d /dev/shm/dlfreeze-identity-gate.XXXXXX) || {
+    runtime_root=$(mktemp -d "$(cd "$BUILD" && pwd -P)/dlfreeze-identity-gate.XXXXXX") || {
         fail "packer transaction identity handoff gate" \
-            "cannot create isolated /dev/shm test directory"
+            "cannot create isolated build test directory"
         return
     }
     helper="$runtime_root/packer_transaction_identity_gate"
@@ -3656,7 +3657,7 @@ test_bootstrap_cet_isolation() {
     cat > "$probe_src" <<'C'
 int main(void) { return 0; }
 C
-    if ! "$TEST_REAL_GCC" -static -fcf-protection=full \
+    if ! "$TEST_REAL_GCC" -static -fcf-protection=full -Wl,-z,shstk \
             -o "$probe" "$probe_src" >/dev/null 2>&1; then
         skip "$suppress_label" "static CET probe cannot be linked"
         skip "$reject_label" "static CET probe cannot be linked"
@@ -3671,9 +3672,9 @@ C
     fi
     if ! grep -Eq 'x86 feature:.*SHSTK' <<<"$notes"; then
         skip "$suppress_label" \
-            "static toolchain does not propagate -fcf-protection=full to SHSTK"
+            "static toolchain cannot synthesize a SHSTK property"
         skip "$reject_label" \
-            "static toolchain does not propagate -fcf-protection=full to SHSTK"
+            "static toolchain cannot synthesize a SHSTK property"
         rm -rf "$root"
         return
     fi
@@ -3684,7 +3685,9 @@ C
 # This property-only regression need not repeat the primary build's expensive
 # loader optimization; the trailing -O0 keeps its two isolated links focused.
 if [ "${DLFREEZE_CET_INJECT_AFTER:-0}" = 1 ]; then
-    exec "$DLFREEZE_CET_REAL_CC" "$@" -O0 -fcf-protection=full
+    # Assembly inputs can legitimately omit SHSTK and clear the merged
+    # property.  Force the final property to exercise the rejection gate.
+    exec "$DLFREEZE_CET_REAL_CC" "$@" -O0 -fcf-protection=full -Wl,-z,shstk
 fi
 exec "$DLFREEZE_CET_REAL_CC" -fcf-protection=full "$@" -O0
 SH
@@ -3784,6 +3787,7 @@ C
     cat > "$mini_src/loader.c" <<'C'
 /* The property gate does not require the production loader body. */
 C
+    cp src/lazy_trampoline.S "$mini_src/lazy_trampoline.S"
     note_src="$root/isa-needed.S"
     note_obj="$root/isa-needed.o"
     cat > "$note_src" <<'ASM'
@@ -16728,7 +16732,8 @@ test_direct_dlopen_only_vfs() {
             -Wl,-soname,libdlfrz_vfs_only.so -o "$plugin_real" \
             tests/vfs_dlopen_only_plugin.c ||
        ! ln -s "$(basename "$plugin_real")" "$plugin" ||
-       ! gcc -std=c11 -Wall -Wextra -Werror -O2 -o "$bin" \
+       ! gcc -std=c11 -Wall -Wextra -Werror -O2 \
+            -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2 -o "$bin" \
             tests/vfs_dlopen_only.c -ldl; then
         fail "direct traced-ELF VFS without DATA" "fixture compile failed"
         rm -rf "$root"
@@ -27550,7 +27555,7 @@ run_direct_runtime_noexec_policy() {
             "$out" "$candidate" || rc=$?
         actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
         if [ "$rc" -ne 0 ] &&
-           [[ "$actual" == *"cannot populate segment"* ]] &&
+           [[ "$actual" == *"segment mapping policy rejected load"* ]] &&
            [[ "$actual" != *"runtime-bounds=42"* ]]; then
             pass "$family late DSO preserves native noexec policy"
         else

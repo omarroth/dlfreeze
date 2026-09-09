@@ -994,7 +994,7 @@ static void gate_vfs_temp_stage(
 
 static int gate_vfs_temp_directory(char path[PATH_MAX])
 {
-    const char *candidates[] = { getenv("TMPDIR"), "/dev/shm", "/tmp" };
+    const char *candidates[] = { getenv("TMPDIR"), "/tmp" };
 
     for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]);
          i++) {

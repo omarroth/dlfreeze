@@ -372,6 +372,42 @@ static int run_pthread_spill_field_gate(void)
         glibc_x86_pthread_rtld_field(
             bad, sizeof(bad), function_vaddr, got_vaddr, 0x10d8, 8),
         0);
+
+    memset(code, 0x90, sizeof(code));
+    memcpy(code,
+           "\x48\x8b\x35\x00\x00\x00\x00" /* GOT -> RSI */
+           "\x48\x89\x74\x24\x38"         /* spill 0x38(RSP) */
+           "\x90\x90\x90\x90\x90\x90\x90\x90"
+           "\x48\x8b\x4c\x24\x38"         /* reload -> RCX */
+           "\x48\x8b\x81\xd8\x10\x00\x00\xc3",
+           33);
+    store_i32(code + 3, (int64_t)got_vaddr -
+                           (int64_t)(function_vaddr + 7));
+    ok &= expect_result(
+        "fixed-RSP private base spill and reload",
+        glibc_x86_pthread_rtld_field(
+            code, sizeof(code), function_vaddr, got_vaddr, 0x10d8, 8), 1);
+    memcpy(bad, code, sizeof(bad));
+    memcpy(bad + 12, "\x48\xc7\x44\x24\x38\x00\x00\x00\x00", 9);
+    /* Move the reload after the complete nine-byte overwrite. */
+    memcpy(bad + 21, code + 20, 13);
+    ok &= expect_result(
+        "overwritten RSP spill is rejected",
+        glibc_x86_pthread_rtld_field(
+            bad, sizeof(bad), function_vaddr, got_vaddr, 0x10d8, 8), 0);
+    memcpy(bad, code, sizeof(bad));
+    bad[12] = 0x50; /* PUSH RAX changes the meaning of 0x38(RSP). */
+    ok &= expect_result(
+        "moved RSP spill is rejected",
+        glibc_x86_pthread_rtld_field(
+            bad, sizeof(bad), function_vaddr, got_vaddr, 0x10d8, 8), 0);
+    memcpy(bad, code, sizeof(bad));
+    bad[11] = 0xf8;
+    bad[24] = 0xf8; /* A red-zone spill cannot survive arbitrary calls. */
+    ok &= expect_result(
+        "red-zone spill is not private-layout evidence",
+        glibc_x86_pthread_rtld_field(
+            bad, sizeof(bad), function_vaddr, got_vaddr, 0x10d8, 8), 0);
     return ok;
 }
 
