@@ -34,6 +34,8 @@ static _Atomic int quiescent_publications;
 static _Atomic int all_publications_quiescent;
 static _Atomic int first_fork_complete;
 static _Atomic int publication_overlap_observed;
+static _Atomic int native_workers_joined;
+static void *native_retained_handle;
 static int publication_overlap_enabled = 1;
 
 static void note_failure(unsigned int bit)
@@ -204,10 +206,15 @@ static void *loader_worker(void *unused)
             atomic_store_explicit(
                 &first_publication_complete, 1, memory_order_release);
             note_quiescent_publication();
-            if (wait_for_flag(&first_fork_complete) != 0)
+            if (publication_overlap_enabled &&
+                wait_for_flag(&first_fork_complete) != 0)
                 note_failure(1U << 25);
         }
-        if (dlclose(handle) != 0)
+        /* Keep plugin zero resident for the native child's RTLD_NOLOAD
+         * check without making this worker wait for the first fork. */
+        if (index == 0 && !publication_overlap_enabled)
+            native_retained_handle = handle;
+        else if (dlclose(handle) != 0)
             note_failure(1U << 10);
         if (index != 0)
             note_quiescent_publication();
@@ -248,11 +255,13 @@ static void *fork_worker(void *unused)
         int status = 0;
         pid_t child;
 
-        /* Older native loaders can acquire internal locks before invoking
-         * application atfork prepares. Their control run forks only after
-         * publication is quiescent; direct replay still requires overlap. */
+        /* Native libc need not support our stronger concurrent-fork loader
+         * contract. In particular, old musl's fork and thread-exit dlerror
+         * cleanup acquire their locks in opposite orders. Publication and
+         * reader completion flags do not prove thread teardown has finished:
+         * wait for actual joins. Direct replay still requires overlap. */
         if (pass == 0 && !publication_overlap_enabled &&
-            wait_for_flag(&all_publications_quiescent) != 0) {
+            wait_for_flag(&native_workers_joined) != 0) {
             note_failure(1U << 27);
             break;
         }
@@ -356,8 +365,11 @@ int main(int argc, char **argv)
     for (int i = 0; i < READER_THREADS; i++)
         if (pthread_join(readers[i], NULL) != 0)
             return 7;
+    atomic_store_explicit(&native_workers_joined, 1, memory_order_release);
     if (pthread_join(forker, NULL) != 0)
         return 8;
+    if (native_retained_handle && dlclose(native_retained_handle) != 0)
+        note_failure(1U << 10);
     alarm(0);
     pthread_barrier_destroy(&start_barrier);
 
