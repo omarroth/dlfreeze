@@ -687,7 +687,7 @@ static int gate_readonly_authority_fast_replay(void)
     phdr[1].p_type = PT_LOAD;
     phdr[1].p_flags = PF_R | PF_W;
     phdr[1].p_vaddr = 256;
-    phdr[1].p_filesz = 128;
+    phdr[1].p_filesz = 64;
     phdr[1].p_memsz = 128;
     phdr[2].p_type = PT_GNU_RELRO;
     phdr[2].p_vaddr = 256;
@@ -840,6 +840,49 @@ static int gate_relocation_word_guard_pages(void)
     return valid;
 }
 
+static int gate_unique_writable_load_cache(void)
+{
+    _Alignas(8) uint8_t image[512] = {0};
+    Elf64_Phdr phdr[2] = {0};
+    struct loaded_obj obj = {0};
+    void *pointer = NULL;
+
+    obj.base = (uintptr_t)image;
+    obj.phdr = phdr;
+    obj.phdr_num = 2;
+    phdr[0].p_type = PT_LOAD;
+    phdr[0].p_flags = PF_R;
+    phdr[0].p_filesz = 128;
+    phdr[0].p_memsz = 128;
+    phdr[1].p_type = PT_LOAD;
+    phdr[1].p_flags = PF_R | PF_W;
+    phdr[1].p_vaddr = 256;
+    phdr[1].p_filesz = 64;
+    phdr[1].p_memsz = 128;
+    loaded_obj_cache_unique_writable_load(&obj);
+    if (obj.unique_writable_load_index_plus_one != 2 ||
+        !loaded_obj_relocation_destination_pointer(
+            &obj, 264, 8, &pointer) ||
+        pointer != image + 264 ||
+        !loaded_obj_relocation_file_destination_pointer(
+            &obj, 264, 8, NULL) ||
+        loaded_obj_relocation_file_destination_pointer(
+            &obj, 320, 8, NULL) ||
+        loaded_obj_relocation_destination_pointer(
+            &obj, 64, 8, NULL))
+        return 0;
+
+    /* Multiple writable loads disable the shortcut and retain the complete
+     * general scan, including a match in the second segment. */
+    phdr[0].p_flags |= PF_W;
+    loaded_obj_cache_unique_writable_load(&obj);
+    return obj.unique_writable_load_index_plus_one == 0 &&
+           loaded_obj_relocation_destination_pointer(
+               &obj, 264, 8, NULL) &&
+           loaded_obj_relocation_destination_pointer(
+               &obj, 64, 8, NULL);
+}
+
 int main(void)
 {
     if (!gate_replay_requires_complete_admission())
@@ -874,5 +917,7 @@ int main(void)
         return 15;
     if (!gate_relocation_word_guard_pages())
         return 16;
+    if (!gate_unique_writable_load_cache())
+        return 17;
     return 0;
 }

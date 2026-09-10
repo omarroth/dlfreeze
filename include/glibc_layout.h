@@ -4259,17 +4259,13 @@ dlfrz_glibc_x86_cpu_generic_kind(
     size_t selected_immediate_file_offset = 0;
     size_t selected_contracts = 0;
 
-    /* This header is also compiled into the bootstrap-neutral direct loader.
-     * A large aggregate initializer is lowered to the build libc's memset by
-     * GCC, leaving a forbidden host-libc import that could be reached after
-     * target-TP handoff.  Volatile byte stores keep this admission scratch
-     * initialization loader-owned without changing the decoder contract. */
-    {
-        volatile unsigned char *state = instruction_state;
-
-        for (size_t i = 0; i < sizeof(instruction_state); i++)
-            state[i] = 0;
-    }
+    /* loader.c redirects this spelling to its TLS-independent primitive
+     * before including the shared header.  Other users retain their normal
+     * libc implementation.  An explicit call avoids GCC synthesizing an
+     * unredirected builtin from an aggregate initializer while allowing the
+     * direct loader's REP/STP implementation to clear this bounded scratch
+     * area a word or cache line at a time. */
+    memset(instruction_state, 0, sizeof(instruction_state));
     if (!code || code_size < 256 || code_size > 32768)
         return 0;
     instruction_state[0] = DLFRZ_X86_INSN_START |

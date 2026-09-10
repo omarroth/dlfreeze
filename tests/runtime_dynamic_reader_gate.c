@@ -1125,6 +1125,7 @@ static int mutable_dynsym_name_gate(void)
     object.dynstr_size = sizeof(string_bytes);
     object.dynsym = symbols;
     object.dynsym_count = 2;
+    object.dynsym_admitted_count = 2;
     if (vfs_seed_hash_key(key_bytes) < 0 ||
         build_loaded_symbol_name_keys(&object) < 0 ||
         !object.dynstr_readonly || !object.dynsym_readonly ||
@@ -1286,7 +1287,9 @@ static int mutable_versym_key_gate(void)
     object.dynstr_size = sizeof(string_bytes);
     object.dynsym = symbols;
     object.dynsym_count = 2;
+    object.dynsym_admitted_count = 2;
     object.versym = versions;
+    object.versym_admitted_count = 2;
     object.version_index = version_index;
     g_version_key_admission_visits = 0;
     if (build_loaded_symbol_name_keys(&object) < 0 ||
@@ -2164,7 +2167,9 @@ static int symbol_lookup_complexity_gate(void)
     object.dynstr_size = strings_size;
     object.dynsym = symbols;
     object.dynsym_count = symbols_count;
+    object.dynsym_admitted_count = symbols_count;
     object.versym = versions;
+    object.versym_admitted_count = symbols_count;
     object.version_index = version_index;
     g_version_key_admission_visits = 0;
     g_symbol_name_radix_sorts = 0;
@@ -3109,6 +3114,7 @@ static int mutable_gnu_unique_registry_gate(void)
     object.phdr_num = 1;
     object.dynsym = symbols;
     object.dynsym_count = 3;
+    object.dynsym_admitted_count = 3;
     object.dynstr = strings;
     object.dynstr_size = page_size - string_offset;
     object.visible = 1;

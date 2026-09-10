@@ -6284,6 +6284,11 @@ struct loaded_obj {
     struct lazy_plt_resolution *lazy_plt_resolutions;
     const Elf64_Relr *relr;
     size_t            relr_count;
+    /* Every RELA/JMPREL record has passed the architecture, symbol-index,
+     * destination, and resolver geometry checks.  Relocation authority is
+     * immutable by construction, so later prelink derivation may consume
+     * this proof instead of rebuilding unused symbol queries. */
+    uint8_t           relocation_records_admitted;
     /* DT_RELR bytes are either declared read-only or copied into the
      * loader's read-only relocation authority.  Admission validates every
      * decoded destination against the immutable PT_LOAD snapshot before any
@@ -6312,6 +6317,11 @@ struct loaded_obj {
     const Elf64_Phdr *phdr;
     const Elf64_Phdr *public_phdr;
     uint16_t          phdr_num;
+    /* Most ELF objects have exactly one writable PT_LOAD.  Cache its
+     * immutable PHDR index so the relocation hot path does not rescan every
+     * header for every destination proof.  Zero keeps the general path for
+     * objects with no or multiple writable loads. */
+    uint16_t          unique_writable_load_index_plus_one;
     uintptr_t         map_start;   /* base + vaddr_lo (first mapped byte) */
     uintptr_t         map_end;     /* base + vaddr_hi (past-the-end) */
     const void       *eh_frame_hdr; /* mapped PT_GNU_EH_FRAME, or NULL */
@@ -6631,6 +6641,54 @@ static int loaded_obj_vaddr_pointer(const struct loaded_obj *obj,
     return 0;
 }
 
+static void loaded_obj_cache_unique_writable_load(struct loaded_obj *obj)
+{
+    uint16_t match = 0;
+
+    if (!obj || !obj->phdr)
+        return;
+    for (uint16_t i = 0; i < obj->phdr_num; i++) {
+        if (obj->phdr[i].p_type != PT_LOAD ||
+            (obj->phdr[i].p_flags & PF_W) == 0)
+            continue;
+        if (match != 0) {
+            match = 0;
+            break;
+        }
+        match = i + 1;
+    }
+    obj->unique_writable_load_index_plus_one = match;
+}
+
+static int loaded_obj_relocation_destination_pointer(
+    const struct loaded_obj *obj, uint64_t vaddr, size_t size,
+    void **pointer_out)
+{
+    uint16_t index;
+    const Elf64_Phdr *ph;
+    uint64_t within;
+
+    if (!obj || obj->unique_writable_load_index_plus_one == 0)
+        return loaded_obj_vaddr_pointer(
+            obj, vaddr, size, PF_W, pointer_out);
+    index = obj->unique_writable_load_index_plus_one - 1;
+    if (index >= obj->phdr_num)
+        return 0;
+    ph = &obj->phdr[index];
+    if (ph->p_type != PT_LOAD || (ph->p_flags & PF_W) == 0 ||
+        ph->p_memsz > SIZE_MAX || vaddr < ph->p_vaddr)
+        return 0;
+    within = vaddr - ph->p_vaddr;
+    if (within > ph->p_memsz || size > ph->p_memsz - within)
+        return 0;
+    if (pointer_out) {
+        if (vaddr > UINTPTR_MAX - obj->base)
+            return 0;
+        *pointer_out = (void *)(uintptr_t)(obj->base + vaddr);
+    }
+    return 1;
+}
+
 /* Return true only when the complete range is covered by a PT_LOAD and no
  * overlapping PT_LOAD declares it writable.  The direct loader may
  * temporarily map segments writable while relocating, so query-cache
@@ -6741,6 +6799,34 @@ static int loaded_obj_file_vaddr_pointer(const struct loaded_obj *obj,
         return 0;
     if (pointer_out)
         *pointer_out = pointer;
+    return 1;
+}
+
+static int loaded_obj_relocation_file_destination_pointer(
+    const struct loaded_obj *obj, uint64_t vaddr, size_t size,
+    void **pointer_out)
+{
+    uint16_t index;
+    const Elf64_Phdr *ph;
+    uint64_t within;
+    uintptr_t address;
+
+    if (!obj || obj->unique_writable_load_index_plus_one == 0)
+        return loaded_obj_file_vaddr_pointer(
+            obj, vaddr, size, pointer_out);
+    index = obj->unique_writable_load_index_plus_one - 1;
+    if (index >= obj->phdr_num || vaddr > UINTPTR_MAX - obj->base)
+        return 0;
+    ph = &obj->phdr[index];
+    if (ph->p_type != PT_LOAD || (ph->p_flags & PF_W) == 0 ||
+        ph->p_filesz > ph->p_memsz || vaddr < ph->p_vaddr)
+        return 0;
+    within = vaddr - ph->p_vaddr;
+    if (within > ph->p_filesz || size > ph->p_filesz - within)
+        return 0;
+    address = (uintptr_t)obj->base + (uintptr_t)vaddr;
+    if (pointer_out)
+        *pointer_out = (void *)address;
     return 1;
 }
 
@@ -14921,12 +15007,37 @@ static struct dlfrz_elf64_dyn_view g_frozen_interp_dyn_view;
 static int g_frozen_interp_dyn_view_ready;
 static int g_frozen_interp_index = -1;
 
+/* Interpreter-provider proofs are immutable for the lifetime of a direct
+ * run, but the same private symbol/version pair can occur in every object's
+ * relocation table and in several replay phases.  Retain a small exact-key
+ * cache so those repetitions do not rescan ld.so's complete DYNSYM/VERDEF
+ * catalog.  Fixed strings avoid retaining a caller-owned dlvsym buffer. */
+#define FROZEN_INTERP_EXPORT_CACHE_SIZE 256U
+#define FROZEN_INTERP_EXPORT_NAME_MAX 63U
+#define FROZEN_INTERP_EXPORT_VERSION_MAX 31U
+_Static_assert((FROZEN_INTERP_EXPORT_CACHE_SIZE &
+                (FROZEN_INTERP_EXPORT_CACHE_SIZE - 1U)) == 0,
+               "interpreter export cache must be a power of two");
+struct frozen_interp_export_cache_entry {
+    volatile uint32_t state; /* 0 empty, 1 publishing, 2 absent, 3 present */
+    uint32_t hash;
+    uint16_t name_length;
+    uint16_t version_length;
+    size_t copy_source_size;
+    char name[FROZEN_INTERP_EXPORT_NAME_MAX + 1U];
+    char version[FROZEN_INTERP_EXPORT_VERSION_MAX + 1U];
+};
+static struct frozen_interp_export_cache_entry
+    g_frozen_interp_export_cache[FROZEN_INTERP_EXPORT_CACHE_SIZE];
+
 static int initialize_frozen_interp_dyn_view(void)
 {
     int interp_index = -1;
 
     g_frozen_interp_dyn_view_ready = 0;
     g_frozen_interp_index = -1;
+    memset(g_frozen_interp_export_cache, 0,
+           sizeof(g_frozen_interp_export_cache));
     memset(&g_frozen_interp_dyn_view, 0,
            sizeof(g_frozen_interp_dyn_view));
     if (!g_frozen_mem || !g_frozen_entries || !g_frozen_metas)
@@ -21222,17 +21333,12 @@ static const char *loaded_symbol_name(const struct loaded_obj *obj,
 /* Validate the same live VERSYM -> normalized version-index -> DT_STRTAB
  * chain used by symbol-version lookup while the mandatory symbol-name-key
  * admission walk already visits this DYNSYM entry. */
-static int loaded_symbol_version_is_admitted(const struct loaded_obj *obj,
-                                             uint32_t symbol_index)
+static int loaded_symbol_version_value_is_admitted(
+    const struct loaded_obj *obj, uint16_t raw)
 {
     const struct loaded_version_entry *entry;
-    uint16_t raw;
     uint16_t index;
 
-    if (!obj->versym)
-        return 1;
-    if (!loaded_versym_value(obj, symbol_index, &raw))
-        return 0;
     index = raw & DL_VERSION_INDEX_MASK;
     if (index <= VER_NDX_GLOBAL)
         return 1;
@@ -21249,6 +21355,22 @@ static int loaded_symbol_version_is_admitted(const struct loaded_obj *obj,
         return loaded_dynstr_value(obj, entry->definition_name) != NULL;
     return 0;
 }
+
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+static int loaded_symbol_version_is_admitted(const struct loaded_obj *obj,
+                                             uint32_t symbol_index)
+    __attribute__((unused));
+static int loaded_symbol_version_is_admitted(const struct loaded_obj *obj,
+                                             uint32_t symbol_index)
+{
+    uint16_t raw;
+
+    if (!obj->versym)
+        return 1;
+    return loaded_versym_value(obj, symbol_index, &raw) &&
+           loaded_symbol_version_value_is_admitted(obj, raw);
+}
+#endif
 
 struct loaded_symbol_name_ref {
     uint32_t offset;
@@ -21516,8 +21638,18 @@ static int build_loaded_symbol_name_keys(struct loaded_obj *obj)
     int result = -1;
 
     if (!obj || !obj->dynsym || !obj->dynstr || obj->dynsym_count == 0 ||
+        obj->dynsym_admitted_count != obj->dynsym_count ||
+        obj->dynsym_admitted_count == 0 ||
         !g_symbol_name_fingerprint_key_ready || obj->symbol_name_keys ||
         obj->version_name_index || obj->runtime_symbol_name_mapping)
+        return -1;
+    /* parse_dynamic() publishes the complete VERSYM geometry together with
+     * DYNSYM.  Validate that relationship once, then consume each live
+     * version word directly in the mandatory symbol walk instead of
+     * rebuilding the same table bounds proof for every entry. */
+    if (obj->versym &&
+        (obj->versym_admitted_count != obj->dynsym_count ||
+         obj->versym_admitted_count == 0))
         return -1;
     if (__builtin_mul_overflow((size_t)obj->dynsym_count, sizeof(*keys),
                                &keys_size) ||
@@ -21636,10 +21768,16 @@ static int build_loaded_symbol_name_keys(struct loaded_obj *obj)
         goto out;
 
     for (uint32_t i = 0; i < obj->dynsym_count; i++) {
-        const Elf64_Sym *symbol = loaded_dynsym(obj, i);
+        const Elf64_Sym *symbol = &obj->dynsym[i];
 
-        if (!symbol || symbol->st_name >= obj->dynstr_size ||
-            !loaded_symbol_version_is_admitted(obj, i))
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+        if (obj->versym)
+            g_versym_value_reads++;
+#endif
+        if (symbol->st_name >= obj->dynstr_size ||
+            (obj->versym &&
+             !loaded_symbol_version_value_is_admitted(
+                 obj, obj->versym[i])))
             goto out;
         refs[ref_index].offset = symbol->st_name;
         refs[ref_index].destination = &keys[i];
@@ -21827,6 +21965,21 @@ static int loaded_object_name_capacity(const struct loaded_obj *obj,
     return 1;
 }
 
+static void loaded_object_name_query_from_admitted_key(
+    const char *name, const struct loaded_symbol_name_key *key,
+    struct symbol_lookup_query *query)
+{
+    query->name = name;
+    query->key = *key;
+    query->keyed_hash = 0;
+    query->gnu_hash = key->gnu_hash;
+    query->sysv_hash = 0;
+    query->keyed_hash_valid = 0;
+    query->keyed_hash_deferred = 1;
+    query->sysv_hash_valid = 0;
+    query->sysv_hash_deferred = 1;
+}
+
 static int loaded_object_name_query_init(
     const struct loaded_obj *obj, const char *name,
     const struct loaded_symbol_name_key *key,
@@ -21862,15 +22015,7 @@ static int loaded_object_name_query_init(
     /* The mapping is loader-owned, complete, and read-only; the offset binds
      * this key to the exact admitted string-table suffix.  No target byte
      * needs to be read again merely to reconstruct its lookup work. */
-    query->name = name;
-    query->key = *key;
-    query->keyed_hash = 0;
-    query->gnu_hash = key->gnu_hash;
-    query->sysv_hash = 0;
-    query->keyed_hash_valid = 0;
-    query->keyed_hash_deferred = 1;
-    query->sysv_hash_valid = 0;
-    query->sysv_hash_deferred = 1;
+    loaded_object_name_query_from_admitted_key(name, key, query);
     return 1;
 }
 
@@ -21939,8 +22084,11 @@ static int symbol_lookup_query_init_dynsym(
         !(name = loaded_symbol_name(obj, symbol)))
         return 0;
     if (obj->symbol_name_keys && obj->dynstr_readonly &&
-        obj->dynsym_readonly)
+        obj->dynsym_readonly) {
         key = &obj->symbol_name_keys[symbol_index];
+        loaded_object_name_query_from_admitted_key(name, key, query);
+        return 1;
+    }
     return symbol_lookup_query_init_object_name(obj, name, key, query);
 }
 
@@ -29294,10 +29442,9 @@ static int frozen_interp_symbol_copy_source_valid(
 /* Prove an interpreter-owned version against the actual frozen interpreter.
  * The interpreter is intentionally not mapped into the normal lookup scope,
  * so its bounded on-disk dynamic metadata is the provider catalog. */
-static int frozen_interp_exports_version_n(const char *name,
-                                           const char *version,
-                                           size_t version_length,
-                                           size_t copy_source_size)
+static int frozen_interp_exports_version_n_uncached(
+    const char *name, const char *version, size_t version_length,
+    size_t copy_source_size)
 {
     const struct dlfrz_elf64_dyn_view *view =
         &g_frozen_interp_dyn_view;
@@ -29399,6 +29546,88 @@ static int frozen_interp_exports_version_n(const char *name,
         matched_symbol = 1;
     }
     return matched_symbol;
+}
+
+static uint32_t frozen_interp_export_cache_hash_n(
+    const char *bytes, size_t length, uint32_t hash)
+{
+    for (size_t i = 0; i < length; i++) {
+        hash ^= (uint8_t)bytes[i];
+        hash *= UINT32_C(16777619);
+    }
+    return hash;
+}
+
+static int frozen_interp_exports_version_n(const char *name,
+                                           const char *version,
+                                           size_t version_length,
+                                           size_t copy_source_size)
+{
+    size_t name_length;
+    uint64_t copy_size;
+    uint32_t hash;
+    uint32_t first;
+    int result;
+
+    if (!name || !version)
+        return 0;
+    name_length = strlen(name);
+    if (name_length > FROZEN_INTERP_EXPORT_NAME_MAX ||
+        version_length > FROZEN_INTERP_EXPORT_VERSION_MAX)
+        return frozen_interp_exports_version_n_uncached(
+            name, version, version_length, copy_source_size);
+    hash = frozen_interp_export_cache_hash_n(
+        name, name_length, UINT32_C(2166136261));
+    hash = frozen_interp_export_cache_hash_n(
+        version, version_length, hash ^ UINT32_C(0x9e3779b9));
+    copy_size = (uint64_t)copy_source_size;
+    hash ^= (uint32_t)copy_size;
+    hash ^= (uint32_t)(copy_size >> 32);
+    first = hash & (FROZEN_INTERP_EXPORT_CACHE_SIZE - 1U);
+
+    for (uint32_t probe = 0;
+         probe < FROZEN_INTERP_EXPORT_CACHE_SIZE; probe++) {
+        const struct frozen_interp_export_cache_entry *entry =
+            &g_frozen_interp_export_cache[
+                (first + probe) &
+                (FROZEN_INTERP_EXPORT_CACHE_SIZE - 1U)];
+        uint32_t state = runtime_atomic_load32(&entry->state);
+
+        if (state == 0)
+            break;
+        if (state >= 2 && entry->hash == hash &&
+            entry->name_length == name_length &&
+            entry->version_length == version_length &&
+            entry->copy_source_size == copy_source_size &&
+            memcmp(entry->name, name, name_length + 1U) == 0 &&
+            memcmp(entry->version, version, version_length) == 0 &&
+            entry->version[version_length] == '\0')
+            return state == 3;
+    }
+
+    result = frozen_interp_exports_version_n_uncached(
+        name, version, version_length, copy_source_size);
+    for (uint32_t probe = 0;
+         probe < FROZEN_INTERP_EXPORT_CACHE_SIZE; probe++) {
+        struct frozen_interp_export_cache_entry *entry =
+            &g_frozen_interp_export_cache[
+                (first + probe) &
+                (FROZEN_INTERP_EXPORT_CACHE_SIZE - 1U)];
+
+        if (runtime_atomic_compare_exchange32(
+                &entry->state, 0, 1) != 0)
+            continue;
+        entry->hash = hash;
+        entry->name_length = (uint16_t)name_length;
+        entry->version_length = (uint16_t)version_length;
+        entry->copy_source_size = copy_source_size;
+        memcpy(entry->name, name, name_length + 1U);
+        memcpy(entry->version, version, version_length);
+        entry->version[version_length] = '\0';
+        runtime_atomic_store32(&entry->state, result ? 3U : 2U);
+        break;
+    }
+    return result;
 }
 
 static int frozen_interp_exports_version(const char *name,
@@ -31019,7 +31248,6 @@ static int validate_relocation_record(struct loaded_obj *obj,
     uint32_t type = ELF64_R_TYPE(rel->r_info);
     uint32_t sidx = ELF64_R_SYM(rel->r_info);
     const Elf64_Sym *reference = NULL;
-    const char *name = NULL;
     struct symbol_lookup_query name_query;
     size_t width = sizeof(uint64_t);
     void *slot = NULL;
@@ -31036,19 +31264,44 @@ static int validate_relocation_record(struct loaded_obj *obj,
 
     if (sidx != 0) {
         const struct loaded_symbol_name_key *key = NULL;
+        const char *name;
 
-        reference = loaded_dynsym(obj, sidx);
+        /* parse_dynamic() normally admits the complete DYNSYM byte span
+         * before any relocation record reaches this validator.  Consume
+         * that published geometry directly in production, while preserving
+         * loaded_dynsym()'s defensive mapped-range fallback for callers
+         * which construct a valid object independently.  The symbol and
+         * st_name bytes remain live reads in either case, preserving PF_W
+         * metadata semantics. */
+        if (!obj->dynsym || sidx >= obj->dynsym_count || !obj->dynstr ||
+            obj->dynstr_size == 0)
+            return -1;
+        if (obj->dynsym_admitted_count == obj->dynsym_count &&
+            obj->dynsym_admitted_count != 0)
+            reference = &obj->dynsym[sidx];
+        else
+            reference = loaded_dynsym(obj, sidx);
         if (!reference)
             return -1;
-        name = loaded_symbol_name(obj, reference);
-        if (!name)
+        if (reference->st_name >= obj->dynstr_size)
             return -1;
-        if (obj->dynstr_readonly && obj->dynsym_readonly &&
-            obj->symbol_name_keys)
-            key = &obj->symbol_name_keys[sidx];
-        if (!symbol_lookup_query_init_object_name(
-                obj, name, key, &name_query))
-            return -1;
+        name = obj->dynstr + reference->st_name;
+        if (name_query_out) {
+            if (obj->dynstr_readonly && obj->dynsym_readonly &&
+                obj->symbol_name_keys) {
+                key = &obj->symbol_name_keys[sidx];
+                /* This is the exact symbol/key pair published together by
+                 * build_loaded_symbol_name_keys().  Both source tables and
+                 * the loader-owned key mapping are read-only, so their
+                 * offset/extent correlation cannot change between the
+                 * admission walk and relocation replay. */
+                loaded_object_name_query_from_admitted_key(
+                    name, key, &name_query);
+            } else if (!symbol_lookup_query_init_object_name(
+                           obj, name, NULL, &name_query)) {
+                return -1;
+            }
+        }
     }
 
     if ((type == ARCH_RELOC_RELATIVE || type == ARCH_RELOC_IRELATIVE) &&
@@ -31066,7 +31319,8 @@ static int validate_relocation_record(struct loaded_obj *obj,
     }
 
     if (width != 0 &&
-        !loaded_obj_vaddr_pointer(obj, rel->r_offset, width, PF_W, &slot))
+        !loaded_obj_relocation_destination_pointer(
+            obj, rel->r_offset, width, &slot))
         return -1;
 
     if (type == ARCH_RELOC_IRELATIVE) {
@@ -31099,7 +31353,8 @@ static int validate_relocation_phase_filter_skip(
 {
     uint32_t sym_index = ELF64_R_SYM(rel->r_info);
 
-    if (validate_relocation_record(obj, rel, NULL, NULL, NULL) < 0)
+    if (validate_relocation_record(
+            obj, rel, NULL, NULL, NULL) < 0)
         return -1;
     if (sym_index != 0 &&
         relocation_symbol_version(
@@ -31189,7 +31444,8 @@ static int preflight_one_resolver_relocation_destination(
     if (!invokes_resolver)
         return 0;
     *has_resolvers = 1;
-    if (validate_relocation_record(obj, rel, NULL, NULL, NULL) < 0)
+    if (validate_relocation_record(
+            obj, rel, NULL, NULL, NULL) < 0)
         return -1;
     if (relocation_destination_overlaps_tls_template(
             obj, rel->r_offset, sizeof(uint64_t))) {
@@ -31820,7 +32076,7 @@ static int prelinked_relocation_requires_runtime_fixup(
      * A RELATIVE destination in its zero-fill suffix must be replayed after
      * the runtime mapping recreates that suffix. */
     if (type == ARCH_RELOC_RELATIVE)
-        return loaded_obj_file_vaddr_pointer(
+        return loaded_obj_relocation_file_destination_pointer(
             obj, rel->r_offset, sizeof(uint64_t), NULL) ? 0 : 1;
 
     switch (admission) {
@@ -31828,6 +32084,8 @@ static int prelinked_relocation_requires_runtime_fixup(
         return 1;
     case RELOCATION_RUNTIME_IF_SYMBOLIC:
         if (sidx == 0)
+            return 1;
+        if (obj->relocation_records_admitted)
             return 1;
         return loaded_dynsym(obj, sidx) &&
                loaded_symbol_name(obj, loaded_dynsym(obj, sidx)) ? 1 : -1;
@@ -32989,6 +33247,7 @@ static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     obj->phdr = phdr;
     obj->runtime_phdr_mapping = phdr;
     obj->runtime_phdr_mapping_size = phdr_bytes;
+    loaded_obj_cache_unique_writable_load(obj);
     return 0;
 
 fail:
@@ -34738,8 +34997,8 @@ static int validate_object_relocations(struct loaded_obj *obj)
             Elf64_Rela relocation;
 
             if (!loaded_rela_read(obj, table, i, &relocation) ||
-                validate_relocation_record(obj, &relocation, NULL, NULL,
-                                           NULL) < 0)
+                validate_relocation_record(
+                    obj, &relocation, NULL, NULL, NULL) < 0)
                 return -1;
         }
     }
@@ -34751,6 +35010,7 @@ static int validate_object_relocations(struct loaded_obj *obj)
          * one-shot runtime replay capability. */
         obj->relr_replay_state = LOADED_RELR_ADMITTED;
     }
+    obj->relocation_records_admitted = 1;
     return 0;
 }
 
@@ -43926,8 +44186,8 @@ static int dl_transaction_commit(void)
             obj->tls.modid > MAX_TOTAL_OBJS ||
             obj->tls.memsz == UINT64_MAX)
             _exit(127);
-        entry = &g_runtime_tls_fast[obj->tls.modid];
         encoded_extent = obj->tls.memsz + 1;
+        entry = &g_runtime_tls_fast[obj->tls.modid];
         published_extent = runtime_atomic_load64(
             &entry->extent_plus_one);
         if (published_extent != 0) {
@@ -44315,6 +44575,7 @@ static struct loaded_obj *load_elf_from_file_fd(
     obj->phdr = phdr_buf;
     obj->runtime_phdr_mapping = phdr_buf;
     obj->runtime_phdr_mapping_size = phdr_size;
+    loaded_obj_cache_unique_writable_load(obj);
     phdr_buf = NULL;
     if (dl_store_name(obj, path) < 0) {
         dl_set_error(path, ": cannot allocate dlopen name storage");
@@ -46710,6 +46971,7 @@ static int initialize_bootstrap_introspection(char **envp)
     obj->phdr = phdr;
     obj->public_phdr = phdr;
     obj->phdr_num = (uint16_t)phnum_value;
+    loaded_obj_cache_unique_writable_load(obj);
     obj->map_start = map_start;
     obj->map_end = map_end;
     obj->map_contiguous = loaded_obj_mapping_is_contiguous(obj);
