@@ -33834,6 +33834,7 @@ static int parse_dynamic(struct loaded_obj *obj,
     int have_soname = 0, have_rpath = 0, have_runpath = 0;
     int have_symbolic = 0, have_bind_now = 0;
     int saw_null = 0;
+    int have_dynsym_count_hint;
 
     if (!obj || !meta || !obj->phdr ||
         !address_has_alignment((uintptr_t)obj->phdr,
@@ -33842,6 +33843,9 @@ static int parse_dynamic(struct loaded_obj *obj,
 
     obj->entry = (meta->flags & LDR_FLAG_MAIN_EXE)
                  ? obj->base + meta->entry : 0;
+    have_dynsym_count_hint = meta->dynsym_count_hint != 0;
+    if (have_dynsym_count_hint)
+        obj->dynsym_count = meta->dynsym_count_hint;
 
     for (uint16_t i = 0; i < obj->phdr_num; i++) {
         if (obj->phdr[i].p_type != PT_DYNAMIC)
@@ -34059,7 +34063,7 @@ static int parse_dynamic(struct loaded_obj *obj,
      * AArch64 GNU ld), so hash chains alone can under-count the table.  Check
      * DT_RELACOUNT in this same walk: rereading/copying the often-large
      * relative prefix adds no evidence to the immutable authority. */
-    {
+    if (!have_dynsym_count_hint) {
         for (enum loaded_rela_table table = LOADED_RELA_DYNAMIC;
              table < LOADED_RELA_TABLE_COUNT; table++) {
             size_t count = loaded_rela_table_count(obj, table);
@@ -34081,6 +34085,21 @@ static int parse_dynamic(struct loaded_obj *obj,
                 if (sidx + 1 > obj->dynsym_count)
                     obj->dynsym_count = sidx + 1;
             }
+        }
+    } else {
+        /* The prelinker already walked every relocation while deriving the
+         * exact symbol span.  DT_RELACOUNT still has independent ordering
+         * semantics, so recheck only that prefix here.  The complete runtime
+         * admission pass below subsequently validates every record and every
+         * symbol index against the hinted, mapped DYNSYM range. */
+        for (size_t i = 0; i < obj->rela_relative_count; i++) {
+            Elf64_Rela relocation;
+
+            if (!loaded_rela_read(
+                    obj, LOADED_RELA_DYNAMIC, i, &relocation) ||
+                ELF64_R_TYPE(relocation.r_info) != ARCH_RELOC_RELATIVE ||
+                ELF64_R_SYM(relocation.r_info) != 0)
+                return -1;
         }
     }
 
@@ -34109,7 +34128,10 @@ static int parse_dynamic(struct loaded_obj *obj,
             if (view.chains[i] >= view.nchain &&
                 view.chains[i] != STN_UNDEF)
                 return -1;
-        if (view.nchain < obj->dynsym_count)
+        if ((have_dynsym_count_hint &&
+             view.nchain != obj->dynsym_count) ||
+            (!have_dynsym_count_hint &&
+             view.nchain < obj->dynsym_count))
             return -1;
         obj->dynsym_count = view.nchain;
         cache_validated_sysv_hash_view(obj, &view);
@@ -34145,7 +34167,9 @@ static int parse_dynamic(struct loaded_obj *obj,
                 (view.buckets[i] < view.symoffset ||
                  view.buckets[i] >= count))
                 return -1;
-        if (count > obj->dynsym_count)
+        if (have_dynsym_count_hint && count > obj->dynsym_count)
+            return -1;
+        if (!have_dynsym_count_hint && count > obj->dynsym_count)
             obj->dynsym_count = count;
         cache_validated_gnu_hash_view(obj, &view, count);
     }
@@ -34177,7 +34201,7 @@ static int parse_dynamic(struct loaded_obj *obj,
         obj->dynsym = (const Elf64_Sym *)pointer;
         obj->dynsym_admitted_count = obj->dynsym_count;
     } else if (gnu_hash_addr || sysv_hash_addr || versym_addr ||
-               have_verdef || have_verneed) {
+               have_verdef || have_verneed || obj->dynsym_count != 0) {
         return -1;
     }
 

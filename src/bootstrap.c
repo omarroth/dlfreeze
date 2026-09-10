@@ -3983,7 +3983,9 @@ static int direct_metadata_is_valid(const uint8_t *mem, uint64_t mem_foff,
 
         if ((entry->flags & DLFRZ_FLAG_INTERP_KERNEL_ONLY) != 0 ||
             (meta->flags & ~metadata_flag_mask) != 0 ||
-            meta->_reserved != 0 ||
+            (meta->dynsym_count_hint != 0 &&
+             (meta->flags & (DLFRZ_FLAG_INTERP |
+                             DLFRZ_FLAG_DATA)) != 0) ||
             (meta->flags & entry_type_mask) !=
                 (entry->flags & entry_type_mask) ||
             ((meta->flags & (DLFRZ_FLAG_DLOPEN_EARLY |

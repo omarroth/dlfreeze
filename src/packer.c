@@ -2889,7 +2889,7 @@ static int compute_lib_meta(const char *path,
     meta->flags      = flags;
     meta->runtime_fixup_off = 0;
     meta->runtime_fixup_count = 0;
-    meta->_reserved  = 0;
+    meta->dynsym_count_hint = 0;
 
     /* Check if this library imports _rtld_global/_rtld_global_ro.  Direct
      * metadata must never be derived from a malformed optional section table.
@@ -5911,7 +5911,8 @@ static int prelink_lazy_admission_required(
  * typed deterministic outcomes. */
 static enum prelink_result prelink_admit_object_scratch(
     FILE *outf, const struct dlfrz_entry *entry,
-    const struct dlfrz_lib_meta *meta, size_t output_size)
+    const struct dlfrz_lib_meta *meta, size_t output_size,
+    uint32_t *dynsym_count_out)
 {
     struct prelink_obj obj = {0};
     struct pl_control_range_builder control_builder = {0};
@@ -5927,6 +5928,8 @@ static enum prelink_result prelink_admit_object_scratch(
     uint64_t input_offset;
     enum prelink_result result = PRELINK_INVALID;
 
+    if (dynsym_count_out)
+        *dynsym_count_out = 0;
     if (!outf || !entry || !meta || entry->data_size > SIZE_MAX)
         return PRELINK_INVALID;
     if (packer_stream_seek(outf, entry->data_offset) < 0 ||
@@ -6053,6 +6056,8 @@ static enum prelink_result prelink_admit_object_scratch(
         result = errno == ENOMEM ? PRELINK_MISSED : PRELINK_INVALID;
         goto out;
     }
+    if (dynsym_count_out)
+        *dynsym_count_out = obj.dynsym_count;
     result = PRELINK_APPLIED;
 
 out:
@@ -6102,7 +6107,7 @@ static enum prelink_result prelink_admit_all_object_sources(
         if (!prelink_source_admission_required(entries, nobj, i))
             continue;
         outcome = prelink_admit_object_scratch(
-            outf, &entries[i], &metas[i], output_size);
+            outf, &entries[i], &metas[i], output_size, NULL);
         if (outcome != PRELINK_APPLIED)
             return outcome;
     }
@@ -6360,6 +6365,7 @@ static enum prelink_result prelink_objects(
             }
         }
         pl_control_range_builder_release(&control_builder);
+        metas[i].dynsym_count_hint = objs[i].dynsym_count;
 
         /* pl_vaddr_pointer() uses these headers throughout relocation and
          * hash validation.  The prelink worker exits after this transaction,
@@ -6376,9 +6382,26 @@ static enum prelink_result prelink_objects(
         if (!prelink_lazy_admission_required(entries, nobj, i))
             continue;
         outcome = prelink_admit_object_scratch(
-            outf, &entries[i], &metas[i], output_size);
+            outf, &entries[i], &metas[i], output_size,
+            &metas[i].dynsym_count_hint);
         if (outcome != PRELINK_APPLIED)
             _exit(outcome);
+    }
+    /* Exact source aliases consume the same immutable DYNSYM bytes.  Only
+     * one identity is parsed above; publish its hint to every alias before
+     * the metadata array is committed. */
+    for (int i = 0; i < nobj; i++) {
+        if (metas[i].dynsym_count_hint != 0 ||
+            (entries[i].flags & (DLFRZ_FLAG_INTERP |
+                                 DLFRZ_FLAG_DATA)) != 0)
+            continue;
+        for (int prior = 0; prior < i; prior++) {
+            if (!prelink_same_embedded_source(entries, i, prior))
+                continue;
+            metas[i].dynsym_count_hint =
+                metas[prior].dynsym_count_hint;
+            break;
+        }
     }
 
     /* 3. Pre-apply only RELA RELATIVE relocations.  Their explicit addends
@@ -6434,8 +6457,6 @@ static enum prelink_result prelink_objects(
 
         metas[i].runtime_fixup_off = 0;
         metas[i].runtime_fixup_count = 0;
-        metas[i]._reserved = 0;
-
         if (metas[i].flags & DLFRZ_FLAG_INTERP) {
             metas[i].flags &= ~DLFRZ_FLAG_PRELINKED;
             metas[i].flags &= ~DLFRZ_FLAG_RUNTIME_SCAN;
@@ -10075,7 +10096,7 @@ int pack_frozen(const struct pack_options *opts)
                 metas[i].flags = entries[i].flags | shared_flags;
                 metas[i].runtime_fixup_off = 0;
                 metas[i].runtime_fixup_count = 0;
-                metas[i]._reserved = 0;
+                metas[i].dynsym_count_hint = 0;
             } else {
                 if (opts->deps->runtime_family == DEP_RUNTIME_GNU &&
                     !(entries[i].flags & DLFRZ_FLAG_INTERP)) {

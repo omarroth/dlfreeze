@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 #define DLFRZ_MAGIC    "DLFREEZ"   /* 7 chars + NUL = 8 bytes */
-#define DLFRZ_VERSION  6
+#define DLFRZ_VERSION  7
 
 /* The direct loader uses fixed-capacity startup object state.  The packer
  * must never emit direct metadata whose ELF closure exceeds this contract. */
@@ -166,7 +166,11 @@ struct dlfrz_lib_meta {
     uint32_t flags;         /* DLFRZ_FLAG_*                           */
     uint32_t runtime_fixup_off;   /* index into footer fixup table      */
     uint32_t runtime_fixup_count; /* number of runtime fixups           */
-    uint32_t _reserved;
+    /* Exact span admitted by the pack-time dynamic parser.  Zero retains
+     * the runtime-derived compatibility path.  This is an optimization hint,
+     * not authority: the direct loader rechecks the mapped symbol/hash ranges
+     * and every relocation index before consuming a nonzero value. */
+    uint32_t dynsym_count_hint;
 };
 
 /* A valid ELF program-header table need not be covered by PT_LOAD.  Direct

@@ -713,8 +713,11 @@ enum metadata_mutation {
     METADATA_DATA_PRELINKED,
     METADATA_DATA_PHDR,
     METADATA_DATA_EMPTY_FIXUP_OFFSET,
+    METADATA_DATA_DYNSYM_HINT,
     METADATA_RUNTIME_RELOCATED_FIXUPS,
     METADATA_EXTERNAL_PHDR_PROVENANCE,
+    METADATA_MAIN_DYNSYM_HINT_LARGE,
+    METADATA_MAIN_DYNSYM_HINT_ZERO,
 };
 
 static int mutate_noncanonical_metadata(const char *path,
@@ -773,6 +776,21 @@ static int mutate_noncanonical_metadata(const char *path,
             changed = 1;
             break;
         }
+    } else if (mutation == METADATA_MAIN_DYNSYM_HINT_LARGE ||
+               mutation == METADATA_MAIN_DYNSYM_HINT_ZERO) {
+        for (uint32_t i = 0; i < footer->num_entries; i++) {
+            uint32_t replacement;
+
+            if ((entries[i].flags & DLFRZ_FLAG_MAIN_EXE) == 0)
+                continue;
+            replacement = mutation == METADATA_MAIN_DYNSYM_HINT_LARGE
+                ? UINT32_MAX : 0;
+            if (metas[i].dynsym_count_hint == replacement)
+                goto out;
+            metas[i].dynsym_count_hint = replacement;
+            changed = 1;
+            break;
+        }
     } else {
         for (uint32_t i = 0; i < footer->num_entries; i++) {
             if ((entries[i].flags & DLFRZ_FLAG_DATA) == 0)
@@ -781,10 +799,12 @@ static int mutate_noncanonical_metadata(const char *path,
                 metas[i].flags |= DLFRZ_FLAG_PRELINKED;
             } else if (mutation == METADATA_DATA_PHDR) {
                 metas[i].phdr_off = 8;
-            } else {
+            } else if (mutation == METADATA_DATA_EMPTY_FIXUP_OFFSET) {
                 if (fixup_count == 0 || fixup_count > UINT32_MAX)
                     goto out;
                 metas[i].runtime_fixup_off = (uint32_t)fixup_count;
+            } else {
+                metas[i].dynsym_count_hint = 1;
             }
             changed = 1;
             break;
@@ -814,7 +834,9 @@ int main(int argc, char **argv)
                 "--stack-exec|--stack-missing|--raw-stack-missing|"
                 "--dynamic-outside|--raw-dynamic-outside|"
                 "--data-prelinked|--data-phdr|"
-                "--data-empty-fixup-offset|--runtime-relocated-fixups|"
+                "--data-empty-fixup-offset|--data-dynsym-hint|"
+                "--dynsym-hint-large|--dynsym-hint-zero|"
+                "--runtime-relocated-fixups|"
                 "--external-phdr-provenance|"
                 "--elf-osabi|--elf-abiversion|--elf-ident-pad|"
                 "--elf-flags|--elf-type FILE\n",
@@ -849,6 +871,15 @@ int main(int argc, char **argv)
     if (strcmp(argv[1], "--data-empty-fixup-offset") == 0)
         return mutate_noncanonical_metadata(
             argv[2], METADATA_DATA_EMPTY_FIXUP_OFFSET);
+    if (strcmp(argv[1], "--data-dynsym-hint") == 0)
+        return mutate_noncanonical_metadata(
+            argv[2], METADATA_DATA_DYNSYM_HINT);
+    if (strcmp(argv[1], "--dynsym-hint-large") == 0)
+        return mutate_noncanonical_metadata(
+            argv[2], METADATA_MAIN_DYNSYM_HINT_LARGE);
+    if (strcmp(argv[1], "--dynsym-hint-zero") == 0)
+        return mutate_noncanonical_metadata(
+            argv[2], METADATA_MAIN_DYNSYM_HINT_ZERO);
     if (strcmp(argv[1], "--runtime-relocated-fixups") == 0)
         return mutate_noncanonical_metadata(
             argv[2], METADATA_RUNTIME_RELOCATED_FIXUPS);

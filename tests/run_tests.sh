@@ -13240,10 +13240,12 @@ C
     if [ "$freeze_rc" -eq 77 ]; then
         skip "direct canonical DATA metadata" "$DIRECT_FREEZE_REASON"
     elif [ "$freeze_rc" -eq 0 ]; then
-        for mode in data-prelinked data-phdr data-empty-fixup-offset; do
+        for mode in data-prelinked data-phdr data-empty-fixup-offset \
+                    data-dynsym-hint; do
             case "$mode" in
                 data-prelinked) label="DATA PRELINKED flag" ;;
                 data-phdr) label="DATA PHDR offset" ;;
+                data-dynsym-hint) label="DATA DYNSYM hint" ;;
                 *) label="empty DATA fixup offset" ;;
             esac
             cp "$data_out" "$bad_meta"
@@ -13262,6 +13264,41 @@ C
                 fail "direct canonical $label" "exit=$rc output=$actual"
             fi
         done
+    fi
+
+    # The serialized symbol count is only a prelink optimization.  An
+    # oversized value must fail the mapped-table proof before target code,
+    # while zero deliberately selects the complete runtime derivation path.
+    cp "$out" "$bad_meta"
+    if ! "$helper" --dynsym-hint-large "$bad_meta"; then
+        fail "direct DYNSYM hint upper bound" \
+            "could not construct malformed fixture"
+    else
+        actual=""; rc=0
+        capture_output actual env DLFREEZE_NO_FORK=1 "$bad_meta" || rc=$?
+        if [ "$rc" -eq 127 ] &&
+           [[ "$actual" == *"malformed dynamic metadata"* ]] &&
+           [[ "$actual" != *"metadata-target-ran"* ]]; then
+            pass "direct DYNSYM hint upper bound"
+        else
+            fail "direct DYNSYM hint upper bound" \
+                "exit=$rc output=$actual"
+        fi
+    fi
+
+    cp "$out" "$bad_meta"
+    if ! "$helper" --dynsym-hint-zero "$bad_meta"; then
+        skip "direct zero DYNSYM hint fallback" \
+            "fixture has no pack-time DYNSYM hint"
+    else
+        actual=""; rc=0
+        capture_output actual env DLFREEZE_NO_FORK=1 "$bad_meta" || rc=$?
+        if [ "$rc" -eq 0 ] && [ "$actual" = "metadata-target-ran" ]; then
+            pass "direct zero DYNSYM hint fallback"
+        else
+            fail "direct zero DYNSYM hint fallback" \
+                "exit=$rc output=$actual"
+        fi
     fi
 
     cp "$out" "$bad_meta"
