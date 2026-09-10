@@ -21681,6 +21681,8 @@ static int loaded_symbol_name_key_direct(
 {
     const char *name;
     size_t capacity;
+    size_t scan_limit;
+    size_t initial_budget;
     size_t length;
     uint64_t fingerprint_body = 0;
     uint64_t fingerprint_power = 1;
@@ -21691,22 +21693,25 @@ static int loaded_symbol_name_key_direct(
         return -1;
     name = obj->dynstr + offset;
     capacity = obj->dynstr_size - offset;
-    for (length = 0; length < capacity; length++) {
+    initial_budget = *work_budget;
+    scan_limit = capacity < initial_budget ? capacity : initial_budget;
+    for (length = 0; length < scan_limit; length++) {
         uint8_t byte;
 
-        if (*work_budget == 0)
-            return 0;
-        (*work_budget)--;
         byte = (uint8_t)name[length];
-        if (byte == 0)
+        if (byte == 0) {
+            *work_budget = initial_budget - length - 1U;
             break;
+        }
         fingerprint_body +=
             g_symbol_name_byte_mix[byte] * fingerprint_power;
         fingerprint_power *= g_symbol_name_fingerprint_multiplier;
         gnu_hash = (gnu_hash << 5) + gnu_hash + byte;
     }
-    if (length == capacity)
-        return -1;
+    if (length == scan_limit) {
+        *work_budget = initial_budget - scan_limit;
+        return capacity <= initial_budget ? -1 : 0;
+    }
     destination->fingerprint = fingerprint_body +
         g_symbol_name_fingerprint_seed * fingerprint_power;
     destination->length = length;

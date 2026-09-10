@@ -818,6 +818,32 @@ static int symbol_name_span_gate(void)
             valid = 0;
         }
     }
+    {
+        static const char terminated[] = { 'a', '\0' };
+        static const char unterminated[] = { 'a', 'b' };
+        struct loaded_symbol_name_key key_out = {0};
+        struct loaded_obj object = {0};
+        size_t budget;
+
+        object.dynstr = terminated;
+        object.dynstr_size = sizeof(terminated);
+        budget = sizeof(terminated);
+        if (loaded_symbol_name_key_direct(
+                &object, 0, &key_out, &budget) != 1 || budget != 0 ||
+            key_out.length != 1 || key_out.dynstr_offset != 0)
+            valid = 0;
+
+        object.dynstr = unterminated;
+        object.dynstr_size = sizeof(unterminated);
+        budget = 1;
+        if (loaded_symbol_name_key_direct(
+                &object, 0, &key_out, &budget) != 0 || budget != 0)
+            valid = 0;
+        budget = 4;
+        if (loaded_symbol_name_key_direct(
+                &object, 0, &key_out, &budget) != -1 || budget != 2)
+            valid = 0;
+    }
     munmap(image, size);
     return valid;
 }
