@@ -14571,27 +14571,27 @@ static void *stub_tls_get_addr_glibc(struct tls_index *ti)
 #if defined(__x86_64__)
 /* The common x86_64 glibc TCB contract places the DTV pointer at FS:8.
  * Select this only after structural layout admission; uncommon or future
- * layouts retain the generic target-derived-offset entry above.  Deferring
- * the TP read to the cold path gives valid lookups the same single segment
- * load used by the native resolver. */
+ * layouts retain the generic target-derived-offset entry above.  As in the
+ * target's native resolver, a published tls_index supplies the module-local
+ * offset and the DTV supplies the allocation authority.  The advertised DTV
+ * capacity still bounds the indexed read, including for conservative DTVs
+ * handed to us by target pthread code.  Deferring the TP read to the cold
+ * path gives valid lookups the same single segment load used by native code. */
 static void *stub_tls_get_addr_glibc_dtv8(struct tls_index *ti)
 {
     unsigned long modid = ti->ti_module;
     unsigned long offset = ti->ti_offset;
-    struct runtime_tls_fast_entry *entry;
     uintptr_t *dtv;
     uintptr_t tls_base;
     size_t capacity;
-    uint64_t extent_plus_one;
 
-    if (modid == 0 || modid > MAX_TOTAL_OBJS)
-        goto slow;
-    entry = &g_runtime_tls_fast[modid];
-    extent_plus_one = runtime_atomic_load64(&entry->extent_plus_one);
-    if (extent_plus_one == 0 || (uint64_t)offset >= extent_plus_one)
+    if (modid == 0)
         goto slow;
     dtv = (uintptr_t *)arch_read_tp_offset(8);
-    if (!glibc_dtv_capacity(dtv, &capacity) || !dtv || modid > capacity)
+    if (!dtv)
+        goto slow;
+    capacity = dtv[-2];
+    if (capacity > MAX_TOTAL_OBJS || modid > capacity)
         goto slow;
     tls_base = dtv[(size_t)modid * 2];
     if (!glibc_tls_slot_allocated(tls_base))
@@ -21398,9 +21398,11 @@ static const char *loaded_symbol_name(const struct loaded_obj *obj,
     return loaded_dynstr_value(obj, sym->st_name);
 }
 
-/* Validate the same live VERSYM -> normalized version-index -> DT_STRTAB
- * chain used by symbol-version lookup while the mandatory symbol-name-key
- * admission walk already visits this DYNSYM entry. */
+/* Validate the live VERSYM -> normalized version-index edge while the
+ * mandatory symbol-name-key admission walk already visits this DYNSYM
+ * entry.  build_loaded_version_index() admitted every referenced DT_STRTAB
+ * offset before publishing its read-only entries, so repeating those string
+ * bounds checks for every symbol adds no new authority here. */
 static int loaded_symbol_version_value_is_admitted(
     const struct loaded_obj *obj, uint16_t raw)
 {
@@ -21413,15 +21415,8 @@ static int loaded_symbol_version_value_is_admitted(
     entry = loaded_version_index_entry(obj, index);
     if (!entry)
         return 0;
-
-    /* VERNEED wins for executable COPY definitions, matching
-     * symbol_version_snapshot_from_raw(). */
-    if (entry->flags & DL_VERSION_ENTRY_NEEDED)
-        return loaded_dynstr_value(obj, entry->needed_name) &&
-               loaded_dynstr_value(obj, entry->provider_name);
-    if (entry->flags & DL_VERSION_ENTRY_DEFINED)
-        return loaded_dynstr_value(obj, entry->definition_name) != NULL;
-    return 0;
+    return (entry->flags & (DL_VERSION_ENTRY_NEEDED |
+                            DL_VERSION_ENTRY_DEFINED)) != 0;
 }
 
 #ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
