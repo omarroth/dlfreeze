@@ -4803,6 +4803,38 @@ static int bs_mremap_targets_smaps_stream_matches(
     return 0;
 }
 
+/* smaps accounts COW and swap per VMA, not per requested subrange.  A
+ * canonical payload VMA also covers dormant libraries and DATA which are
+ * not transfer authority.  If that coarse proof fails, split only this
+ * disposable child's evidence ranges with a content-preserving VMA hint and
+ * repeat the same strict proof.  No advice or mapping change escapes into
+ * the parent, and no resident/swapped private page is discarded or trusted.
+ * An unsupported/denied hint, an already-unsplittable VMA, or dirty state
+ * inside a selected range still selects the normal copy fallback. */
+static int bs_kernel_premap_smaps_matches(
+    FILE *stream, const struct stat *executable,
+    const struct bs_startup_mremap_plan *proof)
+{
+    if (!proof || !proof->targets || proof->count == 0 ||
+        proof->count > 2 * DLFRZ_PREMAP_MAX_PHDRS || !stream)
+        return 0;
+    if (bs_mremap_targets_smaps_stream_matches(stream, executable, proof))
+        return 1;
+#ifdef MADV_DONTDUMP
+    for (size_t i = 0; i < proof->count; i++) {
+        const struct bs_mremap_range *range = &proof->targets[i];
+
+        if (madvise((void *)range->target, range->length, MADV_DONTDUMP) < 0)
+            return 0;
+    }
+    if (fseek(stream, 0, SEEK_SET) != 0)
+        return 0;
+    return bs_mremap_targets_smaps_stream_matches(stream, executable, proof);
+#else
+    return 0;
+#endif
+}
+
 static int bs_startup_mremap_target_unions(
     const struct bs_startup_mremap_plan *plan, int reserve)
 {
@@ -5194,7 +5226,7 @@ static void bs_startup_mremap_probe_child(
             }
         }
         proof.count = merged;
-        ready = bs_mremap_targets_smaps_stream_matches(smaps, &executable, &proof);
+        ready = bs_kernel_premap_smaps_matches(smaps, &executable, &proof);
     } else {
         ready = bs_mremap_targets_smaps_stream_matches(smaps, &executable, plan);
     }

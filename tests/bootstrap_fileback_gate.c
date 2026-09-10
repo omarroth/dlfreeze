@@ -1109,6 +1109,42 @@ out:
     return ok;
 }
 
+static int kernel_premap_unrelated_cow_gate(void)
+{
+    struct mremap_proof_fixture fixture;
+    unsigned char *stage = MAP_FAILED;
+    int ok = 1;
+
+    if (!mremap_proof_fixture_init(&fixture, BS_MREMAP_MIN_STARTUP_BYTES,
+                                   MREMAP_FIXTURE_UNRELATED_COW))
+        return 0;
+    stage = mmap((void *)(uintptr_t)DLFRZ_PREMAP_LO, fixture.size, PROT_READ,
+                  MAP_PRIVATE | MAP_FIXED_NOREPLACE, fileno(fixture.file), 0);
+    if (stage == MAP_FAILED) { ok = 0; goto out; }
+    g_bs_premaps[0] = (struct dlfrz_premap_range){(uintptr_t)stage,
+        (uintptr_t)fixture.target, fixture.size, 0};
+    g_bs_premap_count = 1;
+    ok &= expect_value("kernel staging ignores COW outside admitted ranges",
+                       mremap_source_ready(&fixture), test_signal_zero_clone_available);
+    ok &= expect_value("child proof preserves parent unrelated COW bytes",
+                       fixture.source[fixture.size - 1] == 0x33 &&
+                       fixture.source[BS_MREMAP_MIN_STARTUP_BYTES] ==
+                           (0x33 ^ 0xff), 1);
+#ifdef DLFREEZE_TEST_HAVE_SECCOMP
+    ok &= expect_value("kernel proof refinement errno denial uses copy fallback",
+        mremap_seccomp_decline(&fixture, SYS_madvise,
+                               SECCOMP_RET_ERRNO | EPERM), 1);
+    ok &= expect_value("kernel proof refinement fatal denial is contained",
+        mremap_seccomp_decline(&fixture, SYS_madvise, SECCOMP_RET_KILL_PROCESS), 1);
+#endif
+out:
+    g_bs_premap_count = 0;
+    memset(g_bs_premap_selected, 0, sizeof(g_bs_premap_selected));
+    if (stage != MAP_FAILED) munmap(stage, fixture.size);
+    mremap_proof_fixture_destroy(&fixture);
+    return ok;
+}
+
 static int mremap_proof_gate(void)
 {
     long page_value = sysconf(_SC_PAGESIZE);
@@ -1724,5 +1760,7 @@ int main(void)
         return 8;
     if (!kernel_premap_proof_gate())
         return 10;
+    if (!kernel_premap_unrelated_cow_gate())
+        return 11;
     return 0;
 }

@@ -21394,7 +21394,7 @@ static int loaded_symbol_name_index_geometry(
     return 1;
 }
 
-/* Four stable byte-wise passes sort the uint32_t string offsets without the
+/* Up to four stable byte-wise passes sort the uint32_t string offsets without the
  * branchy O(N log N) heap walk.  The caller may lend the not-yet-published
  * key mapping as scratch: all destination pointers are merely copied during
  * sorting, and no key is dereferenced until the mapping has been cleared and
@@ -21410,6 +21410,7 @@ static int loaded_symbol_name_refs_radix_sort(
     size_t counts_bytes =
         LOADED_SYMBOL_NAME_RADIX_BUCKETS * sizeof(size_t);
     size_t *next;
+    uint32_t offset_bits = 0;
 
     if (!refs || !scratch_mapping || count < LOADED_SYMBOL_NAME_RADIX_MIN ||
         __builtin_mul_overflow(count, sizeof(*refs), &refs_bytes))
@@ -21433,8 +21434,20 @@ static int loaded_symbol_name_refs_radix_sort(
         size_t total = 0;
 
         memset(next, 0, counts_bytes);
-        for (size_t i = 0; i < count; i++)
-            next[(source[i].offset >> shift) & UINT32_C(0xff)]++;
+        if (pass == 0) {
+            /* Learn the occupied width while reading the first histogram.
+             * Typical string tables need only one or two offset bytes; all
+             * remaining high-byte passes would preserve the same order. */
+            for (size_t i = 0; i < count; i++) {
+                uint32_t offset = source[i].offset;
+
+                offset_bits |= offset;
+                next[offset & UINT32_C(0xff)]++;
+            }
+        } else {
+            for (size_t i = 0; i < count; i++)
+                next[(source[i].offset >> shift) & UINT32_C(0xff)]++;
+        }
         for (size_t bucket = 0;
              bucket < LOADED_SYMBOL_NAME_RADIX_BUCKETS; bucket++) {
             size_t bucket_count = next[bucket];
@@ -21454,8 +21467,15 @@ static int loaded_symbol_name_refs_radix_sort(
             source = destination;
             destination = temporary;
         }
+        if (pass == sizeof(uint32_t) - 1 ||
+            (offset_bits >> (shift + 8U)) == 0)
+            break;
     }
-    return source == refs;
+    /* An odd number of useful passes finishes in scratch.  Copy back only
+     * the reference array, before its destination-key storage is cleared. */
+    if (source != refs)
+        memcpy(refs, source, refs_bytes);
+    return 1;
 }
 
 /* Compute the key for every referenced string-table suffix in one reverse
@@ -29568,10 +29588,10 @@ static int selected_definition_requires_native_glibc_gmon(
     return target_libc && owner == target_libc;
 }
 
-static uint64_t lookup_relocation_special(struct loaded_obj *requester,
-                                          uint32_t sym_index,
-                                          struct loaded_obj *objs, int nobj,
-                                          int skip_requester)
+static uint64_t lookup_relocation_special_query(
+    struct loaded_obj *requester, uint32_t sym_index,
+    struct loaded_obj *objs, int nobj, int skip_requester,
+    struct symbol_lookup_query *admitted_query)
 {
     const Elf64_Sym *reference;
     const char *canonical_name = NULL;
@@ -29580,6 +29600,7 @@ static uint64_t lookup_relocation_special(struct loaded_obj *requester,
     const struct loaded_symbol_name_key *version_key = NULL;
     const struct loaded_symbol_name_key *provider_key = NULL;
     struct symbol_lookup_query name_query;
+    struct symbol_lookup_query *query = admitted_query;
     struct symbol_lookup_query version_query;
     struct symbol_lookup_query provider_query;
     const struct symbol_lookup_query *required_provider_query = NULL;
@@ -29595,24 +29616,29 @@ static uint64_t lookup_relocation_special(struct loaded_obj *requester,
         sym_index >= requester->dynsym_count)
         return 0;
     reference = loaded_dynsym(requester, sym_index);
-    if (!reference || !symbol_lookup_query_init_dynsym(
-            requester, sym_index, objs, nobj, &name_query))
+    if (!reference)
         return 0;
+    if (!query) {
+        if (!symbol_lookup_query_init_dynsym(
+                requester, sym_index, objs, nobj, &name_query))
+            return 0;
+        query = &name_query;
+    }
     if (g_is_musl_runtime &&
         (requester->flags & LDR_FLAG_MAIN_EXE) != 0 &&
         symbol_lookup_query_eq_cstr(
-            &name_query, "__libc_start_main")) {
+            query, "__libc_start_main")) {
         address = (uint64_t)(uintptr_t)musl_libc_start_main_adapter;
         canonical_name = "__libc_start_main";
     } else if (!g_is_musl_runtime &&
                (requester->flags & LDR_FLAG_MAIN_EXE) != 0 &&
                symbol_lookup_query_eq_cstr(
-                   &name_query, "__libc_start_main")) {
+                   query, "__libc_start_main")) {
         address = (uint64_t)(uintptr_t)glibc_libc_start_main_adapter;
         canonical_name = "__libc_start_main";
     } else {
         address = raw_relocation_special_query(
-            &name_query, &canonical_name);
+            query, &canonical_name);
     }
     if (!address || !canonical_name)
         return 0;
@@ -29642,9 +29668,9 @@ static uint64_t lookup_relocation_special(struct loaded_obj *requester,
     if (!skip_requester && requester->symbolic_lookup) {
         const Elf64_Sym *self_definition = versioned
             ? lookup_versioned_symbol_mode_query(
-                requester, &name_query, &version_query, 1,
+                requester, query, &version_query, 1,
                 required_hidden, required_provider_query)
-            : lookup_object_symbol_query(requester, &name_query);
+            : lookup_object_symbol_query(requester, query);
 
         if (self_definition)
             return 0;
@@ -29709,6 +29735,14 @@ static uint64_t lookup_relocation_special(struct loaded_obj *requester,
     return frozen_interp_exports_version_n(
         canonical_name, version_query.name, version_query.key.length,
         copy_source_size) ? address : 0;
+}
+
+static uint64_t lookup_relocation_special(
+    struct loaded_obj *requester, uint32_t sym_index,
+    struct loaded_obj *objs, int nobj, int skip_requester)
+{
+    return lookup_relocation_special_query(
+        requester, sym_index, objs, nobj, skip_requester, NULL);
 }
 
 /* Apply the same provider/version admission policy to dlsym and dlvsym.
@@ -30214,7 +30248,7 @@ static int relocation_definition_cache_ifunc_lookup(
     return 1;
 }
 
-static void relocation_definition_cache_ifunc_store(
+static int relocation_definition_cache_ifunc_store(
     struct loaded_obj *requester, uint32_t symbol_index,
     struct loaded_obj *objs, int nobj, int is_ifunc)
 {
@@ -30227,11 +30261,12 @@ static void relocation_definition_cache_ifunc_store(
     if (!relocation_definition_cache_lookup_with_entry(
             requester, symbol_index, objs, nobj, 0,
             &owner, &definition, &entry))
-        return;
+        return 0;
     (void)owner;
     (void)definition;
     entry->is_ifunc = is_ifunc ? 1 : 0;
     entry->ifunc_classification_valid = 1;
+    return 1;
 }
 
 static int global_symbol_cache_scope_immutable(
@@ -30439,22 +30474,21 @@ static int resolve_requester_writable_object(
 static int resolve_relocation_symbol(struct loaded_obj *requester,
                                      uint32_t sym_index,
                                      struct loaded_obj *objs, int nobj,
+                                     const Elf64_Sym *reference,
+                                     struct symbol_lookup_query *query,
                                      uint64_t *address_out)
 {
-    const Elf64_Sym *reference;
     const Elf64_Sym *sym;
     struct loaded_obj *owner = NULL;
-    struct symbol_lookup_query query;
     uint64_t addr;
 
+    /* Every replay caller has just admitted this exact reference and query
+     * in validate_relocation_record(), with no intervening target callback.
+     * Reuse that current (not cached) query, including for writable tables.
+     * Provider/version selection below remains live and authoritative. */
     if (!requester->dynsym || !requester->dynstr ||
-        sym_index == 0 || sym_index >= requester->dynsym_count)
-        return 0;
-    reference = loaded_dynsym(requester, sym_index);
-    if (!reference)
-        return 0;
-    if (!symbol_lookup_query_init_dynsym(
-            requester, sym_index, objs, nobj, &query))
+        sym_index == 0 || sym_index >= requester->dynsym_count ||
+        !reference || !query || !query->name)
         return 0;
     /* A requester-local hidden/internal/protected definition wins even when
      * its name is also implemented by a loader override. */
@@ -30462,8 +30496,8 @@ static int resolve_relocation_symbol(struct loaded_obj *requester,
         return resolve_defined_symbol_address(requester, reference,
                                               address_out, NULL);
 
-    addr = lookup_relocation_special(
-        requester, sym_index, objs, nobj, 0);
+    addr = lookup_relocation_special_query(
+        requester, sym_index, objs, nobj, 0, query);
     if (addr) {
         *address_out = addr;
         return 1;
@@ -30474,7 +30508,7 @@ static int resolve_relocation_symbol(struct loaded_obj *requester,
     if (!sym || !owner ||
         !resolve_defined_symbol_address(owner, sym, &addr, NULL))
         return 0;
-    if (selected_definition_requires_native_glibc_gmon(owner, &query))
+    if (selected_definition_requires_native_glibc_gmon(owner, query))
         return -1;
     *address_out = addr;
     return 1;
@@ -30611,23 +30645,30 @@ static int relocation_resolves_gnu_unique(
 /* Classify a symbolic relocation without invoking its resolver.  This must
  * mirror resolve_relocation_symbol's override precedence: a loader-provided
  * ABI shim suppresses an underlying ELF IFUNC definition. */
-static int relocation_symbol_is_ifunc(struct loaded_obj *requester,
-                                      uint32_t sym_index,
-                                      struct loaded_obj *objs, int nobj)
+static int relocation_symbol_ifunc_classification(
+    struct loaded_obj *requester, uint32_t sym_index,
+    struct loaded_obj *objs, int nobj, int *stable_out)
 {
     const Elf64_Sym *reference;
     const Elf64_Sym *definition;
     struct loaded_obj *owner = NULL;
     uint64_t special;
     int is_ifunc;
+    int stable;
+
+    if (stable_out)
+        *stable_out = 0;
 
 #ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
     g_relocation_ifunc_classification_calls++;
 #endif
 
     if (relocation_definition_cache_ifunc_lookup(
-            requester, sym_index, objs, nobj, &is_ifunc))
+            requester, sym_index, objs, nobj, &is_ifunc)) {
+        if (stable_out)
+            *stable_out = 1;
         return is_ifunc;
+    }
 
     if (!requester->dynsym || !requester->dynstr || sym_index == 0 ||
         sym_index >= requester->dynsym_count)
@@ -30640,9 +30681,12 @@ static int relocation_symbol_is_ifunc(struct loaded_obj *requester,
             requester, sym_index, objs, nobj, 0, &owner);
         is_ifunc = definition && owner &&
             ELF64_ST_TYPE(definition->st_info) == STT_GNU_IFUNC;
-        if (definition && owner)
-            relocation_definition_cache_ifunc_store(
+        if (definition && owner) {
+            stable = relocation_definition_cache_ifunc_store(
                 requester, sym_index, objs, nobj, is_ifunc);
+            if (stable_out)
+                *stable_out = stable;
+        }
         return is_ifunc;
     }
 
@@ -30653,8 +30697,10 @@ static int relocation_symbol_is_ifunc(struct loaded_obj *requester,
          * same guarded ELF-definition lookup.  When that non-unique binding
          * was cacheable, remember that the loader shim suppresses IFUNC
          * classification as part of this exact epoch too. */
-        relocation_definition_cache_ifunc_store(
+        stable = relocation_definition_cache_ifunc_store(
             requester, sym_index, objs, nobj, 0);
+        if (stable_out)
+            *stable_out = stable;
         return 0;
     }
 
@@ -30662,9 +30708,12 @@ static int relocation_symbol_is_ifunc(struct loaded_obj *requester,
         requester, sym_index, objs, nobj, 0, &owner);
     is_ifunc = definition && owner &&
         ELF64_ST_TYPE(definition->st_info) == STT_GNU_IFUNC;
-    if (definition && owner)
-        relocation_definition_cache_ifunc_store(
+    if (definition && owner) {
+        stable = relocation_definition_cache_ifunc_store(
             requester, sym_index, objs, nobj, is_ifunc);
+        if (stable_out)
+            *stable_out = stable;
+    }
     return is_ifunc;
 }
 
@@ -30675,16 +30724,17 @@ static int relocation_symbol_is_ifunc(struct loaded_obj *requester,
  * record must retain the old validate-before-skip behavior so malformed
  * metadata cannot make a previously deferred relocation disappear.  Do not
  * pin an otherwise-valid live reclassification here: before this fast path,
- * writable metadata was deliberately re-read in each phase. */
-static int relocation_ifunc_classification_stable(
+ * writable metadata was deliberately re-read in each phase.  Return that
+ * proof alongside classification above: looking up the very same cache
+ * entry again adds no evidence.  It also proves non-GNU-unique selection,
+ * since neither unique references nor definitions can enter this cache.
+ * Consume it immediately, never across a callback or scope publication. */
+static int relocation_symbol_is_ifunc(
     struct loaded_obj *requester, uint32_t sym_index,
-    struct loaded_obj *objs, int nobj, int expected_ifunc)
+    struct loaded_obj *objs, int nobj)
 {
-    int cached_ifunc;
-
-    return relocation_definition_cache_ifunc_lookup(
-               requester, sym_index, objs, nobj, &cached_ifunc) &&
-           cached_ifunc == (expected_ifunc != 0);
+    return relocation_symbol_ifunc_classification(
+        requester, sym_index, objs, nobj, NULL);
 }
 
 /* Derive, but never assume, phase membership while walking the already
@@ -30719,14 +30769,14 @@ static uint8_t prelinked_relocation_stable_phase(
              type == ARCH_RELOC_GLOB_DAT ||
              type == ARCH_RELOC_JUMP_SLOT) {
         int is_ifunc;
+        int stable;
 
         if (sym_index == 0) {
             phase = PRELINKED_FIXUP_PHASE_ORDINARY;
         } else {
-            is_ifunc = relocation_symbol_is_ifunc(
-                obj, sym_index, scope, scope_count);
-            if (relocation_ifunc_classification_stable(
-                    obj, sym_index, scope, scope_count, is_ifunc))
+            is_ifunc = relocation_symbol_ifunc_classification(
+                obj, sym_index, scope, scope_count, &stable);
+            if (stable)
                 phase = is_ifunc ? PRELINKED_FIXUP_PHASE_IFUNC
                                  : PRELINKED_FIXUP_PHASE_ORDINARY;
         }
@@ -31404,11 +31454,8 @@ static int apply_prelinked_runtime_reloc(struct loaded_obj *obj,
             type == ARCH_RELOC_JUMP_SLOT;
         symbolic_ifunc =
             symbolic_candidate &&
-            relocation_symbol_is_ifunc(obj, sidx, objs, nobj);
-        if (symbolic_candidate)
-            ifunc_classification_stable =
-                relocation_ifunc_classification_stable(
-                    obj, sidx, objs, nobj, symbolic_ifunc);
+            relocation_symbol_ifunc_classification(
+                obj, sidx, objs, nobj, &ifunc_classification_stable);
         if ((pass == RELOC_PASS_IFUNC) != symbolic_ifunc) {
             if (!ifunc_classification_stable &&
                 validate_relocation_phase_filter_skip(obj, rel) < 0) {
@@ -31477,7 +31524,7 @@ static int apply_prelinked_runtime_reloc(struct loaded_obj *obj,
         {
             uint64_t addr = 0;
             int resolved = resolve_relocation_symbol(
-                obj, sidx, objs, nobj, &addr);
+                obj, sidx, objs, nobj, reference, &symbol_query, &addr);
 
             if (resolved < 0) {
                 ldr_err_symbol_query(
@@ -31650,7 +31697,7 @@ static int apply_prelinked_runtime_reloc(struct loaded_obj *obj,
     {
         uint64_t addr = 0;
         int resolved = resolve_relocation_symbol(
-            obj, sidx, objs, nobj, &addr);
+            obj, sidx, objs, nobj, reference, &symbol_query, &addr);
 
         if (resolved < 0) {
             ldr_err_symbol_query(
@@ -34075,11 +34122,8 @@ static int apply_relocs_rela(struct loaded_obj *obj,
                 type == ARCH_RELOC_JUMP_SLOT;
             symbolic_ifunc =
                 symbolic_candidate &&
-                relocation_symbol_is_ifunc(obj, sidx, all, nobj);
-            if (symbolic_candidate)
-                ifunc_classification_stable =
-                    relocation_ifunc_classification_stable(
-                        obj, sidx, all, nobj, symbolic_ifunc);
+                relocation_symbol_ifunc_classification(
+                    obj, sidx, all, nobj, &ifunc_classification_stable);
             if (symbolic_ifunc) {
                 if (pass != RELOC_PASS_IFUNC) {
                     if (!ifunc_classification_stable &&
@@ -34098,7 +34142,8 @@ static int apply_relocs_rela(struct loaded_obj *obj,
                     }
                     continue;
                 }
-                if (sidx != 0 &&
+                if (!(symbolic_candidate && ifunc_classification_stable) &&
+                    sidx != 0 &&
                     (type == ARCH_RELOC_ABS ||
                      type == ARCH_RELOC_GLOB_DAT ||
                      type == ARCH_RELOC_JUMP_SLOT ||
@@ -34187,7 +34232,7 @@ static int apply_relocs_rela(struct loaded_obj *obj,
         case ARCH_RELOC_ABS: {
             uint64_t addr = 0;
             int resolved = resolve_relocation_symbol(
-                obj, sidx, all, nobj, &addr);
+                obj, sidx, all, nobj, reference, &symbol_query, &addr);
             if (resolved < 0) {
                 ldr_err_symbol_query(
                     "glibc gmon profiling requires the native loader for "

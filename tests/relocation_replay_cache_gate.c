@@ -144,6 +144,68 @@ static int immutable_binding_cache_gate(void)
     return 1;
 }
 
+static int fused_classification_proof_gate(void)
+{
+    int stable = -1;
+
+    initialize_symbol_scope();
+    if (relocation_symbol_ifunc_classification(
+            &g_all_objs[0], 1, g_all_objs, 2, &stable) || stable != 1)
+        return 0;
+    g_relocation_definition_cache_queries = 0;
+    stable = -1;
+    if (relocation_symbol_ifunc_classification(
+            &g_all_objs[0], 1, g_all_objs, 2, &stable) || stable != 1 ||
+        g_relocation_definition_cache_queries != 1)
+        return 0;
+
+    /* Publication invalidates both the answer and its stability proof. */
+    clear_resolution_caches();
+    provider_symbols[1].st_info = ELF64_ST_INFO(STB_GLOBAL, STT_GNU_IFUNC);
+    if (!relocation_symbol_ifunc_classification(
+            &g_all_objs[0], 1, g_all_objs, 2, &stable) || stable != 1)
+        return 0;
+    g_relocation_definition_cache_queries = 0;
+    if (!relocation_symbol_ifunc_classification(
+            &g_all_objs[0], 1, g_all_objs, 2, &stable) || stable != 1 ||
+        g_relocation_definition_cache_queries != 1)
+        return 0;
+
+    initialize_symbol_scope();
+    g_all_objs[1].dynsym_readonly = 0;
+    if (relocation_symbol_ifunc_classification(
+            &g_all_objs[0], 1, g_all_objs, 2, &stable) || stable != 0)
+        return 0;
+    provider_symbols[1].st_info = ELF64_ST_INFO(STB_GLOBAL, STT_GNU_IFUNC);
+    if (!relocation_symbol_ifunc_classification(
+            &g_all_objs[0], 1, g_all_objs, 2, &stable) || stable != 0)
+        return 0;
+
+    /* The proof must never suppress GNU-unique handling, whether the unique
+     * binding is declared by the requester or selected from a provider. */
+    for (int requester_unique = 0; requester_unique < 2; requester_unique++) {
+        initialize_symbol_scope();
+        if (requester_unique) {
+            requester_symbols[1].st_info =
+                ELF64_ST_INFO(STB_GNU_UNIQUE, STT_OBJECT);
+            requester_symbols[1].st_shndx = 1;
+        } else {
+            provider_symbols[1].st_info =
+                ELF64_ST_INFO(STB_GNU_UNIQUE, STT_OBJECT);
+        }
+        if (relocation_symbol_ifunc_classification(
+                &g_all_objs[0], 1, g_all_objs, 2, &stable) || stable != 0 ||
+            !relocation_resolves_gnu_unique(
+                &g_all_objs[0], 1, g_all_objs, 2))
+            return 0;
+    }
+    initialize_symbol_scope();
+    if (relocation_symbol_ifunc_classification(
+            &g_all_objs[0], 0, g_all_objs, 2, &stable) || stable != 0)
+        return 0;
+    return 1;
+}
+
 static int many_binding_scope_proof_gate(void)
 {
     struct loaded_obj *owner;
@@ -1075,6 +1137,65 @@ static int run_all_relocation_phases(struct loaded_obj *obj,
     return result && g_relocation_validation_calls == 1;
 }
 
+static int replay_query_refresh_gate(void)
+{
+    uint64_t sources[2] = {11, 29};
+    uint64_t destination = 0;
+    Elf64_Phdr requester_phdr = {
+        .p_type = PT_LOAD, .p_flags = PF_R | PF_W,
+        .p_filesz = sizeof(destination), .p_memsz = sizeof(destination)
+    };
+    Elf64_Phdr provider_phdr = {
+        .p_type = PT_LOAD, .p_flags = PF_R,
+        .p_filesz = sizeof(sources), .p_memsz = sizeof(sources)
+    };
+    const uint32_t types[] = {ARCH_RELOC_ABS, ARCH_RELOC_GLOB_DAT};
+    Elf64_Rela relocation = {0};
+
+    for (int prelinked = 0; prelinked < 2; prelinked++) {
+        for (size_t type = 0; type < sizeof(types) / sizeof(types[0]); type++) {
+            initialize_symbol_scope();
+            g_all_objs[0].base = (uintptr_t)&destination;
+            g_all_objs[0].phdr = &requester_phdr;
+            g_all_objs[0].phdr_num = 1;
+            g_all_objs[0].dynsym_readonly = 0;
+            g_all_objs[1].base = (uintptr_t)sources;
+            g_all_objs[1].phdr = &provider_phdr;
+            g_all_objs[1].phdr_num = 1;
+            g_all_objs[1].dynsym_count = 3;
+            g_all_objs[1].dynsym_admitted_count = 3;
+            provider_symbols[1].st_info = ELF64_ST_INFO(STB_GLOBAL, STT_OBJECT);
+            provider_symbols[1].st_size = sizeof(uint64_t);
+            provider_symbols[2] = provider_symbols[1];
+            provider_symbols[2].st_name = 5;
+            provider_symbols[2].st_value = sizeof(uint64_t);
+            relocation.r_info = ELF64_R_INFO(1, types[type]);
+
+            for (int selection = 0; selection < 2; selection++) {
+                int status;
+
+                requester_symbols[1].st_name = selection ? 5 : 1;
+                destination = 0;
+                if (prelinked) {
+                    status = apply_prelinked_runtime_reloc(
+                        &g_all_objs[0], g_all_objs, 2, &relocation,
+                        LOADED_RELA_DYNAMIC, RELOC_PASS_ORDINARY, 0);
+                } else {
+                    g_all_objs[0].rela = &relocation;
+                    g_all_objs[0].rela_count = 1;
+                    status = apply_relocs_rela(
+                        &g_all_objs[0], LOADED_RELA_DYNAMIC, g_all_objs, 2,
+                        RELOC_PASS_ORDINARY);
+                }
+                if (status < 0 ||
+                    destination != (uintptr_t)&sources[selection])
+                    return 0;
+            }
+        }
+    }
+    return 1;
+}
+
 static int symbolic_relocation_phase_gate(void)
 {
     long page_size_long = sysconf(_SC_PAGESIZE);
@@ -1439,6 +1560,10 @@ int main(void)
     (void)needed_symbol_version;
     if (!immutable_binding_cache_gate())
         return 1;
+    if (!fused_classification_proof_gate())
+        return 17;
+    if (!replay_query_refresh_gate())
+        return 18;
     if (!many_binding_scope_proof_gate())
         return 2;
     if (!cache_mode_and_epoch_gate())

@@ -835,31 +835,36 @@ static int symbol_name_radix_sort_gate(void)
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (scratch == MAP_FAILED)
         return 0;
-    for (size_t i = 0; i < count; i++) {
-        if (i % 17U == 0)
-            refs[i].offset = 0;
-        else if (i % 19U == 0)
-            refs[i].offset = UINT32_MAX;
-        else
-            refs[i].offset =
-                (uint32_t)(i * UINT32_C(2654435761));
-        refs[i].destination =
-            (struct loaded_symbol_name_key *)(uintptr_t)(i + 1U);
-    }
-    /* Refuse undersized scratch before touching either array. */
-    if (loaded_symbol_name_refs_radix_sort(
-            refs, count, scratch, scratch_size - 1U))
-        goto out;
-    if (!loaded_symbol_name_refs_radix_sort(
-            refs, count, scratch, scratch_size))
-        goto out;
-    for (size_t i = 1; i < count; i++) {
-        if (refs[i - 1].offset > refs[i].offset)
+    /* Include zero-only offsets and every width, especially the odd pass
+     * counts which must copy the sorted references back from scratch. */
+    const uint32_t masks[] = {0, 0xff, 0xffff, 0xffffff, UINT32_MAX};
+    for (size_t width = 0; width < sizeof(masks) / sizeof(masks[0]); width++) {
+        for (size_t i = 0; i < count; i++) {
+            if (i % 17U == 0)
+                refs[i].offset = 0;
+            else if (i % 19U == 0)
+                refs[i].offset = masks[width];
+            else
+                refs[i].offset =
+                    (uint32_t)(i * UINT32_C(2654435761)) & masks[width];
+            refs[i].destination =
+                (struct loaded_symbol_name_key *)(uintptr_t)(i + 1U);
+        }
+        /* Refuse undersized scratch before touching either array. */
+        if (loaded_symbol_name_refs_radix_sort(
+                refs, count, scratch, scratch_size - 1U))
             goto out;
-        if (refs[i - 1].offset == refs[i].offset &&
-            (uintptr_t)refs[i - 1].destination >=
-                (uintptr_t)refs[i].destination)
+        if (!loaded_symbol_name_refs_radix_sort(
+                refs, count, scratch, scratch_size))
             goto out;
+        for (size_t i = 1; i < count; i++) {
+            if (refs[i - 1].offset > refs[i].offset)
+                goto out;
+            if (refs[i - 1].offset == refs[i].offset &&
+                (uintptr_t)refs[i - 1].destination >=
+                    (uintptr_t)refs[i].destination)
+                goto out;
+        }
     }
     result = 1;
 

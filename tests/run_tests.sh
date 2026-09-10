@@ -422,7 +422,7 @@ test_bootstrap_fileback_gate() {
             -o "$helper" tests/bootstrap_fileback_gate.c &&
        chmod 0555 "$helper" &&
        run_with_timeout_seconds 8 "$helper"; then
-        pass "bootstrap one-smaps exact clean file-alias proof"
+        pass "bootstrap bounded exact clean file-alias proof"
     else
         fail "bootstrap file-backed payload proof gate" \
             "compile failed, mapping identity differed, or parsing timed out"
