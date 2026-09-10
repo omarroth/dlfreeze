@@ -15563,6 +15563,7 @@ static int g_vfs_temp_forced_unlink_errno;
 #endif
 static uint64_t g_symbol_name_fingerprint_seed;
 static uint64_t g_symbol_name_fingerprint_multiplier;
+static uint64_t g_symbol_name_fingerprint_prepend_delta;
 static uint64_t g_symbol_name_byte_mix[UINT8_MAX + 1U];
 static int g_symbol_name_fingerprint_key_ready;
 
@@ -15753,6 +15754,7 @@ static int vfs_seed_hash_key(const void *kernel_random)
     g_vfs_hash_key_ready = 0;
     g_symbol_name_fingerprint_seed = 0;
     g_symbol_name_fingerprint_multiplier = 0;
+    g_symbol_name_fingerprint_prepend_delta = 0;
     g_symbol_name_fingerprint_key_ready = 0;
     runtime_atomic_store64(&g_vfs_temp_nonce, 0);
     if (!kernel_random)
@@ -15780,6 +15782,9 @@ static int vfs_seed_hash_key(const void *kernel_random)
         g_symbol_name_fingerprint_multiplier == UINT64_MAX)
         g_symbol_name_fingerprint_multiplier =
             UINT64_C(0xa0761d6478bd642f);
+    g_symbol_name_fingerprint_prepend_delta =
+        g_symbol_name_fingerprint_seed *
+        (g_symbol_name_fingerprint_multiplier - 1U);
     g_symbol_name_fingerprint_key_ready = 1;
     return 0;
 }
@@ -20794,8 +20799,7 @@ static int symbol_lookup_query_sysv_hash(
 static __attribute__((unused)) uint64_t
 symbol_name_fingerprint_n(const char *name, size_t length)
 {
-    uint64_t body = 0;
-    uint64_t power = 1;
+    uint64_t fingerprint = g_symbol_name_fingerprint_seed;
 
     for (size_t i = 0; i < length; i++) {
         uint64_t byte = (uint8_t)name[i];
@@ -20803,20 +20807,20 @@ symbol_name_fingerprint_n(const char *name, size_t length)
 #ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
         g_symbol_query_fingerprint_bytes++;
 #endif
-        body += g_symbol_name_byte_mix[byte] * power;
-        power *= g_symbol_name_fingerprint_multiplier;
+        fingerprint = fingerprint * g_symbol_name_fingerprint_multiplier +
+            g_symbol_name_byte_mix[byte];
     }
-    return body + g_symbol_name_fingerprint_seed * power;
+    return fingerprint;
 }
 #endif
 
 struct symbol_lookup_forward_state {
     struct vfs_hash_state keyed;
-    uint64_t fingerprint_body;
-    uint64_t fingerprint_power;
+    uint64_t fingerprint;
     uint32_t gnu_hash;
     uint32_t sysv_hash;
     uint8_t keyed_hash_enabled;
+    uint8_t fingerprint_enabled;
 };
 
 static void symbol_lookup_forward_init(
@@ -20826,8 +20830,9 @@ static void symbol_lookup_forward_init(
         g_vfs_hash_key_ready && !defer_keyed_hash;
     if (state->keyed_hash_enabled)
         vfs_hash_init(&state->keyed);
-    state->fingerprint_body = 0;
-    state->fingerprint_power = defer_keyed_hash ? 0 : 1;
+    state->fingerprint = defer_keyed_hash
+        ? 0 : g_symbol_name_fingerprint_seed;
+    state->fingerprint_enabled = !defer_keyed_hash;
     state->gnu_hash = 5381;
     state->sysv_hash = 0;
 }
@@ -20839,12 +20844,10 @@ static void symbol_lookup_forward_update(
 
     if (state->keyed_hash_enabled)
         vfs_hash_update_byte(&state->keyed, byte);
-    if (state->fingerprint_power != 0) {
-        state->fingerprint_body +=
-            g_symbol_name_byte_mix[byte] * state->fingerprint_power;
-        state->fingerprint_power *=
-            g_symbol_name_fingerprint_multiplier;
-    }
+    if (state->fingerprint_enabled)
+        state->fingerprint =
+            state->fingerprint * g_symbol_name_fingerprint_multiplier +
+            g_symbol_name_byte_mix[byte];
     state->gnu_hash =
         (state->gnu_hash << 5) + state->gnu_hash + byte;
     state->sysv_hash = (state->sysv_hash << 4) + byte;
@@ -20867,8 +20870,7 @@ static void symbol_lookup_query_finish(
     query->key.length = length;
     query->key.fingerprint = known_key
         ? known_key->fingerprint
-        : state->fingerprint_body +
-          g_symbol_name_fingerprint_seed * state->fingerprint_power;
+        : state->fingerprint;
     query->key.gnu_hash = state->gnu_hash;
     query->key.dynstr_offset = UINT32_MAX;
     query->keyed_hash = state->keyed_hash_enabled
@@ -21684,8 +21686,7 @@ static int loaded_symbol_name_key_direct(
     size_t scan_limit;
     size_t initial_budget;
     size_t length;
-    uint64_t fingerprint_body = 0;
-    uint64_t fingerprint_power = 1;
+    uint64_t fingerprint = g_symbol_name_fingerprint_seed;
     uint32_t gnu_hash = UINT32_C(5381);
 
     if (!obj || !destination || !work_budget ||
@@ -21703,17 +21704,15 @@ static int loaded_symbol_name_key_direct(
             *work_budget = initial_budget - length - 1U;
             break;
         }
-        fingerprint_body +=
-            g_symbol_name_byte_mix[byte] * fingerprint_power;
-        fingerprint_power *= g_symbol_name_fingerprint_multiplier;
+        fingerprint = fingerprint * g_symbol_name_fingerprint_multiplier +
+            g_symbol_name_byte_mix[byte];
         gnu_hash = (gnu_hash << 5) + gnu_hash + byte;
     }
     if (length == scan_limit) {
         *work_budget = initial_budget - scan_limit;
         return capacity <= initial_budget ? -1 : 0;
     }
-    destination->fingerprint = fingerprint_body +
-        g_symbol_name_fingerprint_seed * fingerprint_power;
+    destination->fingerprint = fingerprint;
     destination->length = length;
     destination->gnu_hash = gnu_hash;
     destination->dynstr_offset = offset;
@@ -21838,6 +21837,7 @@ static int build_loaded_symbol_name_keys(struct loaded_obj *obj)
     size_t remaining;
     size_t suffix_length = 0;
     uint64_t fingerprint = g_symbol_name_fingerprint_seed;
+    uint64_t fingerprint_power = UINT64_C(1);
     uint32_t gnu_hash = UINT32_C(5381);
     uint32_t gnu_power = UINT32_C(1);
     uint32_t name_index_bucket_mask = 0;
@@ -22095,6 +22095,7 @@ static int build_loaded_symbol_name_keys(struct loaded_obj *obj)
 #endif
             if (byte == 0) {
                 fingerprint = g_symbol_name_fingerprint_seed;
+                fingerprint_power = UINT64_C(1);
                 suffix_length = 0;
                 gnu_hash = UINT32_C(5381);
                 gnu_power = UINT32_C(1);
@@ -22102,8 +22103,11 @@ static int build_loaded_symbol_name_keys(struct loaded_obj *obj)
                 if (suffix_length == SIZE_MAX - 1)
                     goto out;
                 suffix_length++;
-                fingerprint = g_symbol_name_byte_mix[byte] +
-                    g_symbol_name_fingerprint_multiplier * fingerprint;
+                fingerprint +=
+                    (g_symbol_name_fingerprint_prepend_delta +
+                     g_symbol_name_byte_mix[byte]) * fingerprint_power;
+                fingerprint_power *=
+                    g_symbol_name_fingerprint_multiplier;
                 /* For a suffix of length L, H = 5381*33^L + body.
                  * Prepending c adds (5381*32+c)*33^L modulo 2^32. */
                 gnu_hash += (UINT32_C(5381) * UINT32_C(32) + byte) *
