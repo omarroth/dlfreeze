@@ -4193,8 +4193,10 @@ static int published_tls_fast_path_gate(void)
     void *address;
 
     memset(g_runtime_tls_fast, 0, sizeof(g_runtime_tls_fast));
+    memset(g_runtime_tls_static_tpoff_bits, 0,
+           sizeof(g_runtime_tls_static_tpoff_bits));
     runtime_atomic_store64(
-        &g_runtime_tls_fast[3].static_tpoff_bits, (uint64_t)(int64_t)-64);
+        &g_runtime_tls_static_tpoff_bits[3], (uint64_t)(int64_t)-64);
     runtime_atomic_store64(
         &g_runtime_tls_fast[3].extent_plus_one,
         sizeof(tls_block) + 1U);
@@ -4218,7 +4220,7 @@ static int published_tls_fast_path_gate(void)
 
     memset(g_runtime_tls_fast, 0, sizeof(g_runtime_tls_fast));
     runtime_atomic_store64(
-        &g_runtime_tls_fast[3].static_tpoff_bits, 16);
+        &g_runtime_tls_static_tpoff_bits[3], 16);
     runtime_atomic_store64(
         &g_runtime_tls_fast[3].extent_plus_one,
         sizeof(tls_block) + 1U);
@@ -4342,7 +4344,7 @@ static int concurrent_tls_publication_gate(void)
         return 0;
     }
     runtime_atomic_store64(
-        &g_runtime_tls_fast[3].static_tpoff_bits,
+        &g_runtime_tls_static_tpoff_bits[3],
         (uint64_t)(int64_t)-64);
     runtime_atomic_store64(&context.offset_ready, 1);
     while (runtime_atomic_load64(&context.checked_unpublished) == 0 &&

@@ -1894,6 +1894,16 @@ int main(void)
         if (!lookup_special(entry->name, gnu_hash_calc(entry->name)))
             return 6;
     }
+#if defined(__x86_64__)
+    g_special_tab_ready = 0;
+    g_glibc_tcb_dtv_off = 8;
+    if (build_special_table() < 0 ||
+        lookup_special("__tls_get_addr",
+                       gnu_hash_calc("__tls_get_addr")) !=
+            (uint64_t)(uintptr_t)stub_tls_get_addr_glibc_dtv8)
+        return 115;
+    g_glibc_tcb_dtv_off = 0;
+#endif
     g_special_tab_ready = 0;
     g_is_musl_runtime = 1;
     if (build_special_table() < 0 ||

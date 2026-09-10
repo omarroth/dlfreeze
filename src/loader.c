@@ -561,6 +561,7 @@ static int glibc_private_register_pair_path(
       uintptr_t val;
       switch (off) {
       case 0x00: __asm__ volatile("mov %%fs:0x00, %0" : "=r"(val)); break;
+      case 0x08: __asm__ volatile("mov %%fs:0x08, %0" : "=r"(val)); break;
       case 0x10: __asm__ volatile("mov %%fs:0x10, %0" : "=r"(val)); break;
       case 0x28: __asm__ volatile("mov %%fs:0x28, %0" : "=r"(val)); break;
       default:   val = *(uintptr_t *)(arch_get_tp() + off); break;
@@ -13289,11 +13290,14 @@ static void lazy_plt_atfork_child_repair(
  * modules, and DTV growth continue through the serialized slow path below. */
 struct runtime_tls_fast_entry {
     volatile uint64_t extent_plus_one;
-    volatile uint64_t static_tpoff_bits;
 };
 
 static struct runtime_tls_fast_entry
     g_runtime_tls_fast[MAX_TOTAL_OBJS + 1];
+/* Kept out of the steady-state extent array: this value is needed only when
+ * publishing or revalidating a module, not by each TLS address lookup. */
+static uint64_t
+    g_runtime_tls_static_tpoff_bits[MAX_TOTAL_OBJS + 1];
 
 /* glibc deliberately exposes the main executable as an empty name in its
  * public link_map and dl_iterate_phdr views.  musl exposes the executable
@@ -14539,12 +14543,14 @@ static void *stub_tls_get_addr_glibc(struct tls_index *ti)
     uint64_t extent_plus_one;
     uint64_t address;
 
-    if (!ti)
-        return NULL;
+    /* Relocation replay publishes this specialized ABI entry only after the
+     * target runtime and every TLS index are admitted.  Keep defensive null
+     * handling in the generic early entry; native __tls_get_addr likewise
+     * requires a valid tls_index once normal target execution begins. */
     tp = arch_get_tp();
     modid = ti->ti_module;
     offset = ti->ti_offset;
-    if (!tp || modid == 0 || modid > MAX_TOTAL_OBJS)
+    if (modid == 0 || modid > MAX_TOTAL_OBJS)
         return runtime_tls_get_addr_slow(tp, modid, offset);
     entry = &g_runtime_tls_fast[modid];
     extent_plus_one = runtime_atomic_load64(&entry->extent_plus_one);
@@ -14554,12 +14560,48 @@ static void *stub_tls_get_addr_glibc(struct tls_index *ti)
     if (!glibc_dtv_capacity(dtv, &capacity) || !dtv || modid > capacity)
         return runtime_tls_get_addr_slow(tp, modid, offset);
     tls_base = dtv[(size_t)modid * 2];
-    if (!glibc_tls_slot_allocated(tls_base) ||
-        !u64_add_checked(tls_base, (uint64_t)offset, &address) ||
-        address > UINTPTR_MAX)
+    if (!glibc_tls_slot_allocated(tls_base))
         return runtime_tls_get_addr_slow(tp, modid, offset);
+    /* The admitted extent check above and the allocation's admitted end
+     * prove this addition cannot wrap for a loader-published DTV slot. */
+    address = tls_base + (uint64_t)offset;
     return (void *)(uintptr_t)address;
 }
+
+#if defined(__x86_64__)
+/* The common x86_64 glibc TCB contract places the DTV pointer at FS:8.
+ * Select this only after structural layout admission; uncommon or future
+ * layouts retain the generic target-derived-offset entry above.  Deferring
+ * the TP read to the cold path gives valid lookups the same single segment
+ * load used by the native resolver. */
+static void *stub_tls_get_addr_glibc_dtv8(struct tls_index *ti)
+{
+    unsigned long modid = ti->ti_module;
+    unsigned long offset = ti->ti_offset;
+    struct runtime_tls_fast_entry *entry;
+    uintptr_t *dtv;
+    uintptr_t tls_base;
+    size_t capacity;
+    uint64_t extent_plus_one;
+
+    if (modid == 0 || modid > MAX_TOTAL_OBJS)
+        goto slow;
+    entry = &g_runtime_tls_fast[modid];
+    extent_plus_one = runtime_atomic_load64(&entry->extent_plus_one);
+    if (extent_plus_one == 0 || (uint64_t)offset >= extent_plus_one)
+        goto slow;
+    dtv = (uintptr_t *)arch_read_tp_offset(8);
+    if (!glibc_dtv_capacity(dtv, &capacity) || !dtv || modid > capacity)
+        goto slow;
+    tls_base = dtv[(size_t)modid * 2];
+    if (!glibc_tls_slot_allocated(tls_base))
+        goto slow;
+    return (void *)(tls_base + (uintptr_t)offset);
+
+slow:
+    return runtime_tls_get_addr_slow(arch_get_tp(), modid, offset);
+}
+#endif
 
 static void *stub_tls_get_addr_musl(struct tls_index *ti)
 {
@@ -14573,12 +14615,10 @@ static void *stub_tls_get_addr_musl(struct tls_index *ti)
     uint64_t extent_plus_one;
     uint64_t address;
 
-    if (!ti)
-        return NULL;
     tp = arch_get_tp();
     modid = ti->ti_module;
     offset = ti->ti_offset;
-    if (!tp || modid == 0 || modid > MAX_TOTAL_OBJS)
+    if (modid == 0 || modid > MAX_TOTAL_OBJS)
         return runtime_tls_get_addr_slow(tp, modid, offset);
     entry = &g_runtime_tls_fast[modid];
     extent_plus_one = runtime_atomic_load64(&entry->extent_plus_one);
@@ -14589,10 +14629,9 @@ static void *stub_tls_get_addr_musl(struct tls_index *ti)
     if (!dtv || capacity > MAX_TOTAL_OBJS || modid > capacity)
         return runtime_tls_get_addr_slow(tp, modid, offset);
     tls_base = dtv[modid];
-    if (!tls_base ||
-        !u64_add_checked(tls_base, (uint64_t)offset, &address) ||
-        address > UINTPTR_MAX)
+    if (!tls_base)
         return runtime_tls_get_addr_slow(tp, modid, offset);
+    address = tls_base + (uint64_t)offset;
     return (void *)(uintptr_t)address;
 }
 
@@ -29451,10 +29490,15 @@ static int build_special_table(void)
     for (const struct stub_sym *o = g_overrides; o->name; o++) {
         const void *address = o->addr;
 
-        if (strcmp(o->name, "__tls_get_addr") == 0)
+        if (strcmp(o->name, "__tls_get_addr") == 0) {
             address = g_is_musl_runtime
                 ? (const void *)stub_tls_get_addr_musl
                 : (const void *)stub_tls_get_addr_glibc;
+#if defined(__x86_64__)
+            if (!g_is_musl_runtime && g_glibc_tcb_dtv_off == 8)
+                address = (const void *)stub_tls_get_addr_glibc_dtv8;
+#endif
+        }
         SPEC_INSERT(o->name, address);
     }
     if (g_vfs_overrides_active) {
@@ -44398,12 +44442,14 @@ static int dl_transaction_commit(void)
             &entry->extent_plus_one);
         if (published_extent != 0) {
             if (published_extent != encoded_extent ||
-                runtime_atomic_load64(&entry->static_tpoff_bits) !=
+                runtime_atomic_load64(
+                    &g_runtime_tls_static_tpoff_bits[obj->tls.modid]) !=
                     (uint64_t)obj->tls.tpoff)
                 _exit(127);
         } else {
-            runtime_atomic_store64(&entry->static_tpoff_bits,
-                                   (uint64_t)obj->tls.tpoff);
+            runtime_atomic_store64(
+                &g_runtime_tls_static_tpoff_bits[obj->tls.modid],
+                (uint64_t)obj->tls.tpoff);
             runtime_atomic_store64(&entry->extent_plus_one, encoded_extent);
         }
     }
@@ -47460,7 +47506,7 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
              * extent + 1 is nonzero and exactly represents this module.  The
              * release-store publishes the immutable signed offset with it. */
             runtime_atomic_store64(
-                &g_runtime_tls_fast[objs[oi].tls.modid].static_tpoff_bits,
+                &g_runtime_tls_static_tpoff_bits[objs[oi].tls.modid],
                 (uint64_t)objs[oi].tls.tpoff);
             runtime_atomic_store64(
                 &g_runtime_tls_fast[objs[oi].tls.modid].extent_plus_one,
@@ -48796,6 +48842,17 @@ static int loader_run_impl(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         ldr_msg("dlfreeze: direct-load artifact failed target glibc "
                 "thread-layout validation\n");
         RETURN_BEFORE_TARGET_TLS();
+    }
+    if (!is_musl_runtime) {
+        /* The preflight table is built before private target layout can be
+         * inspected.  Rebuild it once that contract is final so a proven
+         * architecture/layout-specific entry may replace its generic-safe
+         * counterpart before any relocation publishes the address. */
+        g_special_tab_ready = 0;
+        if (build_special_table() < 0) {
+            ldr_err("special-symbol table capacity exhausted", NULL);
+            RETURN_BEFORE_TARGET_TLS();
+        }
     }
     if (!is_musl_runtime &&
         admit_lazy_plt(objs, nobj, objs, nobj) < 0) {
