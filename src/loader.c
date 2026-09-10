@@ -15524,6 +15524,7 @@ static int g_vfs_temp_forced_unlink_errno;
 #endif
 static uint64_t g_symbol_name_fingerprint_seed;
 static uint64_t g_symbol_name_fingerprint_multiplier;
+static uint64_t g_symbol_name_byte_mix[UINT8_MAX + 1U];
 static int g_symbol_name_fingerprint_key_ready;
 
 static int vfs_is_negative_entry(const struct vfs_entry *ve)
@@ -15709,6 +15710,7 @@ static uint64_t vfs_hash_n(const char *bytes, size_t length)
 static int vfs_seed_hash_key(const void *kernel_random)
 {
     memset(g_vfs_hash_key, 0, sizeof(g_vfs_hash_key));
+    memset(g_symbol_name_byte_mix, 0, sizeof(g_symbol_name_byte_mix));
     g_vfs_hash_key_ready = 0;
     g_symbol_name_fingerprint_seed = 0;
     g_symbol_name_fingerprint_multiplier = 0;
@@ -15717,6 +15719,17 @@ static int vfs_seed_hash_key(const void *kernel_random)
     if (!kernel_random)
         return -1;
     memcpy(g_vfs_hash_key, kernel_random, sizeof(g_vfs_hash_key));
+    g_vfs_hash_key_ready = 1;
+    for (size_t byte = 0; byte <= UINT8_MAX; byte++) {
+        const uint8_t domain[2] = { UINT8_C(0xd7), (uint8_t)byte };
+
+        /* Public byte coefficients make a wrapping polynomial vulnerable to
+         * chosen-string algebra.  Domain-separated SipHash outputs retain
+         * the cheap composable recurrence while hiding every coefficient
+         * from an ELF producer. */
+        g_symbol_name_byte_mix[byte] =
+            vfs_hash_n((const char *)domain, sizeof(domain));
+    }
     g_symbol_name_fingerprint_seed =
         g_vfs_hash_key[1] ^ UINT64_C(0x9e3779b97f4a7c15);
     g_symbol_name_fingerprint_multiplier =
@@ -15729,7 +15742,6 @@ static int vfs_seed_hash_key(const void *kernel_random)
         g_symbol_name_fingerprint_multiplier =
             UINT64_C(0xa0761d6478bd642f);
     g_symbol_name_fingerprint_key_ready = 1;
-    g_vfs_hash_key_ready = 1;
     return 0;
 }
 
@@ -20565,9 +20577,10 @@ static uint32_t g_cache_epoch = 1;
 
 #ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
 static size_t g_symbol_query_forward_bytes;
-static size_t g_symbol_query_reverse_bytes;
+static size_t g_symbol_query_fingerprint_bytes;
 static size_t g_symbol_query_sysv_bytes;
 static size_t g_symbol_name_radix_sorts;
+static size_t g_symbol_name_direct_builds;
 static size_t g_symbol_name_admission_bytes;
 static size_t g_symbol_name_ref_boundaries;
 static size_t g_version_key_admission_visits;
@@ -20738,25 +20751,30 @@ static int symbol_lookup_query_sysv_hash(
     return 1;
 }
 
-static uint64_t symbol_name_fingerprint_n(const char *name, size_t length)
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+static __attribute__((unused)) uint64_t
+symbol_name_fingerprint_n(const char *name, size_t length)
 {
-    uint64_t fingerprint = g_symbol_name_fingerprint_seed;
+    uint64_t body = 0;
+    uint64_t power = 1;
 
-    while (length != 0) {
-        uint64_t byte = (uint8_t)name[--length];
+    for (size_t i = 0; i < length; i++) {
+        uint64_t byte = (uint8_t)name[i];
 
 #ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
-        g_symbol_query_reverse_bytes++;
+        g_symbol_query_fingerprint_bytes++;
 #endif
-        fingerprint =
-            (fingerprint ^ (byte + UINT64_C(0x100))) *
-            g_symbol_name_fingerprint_multiplier;
+        body += g_symbol_name_byte_mix[byte] * power;
+        power *= g_symbol_name_fingerprint_multiplier;
     }
-    return fingerprint;
+    return body + g_symbol_name_fingerprint_seed * power;
 }
+#endif
 
 struct symbol_lookup_forward_state {
     struct vfs_hash_state keyed;
+    uint64_t fingerprint_body;
+    uint64_t fingerprint_power;
     uint32_t gnu_hash;
     uint32_t sysv_hash;
     uint8_t keyed_hash_enabled;
@@ -20769,6 +20787,8 @@ static void symbol_lookup_forward_init(
         g_vfs_hash_key_ready && !defer_keyed_hash;
     if (state->keyed_hash_enabled)
         vfs_hash_init(&state->keyed);
+    state->fingerprint_body = 0;
+    state->fingerprint_power = defer_keyed_hash ? 0 : 1;
     state->gnu_hash = 5381;
     state->sysv_hash = 0;
 }
@@ -20780,6 +20800,12 @@ static void symbol_lookup_forward_update(
 
     if (state->keyed_hash_enabled)
         vfs_hash_update_byte(&state->keyed, byte);
+    if (state->fingerprint_power != 0) {
+        state->fingerprint_body +=
+            g_symbol_name_byte_mix[byte] * state->fingerprint_power;
+        state->fingerprint_power *=
+            g_symbol_name_fingerprint_multiplier;
+    }
     state->gnu_hash =
         (state->gnu_hash << 5) + state->gnu_hash + byte;
     state->sysv_hash = (state->sysv_hash << 4) + byte;
@@ -20802,7 +20828,8 @@ static void symbol_lookup_query_finish(
     query->key.length = length;
     query->key.fingerprint = known_key
         ? known_key->fingerprint
-        : symbol_name_fingerprint_n(name, length);
+        : state->fingerprint_body +
+          g_symbol_name_fingerprint_seed * state->fingerprint_power;
     query->key.gnu_hash = state->gnu_hash;
     query->key.dynstr_offset = UINT32_MAX;
     query->keyed_hash = state->keyed_hash_enabled
@@ -21600,6 +21627,146 @@ static int loaded_symbol_name_refs_radix_sort(
     return 1;
 }
 
+/* Most DYNSYM tables reference each string-table name once or only a few
+ * times.  Build those keys in place without allocating and sorting a second
+ * pointer-sized record per symbol.  A hostile table can make every symbol a
+ * long overlapping suffix, so bound the aggregate name bytes and fall back
+ * to the shared reverse-table algorithm below.  The abandoned attempt adds
+ * at most a constant multiple of DT_STRSZ to that linear fallback.  The
+ * forward polynomial and reverse recurrence are algebraically identical;
+ * the runtime-random multiplier makes the fingerprint a useful work filter,
+ * while the final exact byte comparison remains authoritative. */
+static int loaded_symbol_name_key_direct(
+    const struct loaded_obj *obj, uint32_t offset,
+    struct loaded_symbol_name_key *destination, size_t *work_budget)
+{
+    const char *name;
+    size_t capacity;
+    size_t length;
+    uint64_t fingerprint_body = 0;
+    uint64_t fingerprint_power = 1;
+    uint32_t gnu_hash = UINT32_C(5381);
+
+    if (!obj || !destination || !work_budget ||
+        offset >= obj->dynstr_size)
+        return -1;
+    name = obj->dynstr + offset;
+    capacity = obj->dynstr_size - offset;
+    for (length = 0; length < capacity; length++) {
+        uint8_t byte;
+
+        if (*work_budget == 0)
+            return 0;
+        (*work_budget)--;
+        byte = (uint8_t)name[length];
+        if (byte == 0)
+            break;
+        fingerprint_body +=
+            g_symbol_name_byte_mix[byte] * fingerprint_power;
+        fingerprint_power *= g_symbol_name_fingerprint_multiplier;
+        gnu_hash = (gnu_hash << 5) + gnu_hash + byte;
+    }
+    if (length == capacity)
+        return -1;
+    destination->fingerprint = fingerprint_body +
+        g_symbol_name_fingerprint_seed * fingerprint_power;
+    destination->length = length;
+    destination->gnu_hash = gnu_hash;
+    destination->dynstr_offset = offset;
+    return 1;
+}
+
+static int build_loaded_symbol_name_keys_direct(
+    struct loaded_obj *obj, struct loaded_symbol_name_key *keys,
+    struct loaded_version_name_index *version_keys, size_t expected_refs)
+{
+    size_t work_budget;
+    size_t refs = 0;
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+    size_t version_visits = 0;
+#endif
+
+    if (!obj || !keys || obj->dynstr_size > SIZE_MAX / 2)
+        return 0;
+    work_budget = obj->dynstr_size * 2;
+    for (uint32_t i = 0; i < obj->dynsym_count; i++) {
+        const Elf64_Sym *symbol = &obj->dynsym[i];
+        int status;
+
+        if (symbol->st_name >= obj->dynstr_size ||
+            (obj->versym &&
+             !loaded_symbol_version_value_is_admitted(
+                 obj, obj->versym[i])))
+            return -1;
+        status = loaded_symbol_name_key_direct(
+            obj, symbol->st_name, &keys[i], &work_budget);
+        if (status <= 0)
+            return status;
+        refs++;
+    }
+    if (obj->version_index) {
+        if (!version_keys)
+            return -1;
+        for (uint32_t page = 0; page < DL_VERSION_PAGE_COUNT; page++) {
+            uint32_t first;
+            uint32_t limit;
+
+            if (obj->version_index->page_slots[page] == 0)
+                continue;
+            first = page << DL_VERSION_PAGE_BITS;
+            limit = first + DL_VERSION_PAGE_ENTRIES;
+            if (first < 2)
+                first = 2;
+            for (uint32_t version = first; version < limit; version++) {
+                const struct loaded_version_entry *entry =
+                    loaded_version_index_entry(obj, (uint16_t)version);
+                struct loaded_version_name_entry *destination =
+                    loaded_version_name_index_entry_mutable(
+                        version_keys, (uint16_t)version);
+                int status;
+
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+                version_visits++;
+#endif
+                if (!entry)
+                    continue;
+                if (!destination)
+                    return -1;
+                if (entry->flags & DL_VERSION_ENTRY_DEFINED) {
+                    status = loaded_symbol_name_key_direct(
+                        obj, entry->definition_name,
+                        &destination->definition, &work_budget);
+                    if (status <= 0)
+                        return status;
+                    refs++;
+                }
+                if (entry->flags & DL_VERSION_ENTRY_NEEDED) {
+                    status = loaded_symbol_name_key_direct(
+                        obj, entry->needed_name, &destination->needed,
+                        &work_budget);
+                    if (status <= 0)
+                        return status;
+                    status = loaded_symbol_name_key_direct(
+                        obj, entry->provider_name, &destination->provider,
+                        &work_budget);
+                    if (status <= 0)
+                        return status;
+                    refs += 2;
+                }
+            }
+        }
+    }
+    if (refs != expected_refs)
+        return -1;
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+    if (obj->versym)
+        g_versym_value_reads += obj->dynsym_count;
+    g_version_key_admission_visits += version_visits;
+    g_symbol_name_direct_builds++;
+#endif
+    return 1;
+}
+
 /* Compute the key for every referenced string-table suffix in one reverse
  * pass.  A hostile table may point N symbols at N overlapping suffixes of
  * one long string; hashing every suffix independently would be quadratic.
@@ -21634,6 +21801,7 @@ static int build_loaded_symbol_name_keys(struct loaded_obj *obj)
     int dynsym_readonly;
     int versym_readonly;
     int have_name_index = 0;
+    int direct_keys_status;
     int used_radix_sort = 0;
     int result = -1;
 
@@ -21762,6 +21930,20 @@ static int build_loaded_symbol_name_keys(struct loaded_obj *obj)
     if (have_name_index)
         name_index = (struct loaded_symbol_name_index *)(
             mapping + name_index_offset);
+    direct_keys_status = build_loaded_symbol_name_keys_direct(
+        obj, keys, version_keys, refs_count);
+    if (direct_keys_status < 0)
+        goto out;
+    if (direct_keys_status > 0)
+        goto build_name_index;
+
+    /* A suffix-heavy table may exhaust the direct work budget after filling
+     * a prefix.  Restore the mapping before it becomes radix scratch. */
+    memset(mapping, 0, mapping_size);
+    if (version_keys)
+        memcpy(version_keys->page_slots,
+               obj->version_index->page_slots,
+               sizeof(version_keys->page_slots));
     refs = mmap(NULL, refs_size, PROT_READ | PROT_WRITE,
                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (refs == MAP_FAILED)
@@ -21876,9 +22058,8 @@ static int build_loaded_symbol_name_keys(struct loaded_obj *obj)
                 if (suffix_length == SIZE_MAX - 1)
                     goto out;
                 suffix_length++;
-                fingerprint =
-                    (fingerprint ^ ((uint64_t)byte + UINT64_C(0x100))) *
-                    g_symbol_name_fingerprint_multiplier;
+                fingerprint = g_symbol_name_byte_mix[byte] +
+                    g_symbol_name_fingerprint_multiplier * fingerprint;
                 /* For a suffix of length L, H = 5381*33^L + body.
                  * Prepending c adds (5381*32+c)*33^L modulo 2^32. */
                 gnu_hash += (UINT32_C(5381) * UINT32_C(32) + byte) *
@@ -21895,6 +22076,7 @@ static int build_loaded_symbol_name_keys(struct loaded_obj *obj)
             remaining--;
         } while (remaining != 0 && refs[remaining - 1].offset == position);
     }
+build_name_index:
     if (name_index) {
         size_t bucket_count =
             (size_t)name_index_bucket_mask + 1U;

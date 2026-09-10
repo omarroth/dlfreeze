@@ -780,6 +780,7 @@ static int symbol_name_span_gate(void)
         struct loaded_obj object = prototype;
 
         symbols[0].st_name = minimum;
+        g_symbol_name_direct_builds = 0;
         g_symbol_name_admission_bytes = g_symbol_name_ref_boundaries = 0;
         if (build_loaded_symbol_name_keys(&object) < 0) {
             valid = 0;
@@ -787,7 +788,8 @@ static int symbol_name_span_gate(void)
         }
         /* Long spans, duplicate references, suffix sharing, empty strings,
          * and an unused prefix all retain exactly the ordinary query keys. */
-        if (g_symbol_name_ref_boundaries != 6 ||
+        if (g_symbol_name_direct_builds != 0 ||
+            g_symbol_name_ref_boundaries != 6 ||
             g_symbol_name_admission_bytes != strings_size - minimum)
             valid = 0;
         for (size_t i = 0; i < count; i++) {
@@ -1126,8 +1128,10 @@ static int mutable_dynsym_name_gate(void)
     object.dynsym = symbols;
     object.dynsym_count = 2;
     object.dynsym_admitted_count = 2;
+    g_symbol_name_direct_builds = 0;
     if (vfs_seed_hash_key(key_bytes) < 0 ||
         build_loaded_symbol_name_keys(&object) < 0 ||
+        g_symbol_name_direct_builds != 1 ||
         !object.dynstr_readonly || !object.dynsym_readonly ||
         g_nobj != 0)
         goto out;
@@ -2300,7 +2304,7 @@ static int symbol_lookup_complexity_gate(void)
     global_object_installed = 1;
     clear_resolution_caches();
     g_symbol_query_forward_bytes = 0;
-    g_symbol_query_reverse_bytes = 0;
+    g_symbol_query_fingerprint_bytes = 0;
     g_symbol_query_sysv_bytes = 0;
     {
         struct symbol_lookup_query first;
@@ -2327,7 +2331,7 @@ static int symbol_lookup_complexity_gate(void)
             first.sysv_hash_valid || !first.sysv_hash_deferred ||
             second.sysv_hash_valid || !second.sysv_hash_deferred ||
             g_symbol_query_forward_bytes != 0 ||
-            g_symbol_query_reverse_bytes != 0 ||
+            g_symbol_query_fingerprint_bytes != 0 ||
             g_symbol_query_sysv_bytes != 0 ||
             !symbol_lookup_query_keyed_hash(
                 &first, &first_keyed_hash) ||
@@ -2371,7 +2375,7 @@ static int symbol_lookup_complexity_gate(void)
             changed_epoch.sysv_hash_valid ||
             !changed_epoch.sysv_hash_deferred ||
             g_symbol_query_forward_bytes != 0 ||
-            g_symbol_query_reverse_bytes != 0)
+            g_symbol_query_fingerprint_bytes != 0)
             goto out;
 
         excessive.length = g_all_objs[0].dynstr_size;
@@ -2395,7 +2399,7 @@ static int symbol_lookup_complexity_gate(void)
             first.gnu_hash == second.gnu_hash ||
             g_symbol_query_forward_bytes !=
                 2 * payload_length ||
-            g_symbol_query_reverse_bytes != 2 * payload_length)
+            g_symbol_query_fingerprint_bytes != 0)
             goto out;
         if (!symbol_lookup_query_init(strings + 1, &changed_epoch) ||
             !symbol_queries_equal(&second, &changed_epoch))
