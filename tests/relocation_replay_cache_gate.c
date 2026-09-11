@@ -906,6 +906,10 @@ static int prelinked_phase_plan_gate(void)
     int has_resolvers = 0;
     int valid = 0;
     Elf64_Rela pinned_relocation;
+    const size_t ordinary_values_offset =
+        (sizeof(fixture.fixups) + sizeof(expected_phases) +
+         _Alignof(uint64_t) - 1U) &
+        ~((size_t)_Alignof(uint64_t) - 1U);
 
     if (!initialize_prelinked_phase_plan_fixture(&fixture))
         return 0;
@@ -919,12 +923,21 @@ static int prelinked_phase_plan_gate(void)
     if (prepare_prelinked_phase_plan_fixture(&fixture) !=
             PRELINKED_RUNTIME_AUTHORITY_READY ||
         !fixture.admitted_fixups || !fixture.plan.phases ||
+        !fixture.plan.ordinary_values ||
         fixture.snapshot.mapping_size !=
-            sizeof(fixture.fixups) + sizeof(expected_phases) ||
+            ordinary_values_offset +
+                sizeof(uint64_t) *
+                    (sizeof(expected_phases) / sizeof(expected_phases[0])) ||
         memcmp(fixture.admitted_fixups, fixture.fixups,
                sizeof(fixture.fixups)) != 0 ||
         memcmp(fixture.plan.phases, expected_phases,
                sizeof(expected_phases)) != 0 ||
+        fixture.plan.ordinary_values[0] !=
+            (uint64_t)(uintptr_t)(fixture.mapping + 512) ||
+        fixture.plan.ordinary_values[1] != 0 ||
+        fixture.plan.ordinary_values[2] != 0 ||
+        fixture.plan.ordinary_values[3] != 0 ||
+        fixture.plan.ordinary_values[4] != 0 ||
         g_prelinked_phase_plan_classified != 5 ||
         g_prelinked_phase_plan_stable != 4 ||
         g_relocation_ifunc_classification_calls != 2 ||
@@ -1006,7 +1019,7 @@ static int prelinked_phase_plan_gate(void)
     g_prelinked_phase_plan_force_allocation_failure = 1;
     if (prepare_prelinked_phase_plan_fixture(&fixture) !=
             PRELINKED_RUNTIME_AUTHORITY_READY ||
-        fixture.plan.phases ||
+        fixture.plan.phases || fixture.plan.ordinary_values ||
         fixture.snapshot.mapping_size != sizeof(fixture.fixups) ||
         g_prelinked_phase_plan_fallbacks != 1 ||
         g_prelinked_phase_plan_publications != 0 ||
@@ -1022,7 +1035,7 @@ static int prelinked_phase_plan_gate(void)
     g_prelinked_phase_plan_force_protection_failure = 1;
     if (prepare_prelinked_phase_plan_fixture(&fixture) !=
             PRELINKED_RUNTIME_AUTHORITY_READY ||
-        fixture.plan.phases ||
+        fixture.plan.phases || fixture.plan.ordinary_values ||
         fixture.snapshot.mapping_size != sizeof(fixture.fixups) ||
         g_prelinked_phase_plan_fallbacks != 1 ||
         g_prelinked_phase_plan_publications != 0 ||
@@ -1049,6 +1062,7 @@ static int prelinked_phase_plan_gate(void)
     if (prepare_prelinked_phase_plan_fixture(&fixture) !=
             PRELINKED_RUNTIME_AUTHORITY_INVALID ||
         fixture.snapshot.mapping || fixture.plan.phases ||
+        fixture.plan.ordinary_values ||
         g_prelinked_phase_plan_classified != 0)
         goto out;
     fixture.fixups[0] = 0;

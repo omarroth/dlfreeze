@@ -31346,6 +31346,7 @@ enum prelinked_fixup_phase {
 
 struct prelinked_relocation_phase_plan {
     const uint8_t *phases;
+    const uint64_t *ordinary_values;
     const struct loaded_obj *scope;
     uint32_t fixup_count;
     uint32_t cache_epoch;
@@ -31441,12 +31442,28 @@ static int relocation_resolves_gnu_unique(
            ELF64_ST_BIND(definition->st_info) == STB_GNU_UNIQUE;
 }
 
+/* The gmon refusal is attached to the selected target-libc definition and
+ * its exact symbol query.  A binding value may bypass replay lookup only
+ * after preserving that same policy decision. */
+static int relocation_definition_requires_native_glibc_gmon(
+    struct loaded_obj *requester, uint32_t sym_index,
+    struct loaded_obj *objs, int nobj,
+    const struct loaded_obj *owner)
+{
+    struct symbol_lookup_query query;
+
+    return !symbol_lookup_query_init_dynsym(
+                requester, sym_index, objs, nobj, &query) ||
+           selected_definition_requires_native_glibc_gmon(owner, &query);
+}
+
 /* Classify a symbolic relocation without invoking its resolver.  This must
  * mirror resolve_relocation_symbol's override precedence: a loader-provided
  * ABI shim suppresses an underlying ELF IFUNC definition. */
-static int relocation_symbol_ifunc_classification(
+static int relocation_symbol_ifunc_classification_with_value(
     struct loaded_obj *requester, uint32_t sym_index,
-    struct loaded_obj *objs, int nobj, int *stable_out)
+    struct loaded_obj *objs, int nobj, int *stable_out,
+    uint64_t *ordinary_value_out)
 {
     const Elf64_Sym *reference;
     const Elf64_Sym *definition;
@@ -31457,6 +31474,8 @@ static int relocation_symbol_ifunc_classification(
 
     if (stable_out)
         *stable_out = 0;
+    if (ordinary_value_out)
+        *ordinary_value_out = 0;
 
 #ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
     g_relocation_ifunc_classification_calls++;
@@ -31464,6 +31483,28 @@ static int relocation_symbol_ifunc_classification(
 
     if (relocation_definition_cache_ifunc_lookup(
             requester, sym_index, objs, nobj, &is_ifunc)) {
+        if (!is_ifunc && ordinary_value_out) {
+            struct loaded_obj *cached_owner = NULL;
+            const Elf64_Sym *cached_definition = NULL;
+
+            special = lookup_relocation_special(
+                requester, sym_index, objs, nobj, 0);
+            if (special) {
+                *ordinary_value_out = special;
+            } else if (!relocation_definition_cache_lookup(
+                           requester, sym_index, objs, nobj, 0,
+                           &cached_owner, &cached_definition) ||
+                       !resolve_defined_symbol_address(
+                           cached_owner, cached_definition,
+                           ordinary_value_out, NULL) ||
+                       relocation_definition_requires_native_glibc_gmon(
+                           requester, sym_index, objs, nobj,
+                           cached_owner)) {
+                if (stable_out)
+                    *stable_out = 0;
+                return is_ifunc;
+            }
+        }
         if (stable_out)
             *stable_out = 1;
         return is_ifunc;
@@ -31483,6 +31524,12 @@ static int relocation_symbol_ifunc_classification(
         if (definition && owner) {
             stable = relocation_definition_cache_ifunc_store(
                 requester, sym_index, objs, nobj, is_ifunc);
+            if (stable && !is_ifunc && ordinary_value_out &&
+                (!resolve_defined_symbol_address(
+                     owner, definition, ordinary_value_out, NULL) ||
+                 relocation_definition_requires_native_glibc_gmon(
+                     requester, sym_index, objs, nobj, owner)))
+                stable = 0;
             if (stable_out)
                 *stable_out = stable;
         }
@@ -31498,6 +31545,8 @@ static int relocation_symbol_ifunc_classification(
          * classification as part of this exact epoch too. */
         stable = relocation_definition_cache_ifunc_store(
             requester, sym_index, objs, nobj, 0);
+        if (stable && ordinary_value_out)
+            *ordinary_value_out = special;
         if (stable_out)
             *stable_out = stable;
         return 0;
@@ -31510,10 +31559,24 @@ static int relocation_symbol_ifunc_classification(
     if (definition && owner) {
         stable = relocation_definition_cache_ifunc_store(
             requester, sym_index, objs, nobj, is_ifunc);
+        if (stable && !is_ifunc && ordinary_value_out &&
+            (!resolve_defined_symbol_address(
+                 owner, definition, ordinary_value_out, NULL) ||
+             relocation_definition_requires_native_glibc_gmon(
+                 requester, sym_index, objs, nobj, owner)))
+            stable = 0;
         if (stable_out)
             *stable_out = stable;
     }
     return is_ifunc;
+}
+
+static int relocation_symbol_ifunc_classification(
+    struct loaded_obj *requester, uint32_t sym_index,
+    struct loaded_obj *objs, int nobj, int *stable_out)
+{
+    return relocation_symbol_ifunc_classification_with_value(
+        requester, sym_index, objs, nobj, stable_out, NULL);
 }
 
 /* Phase filtering may bypass validate_relocation_record(), but only when
@@ -31544,11 +31607,15 @@ static int relocation_symbol_is_ifunc(
  * consumes per-symbol calling-convention metadata. */
 static uint8_t prelinked_relocation_stable_phase(
     struct loaded_obj *obj, struct loaded_obj *scope, int scope_count,
-    enum loaded_rela_table table, const Elf64_Rela *rel)
+    enum loaded_rela_table table, const Elf64_Rela *rel,
+    uint64_t *ordinary_value_out)
 {
     uint32_t type;
     uint32_t sym_index;
     uint8_t phase = PRELINKED_FIXUP_PHASE_LEGACY;
+
+    if (ordinary_value_out)
+        *ordinary_value_out = 0;
 
 #ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
     g_prelinked_phase_plan_classified++;
@@ -31573,8 +31640,9 @@ static uint8_t prelinked_relocation_stable_phase(
         if (sym_index == 0) {
             phase = PRELINKED_FIXUP_PHASE_ORDINARY;
         } else {
-            is_ifunc = relocation_symbol_ifunc_classification(
-                obj, sym_index, scope, scope_count, &stable);
+            is_ifunc = relocation_symbol_ifunc_classification_with_value(
+                obj, sym_index, scope, scope_count, &stable,
+                ordinary_value_out);
             if (stable)
                 phase = is_ifunc ? PRELINKED_FIXUP_PHASE_IFUNC
                                  : PRELINKED_FIXUP_PHASE_ORDINARY;
@@ -32290,12 +32358,11 @@ static int apply_copy_relocation(struct loaded_obj *obj,
     return 0;
 }
 
-static int apply_prelinked_runtime_reloc(struct loaded_obj *obj,
-                                         struct loaded_obj *objs, int nobj,
-                                         const Elf64_Rela *rel,
-                                         enum loaded_rela_table table,
-                                         enum relocation_pass pass,
-                                         int phase_proven)
+static int apply_prelinked_runtime_reloc_with_value(
+    struct loaded_obj *obj, struct loaded_obj *objs, int nobj,
+    const Elf64_Rela *rel, enum loaded_rela_table table,
+    enum relocation_pass pass, int phase_proven,
+    const uint64_t *ordinary_value)
 {
     uint64_t base = obj->base;
     uint32_t type = ELF64_R_TYPE(rel->r_info);
@@ -32419,6 +32486,29 @@ static int apply_prelinked_runtime_reloc(struct loaded_obj *obj,
 
     if (type == ARCH_RELOC_RELATIVE) {
         relocation_store_u64(relocation_slot, base + rel->r_addend);
+        return 0;
+    }
+
+    /* The read-only startup plan may carry the exact non-IFUNC binding which
+     * its immutable phase-classification lookup already selected.  Consume
+     * it only for that same proven ordinary symbolic relocation, before any
+     * callback or scope publication can advance the cache epoch. */
+    if (ordinary_value && phase_proven && !symbolic_ifunc &&
+        (type == ARCH_RELOC_ABS || type == ARCH_RELOC_GLOB_DAT ||
+         type == ARCH_RELOC_JUMP_SLOT)) {
+        uint64_t value = *ordinary_value;
+
+        if (type == ARCH_RELOC_ABS)
+            value += rel->r_addend;
+        relocation_store_u64(relocation_slot, value);
+        if (g_debug) {
+            ldr_msg("[loader] relocation ");
+            if (symbol_query.name)
+                ldr_msg_symbol_query(&symbol_query);
+            else
+                ldr_msg("<STN_UNDEF>");
+            ldr_dbg_hex(" -> 0x", value);
+        }
         return 0;
     }
 
@@ -32629,10 +32719,19 @@ static int apply_prelinked_runtime_reloc(struct loaded_obj *obj,
     return 0;
 }
 
+static inline __attribute__((unused)) int apply_prelinked_runtime_reloc(
+    struct loaded_obj *obj, struct loaded_obj *objs, int nobj,
+    const Elf64_Rela *rel, enum loaded_rela_table table,
+    enum relocation_pass pass, int phase_proven)
+{
+    return apply_prelinked_runtime_reloc_with_value(
+        obj, objs, nobj, rel, table, pass, phase_proven, NULL);
+}
+
 static int apply_one_prelinked_runtime_fixup(
     struct loaded_obj *obj, struct loaded_obj *scope, int scope_count,
     const uint32_t *encoded_fixup, enum relocation_pass pass,
-    int phase_proven)
+    int phase_proven, const uint64_t *ordinary_value)
 {
     Elf64_Rela relocation;
     uint32_t encoded;
@@ -32652,8 +32751,9 @@ static int apply_one_prelinked_runtime_fixup(
         ldr_err("invalid pre-linked runtime fixup in", obj->name);
         return -1;
     }
-    return apply_prelinked_runtime_reloc(
-        obj, scope, scope_count, &relocation, table, pass, phase_proven);
+    return apply_prelinked_runtime_reloc_with_value(
+        obj, scope, scope_count, &relocation, table, pass, phase_proven,
+        ordinary_value);
 }
 
 static int apply_prelinked_runtime_fixups_for_phase(
@@ -32679,7 +32779,8 @@ static int apply_prelinked_runtime_fixups_for_phase(
             g_prelinked_phase_plan_legacy_visits++;
 #endif
             if (apply_one_prelinked_runtime_fixup(
-                    obj, scope, scope_count, fixups + f, pass, 0) < 0)
+                    obj, scope, scope_count, fixups + f, pass, 0,
+                    NULL) < 0)
                 return -1;
         }
         return 0;
@@ -32705,7 +32806,11 @@ static int apply_prelinked_runtime_fixups_for_phase(
 #endif
         if (apply_one_prelinked_runtime_fixup(
                 obj, scope, scope_count, fixups + f, pass,
-                planned_phase != PRELINKED_FIXUP_PHASE_LEGACY) < 0)
+                planned_phase != PRELINKED_FIXUP_PHASE_LEGACY,
+                planned_phase == PRELINKED_FIXUP_PHASE_ORDINARY &&
+                        phase_plan->ordinary_values
+                    ? &phase_plan->ordinary_values[global_fixup_off + f]
+                    : NULL) < 0)
             return -1;
     }
     return 0;
@@ -32747,13 +32852,14 @@ static int prelinked_relocation_requires_runtime_fixup(
  * objects, then DT_RELA order followed by DT_JMPREL order within each object.
  * Re-derive that sequence from the validated mapped ELF instead of trusting
  * offsets/counts which could omit, duplicate, or reorder a runtime fixup. */
-static int validate_prelinked_runtime_fixups(
+static int validate_prelinked_runtime_fixups_with_values(
     struct loaded_obj *objs, int nobj,
     const struct dlfrz_lib_meta *metas, const int *idx_map,
     const struct dlfrz_entry *entries, uint32_t num_entries,
     const uint32_t *runtime_fixups,
     uint32_t runtime_fixup_count,
-    uint8_t *derived_phases)
+    uint8_t *derived_phases,
+    uint64_t *derived_ordinary_values)
 {
     uint64_t expected_total = 0;
 
@@ -32860,10 +32966,14 @@ static int validate_prelinked_runtime_fixups(
                            sizeof(admitted_encoded));
                     if (admitted_encoded != encoded)
                         return -1;
-                    if (derived_phases)
+                    if (derived_phases) {
                         derived_phases[expected_total] =
                             prelinked_relocation_stable_phase(
-                                obj, objs, nobj, table, &relocation);
+                                obj, objs, nobj, table, &relocation,
+                                derived_ordinary_values
+                                    ? &derived_ordinary_values[expected_total]
+                                    : NULL);
+                    }
                     expected_total++;
                     expected_object++;
                 }
@@ -32883,14 +32993,27 @@ static int validate_prelinked_runtime_fixups(
     return expected_total == runtime_fixup_count ? 0 : -1;
 }
 
+static int validate_prelinked_runtime_fixups(
+    struct loaded_obj *objs, int nobj,
+    const struct dlfrz_lib_meta *metas, const int *idx_map,
+    const struct dlfrz_entry *entries, uint32_t num_entries,
+    const uint32_t *runtime_fixups, uint32_t runtime_fixup_count,
+    uint8_t *derived_phases)
+{
+    return validate_prelinked_runtime_fixups_with_values(
+        objs, nobj, metas, idx_map, entries, num_entries,
+        runtime_fixups, runtime_fixup_count, derived_phases, NULL);
+}
+
 enum prelinked_runtime_authority_status {
     PRELINKED_RUNTIME_AUTHORITY_INVALID = -2,
     PRELINKED_RUNTIME_AUTHORITY_SNAPSHOT_FAILED = -1,
     PRELINKED_RUNTIME_AUTHORITY_READY = 0,
 };
 
-/* Pin the compact table and its loader-derived phase proof in one mapping,
- * adding one byte per fixup without adding a successful-path VM syscall.
+/* Pin the compact table, loader-derived phase proof, and immediately usable
+ * ordinary binding values in one mapping without adding a successful-path
+ * VM syscall.
  * The larger mapping is an optimization only: if it cannot be allocated or
  * sealed, recreate the exact historical fixup-only snapshot and re-run the
  * canonical proof with no phase hints.  A canonical mismatch is never an
@@ -32906,6 +33029,9 @@ prepare_prelinked_runtime_authority(
     struct prelinked_relocation_phase_plan *phase_plan)
 {
     size_t fixup_bytes;
+    size_t phase_end;
+    size_t ordinary_values_offset;
+    size_t ordinary_values_bytes;
     size_t combined_bytes;
     void *writable = NULL;
     int saved_loader_errno;
@@ -32923,33 +33049,47 @@ prepare_prelinked_runtime_authority(
                                sizeof(*runtime_fixups), &fixup_bytes))
         return PRELINKED_RUNTIME_AUTHORITY_SNAPSHOT_FAILED;
     combined_bytes = fixup_bytes;
-    if (prelinked_phase_plan_count_worthwhile(runtime_fixup_count) &&
-        !__builtin_add_overflow(combined_bytes,
-                                (size_t)runtime_fixup_count,
-                                &combined_bytes) &&
-        runtime_fixup_count != 0) {
-        saved_loader_errno = g_loader_errno;
+    if (runtime_fixup_count != 0 &&
+        prelinked_phase_plan_count_worthwhile(runtime_fixup_count) &&
+        !__builtin_add_overflow(
+            fixup_bytes, (size_t)runtime_fixup_count, &phase_end) &&
+        !__builtin_add_overflow(
+            phase_end, _Alignof(uint64_t) - 1U,
+            &ordinary_values_offset)) {
+        ordinary_values_offset &=
+            ~((size_t)_Alignof(uint64_t) - 1U);
+        if (!__builtin_mul_overflow(
+                (size_t)runtime_fixup_count, sizeof(uint64_t),
+                &ordinary_values_bytes) &&
+            !__builtin_add_overflow(
+                ordinary_values_offset, ordinary_values_bytes,
+                &combined_bytes)) {
+            saved_loader_errno = g_loader_errno;
 #ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
-        if (!g_prelinked_phase_plan_force_allocation_failure)
+            if (!g_prelinked_phase_plan_force_allocation_failure)
 #endif
-            have_combined = loader_readonly_snapshot_allocate(
-                combined_bytes, snapshot, &writable) == 0;
-        if (!have_combined)
-            g_loader_errno = saved_loader_errno;
+                have_combined = loader_readonly_snapshot_allocate(
+                    combined_bytes, snapshot, &writable) == 0;
+            if (!have_combined)
+                g_loader_errno = saved_loader_errno;
+        }
     }
 
     if (have_combined) {
         uint8_t *derived_phases =
             (uint8_t *)writable + fixup_bytes;
+        uint64_t *derived_ordinary_values =
+            (uint64_t *)((uint8_t *)writable + ordinary_values_offset);
 
         memcpy(writable, runtime_fixups, fixup_bytes);
         memset(derived_phases, PRELINKED_FIXUP_PHASE_LEGACY,
                runtime_fixup_count);
+        memset(derived_ordinary_values, 0, ordinary_values_bytes);
         classification_epoch = g_cache_epoch;
-        if (validate_prelinked_runtime_fixups(
+        if (validate_prelinked_runtime_fixups_with_values(
                 objs, nobj, metas, idx_map, entries, num_entries,
                 (const uint32_t *)writable, runtime_fixup_count,
-                derived_phases) < 0) {
+                derived_phases, derived_ordinary_values) < 0) {
             loader_readonly_snapshot_release(snapshot);
             return PRELINKED_RUNTIME_AUTHORITY_INVALID;
         }
@@ -32961,6 +33101,9 @@ prepare_prelinked_runtime_authority(
             *admitted_fixups_out =
                 (const uint32_t *)snapshot->bytes;
             phase_plan->phases = snapshot->bytes + fixup_bytes;
+            phase_plan->ordinary_values =
+                (const uint64_t *)(const void *)(
+                    snapshot->bytes + ordinary_values_offset);
             phase_plan->scope = objs;
             phase_plan->fixup_count = runtime_fixup_count;
             phase_plan->cache_epoch = classification_epoch;
