@@ -1033,7 +1033,7 @@ static void *ldr_memset(void *destination, int value, size_t length)
 
 #define LDR_MEMCHR_WORD_BATCH 4U
 #define LDR_MEMCHR_VECTOR_BYTES 16U
-#define LDR_MEMCHR_VECTOR_BATCH 4U
+#define LDR_MEMCHR_VECTOR_BATCH 8U
 
 typedef unsigned char ldr_byte_vector
     __attribute__((__vector_size__(LDR_MEMCHR_VECTOR_BYTES)));
@@ -1223,10 +1223,10 @@ static void *ldr_memchr(const void *memory, int value, size_t length)
                     (LDR_MEMCHR_VECTOR_BYTES - 1U)) == 0,
                    "loader vector size must be a power of two");
     /* Both supported ELF64 architectures provide a baseline 16-byte vector
-     * ISA (SSE2 on x86-64, Advanced SIMD on AArch64).  Load four increasing
+     * ISA (SSE2 on x86-64, Advanced SIMD on AArch64).  Load eight increasing
      * vectors without an alignment precondition, retain their equality
      * results, and reduce their OR once for the overwhelmingly common
-     * 64-byte miss.  A hit inspects those saved results in address order, so
+     * 128-byte miss.  A hit inspects those saved results in address order, so
      * first-match semantics require no second read and remain independent of
      * endian.  Every load is entered only when its complete vector is inside
      * the caller's declared span. */
@@ -1252,7 +1252,26 @@ static void *ldr_memchr(const void *memory, int value, size_t length)
             ldr_byte_vector_load(
                 cursor + 3U * LDR_MEMCHR_VECTOR_BYTES), vector_pattern);
         LDR_MEMCHR_COUNT(g_ldr_memchr_vector_loads);
-        combined = matches[0] | matches[1] | matches[2] | matches[3];
+        matches[4] = ldr_byte_vector_equal(
+            ldr_byte_vector_load(
+                cursor + 4U * LDR_MEMCHR_VECTOR_BYTES), vector_pattern);
+        LDR_MEMCHR_COUNT(g_ldr_memchr_vector_loads);
+        matches[5] = ldr_byte_vector_equal(
+            ldr_byte_vector_load(
+                cursor + 5U * LDR_MEMCHR_VECTOR_BYTES), vector_pattern);
+        LDR_MEMCHR_COUNT(g_ldr_memchr_vector_loads);
+        matches[6] = ldr_byte_vector_equal(
+            ldr_byte_vector_load(
+                cursor + 6U * LDR_MEMCHR_VECTOR_BYTES), vector_pattern);
+        LDR_MEMCHR_COUNT(g_ldr_memchr_vector_loads);
+        matches[7] = ldr_byte_vector_equal(
+            ldr_byte_vector_load(
+                cursor + 7U * LDR_MEMCHR_VECTOR_BYTES), vector_pattern);
+        LDR_MEMCHR_COUNT(g_ldr_memchr_vector_loads);
+        combined = (matches[0] | matches[1]) |
+                   (matches[2] | matches[3]);
+        combined |= (matches[4] | matches[5]) |
+                    (matches[6] | matches[7]);
         LDR_MEMCHR_COUNT(g_ldr_memchr_vector_batch_reductions);
         if (ldr_byte_vector_has_match(combined)) {
             for (size_t i = 0; i < LDR_MEMCHR_VECTOR_BATCH; i++) {

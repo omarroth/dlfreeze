@@ -4303,6 +4303,26 @@ dlfrz_glibc_x86_cpu_generic_kind(
                 instruction_state[byte] |= DLFRZ_X86_INSN_INTERIOR;
             }
 
+            /* The reachability walk already decodes every instruction that
+             * the later evidence passes are allowed to consume.  Recover
+             * the unique kind-store register here instead of decoding the
+             * complete initializer a second time solely for that witness. */
+            if (instruction.rip_store_register) {
+                uint64_t next_vaddr;
+                uint64_t target_vaddr;
+
+                if (code_vaddr > UINT64_MAX - next)
+                    return 0;
+                next_vaddr = code_vaddr + next;
+                if (dlfrz_glibc_add_signed_u64(
+                        next_vaddr, instruction.rip_displacement,
+                        &target_vaddr) && target_vaddr == cpu_vaddr) {
+                    source_register = instruction.register_number;
+                    kind_store_position = position;
+                    kind_store_count++;
+                }
+            }
+
             if (instruction.direct_branch ||
                 instruction.conditional_branch ||
                 instruction.direct_call) {
@@ -4380,39 +4400,6 @@ dlfrz_glibc_x86_cpu_generic_kind(
                 jump_count++;
             }
         }
-        if (instruction.rip_store_register) {
-            uint64_t next_vaddr;
-            uint64_t target_vaddr;
-
-            if (code_vaddr > UINT64_MAX - next)
-                return 0;
-            next_vaddr = code_vaddr + next;
-            if (dlfrz_glibc_add_signed_u64(
-                    next_vaddr, instruction.rip_displacement,
-                    &target_vaddr) && target_vaddr == cpu_vaddr) {
-                source_register = instruction.register_number;
-                kind_store_position = position;
-                kind_store_count++;
-            }
-        }
-        position = next;
-    }
-    if (kind_store_count != 1 || source_register == ~0U)
-        return 0;
-
-    for (size_t position = 0; position < code_size;) {
-        struct dlfrz_glibc_x86_instruction instruction;
-        size_t next;
-
-        if (!(instruction_state[position] & DLFRZ_X86_INSN_DECODED)) {
-            position++;
-            continue;
-        }
-        if (!dlfrz_glibc_x86_instruction(
-                code + position, code_size - position, &instruction) ||
-            instruction.length > code_size - position)
-            return 0;
-        next = position + instruction.length;
         if (instruction.immediate_register &&
             instruction.register_number == source_register &&
             instruction.immediate != 0 &&
@@ -4429,6 +4416,8 @@ dlfrz_glibc_x86_cpu_generic_kind(
         }
         position = next;
     }
+    if (kind_store_count != 1 || source_register == ~0U)
+        return 0;
     if (assignment_count < 4)
         return 0;
 
@@ -4576,7 +4565,9 @@ dlfrz_glibc_x86_cpu_generic_kind(
 static inline int
 dlfrz_glibc_x86_reachable_instructions(
     const unsigned char *code, size_t code_size, uint64_t code_vaddr,
-    unsigned char *instruction_state, size_t state_size);
+    unsigned char *instruction_state, size_t state_size,
+    unsigned char *preceding_call_targets,
+    size_t preceding_call_target_size);
 
 static inline int
 dlfrz_glibc_x86_cpu_initializer_matches(
@@ -4693,7 +4684,7 @@ dlfrz_glibc_x86_cpu_initializer_matches(
     if (!reachable_state &&
         !dlfrz_glibc_x86_reachable_instructions(
             code, code_size, code_vaddr, local_instruction_state,
-            sizeof(local_instruction_state)))
+            sizeof(local_instruction_state), NULL, 0))
         return 0;
     for (size_t position = 0; position < code_size; position++) {
         struct dlfrz_glibc_x86_rip_write write;
@@ -5529,11 +5520,15 @@ dlfrz_glibc_aarch64_getauxval_contract_valid(
 /* Mark every instruction reachable through the bounded direct-control-flow
  * subset admitted by the CPU initializer decoder.  Direct calls inside the
  * supplied range are part of the closure; indirect transfers and unknown
- * instruction forms fail closed. */
+ * instruction forms fail closed.  When requested, also retain a bit for
+ * each unique direct-call target immediately preceding the range.  This is
+ * evidence from the same decoded instruction stream, not a second parser. */
 static inline int
 dlfrz_glibc_x86_reachable_instructions(
     const unsigned char *code, size_t code_size, uint64_t code_vaddr,
-    unsigned char *instruction_state, size_t state_size)
+    unsigned char *instruction_state, size_t state_size,
+    unsigned char *preceding_call_targets,
+    size_t preceding_call_target_size)
 {
     enum { DLFRZ_X86_REACHABLE_MAX_BLOCKS = 4096 };
     uint16_t worklist[DLFRZ_X86_REACHABLE_MAX_BLOCKS];
@@ -5541,9 +5536,13 @@ dlfrz_glibc_x86_reachable_instructions(
     size_t tail = 0;
 
     if (!code || !instruction_state || code_size == 0 ||
-        code_size > 32768 || state_size <= code_size)
+        code_size > 32768 || state_size <= code_size ||
+        (preceding_call_target_size != 0 && !preceding_call_targets) ||
+        preceding_call_target_size > SIZE_MAX / 8U)
         return 0;
     memset(instruction_state, 0, state_size);
+    if (preceding_call_targets)
+        memset(preceding_call_targets, 0, preceding_call_target_size);
     instruction_state[0] = DLFRZ_X86_INSN_START |
                            DLFRZ_X86_INSN_QUEUED;
     worklist[tail++] = 0;
@@ -5584,6 +5583,18 @@ dlfrz_glibc_x86_reachable_instructions(
                         code_vaddr + next,
                         instruction.branch_displacement, &target_vaddr))
                     return 0;
+                if (instruction.direct_call &&
+                    target_vaddr < code_vaddr) {
+                    uint64_t delta = code_vaddr - target_vaddr;
+
+                    if (delta != 0 &&
+                        delta <= preceding_call_target_size * 8U) {
+                        size_t bit = (size_t)(delta - 1U);
+
+                        preceding_call_targets[bit / 8U] |=
+                            (unsigned char)(1U << (bit % 8U));
+                    }
+                }
                 if (target_vaddr >= code_vaddr &&
                     target_vaddr - code_vaddr < code_size) {
                     size_t target_position =
@@ -5633,6 +5644,8 @@ dlfrz_glibc_x86_cpu_hwcap2_association_valid(
     struct dlfrz_elf64_dyn_view view;
     const unsigned char *initializer_code;
     unsigned char initializer_state[32769];
+    unsigned char preceding_call_targets[
+        DLFRZ_X86_HWCAP2_CLOSURE_LIMIT / 8];
     size_t initializer_offset;
     size_t initializer_size;
     uint64_t selected_helper = 0;
@@ -5661,12 +5674,13 @@ dlfrz_glibc_x86_cpu_hwcap2_association_valid(
     if (!dlfrz_glibc_x86_reachable_instructions(
             initializer_code, initializer_size,
             cpu_contract->initializer_vaddr, initializer_state,
-            sizeof(initializer_state)))
+            sizeof(initializer_state), preceding_call_targets,
+            sizeof(preceding_call_targets)))
         return 0;
 
-    for (size_t position = 0; position < initializer_size;) {
-        struct dlfrz_glibc_x86_instruction instruction;
-        uint64_t next_vaddr;
+    for (size_t target_bit = 0;
+         target_bit < sizeof(preceding_call_targets) * 8U;
+         target_bit++) {
         uint64_t helper_vaddr;
         size_t helper_size;
         size_t helper_offset;
@@ -5675,34 +5689,11 @@ dlfrz_glibc_x86_cpu_hwcap2_association_valid(
         size_t helper_displacement = 0;
         int helper_complete = 0;
 
-        if (!(initializer_state[position] & DLFRZ_X86_INSN_DECODED)) {
-            position++;
+        if (!(preceding_call_targets[target_bit / 8U] &
+              (unsigned char)(1U << (target_bit % 8U))))
             continue;
-        }
-        if (!dlfrz_glibc_x86_instruction(
-                initializer_code + position,
-                initializer_size - position, &instruction) ||
-            instruction.length > initializer_size - position)
-            return 0;
-        if (!instruction.direct_call) {
-            position += instruction.length;
-            continue;
-        }
-        if (cpu_contract->initializer_vaddr > UINT64_MAX - position -
-                instruction.length)
-            return 0;
-        next_vaddr = cpu_contract->initializer_vaddr + position +
-                     instruction.length;
-        if (!dlfrz_glibc_add_signed_u64(
-                next_vaddr, instruction.branch_displacement,
-                &helper_vaddr))
-            return 0;
-        if (helper_vaddr >= cpu_contract->initializer_vaddr ||
-            cpu_contract->initializer_vaddr - helper_vaddr >
-                DLFRZ_X86_HWCAP2_CLOSURE_LIMIT) {
-            position += instruction.length;
-            continue;
-        }
+        helper_vaddr = cpu_contract->initializer_vaddr -
+                       (uint64_t)(target_bit + 1U);
         helper_size = (size_t)(cpu_contract->initializer_vaddr -
                                helper_vaddr);
         /* This is a direct-call target, but stripped ld.so has no reliable
@@ -5771,7 +5762,6 @@ dlfrz_glibc_x86_cpu_hwcap2_association_valid(
             helper_position += helper_instruction.length;
         }
         if (!helper_complete) {
-            position += instruction.length;
             continue;
         }
         if (helper_matches > 1)
@@ -5781,7 +5771,6 @@ dlfrz_glibc_x86_cpu_hwcap2_association_valid(
             selected_displacement = helper_displacement;
             selected_helpers++;
         }
-        position += instruction.length;
     }
     if (selected_helpers != 1)
         return 0;
