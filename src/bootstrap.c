@@ -52,6 +52,9 @@
 #ifndef MADV_WIPEONFORK
 #define MADV_WIPEONFORK 18
 #endif
+#ifndef PR_GET_SECCOMP
+#define PR_GET_SECCOMP 21
+#endif
 
 /*
  * Reserve one program-header slot for the packer to turn into the payload
@@ -4842,6 +4845,80 @@ static int bs_kernel_premap_smaps_matches(
 #endif
 }
 
+/* Construct the two-alias proof used by kernel staging: every selected page
+ * must still be a clean mapping of both its dedicated stage and its canonical
+ * payload location.  In the disposable transfer probe the first alias has
+ * already moved to its target; the parent-side fast admission instead names
+ * the untouched stage. */
+static int bs_kernel_premap_evidence(
+    const struct bs_startup_mremap_plan *plan,
+    uint64_t payload_vaddr, uint64_t payload_filesz,
+    uint64_t payload_foff, int use_source,
+    struct bs_mremap_range evidence[2 * DLFRZ_PREMAP_MAX_PHDRS],
+    struct bs_startup_mremap_plan *proof)
+{
+    size_t merged = 0;
+
+    if (!plan || !plan->kernel_premap || !plan->ranges || !plan->targets ||
+        !plan->count || plan->count > DLFRZ_PREMAP_MAX_PHDRS ||
+        !evidence || !proof)
+        return 0;
+    *proof = *plan;
+    for (size_t i = 0; i < plan->count; i++) {
+        const struct bs_mremap_range *range = &plan->ranges[i];
+
+        if (range->file_offset < payload_foff ||
+            range->file_offset - payload_foff > payload_filesz ||
+            range->length > payload_filesz -
+                (range->file_offset - payload_foff) ||
+            payload_vaddr > UINTPTR_MAX -
+                (range->file_offset - payload_foff))
+            return 0;
+        evidence[2 * i] = *range;
+        evidence[2 * i].target = use_source
+            ? range->source : range->target;
+        evidence[2 * i + 1] = *range;
+        evidence[2 * i + 1].target = (uintptr_t)(payload_vaddr +
+            range->file_offset - payload_foff);
+    }
+    proof->count *= 2;
+    proof->targets = evidence;
+    qsort(evidence, proof->count, sizeof(*evidence), bs_mremap_target_cmp);
+
+    /* Shared source pages are allowed in the loader plan.  Union only exact
+     * same-file translations before feeding the non-overlapping VMA proof. */
+    for (size_t i = 0; i < proof->count; i++) {
+        struct bs_mremap_range *range = &evidence[i];
+
+        if (merged) {
+            struct bs_mremap_range *previous = &evidence[merged - 1];
+            uint64_t previous_end;
+
+            if (!u64_add_checked(previous->target, previous->length,
+                                 &previous_end) ||
+                previous_end > UINTPTR_MAX)
+                return 0;
+            if (range->target < previous_end) {
+                uint64_t delta = range->target - previous->target;
+                uint64_t merged_length;
+
+                if (range->file_offset < previous->file_offset ||
+                    range->file_offset - previous->file_offset != delta ||
+                    !u64_add_checked(delta, range->length,
+                                     &merged_length) ||
+                    merged_length > SIZE_MAX)
+                    return 0;
+                if (merged_length > previous->length)
+                    previous->length = (size_t)merged_length;
+                continue;
+            }
+        }
+        evidence[merged++] = *range;
+    }
+    proof->count = merged;
+    return merged != 0;
+}
+
 static int bs_startup_mremap_target_unions(
     const struct bs_startup_mremap_plan *plan, int reserve)
 {
@@ -5222,40 +5299,12 @@ static void bs_startup_mremap_probe_child(
          * Proving both exact file translations avoids faulting every page
          * merely to compare equal bytes. */
         struct bs_mremap_range evidence[2 * DLFRZ_PREMAP_MAX_PHDRS];
-        struct bs_startup_mremap_plan proof = *plan;
-        if (plan->count > DLFRZ_PREMAP_MAX_PHDRS) goto out;
-        for (size_t i = 0; i < plan->count; i++) {
-            const struct bs_mremap_range *r = &plan->ranges[i];
-            if (r->file_offset < payload_foff ||
-                r->file_offset - payload_foff > payload_filesz ||
-                r->length > payload_filesz - (r->file_offset - payload_foff))
-                goto out;
-            evidence[2 * i] = *r;
-            evidence[2 * i + 1] = *r;
-            evidence[2 * i + 1].target = (uintptr_t)(payload_vaddr +
-                r->file_offset - payload_foff);
-        }
-        proof.count *= 2;
-        proof.targets = evidence;
-        qsort(evidence, proof.count, sizeof(*evidence), bs_mremap_target_cmp);
-        /* Shared source pages are allowed in the loader plan; union exact
-         * same-file translations before feeding the non-overlapping proof. */
-        size_t merged = 0;
-        for (size_t i = 0; i < proof.count; i++) {
-            struct bs_mremap_range *r = &evidence[i];
-            if (merged && r->target < evidence[merged - 1].target +
-                                     evidence[merged - 1].length) {
-                struct bs_mremap_range *prev = &evidence[merged - 1];
-                uint64_t delta = r->target - prev->target;
-                if (r->file_offset < prev->file_offset ||
-                    r->file_offset - prev->file_offset != delta) goto out;
-                if (delta + r->length > prev->length)
-                    prev->length = (size_t)(delta + r->length);
-            } else {
-                evidence[merged++] = *r;
-            }
-        }
-        proof.count = merged;
+        struct bs_startup_mremap_plan proof;
+
+        if (!bs_kernel_premap_evidence(
+                plan, payload_vaddr, payload_filesz, payload_foff, 0,
+                evidence, &proof))
+            goto out;
         ready = bs_kernel_premap_smaps_matches(smaps, &executable, &proof);
     } else {
         ready = bs_mremap_targets_smaps_stream_matches(smaps, &executable, plan);
@@ -5281,6 +5330,96 @@ out:
         ? (ready ? BS_MREMAP_PROBE_READY_WITH_COOKIE
                  : BS_MREMAP_PROBE_COOKIE_ONLY)
         : (ready ? BS_MREMAP_PROBE_READY : BS_MREMAP_PROBE_DECLINED));
+}
+
+/* A -p artifact has kernel-created, read-only staging aliases.  When no
+ * seccomp filter can turn the eventual mremap into a fatal signal, prove the
+ * untouched aliases directly and let the loader consume them once.  This
+ * avoids cloning a process and remapping every startup segment twice.  The
+ * strict parent proof deliberately does not use the child-only VMA-splitting
+ * hint: coarse or dirty accounting simply retains the contained probe. */
+static int bs_kernel_premap_parent_ready(
+    const struct bs_startup_mremap_plan *plan,
+    uint64_t payload_vaddr, uint64_t payload_filesz,
+    uint64_t payload_foff, volatile uint32_t *runtime_fork_cookie,
+    size_t page_size, int *runtime_fork_cookie_ready_out)
+{
+#if defined(SYS_prctl)
+    unsigned char stream_buffer[4096];
+    struct bs_mremap_range evidence[2 * DLFRZ_PREMAP_MAX_PHDRS];
+    struct bs_startup_mremap_plan proof;
+    struct bs_proc_self_context context = {
+        .root_fd = -1,
+        .self_fd = -1,
+    };
+    struct stat executable;
+    struct stat smaps_status;
+    FILE *smaps = NULL;
+    int executable_fd = -1;
+    int smaps_fd = -1;
+    int ready = 0;
+    long seccomp = syscall(SYS_prctl, PR_GET_SECCOMP, 0, 0, 0, 0);
+
+    if (runtime_fork_cookie_ready_out)
+        *runtime_fork_cookie_ready_out = 0;
+    if (seccomp != 0 ||
+        !bs_kernel_premap_evidence(
+            plan, payload_vaddr, payload_filesz, payload_foff, 1,
+            evidence, &proof) ||
+        bs_proc_self_context_open_at("/proc", &context) < 0)
+        goto out;
+    executable_fd = bs_proc_self_executable_open(&context);
+    if (executable_fd < 0 || fstat(executable_fd, &executable) < 0 ||
+        !S_ISREG(executable.st_mode) || executable.st_size < 0 ||
+        executable.st_ino == 0)
+        goto out;
+    for (size_t i = 0; i < plan->count; i++)
+        if (plan->ranges[i].file_offset >
+                (uint64_t)executable.st_size ||
+            plan->ranges[i].length > (uint64_t)executable.st_size -
+                plan->ranges[i].file_offset)
+            goto out;
+    smaps_fd = openat(context.self_fd, "smaps",
+                      O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (!bs_proc_entry_status(smaps_fd, context.device, S_IFREG,
+                              &smaps_status))
+        goto out;
+    smaps = fdopen(smaps_fd, "r");
+    if (!smaps)
+        goto out;
+    smaps_fd = -1;
+    if (setvbuf(smaps, (char *)stream_buffer, _IOFBF,
+                sizeof(stream_buffer)) != 0)
+        goto out;
+    ready = bs_mremap_targets_smaps_stream_matches(
+        smaps, &executable, &proof);
+    if (fclose(smaps) != 0)
+        ready = 0;
+    smaps = NULL;
+    if (ready && runtime_fork_cookie && runtime_fork_cookie_ready_out &&
+        bs_runtime_fork_cookie_establish_at(
+            runtime_fork_cookie, page_size, &context))
+        *runtime_fork_cookie_ready_out = 1;
+out:
+    if (smaps)
+        fclose(smaps);
+    if (smaps_fd >= 0)
+        close(smaps_fd);
+    if (executable_fd >= 0)
+        close(executable_fd);
+    bs_proc_self_context_close(&context);
+    return ready;
+#else
+    (void)plan;
+    (void)payload_vaddr;
+    (void)payload_filesz;
+    (void)payload_foff;
+    (void)runtime_fork_cookie;
+    (void)page_size;
+    if (runtime_fork_cookie_ready_out)
+        *runtime_fork_cookie_ready_out = 0;
+    return 0;
+#endif
 }
 
 /* Return one only when a sufficiently large plan passed in a disposable
@@ -5345,6 +5484,20 @@ static int bs_startup_mremap_source_ready(
     if (runtime_fork_cookie_out)
         runtime_fork_cookie = bs_runtime_fork_cookie_allocate(
             metas, num_entries, (size_t)page_value);
+    int parent_cookie_ready = 0;
+    if (plan.kernel_premap && bs_kernel_premap_parent_ready(
+            &plan, payload_vaddr, payload_filesz, payload_foff,
+            runtime_fork_cookie, (size_t)page_value,
+            &parent_cookie_ready)) {
+        bs_startup_mremap_plan_destroy(&plan);
+        if (runtime_fork_cookie && parent_cookie_ready) {
+            *runtime_fork_cookie_out = runtime_fork_cookie;
+            runtime_fork_cookie = NULL;
+        }
+        if (runtime_fork_cookie)
+            munmap((void *)runtime_fork_cookie, (size_t)page_value);
+        return 1;
+    }
 #ifdef DLFREEZE_BOOTSTRAP_FILEBACK_GATE
     g_bs_mremap_clone_attempts++;
 #endif

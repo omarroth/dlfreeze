@@ -21424,8 +21424,8 @@ static void cache_validated_sysv_hash_view(
     obj->sysv_hash_view_cached = 1;
 }
 
-static const Elf64_Sym *loaded_dynsym(const struct loaded_obj *obj,
-                                      uint32_t index)
+static __attribute__((always_inline)) inline const Elf64_Sym *
+loaded_dynsym(const struct loaded_obj *obj, uint32_t index)
 {
     uintptr_t addr;
 
@@ -21447,8 +21447,9 @@ static const Elf64_Sym *loaded_dynsym(const struct loaded_obj *obj,
     return (const Elf64_Sym *)addr;
 }
 
-static int loaded_versym_value(const struct loaded_obj *obj, uint32_t index,
-                               uint16_t *value)
+static __attribute__((always_inline)) inline int
+loaded_versym_value(const struct loaded_obj *obj, uint32_t index,
+                    uint16_t *value)
 {
     uintptr_t addr;
 
