@@ -30545,6 +30545,45 @@ relocation_definition_cache_entry(
     return NULL;
 }
 
+/* Cache hits dominate relocation replay.  Keep their immutable-table probe
+ * separate from the recursive create/grow path above: entering that much
+ * larger function merely to discover an existing entry otherwise spills a
+ * wide register set on every ordinary and IFUNC phase.  Superseded tables
+ * remain mapped, so a signal-driven publication between the table snapshot
+ * and this bounded walk has the same safe miss semantics as the original
+ * shared path. */
+static inline __attribute__((always_inline))
+struct relocation_definition_cache_ent *
+relocation_definition_cache_lookup_entry(
+    uint16_t requester_index, uint32_t symbol_index,
+    uint16_t object_count, int skip_requester)
+{
+    struct relocation_definition_cache_table *table =
+        g_relocation_definition_table;
+    uint32_t index;
+
+#ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
+    g_relocation_definition_cache_queries++;
+#endif
+    index = relocation_definition_cache_hash(
+        requester_index, symbol_index, object_count, skip_requester) &
+        (table->size - 1U);
+    for (uint32_t probe = 0; probe < table->size; probe++) {
+        struct relocation_definition_cache_ent *entry =
+            &table->entries[index];
+
+        if (entry->epoch != g_cache_epoch)
+            return NULL;
+        if (entry->requester_index == requester_index &&
+            entry->reference_symbol_index == symbol_index &&
+            entry->object_count == object_count &&
+            entry->skip_requester == (skip_requester ? 1 : 0))
+            return entry;
+        index = (index + 1U) & (table->size - 1U);
+    }
+    return NULL;
+}
+
 /* Match lookup_relocation_definition's exact root order.  A single PF_W
  * symbol, string, version, or selected hash table anywhere in that order
  * disables caching for the requester; later relocations must then continue
@@ -30637,9 +30676,9 @@ static int relocation_definition_cache_lookup_with_entry(
                 requester, requester_index, &transient_root))
             return 0;
     }
-    entry = relocation_definition_cache_entry(
+    entry = relocation_definition_cache_lookup_entry(
         (uint16_t)requester_index, symbol_index, (uint16_t)nobj,
-        skip_requester, 0);
+        skip_requester);
     if (!entry || !entry->found ||
         entry->definition_owner_index >= (uint16_t)nobj)
         return 0;
