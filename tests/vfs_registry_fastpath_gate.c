@@ -191,7 +191,7 @@ static int mapped_fd_gate(void)
     memset(&entry, 0, sizeof(entry));
     entry.size = 3;
     entry.inode = 71;
-    if (remember_vfs_regular_fd(fd, &entry) != 0 ||
+    if (remember_vfs_regular_fd(fd, &entry, NULL) != 0 ||
         !vfs_registry_may_have(VFS_REGISTRY_REGULAR_FD_MAPS))
         goto fail;
     acquisitions = g_runtime_loader_lock_acquisitions;
@@ -240,7 +240,7 @@ static int unrelated_fd_hint_gate(void)
     memset(&entry, 0, sizeof(entry));
     entry.size = 5;
     entry.inode = 74;
-    if (remember_vfs_regular_fd(mapped_fd, &entry) != 0)
+    if (remember_vfs_regular_fd(mapped_fd, &entry, NULL) != 0)
         goto fail;
     host_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
     while (host_fd >= 0 &&
@@ -316,7 +316,7 @@ static int recursive_publication_gate(void)
     entry.size = 1;
     entry.inode = 72;
     outer = runtime_loader_lock_acquire();
-    if (remember_vfs_regular_fd(fd, &entry) != 0 ||
+    if (remember_vfs_regular_fd(fd, &entry, NULL) != 0 ||
         vfs_close(fd) != 0 || g_vfs_regular_fd_map_count != 0 ||
         !vfs_registry_may_have(VFS_REGISTRY_REGULAR_FD_MAPS)) {
         runtime_loader_lock_release(outer);
@@ -402,7 +402,8 @@ static int fclose_cleanup_gate(void)
 
         entries[index].size = index + 1;
         entries[index].inode = (ino_t)(1000 + index);
-        if (fd < 0 || remember_vfs_regular_fd(fd, &entries[index]) != 0)
+        if (fd < 0 ||
+            remember_vfs_regular_fd(fd, &entries[index], NULL) != 0)
             return 0;
         streams[index] = fdopen(fd, "r");
         if (!streams[index])
@@ -423,7 +424,7 @@ static int fclose_cleanup_gate(void)
     entries[0].size = 1;
     entries[0].inode = 2000;
     if (g_errno_stub_fd < 0 ||
-        remember_vfs_regular_fd(g_errno_stub_fd, &entries[0]) != 0)
+        remember_vfs_regular_fd(g_errno_stub_fd, &entries[0], NULL) != 0)
         return 0;
     g_real_fileno = errno_stub_fileno;
     g_real_fclose = errno_stub_fclose;
@@ -440,7 +441,7 @@ static int fclose_cleanup_gate(void)
     entries[0].size = 2;
     entries[0].inode = 2001;
     if (g_errno_stub_fd < 0 ||
-        remember_vfs_regular_fd(g_errno_stub_fd, &entries[0]) != 0)
+        remember_vfs_regular_fd(g_errno_stub_fd, &entries[0], NULL) != 0)
         return 0;
     g_real_fileno = NULL;
     errno = EDOM;
@@ -464,7 +465,7 @@ static int fork_snapshot_gate(void)
     memset(&entry, 0, sizeof(entry));
     entry.size = 4;
     entry.inode = 73;
-    if (remember_vfs_regular_fd(fd, &entry) != 0)
+    if (remember_vfs_regular_fd(fd, &entry, NULL) != 0)
         return 0;
     child = fork();
     if (child == 0) {

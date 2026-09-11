@@ -663,6 +663,44 @@ struct dlfrz_elf64_dyn_view {
     uint32_t needed_count;
 };
 
+#ifdef DLFREEZE_ELF64_DYN_VIEW_STARTUP_CACHE
+/* Direct loading validates several independent private-libc contracts against
+ * the same immutable embedded interpreter and libc images.  Keep the shared
+ * dynamic view while that bounded startup phase is active, so every contract
+ * does not rescan the same program headers, dynamic tags, hash tables, and
+ * symbol-name offsets.  The cache is deliberately opt-in: standalone
+ * validators mutate buffers between calls, and runtime filesystem mappings
+ * can reuse virtual addresses after unmap. */
+enum { DLFRZ_ELF64_DYN_VIEW_CACHE_SLOTS = 4 };
+
+struct dlfrz_elf64_dyn_view_cache_entry {
+    const void *data;
+    size_t size;
+    struct dlfrz_elf64_dyn_view view;
+};
+
+static struct dlfrz_elf64_dyn_view_cache_entry
+    dlfrz_elf64_dyn_view_cache[DLFRZ_ELF64_DYN_VIEW_CACHE_SLOTS];
+static size_t dlfrz_elf64_dyn_view_cache_next;
+static int dlfrz_elf64_dyn_view_cache_active;
+
+static inline void dlfrz_elf64_dyn_view_cache_begin(void)
+{
+    memset(dlfrz_elf64_dyn_view_cache, 0,
+           sizeof(dlfrz_elf64_dyn_view_cache));
+    dlfrz_elf64_dyn_view_cache_next = 0;
+    dlfrz_elf64_dyn_view_cache_active = 1;
+}
+
+static inline void dlfrz_elf64_dyn_view_cache_end(void)
+{
+    dlfrz_elf64_dyn_view_cache_active = 0;
+    memset(dlfrz_elf64_dyn_view_cache, 0,
+           sizeof(dlfrz_elf64_dyn_view_cache));
+    dlfrz_elf64_dyn_view_cache_next = 0;
+}
+#endif
+
 static inline int
 dlfrz_elf64_dyn_view_init(const void *data, size_t elf_size,
                           struct dlfrz_elf64_dyn_view *view)
@@ -692,6 +730,19 @@ dlfrz_elf64_dyn_view_init(const void *data, size_t elf_size,
 
     if (!view)
         return 0;
+#ifdef DLFREEZE_ELF64_DYN_VIEW_STARTUP_CACHE
+    if (dlfrz_elf64_dyn_view_cache_active) {
+        for (size_t i = 0; i < DLFRZ_ELF64_DYN_VIEW_CACHE_SLOTS; i++) {
+            const struct dlfrz_elf64_dyn_view_cache_entry *entry =
+                &dlfrz_elf64_dyn_view_cache[i];
+
+            if (entry->data == data && entry->size == elf_size) {
+                memcpy(view, &entry->view, sizeof(*view));
+                return 1;
+            }
+        }
+    }
+#endif
     memset(view, 0, sizeof(*view));
     if (!elf || elf_size < sizeof(ehdr))
         return 0;
@@ -879,6 +930,19 @@ dlfrz_elf64_dyn_view_init(const void *data, size_t elf_size,
     view->have_soname = have_soname;
     view->has_interp = interp_found;
     view->needed_count = needed_count;
+#ifdef DLFREEZE_ELF64_DYN_VIEW_STARTUP_CACHE
+    if (dlfrz_elf64_dyn_view_cache_active) {
+        struct dlfrz_elf64_dyn_view_cache_entry *entry =
+            &dlfrz_elf64_dyn_view_cache[
+                dlfrz_elf64_dyn_view_cache_next %
+                    DLFRZ_ELF64_DYN_VIEW_CACHE_SLOTS];
+
+        entry->data = data;
+        entry->size = elf_size;
+        memcpy(&entry->view, view, sizeof(entry->view));
+        dlfrz_elf64_dyn_view_cache_next++;
+    }
+#endif
     return 1;
 }
 

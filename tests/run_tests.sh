@@ -1060,7 +1060,7 @@ test_packer_helper_discovery_without_proc() {
     echo "--- packer helper discovery without procfs ---"
     local root="$BUILD/helper_discovery_without_proc"
     local src="$root/main.c" bin="$root/main" out="$root/main.frozen"
-    local log="$root/pack.log" freezer actual="" rc=0
+    local log="$root/pack.log" freezer root_abs actual="" rc=0
 
     if ! command -v bwrap >/dev/null 2>&1; then
         skip "packer helper discovery without procfs" \
@@ -1087,9 +1087,11 @@ C
         return
     fi
     freezer=$(readlink -f "$DLFREEZE")
+    root_abs=$(readlink -f "$root")
     bin=$(readlink -f "$bin")
     out=$(readlink -m "$out")
-    if ! bwrap --ro-bind / / --bind /tmp /tmp --tmpfs /proc \
+    if ! bwrap --ro-bind / / --bind /tmp /tmp \
+            --bind "$root_abs" "$root_abs" --tmpfs /proc \
             --dev-bind /dev /dev -- "$freezer" -x -o "$out" -- "$bin" \
             >"$log" 2>&1; then
         fail "packer helper discovery without procfs" \

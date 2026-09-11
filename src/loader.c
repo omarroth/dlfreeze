@@ -66,6 +66,10 @@ static char *ldr_strrchr(const char *, int);
 #define strchr  ldr_strchr
 #define strrchr ldr_strrchr
 
+/* Private glibc admission applies several independent proofs to the same
+ * read-only embedded images during one single-threaded startup phase. */
+#define DLFREEZE_ELF64_DYN_VIEW_STARTUP_CACHE 1
+
 #include "common.h"
 #include "dynamic_semantics.h"
 #include "gnu_properties.h"
@@ -17750,7 +17754,8 @@ static int remember_vfs_regular_node_fd_locked(
         return -1;
     }
     if (admitted_status)
-        placeholder_status = *admitted_status;
+        ldr_memcpy(&placeholder_status, admitted_status,
+                   sizeof(placeholder_status));
     else if (VFS_SYSCALL(SYS_fstat, fd, &placeholder_status) < 0)
         return -1;
     if (!S_ISREG(placeholder_status.st_mode) ||
@@ -18867,7 +18872,8 @@ static int vfs_validate_served_descriptor(int writer_fd, int served_fd,
     if (!(flags & O_PATH) &&
         (flags & vfs_observable_open_status_mask()) == 0) {
         if (served_status_out)
-            *served_status_out = served_status;
+            ldr_memcpy(served_status_out, &served_status,
+                       sizeof(*served_status_out));
         return 0;
     }
 
@@ -18891,7 +18897,8 @@ static int vfs_validate_served_descriptor(int writer_fd, int served_fd,
         return -1;
     }
     if (served_status_out)
-        *served_status_out = served_status;
+        ldr_memcpy(served_status_out, &served_status,
+                   sizeof(*served_status_out));
     return 0;
 }
 
@@ -48846,6 +48853,7 @@ static int loader_run_impl(const uint8_t *mem, uint64_t mem_foff, int srcfd,
      * deployment metadata and may legitimately be renamed, so admit a
      * family only when exactly one validated private-layout detector accepts
      * the embedded interpreter bytes. */
+    dlfrz_elf64_dyn_view_cache_begin();
     const struct glibc_ver_offsets *glibc_off =
         detect_glibc_offsets_from_interp(mem, mem_foff, entries, metas,
                                          num_entries);
@@ -48859,6 +48867,7 @@ static int loader_run_impl(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     else if (musl_layout && !glibc_off)
         runtime = FROZEN_RUNTIME_MUSL;
     if (runtime == FROZEN_RUNTIME_UNKNOWN) {
+        dlfrz_elf64_dyn_view_cache_end();
         ldr_msg("dlfreeze: direct-load artifact is incompatible with this "
                 "runtime layout\n");
         return -1;
@@ -48875,6 +48884,7 @@ static int loader_run_impl(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         if (!embedded_glibc_config_paths(
                 mem, mem_foff, entries, metas, num_entries,
                 g_glibc_cache_path, g_glibc_preload_path)) {
+            dlfrz_elf64_dyn_view_cache_end();
             ldr_msg("dlfreeze: target glibc configuration paths are "
                     "missing or ambiguous\n");
             return -1;
@@ -48883,6 +48893,7 @@ static int loader_run_impl(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         if (g_kernel_minsigstksz == 0)
             g_kernel_minsigstksz = glibc_legacy_minsigstksz();
         if (g_kernel_minsigstksz == 0) {
+            dlfrz_elf64_dyn_view_cache_end();
             ldr_msg("dlfreeze: target glibc signal-stack parameter is "
                     "unavailable\n");
             return -1;
@@ -48891,6 +48902,7 @@ static int loader_run_impl(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         system_preload =
             glibc_system_preload_state(g_glibc_preload_path);
         if (system_preload != 0) {
+            dlfrz_elf64_dyn_view_cache_end();
             ldr_msg(system_preload > 0
                 ? "dlfreeze: refusing direct load: nonempty system "
                   "preload file: "
@@ -48904,10 +48916,12 @@ static int loader_run_impl(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         if (!embedded_glibc_libc_release_matches(
                 mem, mem_foff, entries, metas, num_entries,
                 g_glibc_minor)) {
+            dlfrz_elf64_dyn_view_cache_end();
             ldr_msg("dlfreeze: direct-load artifact has a glibc "
                     "libc/interpreter release mismatch\n");
             return -1;
         }
+        dlfrz_elf64_dyn_view_cache_end();
         {
             int target_tunables = dl_gnu_cache_target_tunables_state(
                 g_glibc_cache_path);
@@ -48927,6 +48941,8 @@ static int loader_run_impl(const uint8_t *mem, uint64_t mem_foff, int srcfd,
             ldr_msg(" is unsupported\n");
             return -1;
         }
+    } else {
+        dlfrz_elf64_dyn_view_cache_end();
     }
 
     /* Private libc layouts must be positively identified before mapping any
