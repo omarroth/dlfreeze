@@ -13247,6 +13247,16 @@ static int initialize_musl_target_contract(struct loaded_obj *objs,
 /* Global object table — populated by loader_run, extended by my_dlopen. */
 static struct loaded_obj g_all_objs[MAX_TOTAL_OBJS];
 static int g_nobj;
+/* -p may place the immutable file pages of traced lazy objects at their
+ * final manifest-selected addresses before target handoff.  These records
+ * are deliberately outside g_all_objs: mapping bytes must not publish an
+ * object, alter lookup scope, allocate TLS, or advance native dlopen timing. */
+struct kernel_dormant_mapping {
+    struct loaded_obj object;
+    uint32_t owner_index_plus_one;
+};
+static struct kernel_dormant_mapping *g_kernel_dormant_mappings;
+static size_t g_kernel_dormant_mapping_count;
 static void *g_startup_lazy_plt_resolution_mapping;
 static size_t g_startup_lazy_plt_resolution_mapping_size;
 /* Unlike the live namespace, these startup dispatch records never grow or
@@ -34082,6 +34092,207 @@ fail:
     return -1;
 }
 
+static int kernel_premap_range_available(uint64_t target, size_t length)
+{
+    for (size_t i = 0; i < g_kernel_premap_count; i++)
+        if (g_kernel_premaps[i].length == length &&
+            g_kernel_premaps[i].target == target)
+            return 1;
+    return 0;
+}
+
+/* A raw dormant map is worthwhile only when every complete source-page run
+ * can be consumed from a kernel stage.  The one possible terminal fragment
+ * remains an ordinary bounded copy.  Re-derive the exact lengths used by
+ * map_object so a partially emitted outer PHDR set never causes an otherwise
+ * lazy object to be copied early merely because one small stage exists. */
+static int embedded_object_kernel_stages_complete(
+    const uint8_t *mem, uint64_t mem_foff,
+    const struct dlfrz_lib_meta *meta,
+    const struct dlfrz_entry *ent)
+{
+    Elf64_Ehdr ehdr;
+    const uint8_t *elf_base;
+    size_t entry_offset;
+    int saw_stage = 0;
+
+    if (!mem || !meta || !ent || ent->data_offset < mem_foff ||
+        ent->data_offset - mem_foff > SIZE_MAX)
+        return 0;
+    entry_offset = (size_t)(ent->data_offset - mem_foff);
+    elf_base = mem + entry_offset;
+    if (ent->data_size < sizeof(ehdr))
+        return 0;
+    memcpy(&ehdr, elf_base, sizeof(ehdr));
+    if (ehdr.e_phentsize != sizeof(Elf64_Phdr) ||
+        ehdr.e_phnum == 0 || ehdr.e_phnum == PN_XNUM ||
+        ehdr.e_phnum != meta->phdr_num ||
+        ehdr.e_phoff > ent->data_size ||
+        (uint64_t)ehdr.e_phnum >
+            (ent->data_size - ehdr.e_phoff) / sizeof(Elf64_Phdr))
+        return 0;
+
+    for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
+        Elf64_Phdr ph;
+        uint64_t seg_page_vaddr;
+        uint64_t seg_page_off;
+        uint64_t page_delta;
+        uint64_t map_input;
+        uint64_t map_len;
+        uint64_t safe_map_len;
+        uint64_t available;
+        uint64_t target;
+        uint64_t populated = 0;
+
+        memcpy(&ph, elf_base + ehdr.e_phoff +
+                         (size_t)i * sizeof(ph), sizeof(ph));
+        if (ph.p_type != PT_LOAD || ph.p_filesz == 0)
+            continue;
+        if (ph.p_offset > ent->data_size ||
+            ph.p_filesz > ent->data_size - ph.p_offset ||
+            (ph.p_vaddr - page_floor(ph.p_vaddr)) !=
+                (ph.p_offset - page_floor(ph.p_offset)))
+            return 0;
+        seg_page_vaddr = page_floor(ph.p_vaddr);
+        seg_page_off = page_floor(ph.p_offset);
+        page_delta = ph.p_vaddr - seg_page_vaddr;
+        if (!u64_add_checked(page_delta, ph.p_filesz, &map_input) ||
+            !u64_align_up_checked(map_input, g_page_size, &map_len) ||
+            seg_page_off > ent->data_size ||
+            !u64_add_checked(meta->base_addr, seg_page_vaddr, &target))
+            return 0;
+        available = ent->data_size - seg_page_off;
+        safe_map_len = map_len;
+        if (safe_map_len > available)
+            safe_map_len = page_floor(available);
+        if (safe_map_len > page_delta) {
+            if (safe_map_len > SIZE_MAX ||
+                !kernel_premap_range_available(
+                    target, (size_t)safe_map_len))
+                return 0;
+            populated = safe_map_len - page_delta;
+            if (populated > ph.p_filesz)
+                populated = ph.p_filesz;
+            saw_stage = 1;
+        }
+        if (ph.p_filesz - populated >= g_page_size)
+            return 0;
+    }
+    return saw_stage;
+}
+
+static int manifest_has_earlier_mapping_owner(
+    const struct dlfrz_entry *entries,
+    const struct dlfrz_lib_meta *metas, uint32_t index)
+{
+    for (uint32_t i = 0; i < index; i++)
+        if (metas[i].base_addr == metas[index].base_addr &&
+            dl_manifest_shlib_source_alias(entries, i, index))
+            return 1;
+    return 0;
+}
+
+/* Consume optional -p stages for traced lazy objects while bootstrap TLS and
+ * the inherited syscall policy are still active.  map_object performs its
+ * normal ELF/protection validation, but the resulting records stay outside
+ * every loader namespace until their original dlopen transaction takes one.
+ * Any optional allocation or mapping miss simply preserves lazy copy replay. */
+static void initialize_kernel_dormant_mappings(
+    const uint8_t *mem, uint64_t mem_foff, int srcfd,
+    uint32_t source_flags, const struct dlfrz_lib_meta *metas,
+    const struct dlfrz_entry *entries, const char *strtab,
+    uint32_t num_entries)
+{
+    struct kernel_dormant_mapping *records;
+    size_t allocation_size;
+
+    if (!g_kernel_premap_count ||
+        !(source_flags & DLFRZ_SOURCE_KERNEL_PREMAP) ||
+        g_kernel_dormant_mappings)
+        return;
+    /* Every accepted object consumes at least one stage, so the bounded
+     * stage count is also a tight allocation ceiling independent of a broad
+     * captured-data manifest. */
+    if (__builtin_mul_overflow(g_kernel_premap_count, sizeof(*records),
+                               &allocation_size))
+        return;
+    records = mmap(NULL, allocation_size, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (records == MAP_FAILED)
+        return;
+    ldr_memset(records, 0, allocation_size);
+
+    for (uint32_t i = 0; i < num_entries; i++) {
+        struct kernel_dormant_mapping *record;
+
+        if ((metas[i].flags &
+             (LDR_FLAG_DLOPEN | LDR_FLAG_DLOPEN_EARLY |
+              LDR_FLAG_DATA | LDR_FLAG_INTERP)) != LDR_FLAG_DLOPEN ||
+            manifest_has_earlier_mapping_owner(entries, metas, i) ||
+            !embedded_object_kernel_stages_complete(
+                mem, mem_foff, &metas[i], &entries[i]))
+            continue;
+        record = &records[g_kernel_dormant_mapping_count];
+        record->object.name = dl_manifest_logical_name(entries, strtab, i);
+        record->object.flags = metas[i].flags;
+        record->object.frozen_manifest_index_plus_one = i + 1;
+        if (map_object(mem, mem_foff, srcfd, source_flags,
+                       &metas[i], &entries[i], &record->object, 0) < 0) {
+            ldr_memset(&record->object, 0, sizeof(record->object));
+            continue;
+        }
+        record->owner_index_plus_one = i + 1;
+        g_kernel_dormant_mapping_count++;
+        if (g_debug) {
+            ldr_msg("[loader] kernel-staged dormant: ");
+            ldr_msg(record->object.name);
+            ldr_msg("\n");
+        }
+    }
+    if (!g_kernel_dormant_mapping_count) {
+        (void)munmap(records, allocation_size);
+        return;
+    }
+    g_kernel_dormant_mappings = records;
+    ldr_dbg_hex("[loader] kernel-staged dormant objects=0x",
+                g_kernel_dormant_mapping_count);
+}
+
+static int take_kernel_dormant_mapping(
+    uint32_t manifest_index, const struct dlfrz_lib_meta *meta,
+    struct loaded_obj *destination)
+{
+    struct object_reservation_bounds bounds;
+
+    if (!destination || !meta || !g_kernel_dormant_mappings ||
+        manifest_index >= g_frozen_num_entries ||
+        object_reservation_bounds_from_meta(meta, &bounds) < 0)
+        return 0;
+    for (size_t i = 0; i < g_kernel_dormant_mapping_count; i++) {
+        struct kernel_dormant_mapping *record =
+            &g_kernel_dormant_mappings[i];
+        uint32_t owner;
+
+        if (!record->owner_index_plus_one)
+            continue;
+        owner = record->owner_index_plus_one - 1;
+        if (owner >= g_frozen_num_entries ||
+            !dl_manifest_shlib_source_alias(
+                g_frozen_entries, owner, manifest_index) ||
+            record->object.base != meta->base_addr ||
+            record->object.runtime_reservation !=
+                (void *)(uintptr_t)bounds.start ||
+            record->object.runtime_reservation_size != bounds.size)
+            continue;
+        ldr_memcpy(destination, &record->object, sizeof(*destination));
+        ldr_memset(&record->object, 0, sizeof(record->object));
+        record->owner_index_plus_one = 0;
+        destination->frozen_manifest_index_plus_one = manifest_index + 1;
+        return 1;
+    }
+    return 0;
+}
+
 /* ==== Parse PT_DYNAMIC ================================================= */
 
 static void loaded_version_page_mark(uint64_t pages[2], uint16_t index)
@@ -45662,8 +45873,17 @@ static struct loaded_obj *load_embedded_object(
     memset(obj, 0, sizeof(*obj));
     obj->frozen_manifest_index_plus_one = mi + 1;
 
-    /* Map segments from the frozen image at the pre-assigned base */
-    if (map_object(g_frozen_mem, g_frozen_mem_foff, g_frozen_srcfd,
+    /* -p may already have placed these still-unpublished bytes while the
+     * bootstrap syscall environment was available.  Taking that exact
+     * reservation changes no dlopen timing: dynamic parsing, dependency
+     * discovery, relocation, TLS publication, and constructors all remain
+     * in this transaction. */
+    int took_kernel_mapping =
+        take_kernel_dormant_mapping(mi, emeta, obj);
+
+    /* Otherwise map segments from the frozen image at the assigned base. */
+    if (!took_kernel_mapping &&
+        map_object(g_frozen_mem, g_frozen_mem_foff, g_frozen_srcfd,
                    g_frozen_source_flags,
                    emeta, eent, obj, 0) < 0) {
         dl_set_error(ename, ": mmap failed");
@@ -49484,6 +49704,9 @@ static int loader_run_impl(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         ldr_dbg(objs[i].name);
         ldr_dbg_hex("  base=0x", objs[i].base);
     }
+    initialize_kernel_dormant_mappings(
+        mem, mem_foff, srcfd, source_flags, metas, entries, strtab,
+        num_entries);
     if (!startup_gnu_properties_admitted(
             objs, nobj, g_kernel_hwcap, g_kernel_hwcap2)) {
         ldr_msg("dlfreeze: direct-load artifact requires unsupported "

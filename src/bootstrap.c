@@ -4391,7 +4391,8 @@ static int bs_kernel_premap_select(struct bs_startup_mremap_plan *plan)
 }
 
 /* Called before handoff even when the optional proof declined. Unmap only
- * still-owned intervals; after trimming, the loader owns the exact survivors. */
+ * still-owned intervals.  After a successful proof, selected startup pieces
+ * and complete unselected lazy-object stages remain loader-owned. */
 static int bs_kernel_premap_finish(int ready)
 {
     struct dlfrz_premap_range kept[DLFRZ_PREMAP_MAX_PHDRS];
@@ -4399,6 +4400,10 @@ static int bs_kernel_premap_finish(int ready)
     for (size_t i = 0; i < g_bs_premap_count; i++) {
         const struct dlfrz_premap_range *s = &g_bs_premaps[i];
         const struct dlfrz_premap_range *r = &g_bs_premap_selected[i];
+        if (ready && !r->length) {
+            kept[count++] = *s;
+            continue;
+        }
         uint64_t prefix = ready && r->length ? r->source - s->source : s->length;
         uint64_t suffix = ready && r->length ?
             s->length - prefix - r->length : 0;

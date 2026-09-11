@@ -292,7 +292,7 @@ static void usage(const char *prog)
         "Options:\n"
         "  -o <path>   Output file  (default: <name>.frozen)\n"
         "  -d          Prefer direct-load mode (the default)\n"
-        "  -p          Experimental kernel pre-mapping (direct only; not UPX)\n"
+        "  -p          Experimental library pre-mapping (direct only; not UPX)\n"
         "  -x          Force extraction mode instead of direct loading\n"
         "  -t          Trace runtime loading by running the program (TTY preserved)\n"
         "  -f <glob>   Embed data files matching glob (requires -t, repeatable)\n"

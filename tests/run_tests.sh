@@ -335,6 +335,9 @@ test_kernel_premap() {
     echo "--- optional kernel pre-map layout ---"
     local root="$BUILD/kernel_premap" actual="" stderr_out="" rc=0
     local freeze_rc=0 phnum phoff
+    local lazy_lib="$root/libkernel_premap_lazy.so"
+    local lazy_main="$root/lazy-main"
+    local lazy_frozen="$root/lazy-main.frozen"
     mkdir -p "$root"
     if gcc -std=c11 -O2 -Wall -Wextra -Werror -Iinclude \
            tests/kernel_premap_gate.c -o "$root/gate" &&
@@ -377,6 +380,38 @@ test_kernel_premap() {
         else
             fail "kernel pre-map runtime fast path" \
                 "verified artifact silently selected copy fallback"
+        fi
+
+        if ! gcc -O2 -Wall -Wextra -Werror -fPIC -shared \
+                 tests/kernel_premap_lazy_plugin.c -o "$lazy_lib" ||
+           ! gcc -O2 -Wall -Wextra -Werror -rdynamic \
+                 tests/kernel_premap_lazy_program.c -ldl -o "$lazy_main"; then
+            fail "kernel pre-map dormant fixture" "compile failed"
+        else
+            freeze_rc=0
+            LD_LIBRARY_PATH="$root" freeze_require_direct \
+                "kernel pre-map dormant target" "$root/lazy-freeze.log" \
+                "$lazy_frozen" -p -t -- "$lazy_main" || freeze_rc=$?
+            actual=""; stderr_out=""; rc=0
+            if [ "$freeze_rc" -eq 77 ]; then
+                skip "kernel pre-map dormant target" "$DIRECT_FREEZE_REASON"
+            elif [ "$freeze_rc" -ne 0 ]; then
+                fail "kernel pre-map dormant packing" \
+                    "see $root/lazy-freeze.log"
+            else
+                capture_output_split actual stderr_out env -u LD_LIBRARY_PATH \
+                    DLFREEZE_DEBUG=1 DLFREEZE_TEST_PREMAP=1 \
+                    "$lazy_frozen" || rc=$?
+                if [ "$rc" -eq 0 ] &&
+                   [ "$actual" = kernel-premap-lazy-ok ] &&
+                   printf '%s\n' "$stderr_out" |
+                       grep -Fq 'kernel-staged dormant: '; then
+                    pass "kernel pre-map preserves dormant dlopen timing"
+                else
+                    fail "kernel pre-map dormant dlopen" \
+                        "exit=$rc output=$actual"
+                fi
+            fi
         fi
         actual=""; rc=0
         capture_output actual env DLFREEZE_NO_FORK=1 "$root/main.frozen" || rc=$?

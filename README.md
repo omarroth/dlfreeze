@@ -74,7 +74,7 @@ dlfreeze [options] [--] <executable> [args...]
 Options:
   -o <path>   Output file  (default: <name>.frozen)
   -d          Prefer direct-load mode (the default)
-  -p          Experimental kernel pre-mapping (direct only; not UPX)
+  -p          Experimental library pre-mapping (direct only; not UPX)
   -x          Force extraction mode instead of direct loading
   -t          Trace runtime loading by running the program (TTY preserved)
   -f <glob>   Embed data files matching glob (requires -t, repeatable)
@@ -88,12 +88,14 @@ Options:
 ./build/dlfreeze -p -d -t -f '/usr/*' -- python3 test.py
 ```
 
-The kernel maps read-only aliases of eligible startup library pages into a
-low-address staging area. Before application code runs, the loader moves
-admitted pages into its independently reserved object ranges and discards
-unused staging mappings. The original payload remains available for copy
-fallback. No persistent cache or runtime extraction is introduced, and lazy
-`dlopen` constructors/TLS activation retain their normal timing.
+The kernel maps read-only aliases of eligible library pages into a low-address
+staging area. Before application code runs, the loader moves admitted startup
+pages and fully staged traced-lazy objects into independently reserved object
+ranges, then discards unused stages. A raw lazy mapping remains outside the
+loader namespace until its original `dlopen`: dynamic parsing, relocation,
+TLS publication, constructors, and `RTLD_NOLOAD` visibility retain their
+normal timing. The original payload remains available for copy fallback. No
+persistent cache or runtime extraction is introduced.
 
 This layout relocates the outer program-header table and is **not guaranteed
 to work with UPX or other ELF rewriters**. It uses additional temporary virtual
@@ -106,6 +108,9 @@ overhead. A denied/unavailable transfer proof also selects copying;
 format, policies killing the initial probe's `clone`/parent `wait4` require
 that override. Benchmark your workload: `-p` is not a promise of native parity
 or a speedup on every host. Without `-p`, the existing format is unchanged.
+Because traced-lazy address ranges are reserved before application handoff,
+programs that intentionally claim fixed addresses should use the default
+format.
 
 When `-t` is used, `[args...]` are passed to the traced run so the program
 exercises the code paths that trigger `dlopen()` and resource access. The

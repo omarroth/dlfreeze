@@ -7136,16 +7136,13 @@ static int pack_kernel_premap(const char *path, struct stat *identity,
     for (size_t i = 0; i < n && count + 1 < DLFRZ_PREMAP_MAX_PHDRS; i++) {
         Elf64_Ehdr object;
         if (metas[i].flags & (DLFRZ_FLAG_DATA | DLFRZ_FLAG_INTERP)) continue;
-        if ((metas[i].flags & DLFRZ_FLAG_DLOPEN) &&
-            !(metas[i].flags & DLFRZ_FLAG_DLOPEN_EARLY)) continue;
         int duplicate = 0;
         for (size_t j = 0; j < i; j++)
             if (entries[j].data_offset == entries[i].data_offset &&
                 entries[j].data_size == entries[i].data_size &&
                 metas[j].base_addr == metas[i].base_addr &&
-                !(metas[j].flags & (DLFRZ_FLAG_DATA | DLFRZ_FLAG_INTERP)) &&
-                (!(metas[j].flags & DLFRZ_FLAG_DLOPEN) ||
-                 (metas[j].flags & DLFRZ_FLAG_DLOPEN_EARLY))) duplicate = 1;
+                !(metas[j].flags & (DLFRZ_FLAG_DATA | DLFRZ_FLAG_INTERP)))
+                duplicate = 1;
         if (duplicate) continue;
         if (entries[i].data_offset > old_size ||
             entries[i].data_size > old_size - entries[i].data_offset ||
@@ -7160,7 +7157,7 @@ static int pack_kernel_premap(const char *path, struct stat *identity,
         for (size_t j = 0; j < object.e_phnum &&
              count + 1 < DLFRZ_PREMAP_MAX_PHDRS; j++) {
             Elf64_Phdr p;
-            uint64_t file, target, length, delta, raw_end;
+            uint64_t file, target, length, delta, raw_end, available;
             memcpy(&p, elf + object.e_phoff + j * sizeof(p), sizeof(p));
             if (p.p_type != PT_LOAD || !p.p_filesz) continue;
             if (p.p_offset > entries[i].data_size ||
@@ -7174,6 +7171,11 @@ static int pack_kernel_premap(const char *path, struct stat *identity,
                 !u64_align_up_checked(raw_end, page, &length)) goto done;
             file -= delta;
             target -= delta;
+            available = entries[i].data_size - (p.p_offset - delta);
+            if (length > available)
+                length = available & ~(page - 1);
+            if (length <= delta)
+                continue;
             if (cursor < table_address + page &&
                 (cursor >= table_address || length > table_address - cursor))
                 cursor = table_address + page;
@@ -7223,7 +7225,7 @@ static int pack_kernel_premap(const char *path, struct stat *identity,
         fwrite(&info, sizeof(info), 1, out) != 1 ||
         fseeko(out, 0, SEEK_SET) || fwrite(&eh, sizeof(eh), 1, out) != 1 ||
         fflush(out) || fsync(fd)) goto done;
-    printf("  pre-mapped : %zu startup segments (experimental; no UPX guarantee)\n",
+    printf("  pre-mapped : %zu library segments (experimental; no UPX guarantee)\n",
            stages);
     result = 0;
 done:
