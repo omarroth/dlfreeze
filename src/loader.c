@@ -19678,15 +19678,8 @@ static int vfs_open(const char *path, int flags, int mode)
      * normal host-filesystem semantics; a trace is evidence about exact
      * lookups, not proof that an entire parent directory was snapshotted. */
     if (lookup_path && lookup_path[0] == '/') {
-        /* Directory path captured in VFS: serve virtually (no FS touch). */
-        if (vfs_dir_exists(lookup_path)) {
-            const struct vfs_entry *ve = vfs_lookup(lookup_path);
-            if (!ve || vfs_is_directory_entry(ve)) {
-                return vfs_open_directory_placeholder(
-                    lookup_path, flags, mode, "open");
-            }
-        }
         const struct vfs_entry *ve = vfs_lookup(lookup_path);
+
         if (ve && vfs_is_negative_entry(ve)) {
             vfs_dbg_op("open", lookup_path, "negative");
             set_loader_errno(ENOENT);
@@ -19702,6 +19695,13 @@ static int vfs_open(const char *path, int flags, int mode)
             }
             vfs_dbg_op("open", lookup_path, "file");
             return vfs_serve_memfd(ve, lookup_path, flags);
+        }
+        /* Directory path captured in VFS: serve virtually (no FS touch). */
+        if (vfs_dir_exists(lookup_path)) {
+            if (!ve || vfs_is_directory_entry(ve)) {
+                return vfs_open_directory_placeholder(
+                    lookup_path, flags, mode, "open");
+            }
         }
         if (frozen_elf_find(lookup_path) >= 0) {
             int open_error = vfs_regular_open_error(flags);
@@ -19743,18 +19743,8 @@ static int vfs_openat(int dirfd, const char *path, int flags, int mode)
     }
 
     if (lookup_path && lookup_path[0] == '/') {
-        /* Serve captured directories purely from VFS: avoid touching the
-         * host filesystem whenever the VFS already knows the directory.
-         * This applies to both explicit O_DIRECTORY opens and plain
-         * O_RDONLY opens that happen to target a directory path. */
-        if (vfs_dir_exists(lookup_path)) {
-            const struct vfs_entry *ve = vfs_lookup(lookup_path);
-            if (!ve || vfs_is_directory_entry(ve)) {
-                return vfs_open_directory_placeholder(
-                    lookup_path, flags, mode, "openat");
-            }
-        }
         const struct vfs_entry *ve = vfs_lookup(lookup_path);
+
         if (ve && vfs_is_negative_entry(ve)) {
             vfs_dbg_op("openat", lookup_path, "negative");
             set_loader_errno(ENOENT);
@@ -19771,6 +19761,16 @@ static int vfs_openat(int dirfd, const char *path, int flags, int mode)
             }
             vfs_dbg_op("openat", lookup_path, "file");
             return vfs_serve_memfd(ve, lookup_path, flags);
+        }
+        /* Serve captured directories purely from VFS: avoid touching the
+         * host filesystem whenever the VFS already knows the directory.
+         * This applies to both explicit O_DIRECTORY opens and plain
+         * O_RDONLY opens that happen to target a directory path. */
+        if (vfs_dir_exists(lookup_path)) {
+            if (!ve || vfs_is_directory_entry(ve)) {
+                return vfs_open_directory_placeholder(
+                    lookup_path, flags, mode, "openat");
+            }
         }
         if (frozen_elf_find(lookup_path) >= 0) {
             int open_error = vfs_regular_open_error(flags);
