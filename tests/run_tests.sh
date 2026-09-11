@@ -29421,7 +29421,9 @@ test_glibc_tls_teardown_direct() {
 # a capacity-zero DTV at the end of a readable page and protect the following
 # page.  The native control only proves that the late GD access works; the
 # foreign guarded DTV is a direct-loader safety gate which must grow the table
-# instead of indexing beyond its advertised capacity.
+# instead of indexing beyond its advertised capacity.  A worker created before
+# the late load also proves that a stale per-thread generation enters repair
+# before it touches the new module's slot.
 # ===================================================================
 test_glibc_dtv_capacity_direct() {
     echo "--- glibc DTV capacity direct-load ---"
@@ -29479,8 +29481,20 @@ C
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <unistd.h>
+
+static pthread_barrier_t late_barrier;
+static int (*late_dtvcap_read)(void);
+
+static void *late_worker(void *unused)
+{
+    (void)unused;
+    pthread_barrier_wait(&late_barrier);
+    pthread_barrier_wait(&late_barrier);
+    return (void *)(intptr_t)(late_dtvcap_read() == 37 ? 0 : 1);
+}
 
 static uintptr_t current_tp(void)
 {
@@ -29502,9 +29516,15 @@ int main(int argc, char **argv)
     uintptr_t tp;
     uintptr_t **dtv_slot;
     uintptr_t *raw;
+    pthread_t worker;
+    void *worker_result = (void *)1;
 
     if (argc != 3)
         return 2;
+    if (pthread_barrier_init(&late_barrier, NULL, 2) != 0 ||
+        pthread_create(&worker, NULL, late_worker, NULL) != 0)
+        return 10;
+    pthread_barrier_wait(&late_barrier);
     handle = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     if (!handle)
         return 3;
@@ -29512,6 +29532,11 @@ int main(int argc, char **argv)
     dtvcap_read = (int (*)(void))dlsym(handle, "dtvcap_read");
     if (!dtvcap_read || dlerror() != NULL)
         return 4;
+    late_dtvcap_read = dtvcap_read;
+    pthread_barrier_wait(&late_barrier);
+    if (pthread_join(worker, &worker_result) != 0 || worker_result != NULL)
+        return 11;
+    pthread_barrier_destroy(&late_barrier);
     if (strcmp(argv[2], "control") == 0) {
         if (dtvcap_read() != 37)
             return 5;
@@ -29551,7 +29576,7 @@ int main(int argc, char **argv)
     return 0;
 }
 C
-    if ! gcc -o "$bin" "$src" -ldl; then
+    if ! gcc -pthread -o "$bin" "$src" -ldl; then
         fail "glibc DTV capacity direct-load" \
             "could not build guarded-DTV fixture"
         rm -f "$libsrc" "$lib" "$src" "$bin" "$out" "$log"

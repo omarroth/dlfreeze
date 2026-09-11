@@ -13305,8 +13305,9 @@ static void lazy_plt_atfork_child_repair(
  * as a publication invariant and is written before the release-published
  * extent + 1.  It is not independent address authority: every fast lookup,
  * including a startup static-TLS module, must first admit the current thread's
- * DTV capacity and populated slot.  Missing slots, unpublished transaction
- * modules, and DTV growth continue through the serialized slow path below. */
+ * DTV through its capacity or an equivalent generation proof, then require a
+ * populated slot.  Missing slots, unpublished transaction modules, and DTV
+ * growth continue through the serialized slow path below. */
 struct runtime_tls_fast_entry {
     volatile uint64_t extent_plus_one;
 };
@@ -13317,6 +13318,34 @@ static struct runtime_tls_fast_entry
  * publishing or revalidating a module, not by each TLS address lookup. */
 static uint64_t
     g_runtime_tls_static_tpoff_bits[MAX_TOTAL_OBJS + 1];
+/* On x86, every loader-owned glibc DTV carries this process-random generation in
+ * dtv[0].  A matching generation proves that the vector was sized for the
+ * module set published with that generation, just as native x86 glibc's
+ * __tls_get_addr uses GL(dl_tls_generation) before indexing its DTV.  A late
+ * TLS publication advances the value before exposing the new namespace, so
+ * older threads enter the capacity-checking slow path without an unsafe
+ * indexed read. */
+#if defined(__x86_64__)
+static volatile uint64_t g_glibc_dtv_generation;
+static uint64_t glibc_dtv_generation_current(void)
+{
+    return runtime_atomic_load64(&g_glibc_dtv_generation);
+}
+
+static uint64_t glibc_dtv_generation_next(uint64_t current)
+{
+    uint64_t next = current + UINT64_C(0x9e3779b97f4a7c15);
+
+    if (next <= 1)
+        next += UINT64_C(0xd6e8feb86659fd93);
+    return next;
+}
+#else
+static uint64_t glibc_dtv_generation_current(void)
+{
+    return 1;
+}
+#endif
 
 /* glibc deliberately exposes the main executable as an empty name in its
  * public link_map and dl_iterate_phdr views.  musl exposes the executable
@@ -14337,7 +14366,7 @@ static int install_glibc_tls_for_thread(uintptr_t tp,
         }
         new_raw[0] = new_capacity;
         glibc_mark_dtv_owned(new_raw);
-        dtv[0] = 1;
+        dtv[0] = glibc_dtv_generation_current();
         dtv[1] = 0;
         if (!glibc_seed_static_tls_slots(tp, dtv, new_capacity)) {
             munmap(new_raw, new_map_size);
@@ -14592,21 +14621,22 @@ static void *stub_tls_get_addr_glibc(struct tls_index *ti)
  * Select this only after structural layout admission; uncommon or future
  * layouts retain the generic target-derived-offset entry above.  As in the
  * target's native resolver, a published tls_index supplies the module-local
- * offset and the DTV supplies the allocation authority.  The advertised DTV
- * capacity still bounds the indexed read, including for conservative DTVs
- * handed to us by target pthread code.  Deferring the TP read to the cold
- * path gives valid lookups the same single segment load used by native code. */
+ * offset and the DTV supplies the allocation authority.  The process-random
+ * generation is published only in vectors sized for its complete module set;
+ * conservative or stale DTVs therefore enter the capacity-checking slow path
+ * before any indexed read.  Deferring the TP read to that cold path gives
+ * valid lookups the same single segment load used by native code. */
 static void *stub_tls_get_addr_glibc_dtv8(struct tls_index *ti)
 {
     unsigned long modid = ti->ti_module;
     unsigned long offset = ti->ti_offset;
     uintptr_t *dtv;
     uintptr_t tls_base;
-    size_t capacity;
+    uint64_t generation;
 
     dtv = (uintptr_t *)arch_read_tp_offset(8);
-    capacity = dtv[-2];
-    if (capacity > MAX_TOTAL_OBJS || modid > capacity)
+    generation = glibc_dtv_generation_current();
+    if (dtv[0] != generation)
         goto slow;
     tls_base = dtv[(size_t)modid * 2];
     if (!glibc_tls_slot_allocated(tls_base))
@@ -14686,8 +14716,6 @@ static void *stub_dl_allocate_tls_init_locked(void *mem)
     if (!glibc_dtv_capacity(dtv, &dtv_capacity) || !dtv ||
         !glibc_seed_static_tls_slots(tp, dtv, dtv_capacity))
         return NULL;
-    dtv[0] = 1;
-    dtv[1] = 0;
     g_tls_init_count++;
     ldr_dbg("[loader] _dl_allocate_tls_init #");
     ldr_dbg_hex("", (uint64_t)g_tls_init_count);
@@ -14783,6 +14811,15 @@ static void *stub_dl_allocate_tls_init_locked(void *mem)
             GLIBC_RSEQ_CPU_ID_REGISTRATION_FAILED;
 #endif
 
+    /* install_glibc_tls_for_thread() may have replaced a conservative DTV.
+     * Publish the current generation only after every known module has a
+     * capacity-bounded slot in the final vector. */
+    dtv = *(uintptr_t **)(tp + TCB_OFF_DTV);
+    if (!dtv)
+        return NULL;
+    dtv[1] = 0;
+    dtv[0] = glibc_dtv_generation_current();
+
     return mem;
 }
 
@@ -14834,7 +14871,7 @@ static void *stub_dl_allocate_tls_locked(void *mem)
     if (!dtv)
         return NULL;
     raw_dtv = dtv - 2;
-    dtv[0] = 1;
+    dtv[0] = glibc_dtv_generation_current();
     dtv[1] = 0;
     for (int i = 0; i < g_nobj; i++) {
         struct loaded_obj *obj = &g_all_objs[i];
@@ -43622,7 +43659,7 @@ static int dl_transaction_prepare_glibc_tls(struct loaded_obj **objects,
     }
     new_raw[0] = new_capacity;
     glibc_mark_dtv_owned(new_raw);
-    new_dtv[0] = 1;
+    new_dtv[0] = glibc_dtv_generation_current();
     new_dtv[1] = 0;
     if (!glibc_seed_static_tls_slots(tp, new_dtv, new_capacity)) {
         munmap(new_raw, map_size);
@@ -43700,7 +43737,23 @@ static void dl_transaction_publish_tls(void)
         return;
     if (!dl_transaction_tls_publication_is_current())
         loader_exit(127);
+#if defined(__x86_64__)
+    if (kind == DL_TLS_PUBLICATION_GLIBC) {
+        uint64_t generation = glibc_dtv_generation_next(
+            glibc_dtv_generation_current());
+
+        /* Only this thread can consume its DTV pointer, and signals remain
+         * blocked.  Publish that pointer first, then invalidate every older
+         * thread's generation before the new object becomes visible. */
+        plan->new_dtv[0] = generation;
+        *plan->dtv_slot = plan->new_dtv;
+        runtime_atomic_store64(&g_glibc_dtv_generation, generation);
+    } else {
+        *plan->dtv_slot = plan->new_dtv;
+    }
+#else
     *plan->dtv_slot = plan->new_dtv;
+#endif
     /* The replacement mapping is live target state now.  Clear its rollback
      * ownership before retiring the prior loader-owned glibc vector. */
     memset(plan, 0, sizeof(*plan));
@@ -48015,7 +48068,7 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
         glibc_mark_dtv_owned(raw_dtv);
         /* dtv = raw_dtv + one dtv_t entry (2 uintptr_t's) */
         uintptr_t *dtv = raw_dtv + 2;
-        dtv[0] = 1;
+        dtv[0] = glibc_dtv_generation_current();
         dtv[1] = 0;
         /* dtv[modid] for each TLS module: .val = tp + tpoff and the admitted
          * modern target's `to_free` word is NULL for a static allocation.
@@ -48587,11 +48640,21 @@ static int loader_run_impl(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     }
     {
         uintptr_t random = get_auxval(envp, AT_RANDOM);
+#if defined(__x86_64__)
+        uint64_t generation;
+#endif
 
         g_fake_stack_chk_guard = 0;
         g_fake_pointer_chk_guard = 0;
         (void)vfs_seed_hash_key(
             random ? (const void *)(uintptr_t)random : NULL);
+#if defined(__x86_64__)
+        generation = g_vfs_hash_key[0] ^ g_vfs_hash_key[1] ^
+                     UINT64_C(0xa0761d6478bd642f);
+        if (generation <= 1)
+            generation += UINT64_C(0xe7037ed1a0b428db);
+        runtime_atomic_store64(&g_glibc_dtv_generation, generation);
+#endif
         if (random) {
             memcpy(&g_fake_stack_chk_guard, (const void *)random,
                    sizeof(g_fake_stack_chk_guard));
