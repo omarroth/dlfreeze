@@ -17735,7 +17735,8 @@ static void remove_vfs_regular_fd_map_locked(size_t slot)
 static int remember_vfs_regular_node_fd_locked(
     int fd, enum vfs_regular_node_kind kind,
     const struct vfs_entry *entry, uint32_t manifest_index,
-    uint64_t size, ino_t inode, mode_t mode)
+    uint64_t size, ino_t inode, mode_t mode,
+    const struct stat *admitted_status)
 {
     struct stat placeholder_status;
     int inserted = 0;
@@ -17748,7 +17749,9 @@ static int remember_vfs_regular_node_fd_locked(
         set_loader_errno(EINVAL);
         return -1;
     }
-    if (VFS_SYSCALL(SYS_fstat, fd, &placeholder_status) < 0)
+    if (admitted_status)
+        placeholder_status = *admitted_status;
+    else if (VFS_SYSCALL(SYS_fstat, fd, &placeholder_status) < 0)
         return -1;
     if (!S_ISREG(placeholder_status.st_mode) ||
         placeholder_status.st_nlink != 0 ||
@@ -17816,14 +17819,18 @@ no_memory:
 }
 
 static int remember_vfs_regular_fd_locked(
-    int fd, const struct vfs_entry *entry)
+    int fd, const struct vfs_entry *entry,
+    const struct stat *admitted_status)
 {
     return remember_vfs_regular_node_fd_locked(
         fd, VFS_REGULAR_NODE_DATA, entry, 0,
-        entry ? entry->size : 0, entry ? entry->inode : 0, 0100444);
+        entry ? entry->size : 0, entry ? entry->inode : 0, 0100444,
+        admitted_status);
 }
 
-static int remember_vfs_elf_fd_locked(int fd, uint32_t manifest_index)
+static int remember_vfs_elf_fd_locked(
+    int fd, uint32_t manifest_index,
+    const struct stat *admitted_status)
 {
     if (!g_frozen_entries || !g_frozen_elf_inodes ||
         manifest_index >= g_frozen_num_entries) {
@@ -17833,25 +17840,30 @@ static int remember_vfs_elf_fd_locked(int fd, uint32_t manifest_index)
     return remember_vfs_regular_node_fd_locked(
         fd, VFS_REGULAR_NODE_ELF, NULL, manifest_index,
         g_frozen_entries[manifest_index].data_size,
-        g_frozen_elf_inodes[manifest_index], 0100555);
+        g_frozen_elf_inodes[manifest_index], 0100555, admitted_status);
 }
 
-static int remember_vfs_regular_fd(int fd, const struct vfs_entry *entry)
+static int remember_vfs_regular_fd(
+    int fd, const struct vfs_entry *entry,
+    const struct stat *admitted_status)
 {
     int result;
     runtime_loader_lock_token lock_token = vfs_dirfd_lock();
 
-    result = remember_vfs_regular_fd_locked(fd, entry);
+    result = remember_vfs_regular_fd_locked(fd, entry, admitted_status);
     vfs_dirfd_unlock(lock_token);
     return result;
 }
 
-static int remember_vfs_elf_fd(int fd, uint32_t manifest_index)
+static int remember_vfs_elf_fd(
+    int fd, uint32_t manifest_index,
+    const struct stat *admitted_status)
 {
     int result;
     runtime_loader_lock_token lock_token = vfs_dirfd_lock();
 
-    result = remember_vfs_elf_fd_locked(fd, manifest_index);
+    result = remember_vfs_elf_fd_locked(
+        fd, manifest_index, admitted_status);
     vfs_dirfd_unlock(lock_token);
     return result;
 }
@@ -18825,7 +18837,8 @@ static int vfs_served_reopen_flags(int flags)
 
 static int vfs_validate_served_descriptor(int writer_fd, int served_fd,
                                           int flags, uint64_t size,
-                                          mode_t mode)
+                                          mode_t mode,
+                                          struct stat *served_status_out)
 {
     long descriptor_flags;
     long status_flags;
@@ -18843,6 +18856,19 @@ static int vfs_validate_served_descriptor(int writer_fd, int served_fd,
         !vfs_stat_identity_equal(&writer_status, &served_status)) {
         set_loader_errno(EIO);
         return -1;
+    }
+
+    /* A successful raw openat fixes O_RDONLY and O_CLOEXEC atomically; no
+     * libc policy or mutable process state participates in that contract.
+     * The two F_GET* probes add no authority for the overwhelmingly common
+     * read-only case after the inode/size/mode proof above.  Retain them for
+     * O_PATH and observable status flags, whose kernel normalization is part
+     * of the VFS contract and is explicitly checked below. */
+    if (!(flags & O_PATH) &&
+        (flags & vfs_observable_open_status_mask()) == 0) {
+        if (served_status_out)
+            *served_status_out = served_status;
+        return 0;
     }
 
     status_flags = VFS_SYSCALL(SYS_fcntl, served_fd, F_GETFL, 0);
@@ -18864,6 +18890,8 @@ static int vfs_validate_served_descriptor(int writer_fd, int served_fd,
         set_loader_errno(EPROTO);
         return -1;
     }
+    if (served_status_out)
+        *served_status_out = served_status;
     return 0;
 }
 
@@ -18939,7 +18967,8 @@ static void vfs_close_with_saved_errno(int fd, int saved_errno)
 }
 
 static int vfs_reopen_memfd(int fd, int flags, uint64_t size, mode_t mode,
-                            int *fallback_allowed)
+                            int *fallback_allowed,
+                            struct stat *served_status_out)
 {
     const char prefix[] = "/proc/self/fd/";
     char path[64];
@@ -18969,7 +18998,8 @@ static int vfs_reopen_memfd(int fd, int flags, uint64_t size, mode_t mode,
         vfs_close_with_saved_errno(fd, saved_errno);
         return -1;
     }
-    if (vfs_validate_served_descriptor(fd, result, flags, size, mode) < 0) {
+    if (vfs_validate_served_descriptor(
+            fd, result, flags, size, mode, served_status_out) < 0) {
         saved_errno = loader_errno_value();
         vfs_close_with_saved_errno(result, saved_errno);
         vfs_close_with_saved_errno(fd, saved_errno);
@@ -19017,7 +19047,8 @@ static int vfs_write_all(int fd, const uint8_t *data, uint64_t size)
 
 static int vfs_serve_bytes_memfd(const char *name, const uint8_t *data,
                                  uint64_t size, int flags, mode_t mode,
-                                 int *fallback_allowed)
+                                 int *fallback_allowed,
+                                 struct stat *served_status_out)
 {
     int fd = (int)VFS_SYSCALL(SYS_memfd_create, name,
                               MFD_ALLOW_SEALING | MFD_CLOEXEC);
@@ -19049,7 +19080,7 @@ static int vfs_serve_bytes_memfd(const char *name, const uint8_t *data,
         return -1;
     }
     return vfs_reopen_memfd(
-        fd, flags, size, mode, fallback_allowed);
+        fd, flags, size, mode, fallback_allowed, served_status_out);
 }
 
 static uint64_t vfs_next_temp_nonce(void)
@@ -19180,7 +19211,7 @@ static int vfs_serve_bytes_temp_dir(const char *directory,
             break;
         }
         if (vfs_validate_served_descriptor(
-                writer_fd, served_fd, flags, size, private_mode) < 0) {
+                writer_fd, served_fd, flags, size, private_mode, NULL) < 0) {
             saved_errno = loader_errno_value();
             vfs_abandon_temp_file(
                 dirfd, leaf, writer_fd, served_fd, saved_errno);
@@ -19219,7 +19250,7 @@ static int vfs_serve_bytes_temp_dir(const char *directory,
 #endif
             if (VFS_SYSCALL(SYS_fchmod, writer_fd, mode) < 0 ||
                 vfs_validate_served_descriptor(
-                    writer_fd, served_fd, flags, size, mode) < 0 ||
+                    writer_fd, served_fd, flags, size, mode, NULL) < 0 ||
                 vfs_validate_executable_backing(
                     writer_fd, size, mode) < 0) {
                 saved_errno = loader_errno_value();
@@ -19289,20 +19320,29 @@ static int vfs_serve_bytes_temp(const uint8_t *data, uint64_t size,
 }
 
 static int vfs_serve_bytes(const char *name, const uint8_t *data,
-                           uint64_t size, int flags, mode_t mode)
+                           uint64_t size, int flags, mode_t mode,
+                           struct stat *served_status_out,
+                           int *served_status_valid_out)
 {
     int fallback_allowed = 0;
     int fd;
+
+    if (served_status_valid_out)
+        *served_status_valid_out = 0;
 
     if (size > (uint64_t)INT64_MAX || (!data && size != 0)) {
         set_loader_errno(EFBIG);
         return -1;
     }
     fd = vfs_serve_bytes_memfd(
-        name, data, size, flags, mode, &fallback_allowed);
+        name, data, size, flags, mode, &fallback_allowed,
+        served_status_out);
 
-    if (fd >= 0)
+    if (fd >= 0) {
+        if (served_status_valid_out)
+            *served_status_valid_out = 1;
         return fd;
+    }
     if (!fallback_allowed)
         return -1;
     return vfs_serve_bytes_temp(data, size, flags, mode);
@@ -19311,10 +19351,14 @@ static int vfs_serve_bytes(const char *name, const uint8_t *data,
 static int vfs_serve_memfd(const struct vfs_entry *ve, const char *path,
                            int flags)
 {
+    struct stat served_status;
+    int served_status_valid = 0;
     int fd = vfs_serve_bytes("dlfrz-vfs", ve->data, ve->size,
-                             flags, 0444);
+                             flags, 0444, &served_status,
+                             &served_status_valid);
 
-    if (fd >= 0 && remember_vfs_regular_fd(fd, ve) < 0) {
+    if (fd >= 0 && remember_vfs_regular_fd(
+            fd, ve, served_status_valid ? &served_status : NULL) < 0) {
         int saved_errno = loader_errno_value();
 
         VFS_SYSCALL(SYS_close, fd);
@@ -19471,7 +19515,7 @@ static int vfs_duplicate_fd(int oldfd, int newfd, int flags,
                  remember_vfs_regular_node_fd_locked(
                      result, regular_source.kind, regular_source.entry,
                      regular_source.manifest_index, regular_source.size,
-                     regular_source.inode, regular_source.mode) < 0)
+                     regular_source.inode, regular_source.mode, NULL) < 0)
             mapping_error = loader_errno_value();
         if (mapping_error) {
             VFS_SYSCALL(SYS_close, result);
@@ -19965,14 +20009,20 @@ static int64_t frozen_elf_size(const char *path)
  * the original path is absent or names a different host file. */
 static int frozen_elf_serve_memfd(const char *path, int flags)
 {
+    struct stat served_status;
+    int served_status_valid = 0;
     int idx = frozen_elf_find(path);
     if (idx < 0) return -1;
     const uint8_t *data = g_frozen_mem +
         (g_frozen_entries[idx].data_offset - g_frozen_mem_foff);
     uint64_t size = g_frozen_entries[idx].data_size;
-    int fd = vfs_serve_bytes("dlfrz-elf", data, size, flags, 0555);
+    int fd = vfs_serve_bytes(
+        "dlfrz-elf", data, size, flags, 0555,
+        &served_status, &served_status_valid);
 
-    if (fd >= 0 && remember_vfs_elf_fd(fd, (uint32_t)idx) < 0) {
+    if (fd >= 0 && remember_vfs_elf_fd(
+            fd, (uint32_t)idx,
+            served_status_valid ? &served_status : NULL) < 0) {
         int saved_errno = loader_errno_value();
 
         (void)arch_raw_close(fd);
