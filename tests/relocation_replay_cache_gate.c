@@ -847,6 +847,7 @@ static int initialize_prelinked_phase_plan_fixture(
         fixture->mapping = NULL;
         return 0;
     }
+    g_all_objs[0].relocation_records_admitted = 1;
 
     fixture->metas[0].flags =
         LDR_FLAG_PRELINKED | LDR_FLAG_RUNTIME_SCAN;
@@ -970,7 +971,7 @@ static int prelinked_phase_plan_gate(void)
         g_prelinked_phase_plan_record_reads != 1 ||
         g_prelinked_phase_plan_legacy_visits != 0 ||
         g_relocation_ifunc_classification_calls != 0 ||
-        g_relocation_validation_calls != 1)
+        g_relocation_validation_calls != 0)
         goto out;
 
     /* An epoch change invalidates the entire accelerator, not individual

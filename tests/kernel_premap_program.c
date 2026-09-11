@@ -6,9 +6,14 @@
 #include <unistd.h>
 
 static volatile unsigned char bss[192 * 1024];
+static const unsigned char startup_image[3 * 1024 * 1024] = {0x5a};
 
 int main(void)
 {
+    volatile const unsigned char *image = startup_image;
+
+    if (image[0] != 0x5a || image[sizeof(startup_image) - 1] != 0)
+        return 4;
     /* A real allocation also exercises the unchanged native heap region. */
     char *memory = malloc(2 * 1024 * 1024);
     if (!memory) return 1;

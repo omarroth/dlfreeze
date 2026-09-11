@@ -333,7 +333,8 @@ test_bootstrap_secure_gate() {
 
 test_kernel_premap() {
     echo "--- optional kernel pre-map layout ---"
-    local root="$BUILD/kernel_premap" actual="" rc=0 freeze_rc=0 phnum phoff
+    local root="$BUILD/kernel_premap" actual="" stderr_out="" rc=0
+    local freeze_rc=0 phnum phoff
     mkdir -p "$root"
     if gcc -std=c11 -O2 -Wall -Wextra -Werror -Iinclude \
            tests/kernel_premap_gate.c -o "$root/gate" &&
@@ -363,11 +364,19 @@ test_kernel_premap() {
         else
             fail "kernel pre-map outer ELF" "missing layout or excessive headers"
         fi
-        capture_output actual "$root/main.frozen" || rc=$?
+        capture_output_split actual stderr_out env DLFREEZE_DEBUG=1 \
+            "$root/main.frozen" || rc=$?
         if [ "$rc" -eq 0 ] && [ "$actual" = kernel-premap-ok ]; then
             pass "kernel pre-map startup, BSS, heap and stage cleanup"
         else
             fail "kernel pre-map startup" "exit=$rc output=$actual"
+        fi
+        if printf '%s\n' "$stderr_out" |
+                grep -Fq 'dlfreeze-bootstrap: kernel pre-map ready'; then
+            pass "kernel pre-map runtime selects verified fast path"
+        else
+            fail "kernel pre-map runtime fast path" \
+                "verified artifact silently selected copy fallback"
         fi
         actual=""; rc=0
         capture_output actual env DLFREEZE_NO_FORK=1 "$root/main.frozen" || rc=$?

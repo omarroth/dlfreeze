@@ -2716,34 +2716,39 @@ static int bs_parse_maps_entry(const unsigned char *line, size_t length,
 }
 
 /* Return 1 for a line, 0 for clean EOF, and -1 for malformed or oversized
- * input.  Reading one byte at a time keeps a hostile synthetic stream from
- * making getline allocate without a bound; procfs maps lines are small. */
+ * input.  fgets retains the fixed caller-owned bound while letting stdio
+ * scan each buffered chunk in bulk; the former byte-at-a-time fgetc loop was
+ * a measurable part of every authenticated smaps proof.  Prefilling with a
+ * nonzero sentinel distinguishes fgets' final terminator from an embedded
+ * NUL even though the interface does not return a byte count. */
 static int bs_read_maps_line(FILE *stream, unsigned char *line,
                              size_t capacity, size_t *length_out)
 {
-    size_t length = 0;
+    size_t length;
 
-    if (!stream || !line || capacity == 0 || !length_out)
+    if (!stream || !line || capacity < 2 || capacity > INT_MAX ||
+        !length_out)
         return -1;
-    for (;;) {
+    memset(line, 0xff, capacity);
+    if (!fgets((char *)line, (int)capacity, stream))
+        return ferror(stream) ? -1 : 0;
+    for (length = 0; length < capacity && line[length] != '\0'; length++)
+        ;
+    if (length == capacity ||
+        (length + 1 < capacity && line[length + 1] != 0xff))
+        return -1;
+    if (length != 0 && line[length - 1] == '\n') {
+        length--;
+    } else if (!feof(stream)) {
+        /* fgets may fill its complete destination immediately before EOF;
+         * one bounded lookahead preserves the old exact-limit behavior. */
         int byte = fgetc(stream);
 
-        if (byte == EOF) {
-            if (ferror(stream))
-                return -1;
-            if (length == 0)
-                return 0;
-            *length_out = length;
-            return 1;
-        }
-        if (byte == '\0' || length == capacity)
+        if (byte != EOF || ferror(stream))
             return -1;
-        if (byte == '\n') {
-            *length_out = length;
-            return 1;
-        }
-        line[length++] = (unsigned char)byte;
     }
+    *length_out = length;
+    return 1;
 }
 
 struct bs_smaps_evidence {

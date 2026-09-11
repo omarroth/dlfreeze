@@ -24334,8 +24334,9 @@ static const Elf64_Sym *lookup_relocation_definition_uncached(
          * lookup uses the requesting root's complete group after preexisting
          * globals.  Select that root transiently instead of rewriting object
          * metadata which rollback could not restore. */
-        (void)dl_transient_relocation_scope_root(
-            requester, requester_index, &lookup_root);
+        if (!dl_object_is_visible(requester))
+            (void)dl_transient_relocation_scope_root(
+                requester, requester_index, &lookup_root);
         if (lookup_root < 0 || lookup_root >= nobj ||
             dl_build_root_lookup_order(
                 lookup_root, nobj, order, &order_count) < 0)
@@ -30516,7 +30517,8 @@ static int relocation_definition_cache_scope_immutable(
     {
         int transient_root;
 
-        if (dl_transient_relocation_scope_root(
+        if (!dl_object_is_visible(requester) &&
+            dl_transient_relocation_scope_root(
                 requester, requester_index, &transient_root))
             return 0;
     }
@@ -30562,8 +30564,8 @@ static int relocation_definition_cache_lookup_with_entry(
     struct relocation_definition_cache_ent **entry_out)
 {
     struct relocation_definition_cache_ent *entry;
-    const Elf64_Sym *reference;
     const Elf64_Sym *definition;
+    struct loaded_obj *definition_owner;
     int requester_index;
 
     if (!owner_out || !symbol_out || objs != g_all_objs || nobj <= 0 ||
@@ -30574,7 +30576,8 @@ static int relocation_definition_cache_lookup_with_entry(
     {
         int transient_root;
 
-        if (dl_transient_relocation_scope_root(
+        if (!dl_object_is_visible(requester) &&
+            dl_transient_relocation_scope_root(
                 requester, requester_index, &transient_root))
             return 0;
     }
@@ -30584,15 +30587,16 @@ static int relocation_definition_cache_lookup_with_entry(
     if (!entry || !entry->found ||
         entry->definition_owner_index >= (uint16_t)nobj)
         return 0;
-    reference = loaded_dynsym(requester, symbol_index);
-    definition = loaded_dynsym(
-        &objs[entry->definition_owner_index],
-        entry->definition_symbol_index);
-    if (!reference || !definition ||
-        ELF64_ST_BIND(reference->st_info) == STB_GNU_UNIQUE ||
-        ELF64_ST_BIND(definition->st_info) == STB_GNU_UNIQUE)
+    definition_owner = &objs[entry->definition_owner_index];
+    if (!definition_owner->dynsym ||
+        entry->definition_symbol_index >= definition_owner->dynsym_count)
         return 0;
-    *owner_out = &objs[entry->definition_owner_index];
+    /* Store admits both symbol records as immutable and excludes GNU-unique
+     * bindings before publishing found.  The epoch check in cache_entry()
+     * preserves that proof across graph changes, so re-reading the requester
+     * record and repeating both binding checks on every hit adds no safety. */
+    definition = &definition_owner->dynsym[entry->definition_symbol_index];
+    *owner_out = definition_owner;
     *symbol_out = definition;
     if (entry_out)
         *entry_out = entry;
@@ -31573,6 +31577,64 @@ static int validate_relocation_record(struct loaded_obj *obj,
     return 0;
 }
 
+/* The startup admission pass has already checked every immutable relocation
+ * record against the immutable program-header snapshot.  A published phase
+ * byte additionally proves that the symbol lookup metadata used to classify
+ * a symbolic relocation cannot change before replay.  Reconstruct the few
+ * values replay consumes without repeating the destination and table bounds
+ * proof for every slot.  Mutable symbol metadata deliberately retains the
+ * full live validator even when the relocation type itself has a stable
+ * phase (for example TLS and COPY relocations). */
+static int admitted_prelinked_relocation_record(
+    struct loaded_obj *obj, const Elf64_Rela *rel,
+    const Elf64_Sym **reference_out,
+    struct symbol_lookup_query *name_query_out,
+    void **slot_out)
+{
+    uint32_t type;
+    uint32_t sidx;
+    const Elf64_Sym *reference = NULL;
+    struct symbol_lookup_query name_query;
+
+    if (!obj || !rel || !obj->relocation_records_admitted)
+        return 0;
+    type = ELF64_R_TYPE(rel->r_info);
+    sidx = ELF64_R_SYM(rel->r_info);
+    if (sidx != 0) {
+        const struct loaded_symbol_name_key *key = NULL;
+        const char *name;
+
+        if (!symbol_lookup_metadata_declared_immutable(obj) ||
+            !obj->dynsym || sidx >= obj->dynsym_count || !obj->dynstr ||
+            obj->dynstr_size == 0)
+            return 0;
+        reference = &obj->dynsym[sidx];
+        name = obj->dynstr + reference->st_name;
+        if (name_query_out) {
+            if (obj->symbol_name_keys) {
+                key = &obj->symbol_name_keys[sidx];
+                loaded_object_name_query_from_admitted_key(
+                    name, key, &name_query);
+            } else if (!symbol_lookup_query_init_object_name(
+                           obj, name, NULL, &name_query)) {
+                return 0;
+            }
+        }
+    }
+
+    if (reference_out)
+        *reference_out = reference;
+    if (name_query_out) {
+        memset(name_query_out, 0, sizeof(*name_query_out));
+        if (sidx != 0)
+            *name_query_out = name_query;
+    }
+    if (slot_out)
+        *slot_out = type == 0
+            ? NULL : (void *)(uintptr_t)(obj->base + rel->r_offset);
+    return 1;
+}
+
 /* A phase filter consumes classification metadata in addition to the
  * relocation record's symbol name and destination geometry.  In the rare
  * mutable-metadata fallback, revalidate the live VERSYM interpretation too:
@@ -31952,7 +32014,10 @@ static int apply_prelinked_runtime_reloc(struct loaded_obj *obj,
         }
     }
 
-    if (validate_relocation_record(obj, rel, &reference, &symbol_query,
+    if ((!phase_proven ||
+         !admitted_prelinked_relocation_record(
+             obj, rel, &reference, &symbol_query, &relocation_slot)) &&
+        validate_relocation_record(obj, rel, &reference, &symbol_query,
                                    &relocation_slot) < 0) {
         ldr_err("malformed relocation in", obj->name);
         return -1;
@@ -33331,8 +33396,12 @@ static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     for (int i = 0; i < meta->phdr_num; i++) {
         const Elf64_Phdr *ph = &phdr[i];
         uint64_t populated_file_bytes = 0;
+        int final_protection_already = 0;
+        int final_protection;
 
         if (ph->p_type != PT_LOAD || ph->p_memsz == 0) continue;
+        final_protection =
+            phdr_prot_with_gnu_property(ph, &property_profile);
 
         if (ph->p_filesz > 0 && !anonymous_copy_mode &&
             (ph->p_vaddr - page_floor(ph->p_vaddr)) ==
@@ -33400,6 +33469,8 @@ static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
                             (size_t)safe_map_len);
                         if (mapped < 0)
                             goto fail;
+                        if (mapped && final_protection == PROT_READ)
+                            final_protection_already = 1;
                     }
                 }
                 if (!mapped && fileback_mode &&
@@ -33409,10 +33480,12 @@ static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
                     mapped = map_fileback_segment(
                         (void *)(uintptr_t)target_address,
                         (size_t)safe_map_len,
-                        phdr_prot_with_gnu_property(ph, &property_profile),
+                        final_protection,
                         srcfd, (off_t)file_off);
                     if (mapped < 0)
                         goto fail;
+                    if (mapped)
+                        final_protection_already = 1;
                 }
 
                 if (mapped) {
@@ -33423,6 +33496,7 @@ static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
             }
         }
         if (populated_file_bytes < ph->p_filesz) {
+            final_protection_already = 0;
             if (!anonymous_copy_mode &&
                 make_file_range_writable(base, ph) < 0)
                 goto fail;
@@ -33436,21 +33510,19 @@ static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
          * bytes, so it must remain untouched. */
         if (!anonymous_copy_mode && zero_segment_bss_tail(base, ph) < 0)
             goto fail;
-    }
-
-    /* Copied segments were writable while populated.  Restore the ELF
-     * segment permissions now so code is executable for IFUNC resolvers,
-     * while reserved holes and guard pages remain PROT_NONE. */
-    for (int i = 0; i < meta->phdr_num; i++) {
-        const Elf64_Phdr *ph = &phdr[i];
-
-        if (ph->p_type == PT_LOAD && ph->p_memsz != 0 &&
+        /* Disjoint PT_LOAD page ranges were admitted above, so finalizing
+         * each segment cannot interfere with a later population.  A wholly
+         * transferred file-only segment already has its final protection
+         * when file-backed mmap supplied it, or when an R-only payload stage
+         * was moved into an R-only target.  Avoid a redundant mprotect for
+         * those common read-only segments; copied bytes, BSS tails, and
+         * executable/writable mremap targets retain the full transition. */
+        if (ph->p_memsz != ph->p_filesz)
+            final_protection_already = 0;
+        if (!final_protection_already &&
             !(anonymous_copy_mode && ph->p_filesz != 0 &&
-              phdr_prot_with_gnu_property(ph, &property_profile) ==
-                  (PROT_READ | PROT_WRITE)) &&
-            set_segment_protection(
-                base, ph,
-                phdr_prot_with_gnu_property(ph, &property_profile)) < 0)
+              final_protection == (PROT_READ | PROT_WRITE)) &&
+            set_segment_protection(base, ph, final_protection) < 0)
             goto fail;
     }
 
@@ -35202,8 +35274,65 @@ out:
 static int loaded_object_requires_native_glibc_gmon(
     const struct loaded_obj *obj)
 {
+    static const char *const names[] = {"__monstartup", "_mcleanup"};
+    struct loaded_symbol_name_index_view index_view;
+    int index_status;
+
     if (!obj)
         return 0;
+    index_status = loaded_symbol_name_index_view_init(obj, &index_view);
+    if (index_status < 0)
+        return 1;
+    if (index_status > 0) {
+        for (size_t name_index = 0;
+             name_index < sizeof(names) / sizeof(names[0]); name_index++) {
+            struct symbol_lookup_query query;
+            uint32_t link;
+            uint32_t steps = 0;
+
+            if (!symbol_lookup_query_init(names[name_index], &query))
+                return 1;
+            link = index_view.bucket_heads[
+                loaded_symbol_name_index_bucket(
+                    query.key.fingerprint, index_view.bucket_mask)];
+            while (link != 0 && steps < obj->dynsym_count) {
+                const Elf64_Sym *symbol;
+                uint32_t next;
+
+                if (link >= obj->dynsym_count)
+                    return 1;
+                next = index_view.next[link];
+                symbol = loaded_dynsym(obj, link);
+                if (!symbol || !loaded_symbol_name(obj, symbol))
+                    return 1;
+                if (symbol->st_shndx == SHN_UNDEF &&
+                    loaded_symbol_name_eq_query(obj, symbol, &query)) {
+                    const char *version = NULL;
+                    const char *provider = NULL;
+                    const struct loaded_symbol_name_key *provider_key = NULL;
+                    struct symbol_lookup_query provider_query;
+                    int versioned = relocation_symbol_version(
+                        obj, link, &version, NULL, NULL,
+                        &provider, &provider_key);
+
+                    if (versioned < 0 ||
+                        (versioned > 0 && (!version || !provider)) ||
+                        (versioned > 0 &&
+                         (!symbol_lookup_query_init_object_name(
+                              obj, provider, provider_key,
+                              &provider_query) ||
+                          symbol_lookup_query_eq_cstr(
+                              &provider_query, "libc.so.6"))))
+                        return 1;
+                }
+                link = next;
+                steps++;
+            }
+            if (link != 0)
+                return 1;
+        }
+        return 0;
+    }
     for (uint32_t i = 1; i < obj->dynsym_count; i++) {
         const Elf64_Sym *symbol = loaded_dynsym(obj, i);
         const char *name;
