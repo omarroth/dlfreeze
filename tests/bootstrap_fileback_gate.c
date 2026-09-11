@@ -400,6 +400,44 @@ static int smaps_match_bytes(const void *bytes, size_t size,
     return result;
 }
 
+static int maps_line_reader_reuse_gate(void)
+{
+    unsigned char line[32];
+    struct bs_maps_line_reader reader;
+    char ordinary[] = "a deliberately longer line\nx\nlast";
+    const unsigned char embedded_nul[] = {'x', '\0', 'y', '\n'};
+    FILE *stream = fmemopen(ordinary, sizeof(ordinary) - 1, "r");
+    size_t length;
+    int ok = 1;
+
+    if (!stream ||
+        !bs_maps_line_reader_init(&reader, stream, line, sizeof(line))) {
+        if (stream)
+            fclose(stream);
+        return 0;
+    }
+    ok &= bs_read_maps_line(&reader, &length) == 1 &&
+          length == sizeof("a deliberately longer line") - 1 &&
+          memcmp(line, "a deliberately longer line", length) == 0;
+    ok &= bs_read_maps_line(&reader, &length) == 1 && length == 1 &&
+          line[0] == 'x';
+    ok &= bs_read_maps_line(&reader, &length) == 1 && length == 4 &&
+          memcmp(line, "last", length) == 0;
+    ok &= bs_read_maps_line(&reader, &length) == 0;
+    fclose(stream);
+
+    stream = fmemopen((void *)embedded_nul, sizeof(embedded_nul), "r");
+    if (!stream ||
+        !bs_maps_line_reader_init(&reader, stream, line, sizeof(line))) {
+        if (stream)
+            fclose(stream);
+        return 0;
+    }
+    ok &= bs_read_maps_line(&reader, &length) == -1;
+    fclose(stream);
+    return ok;
+}
+
 static int smaps_match_text(const char *text, const struct stat *executable,
                             uint64_t payload_vaddr,
                             uint64_t payload_filesz,
@@ -1746,6 +1784,8 @@ int main(void)
         return 1;
     if (!auxv_gate())
         return 2;
+    if (!maps_line_reader_reuse_gate())
+        return 12;
     if (!smaps_gate())
         return 3;
     if (!mremap_target_smaps_gate())
