@@ -31567,17 +31567,17 @@ static enum relocation_admission classify_relocation_type(uint32_t type)
     }
 }
 
-static int validate_relocation_record(struct loaded_obj *obj,
-                                      const Elf64_Rela *rel,
-                                      const Elf64_Sym **reference_out,
-                                      struct symbol_lookup_query
-                                          *name_query_out,
-                                      void **slot_out)
+/* Geometry/type admission is also the complete operation for startup table
+ * validation and phase-filter skips.  Keep it free of the substantially
+ * larger symbol-query frame; replay callers layer name construction on top
+ * only for the one phase which consumes a symbolic relocation. */
+static int validate_relocation_record_core(
+    struct loaded_obj *obj, const Elf64_Rela *rel,
+    const Elf64_Sym **reference_out, void **slot_out)
 {
     uint32_t type = ELF64_R_TYPE(rel->r_info);
     uint32_t sidx = ELF64_R_SYM(rel->r_info);
     const Elf64_Sym *reference = NULL;
-    struct symbol_lookup_query name_query;
     size_t width = sizeof(uint64_t);
     void *slot = NULL;
 
@@ -31592,9 +31592,6 @@ static int validate_relocation_record(struct loaded_obj *obj,
     }
 
     if (sidx != 0) {
-        const struct loaded_symbol_name_key *key = NULL;
-        const char *name;
-
         /* parse_dynamic() normally admits the complete DYNSYM byte span
          * before any relocation record reaches this validator.  Consume
          * that published geometry directly in production, while preserving
@@ -31614,23 +31611,6 @@ static int validate_relocation_record(struct loaded_obj *obj,
             return -1;
         if (reference->st_name >= obj->dynstr_size)
             return -1;
-        name = obj->dynstr + reference->st_name;
-        if (name_query_out) {
-            if (obj->dynstr_readonly && obj->dynsym_readonly &&
-                obj->symbol_name_keys) {
-                key = &obj->symbol_name_keys[sidx];
-                /* This is the exact symbol/key pair published together by
-                 * build_loaded_symbol_name_keys().  Both source tables and
-                 * the loader-owned key mapping are read-only, so their
-                 * offset/extent correlation cannot change between the
-                 * admission walk and relocation replay. */
-                loaded_object_name_query_from_admitted_key(
-                    name, key, &name_query);
-            } else if (!symbol_lookup_query_init_object_name(
-                           obj, name, NULL, &name_query)) {
-                return -1;
-            }
-        }
     }
 
     if ((type == ARCH_RELOC_RELATIVE || type == ARCH_RELOC_IRELATIVE) &&
@@ -31662,13 +31642,50 @@ static int validate_relocation_record(struct loaded_obj *obj,
 
     if (reference_out)
         *reference_out = reference;
+    if (slot_out)
+        *slot_out = slot;
+    return 0;
+}
+
+static int validate_relocation_record(struct loaded_obj *obj,
+                                      const Elf64_Rela *rel,
+                                      const Elf64_Sym **reference_out,
+                                      struct symbol_lookup_query
+                                          *name_query_out,
+                                      void **slot_out)
+{
+    uint32_t sidx = ELF64_R_SYM(rel->r_info);
+    const Elf64_Sym *reference = NULL;
+    struct symbol_lookup_query name_query;
+
+    if (validate_relocation_record_core(
+            obj, rel, &reference, slot_out) < 0)
+        return -1;
+    if (name_query_out && sidx != 0) {
+        const struct loaded_symbol_name_key *key = NULL;
+        const char *name;
+
+        /* The core rechecked st_name against the live DT_STRTAB extent.
+         * Immutable tables use the key published by the same admission;
+         * writable tables deliberately rebuild from their current bytes. */
+        name = obj->dynstr + reference->st_name;
+        if (obj->dynstr_readonly && obj->dynsym_readonly &&
+            obj->symbol_name_keys) {
+            key = &obj->symbol_name_keys[sidx];
+            loaded_object_name_query_from_admitted_key(
+                name, key, &name_query);
+        } else if (!symbol_lookup_query_init_object_name(
+                       obj, name, NULL, &name_query)) {
+            return -1;
+        }
+    }
+    if (reference_out)
+        *reference_out = reference;
     if (name_query_out) {
         memset(name_query_out, 0, sizeof(*name_query_out));
         if (sidx != 0)
             *name_query_out = name_query;
     }
-    if (slot_out)
-        *slot_out = slot;
     return 0;
 }
 
@@ -31740,8 +31757,7 @@ static int validate_relocation_phase_filter_skip(
 {
     uint32_t sym_index = ELF64_R_SYM(rel->r_info);
 
-    if (validate_relocation_record(
-            obj, rel, NULL, NULL, NULL) < 0)
+    if (validate_relocation_record_core(obj, rel, NULL, NULL) < 0)
         return -1;
     if (sym_index != 0 &&
         relocation_symbol_version(
@@ -31831,8 +31847,7 @@ static int preflight_one_resolver_relocation_destination(
     if (!invokes_resolver)
         return 0;
     *has_resolvers = 1;
-    if (validate_relocation_record(
-            obj, rel, NULL, NULL, NULL) < 0)
+    if (validate_relocation_record_core(obj, rel, NULL, NULL) < 0)
         return -1;
     if (relocation_destination_overlaps_tls_template(
             obj, rel->r_offset, sizeof(uint64_t))) {
@@ -35475,8 +35490,8 @@ static int validate_object_relocations(struct loaded_obj *obj)
             Elf64_Rela relocation;
 
             if (!loaded_rela_read(obj, table, i, &relocation) ||
-                validate_relocation_record(
-                    obj, &relocation, NULL, NULL, NULL) < 0)
+                validate_relocation_record_core(
+                    obj, &relocation, NULL, NULL) < 0)
                 return -1;
         }
     }
@@ -35511,8 +35526,8 @@ static int lazy_plt_slot(
             obj, LOADED_RELA_PLT, &relocation))
         return 0;
     if (ELF64_R_SYM(relocation.r_info) == 0 ||
-        validate_relocation_record(
-            obj, &relocation, NULL, NULL, &slot) < 0 ||
+        validate_relocation_record_core(
+            obj, &relocation, NULL, &slot) < 0 ||
         relocation_destination_overlaps_tls_template(
             obj, relocation.r_offset, sizeof(uint64_t)) ||
         !address_has_alignment((uintptr_t)slot, sizeof(uint64_t)) ||
@@ -35721,8 +35736,8 @@ static int lazy_plt_relocation_width(
     uint32_t type;
 
     if (!obj || !relocation || !width_out ||
-        validate_relocation_record(
-            obj, relocation, &reference, NULL, NULL) < 0)
+        validate_relocation_record_core(
+            obj, relocation, &reference, NULL) < 0)
         return -1;
     type = ELF64_R_TYPE(relocation->r_info);
     if (type == 0)
@@ -38165,8 +38180,8 @@ static int relocate_target_tunable_service(struct loaded_obj *obj)
             if (!loaded_rela_read(obj, table, i, &relocation))
                 return -1;
             type = ELF64_R_TYPE(rel->r_info);
-            if (validate_relocation_record(obj, rel, &reference, NULL,
-                                           &slot_pointer) < 0)
+            if (validate_relocation_record_core(
+                    obj, rel, &reference, &slot_pointer) < 0)
                 return -1;
             switch (type) {
             case 0:
