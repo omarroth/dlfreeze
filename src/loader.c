@@ -14632,8 +14632,6 @@ static void *stub_tls_get_addr_glibc(struct tls_index *ti)
  * valid lookups the same single segment load used by native code. */
 static void *stub_tls_get_addr_glibc_dtv8(struct tls_index *ti)
 {
-    unsigned long modid = ti->ti_module;
-    unsigned long offset = ti->ti_offset;
     uintptr_t *dtv;
     uintptr_t tls_base;
     uint64_t generation;
@@ -14642,13 +14640,18 @@ static void *stub_tls_get_addr_glibc_dtv8(struct tls_index *ti)
     generation = glibc_dtv_generation_current();
     if (dtv[0] != generation)
         goto slow;
-    tls_base = dtv[(size_t)modid * 2];
-    if (!glibc_tls_slot_allocated(tls_base))
+    tls_base = dtv[(size_t)ti->ti_module * 2];
+    /* A matching loader-owned generation guarantees that every published
+     * tls_index has a populated slot.  Retain glibc's native unallocated
+     * sentinel check for the current entry instead of repeating the slower
+     * general NULL-or-sentinel classification on every successful access. */
+    if (tls_base == UINTPTR_MAX)
         goto slow;
-    return (void *)(tls_base + (uintptr_t)offset);
+    return (void *)(tls_base + (uintptr_t)ti->ti_offset);
 
 slow:
-    return runtime_tls_get_addr_slow(arch_get_tp(), modid, offset);
+    return runtime_tls_get_addr_slow(
+        arch_get_tp(), ti->ti_module, ti->ti_offset);
 }
 #endif
 
