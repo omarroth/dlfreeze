@@ -1568,6 +1568,7 @@ static size_t g_kernel_minsigstksz;
 static int g_kernel_clktck;
 static uintptr_t g_kernel_hwcap;
 static uintptr_t g_kernel_hwcap2;
+static uintptr_t g_kernel_sysinfo_ehdr;
 #if defined(__aarch64__)
 static uintptr_t g_kernel_hwcap3;
 static uintptr_t g_kernel_hwcap4;
@@ -2769,6 +2770,9 @@ static const struct glibc_ver_offsets glibc_x86_rtld_952_2888 = {
 static uint8_t *g_fake_rtld_global;
 static uint8_t *g_fake_rtld_global_ro;
 static const struct glibc_ver_offsets *g_glibc_off;
+static size_t g_glibc_rtld_global_ro_size;
+static int g_glibc_vdso_clock_offset = -1;
+static void *g_glibc_vdso_clock;
 static size_t g_glibc_pthread_size;
 static size_t g_glibc_pthread_tid_off;
 static size_t g_glibc_pthread_list_off;
@@ -4906,6 +4910,10 @@ static void fixup_rtld_for_glibc(const struct glibc_ver_offsets *o)
 #if defined(__x86_64__)
     init_x86_loader_isa();
 #endif
+    if (g_glibc_vdso_clock_offset >= 0 && g_glibc_vdso_clock)
+        *(void **)(g_fake_rtld_global_ro +
+                   (size_t)g_glibc_vdso_clock_offset) =
+            g_glibc_vdso_clock;
 
     /* Install glibc's complete static-loader hook only at an exact validated
      * layout/release offset.  In 2.34/2.35 a NULL _dl_init_all_dirs selects
@@ -5107,6 +5115,9 @@ detect_glibc_offsets_from_interp(const uint8_t *mem, uint64_t mem_foff,
                                   const struct dlfrz_lib_meta *metas,
                                   uint32_t num_entries)
 {
+    g_glibc_rtld_global_ro_size = 0;
+    g_glibc_vdso_clock_offset = -1;
+    g_glibc_vdso_clock = NULL;
     memset(&g_glibc_getauxval_contract, 0,
            sizeof(g_glibc_getauxval_contract));
     g_glibc_getauxval_contract_ready = 0;
@@ -5294,6 +5305,7 @@ detect_glibc_offsets_from_interp(const uint8_t *mem, uint64_t mem_foff,
 
     if (glibc_minor >= 0)
         g_glibc_minor = glibc_minor;
+    g_glibc_rtld_global_ro_size = glro_size;
 #if defined(__x86_64__)
     g_glibc_x86_cpu_contract_ready = 1;
     g_x86_cet_contract_ready = 1;
@@ -6334,10 +6346,12 @@ struct loaded_obj {
     /* Entry point (exe only) */
     uint64_t          entry;
 
-    /* Program headers used as loader authority are always an immutable,
-     * loader-owned admission snapshot.  public_phdr preserves native ABI
-     * identity: it names the mapped in-image table when one exists, otherwise
-     * the same owned snapshot published by AT_PHDR/dlinfo/dl_iterate_phdr. */
+    /* Program headers used as loader authority are an immutable admission
+     * snapshot: normally the authenticated read-only packed image, with a
+     * separately protected copy for unproved or under-aligned sources.
+     * public_phdr preserves native ABI identity by naming the mapped in-image
+     * table when one exists, otherwise the same admitted snapshot published
+     * by AT_PHDR/dlinfo/dl_iterate_phdr. */
     const Elf64_Phdr *phdr;
     const Elf64_Phdr *public_phdr;
     uint16_t          phdr_num;
@@ -15092,6 +15106,7 @@ static const uint8_t *g_frozen_mem;
 static uint64_t g_frozen_mem_foff;
 static int g_frozen_srcfd;
 static uint32_t g_frozen_source_flags;
+static int g_frozen_phdr_source_admitted;
 static const struct dlfrz_lib_meta *g_frozen_metas;
 static const struct dlfrz_entry *g_frozen_entries;
 static const char *g_frozen_strtab;
@@ -28688,6 +28703,145 @@ static int glibc_target_pthread_rtld_field(
 #endif
 }
 
+/* Recover libc's vDSO clock slot from its own exported wrapper.  The GLRO
+ * object size only bounds the search; the unique target-code access is the
+ * authority for the private offset, so this does not depend on a glibc
+ * release number or a host header's struct rtld_global_ro layout. */
+static int glibc_vdso_clock_field_offset(
+    const struct loaded_obj *libc_obj, size_t glro_size,
+    size_t *offset_out)
+{
+    const uint8_t *code;
+    size_t length;
+    uint64_t function_vaddr;
+    uint64_t got_vaddr;
+    size_t selected = 0;
+    unsigned int matches = 0;
+
+    if (!libc_obj || !offset_out || glro_size < sizeof(void *) ||
+        !glibc_target_function_view(
+            libc_obj, "__clock_gettime", 24, 256, &code, &length) ||
+        !glibc_target_rtld_got_slot(
+            libc_obj, "_rtld_global_ro", &got_vaddr) ||
+        (uintptr_t)code < libc_obj->base)
+        return 0;
+    function_vaddr = (uint64_t)((uintptr_t)code - libc_obj->base);
+    for (size_t offset = 0;
+         offset <= glro_size - sizeof(void *); offset += sizeof(void *)) {
+#if defined(__x86_64__)
+        int accepted = glibc_x86_rtld_field_access(
+                code, length, function_vaddr, got_vaddr,
+                offset, sizeof(void *));
+#elif defined(__aarch64__)
+        int accepted = glibc_aarch64_rtld_field_access(
+                code, length, function_vaddr, got_vaddr,
+                offset, sizeof(void *));
+#else
+        int accepted = 0;
+#endif
+        if (!accepted)
+            continue;
+        selected = offset;
+        matches++;
+    }
+    if (matches != 1)
+        return 0;
+    *offset_out = selected;
+    return 1;
+}
+
+/* AT_SYSINFO_EHDR is kernel-authenticated process input.  Treat the vDSO as
+ * an optional bounded ELF image and accept only one hash-exported executable
+ * definition.  Any unfamiliar kernel layout simply retains libc's syscall
+ * fallback; direct loading never depends on this optimization. */
+static void *kernel_vdso_function(const char *name)
+{
+    enum { KERNEL_VDSO_MAX_PHNUM = 64, KERNEL_VDSO_MAX_SIZE = 16 << 20 };
+    const uint8_t *image =
+        (const uint8_t *)(uintptr_t)g_kernel_sysinfo_ehdr;
+    struct dlfrz_elf64_dyn_view view;
+    Elf64_Ehdr ehdr;
+    Elf64_Sym symbol;
+    size_t image_size = 0;
+    size_t symbol_offset;
+    unsigned int executable_owners = 0;
+
+    if (!name || !image ||
+        ((uintptr_t)image & (sizeof(uintptr_t) - 1U)) != 0)
+        return NULL;
+    memcpy(&ehdr, image, sizeof(ehdr));
+    if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0 ||
+        ehdr.e_ident[EI_CLASS] != ELFCLASS64 ||
+        ehdr.e_ident[EI_DATA] != ELFDATA2LSB ||
+#if defined(__x86_64__)
+        ehdr.e_machine != EM_X86_64 ||
+#elif defined(__aarch64__)
+        ehdr.e_machine != EM_AARCH64 ||
+#else
+        1 ||
+#endif
+        ehdr.e_type != ET_DYN ||
+        ehdr.e_ehsize != sizeof(ehdr) ||
+        ehdr.e_phentsize != sizeof(Elf64_Phdr) || ehdr.e_phnum == 0 ||
+        ehdr.e_phnum > KERNEL_VDSO_MAX_PHNUM ||
+        ehdr.e_phoff > g_page_size ||
+        (size_t)ehdr.e_phnum >
+            (g_page_size - (size_t)ehdr.e_phoff) / sizeof(Elf64_Phdr))
+        return NULL;
+    for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
+        Elf64_Phdr phdr;
+        uint64_t end;
+
+        memcpy(&phdr, image + (size_t)ehdr.e_phoff +
+                           (size_t)i * sizeof(phdr), sizeof(phdr));
+        if (phdr.p_filesz > phdr.p_memsz ||
+            !u64_add_checked(phdr.p_offset, phdr.p_filesz, &end) ||
+            end > KERNEL_VDSO_MAX_SIZE)
+            return NULL;
+        if (end > image_size)
+            image_size = (size_t)end;
+    }
+    if (image_size < sizeof(ehdr) ||
+        !dlfrz_elf64_dyn_view_init(image, image_size, &view) ||
+#if defined(__x86_64__)
+        view.ehdr.e_machine != EM_X86_64 ||
+#elif defined(__aarch64__)
+        view.ehdr.e_machine != EM_AARCH64 ||
+#else
+        1 ||
+#endif
+        dlfrz_elf64_dyn_view_find(&view, name, &symbol, NULL) != 1 ||
+        symbol.st_shndx == SHN_UNDEF ||
+        symbol.st_shndx >= SHN_LORESERVE ||
+        ELF64_ST_TYPE(symbol.st_info) != STT_FUNC || symbol.st_size == 0 ||
+        symbol.st_size > SIZE_MAX ||
+        !dlfrz_glibc_vaddr_file_range(
+            image, image_size, &ehdr, symbol.st_value,
+            (size_t)symbol.st_size, &symbol_offset))
+        return NULL;
+    for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
+        Elf64_Phdr phdr;
+        uint64_t within;
+
+        memcpy(&phdr, image + (size_t)ehdr.e_phoff +
+                           (size_t)i * sizeof(phdr), sizeof(phdr));
+        if (phdr.p_type != PT_LOAD || !(phdr.p_flags & PF_X) ||
+            symbol.st_value < phdr.p_vaddr)
+            continue;
+        within = symbol.st_value - phdr.p_vaddr;
+        if (within > phdr.p_filesz ||
+            symbol.st_size > phdr.p_filesz - within ||
+            phdr.p_offset > SIZE_MAX - within ||
+            (size_t)(phdr.p_offset + within) != symbol_offset)
+            continue;
+        executable_owners++;
+    }
+    if (executable_owners != 1 || symbol_offset > image_size ||
+        (size_t)symbol.st_size > image_size - symbol_offset)
+        return NULL;
+    return (void *)(uintptr_t)(image + symbol_offset);
+}
+
 /* Admit every non-callback word which the direct runtime writes into the
  * synthetic glibc rtld objects.  Size/release profiles merely nominate
  * offsets; target libc must independently publish or execute a consumer for
@@ -28701,6 +28855,7 @@ static int glibc_private_rtld_contract(
 #if defined(__x86_64__)
     uint16_t target_fpu_control;
 #endif
+    size_t vdso_clock_offset;
 #define GLIBC_RTLD_REQUIRE(expr_, diagnostic_)                              \
     do {                                                                    \
         if (!(expr_)) {                                                     \
@@ -28770,7 +28925,32 @@ static int glibc_private_rtld_contract(
     GLIBC_RTLD_REQUIRE(
         glibc_x86_fpu_control_contract(libc_obj, &target_fpu_control),
         "FPU control");
+
 #endif
+
+    /* The vDSO is an optional kernel accelerator rather than correctness
+     * state.  Publish it only when both sides of the private ABI are exact:
+     * libc uniquely identifies its GLRO slot and the kernel image uniquely
+     * exports the architecture's executable clock entry point. */
+    g_glibc_vdso_clock_offset = -1;
+    g_glibc_vdso_clock = NULL;
+    if (glibc_vdso_clock_field_offset(
+            libc_obj, g_glibc_rtld_global_ro_size,
+            &vdso_clock_offset)) {
+        void *vdso_clock = kernel_vdso_function(
+#if defined(__x86_64__)
+            "__vdso_clock_gettime");
+#elif defined(__aarch64__)
+            "__kernel_clock_gettime");
+#else
+            "");
+#endif
+
+        if (vdso_clock && vdso_clock_offset <= INT_MAX) {
+            g_glibc_vdso_clock_offset = (int)vdso_clock_offset;
+            g_glibc_vdso_clock = vdso_clock;
+        }
+    }
 
     /* The target-published thread_db descriptors above are the semantic
      * contract for the debugger-visible used/user list heads.  Keep code
@@ -33435,7 +33615,8 @@ static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     size_t phdr_bytes;
     const uint8_t *elf_base;
     const Elf64_Ehdr *ehdr;
-    Elf64_Phdr *phdr = MAP_FAILED;
+    const Elf64_Phdr *phdr = NULL;
+    void *phdr_mapping = MAP_FAILED;
     const Elf64_Phdr *dynamic = NULL;
     struct dlfrz_gnu_property_profile property_profile = {0};
     struct object_reservation_bounds reservation_bounds;
@@ -33502,11 +33683,30 @@ static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         goto fail;
     }
 
-    phdr = mmap(NULL, phdr_bytes, PROT_READ | PROT_WRITE,
-                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (phdr == MAP_FAILED)
-        goto fail;
-    memcpy(phdr, elf_base + (size_t)ehdr->e_phoff, phdr_bytes);
+    /* A source authenticated as an exact clean file, or by the bootstrap's
+     * contained page-transfer proof, remains mapped loader-read-only for the
+     * complete direct run, including lazy dlopen.  Its already-bounded PHDR
+     * bytes are therefore the cheapest immutable internal snapshot.  An
+     * unproved caller (including format-gate fixtures) and an under-aligned
+     * valid ELF retain the independently protected anonymous copy. */
+    if (((source_flags & (DLFRZ_SOURCE_EXACT_CLEAN_FILE |
+                          DLFRZ_SOURCE_MREMAP_DONTUNMAP |
+                          DLFRZ_SOURCE_KERNEL_PREMAP)) != 0 ||
+         (mem == g_frozen_mem && g_frozen_phdr_source_admitted)) &&
+        address_has_alignment(
+            (uintptr_t)(elf_base + (size_t)ehdr->e_phoff),
+            _Alignof(Elf64_Phdr))) {
+        phdr = (const Elf64_Phdr *)(const void *)(
+            elf_base + (size_t)ehdr->e_phoff);
+    } else {
+        phdr_mapping = mmap(NULL, phdr_bytes, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (phdr_mapping == MAP_FAILED)
+            goto fail;
+        memcpy(phdr_mapping, elf_base + (size_t)ehdr->e_phoff,
+               phdr_bytes);
+        phdr = phdr_mapping;
+    }
 
     if (!dlfrz_load_pages_do_not_overlap(
             phdr, meta->phdr_num, g_page_size) ||
@@ -33715,17 +33915,20 @@ static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     } else {
         obj->public_phdr = phdr;
     }
-    if (mprotect(phdr, phdr_bytes, PROT_READ) < 0)
+    if (phdr_mapping != MAP_FAILED &&
+        mprotect(phdr_mapping, phdr_bytes, PROT_READ) < 0)
         goto fail;
     obj->phdr = phdr;
-    obj->runtime_phdr_mapping = phdr;
-    obj->runtime_phdr_mapping_size = phdr_bytes;
+    if (phdr_mapping != MAP_FAILED) {
+        obj->runtime_phdr_mapping = phdr_mapping;
+        obj->runtime_phdr_mapping_size = phdr_bytes;
+    }
     loaded_obj_cache_unique_writable_load(obj);
     return 0;
 
 fail:
-    if (phdr != MAP_FAILED)
-        (void)munmap(phdr, phdr_bytes);
+    if (phdr_mapping != MAP_FAILED)
+        (void)munmap(phdr_mapping, phdr_bytes);
     if (reservation_created && obj->runtime_reservation &&
         obj->runtime_reservation_size) {
         (void)munmap(obj->runtime_reservation,
@@ -47682,6 +47885,7 @@ static int capture_kernel_runtime_parameters(char **envp)
     g_kernel_clktck = (int)clktck;
     g_kernel_hwcap = get_auxval(envp, AT_HWCAP);
     g_kernel_hwcap2 = get_auxval(envp, AT_HWCAP2);
+    g_kernel_sysinfo_ehdr = get_auxval(envp, AT_SYSINFO_EHDR);
 #if defined(__aarch64__)
     g_kernel_hwcap3 = get_auxval(envp, AT_HWCAP3);
     g_kernel_hwcap4 = get_auxval(envp, AT_HWCAP4);
@@ -48572,7 +48776,7 @@ static int loader_source_contract_is_valid(int srcfd, uint32_t source_flags)
     /* At initial handoff an exact token must name the still-open descriptor
      * whose clean private view is byte-equivalent to mem.  The descriptor is
      * closed after TLS while that proven live mapping remains retained;
-     * fdless lazy loads therefore consume mem through the ordinary copy path. */
+     * fdless lazy segment population therefore uses the ordinary copy path. */
     if ((source_flags & DLFRZ_SOURCE_EXACT_CLEAN_FILE) != 0 &&
         srcfd < 0)
         return 0;
@@ -48621,6 +48825,7 @@ static int loader_run_impl(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     g_runtime_loader_fork_cookie = runtime_fork_cookie;
     g_nobj = 0;
     g_is_musl_runtime = 0;
+    g_frozen_phdr_source_admitted = 0;
     g_bootstrap_publication_boundary = 0;
     memset(&g_bootstrap_introspection_obj, 0,
            sizeof(g_bootstrap_introspection_obj));
@@ -48996,6 +49201,10 @@ static int loader_run_impl(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     g_frozen_mem_foff    = mem_foff;
     g_frozen_srcfd       = srcfd;
     g_frozen_source_flags = source_flags;
+    g_frozen_phdr_source_admitted =
+        (source_flags & (DLFRZ_SOURCE_EXACT_CLEAN_FILE |
+                         DLFRZ_SOURCE_MREMAP_DONTUNMAP |
+                         DLFRZ_SOURCE_KERNEL_PREMAP)) != 0;
     g_frozen_metas       = metas;
     g_frozen_entries     = entries;
     g_frozen_strtab      = strtab;
