@@ -2720,69 +2720,95 @@ static int bs_parse_maps_entry(const unsigned char *line, size_t length,
 
 struct bs_maps_line_reader {
     FILE *stream;
-    unsigned char *line;
+    unsigned char *buffer;
     size_t capacity;
-    size_t dirty_length;
+    size_t begin;
+    size_t end;
+    int eof;
 };
 
 static int bs_maps_line_reader_init(struct bs_maps_line_reader *reader,
-                                    FILE *stream, unsigned char *line,
+                                    FILE *stream, unsigned char *buffer,
                                     size_t capacity)
 {
-    if (!reader || !stream || !line || capacity < 2 || capacity > INT_MAX)
+    if (!reader || !stream || !buffer || capacity < 2)
         return 0;
     reader->stream = stream;
-    reader->line = line;
+    reader->buffer = buffer;
     reader->capacity = capacity;
-    reader->dirty_length = 0;
-    memset(line, 0xff, capacity);
+    reader->begin = 0;
+    reader->end = 0;
+    reader->eof = 0;
     return 1;
 }
 
 /* Return 1 for a line, 0 for clean EOF, and -1 for malformed or oversized
- * input.  fgets retains the fixed caller-owned bound while letting stdio
- * scan each buffered chunk in bulk; the former byte-at-a-time fgetc loop was
- * a measurable part of every authenticated smaps proof.  A nonzero sentinel
- * distinguishes fgets' final terminator from an embedded NUL even though the
- * interface does not return a byte count.  Initialize the full buffer once,
- * then restore only bytes dirtied by the preceding line: total clearing work
- * is linear in procfs input rather than line-limit times line count. */
+ * input.  Read bounded blocks from stdio and return spans into the caller's
+ * buffer.  This preserves exact byte counts (and therefore embedded-NUL
+ * rejection) without copying each small procfs line out of stdio's buffer.
+ * Only a fragment crossing a block boundary is compacted. */
 static int bs_read_maps_line(struct bs_maps_line_reader *reader,
+                             const unsigned char **line_out,
                              size_t *length_out)
 {
-    size_t length;
-    unsigned char *line;
-    size_t capacity;
-
-    if (!reader || !reader->stream || !reader->line ||
-        reader->capacity < 2 || reader->capacity > INT_MAX ||
-        reader->dirty_length > reader->capacity || !length_out)
+    if (!reader || !reader->stream || !reader->buffer ||
+        reader->capacity < 2 || reader->begin > reader->end ||
+        reader->end > reader->capacity || !line_out || !length_out)
         return -1;
-    line = reader->line;
-    capacity = reader->capacity;
-    if (reader->dirty_length != 0)
-        memset(line, 0xff, reader->dirty_length);
-    reader->dirty_length = 0;
-    if (!fgets((char *)line, (int)capacity, reader->stream))
-        return ferror(reader->stream) ? -1 : 0;
-    for (length = 0; length < capacity && line[length] != '\0'; length++)
-        ;
-    reader->dirty_length = length < capacity ? length + 1 : capacity;
-    if (length == capacity ||
-        (length + 1 < capacity && line[length + 1] != 0xff))
-        return -1;
-    if (length != 0 && line[length - 1] == '\n') {
-        length--;
-    } else if (!feof(reader->stream)) {
-        /* fgets may fill its complete destination immediately before EOF;
-         * one bounded lookahead preserves the old exact-limit behavior. */
-        int byte = fgetc(reader->stream);
+    *line_out = NULL;
+    *length_out = 0;
 
-        if (byte != EOF || ferror(reader->stream))
+    for (;;) {
+        unsigned char *line = reader->buffer + reader->begin;
+        size_t available = reader->end - reader->begin;
+        unsigned char *newline = memchr(line, '\n', available);
+
+        if (newline) {
+            size_t length = (size_t)(newline - line);
+
+            /* fgets(capacity) accepts at most capacity-2 bytes followed by
+             * a newline.  Retain that exact historical bound. */
+            if (length > reader->capacity - 2 ||
+                memchr(line, '\0', length))
+                return -1;
+            reader->begin += length + 1;
+            *line_out = line;
+            *length_out = length;
+            return 1;
+        }
+        if (reader->eof) {
+            if (available == 0)
+                return 0;
+            if (available > reader->capacity - 1 ||
+                memchr(line, '\0', available))
+                return -1;
+            reader->begin = reader->end;
+            *line_out = line;
+            *length_out = available;
+            return 1;
+        }
+        if (reader->begin != 0) {
+            memmove(reader->buffer, line, available);
+            reader->begin = 0;
+            reader->end = available;
+        } else if (reader->end == reader->capacity) {
             return -1;
+        }
+        {
+            size_t count = fread(reader->buffer + reader->end, 1,
+                                 reader->capacity - reader->end,
+                                 reader->stream);
+
+            reader->end += count;
+            if (count == 0) {
+                if (ferror(reader->stream))
+                    return -1;
+                if (!feof(reader->stream))
+                    return -1;
+                reader->eof = 1;
+            }
+        }
     }
-    *length_out = length;
-    return 1;
 }
 
 struct bs_smaps_evidence {
@@ -2902,7 +2928,7 @@ static int bs_payload_smaps_stream_matches(
     uint64_t payload_vaddr, uint64_t payload_filesz,
     uint64_t payload_foff)
 {
-    unsigned char line[BS_MAX_MAPS_LINE];
+    unsigned char buffer[BS_MAX_MAPS_LINE];
     struct bs_maps_line_reader reader;
     struct bs_smaps_evidence evidence = {0};
     uint64_t payload_end;
@@ -2916,14 +2942,15 @@ static int bs_payload_smaps_stream_matches(
         payload_end > UINTPTR_MAX ||
         payload_filesz > UINT64_MAX - payload_foff)
         return 0;
-    if (!bs_maps_line_reader_init(&reader, stream, line, sizeof(line)))
+    if (!bs_maps_line_reader_init(&reader, stream, buffer, sizeof(buffer)))
         return 0;
     cursor = payload_vaddr;
 
     for (uint64_t count = 0; count < BS_MAX_SMAPS_LINES; count++) {
         struct bs_maps_entry entry;
+        const unsigned char *line;
         size_t length;
-        int line_status = bs_read_maps_line(&reader, &length);
+        int line_status = bs_read_maps_line(&reader, &line, &length);
 
         if (line_status == 0) {
             if (!bs_smaps_finish_relevant(&evidence, payload_end, &cursor))
@@ -4765,7 +4792,7 @@ static int bs_mremap_targets_smaps_stream_matches(
     FILE *stream, const struct stat *executable,
     const struct bs_startup_mremap_plan *plan)
 {
-    unsigned char line[BS_MAX_MAPS_LINE];
+    unsigned char buffer[BS_MAX_MAPS_LINE];
     struct bs_maps_line_reader reader;
     struct bs_smaps_evidence evidence = {0};
     size_t range_index = 0;
@@ -4776,14 +4803,15 @@ static int bs_mremap_targets_smaps_stream_matches(
     if (!stream || !executable || executable->st_ino == 0 || !plan ||
         !plan->targets || plan->count == 0)
         return 0;
-    if (!bs_maps_line_reader_init(&reader, stream, line, sizeof(line)))
+    if (!bs_maps_line_reader_init(&reader, stream, buffer, sizeof(buffer)))
         return 0;
     cursor = (uint64_t)plan->targets[0].target;
 
     for (uint64_t count = 0; count < BS_MAX_SMAPS_LINES; count++) {
         struct bs_maps_entry entry;
+        const unsigned char *line;
         size_t length;
-        int line_status = bs_read_maps_line(&reader, &length);
+        int line_status = bs_read_maps_line(&reader, &line, &length);
 
         if (line_status == 0) {
             if (!bs_mremap_targets_finish_vma(
@@ -5036,7 +5064,7 @@ static int bs_startup_mremap_transfer_batch(
 static int bs_runtime_fork_cookie_smaps_matches(
     FILE *stream, uintptr_t cookie, size_t page_size)
 {
-    unsigned char line[BS_MAX_MAPS_LINE];
+    unsigned char buffer[BS_MAX_MAPS_LINE];
     struct bs_maps_line_reader reader;
     uint64_t cookie_end;
     uint64_t previous_end = 0;
@@ -5046,14 +5074,15 @@ static int bs_runtime_fork_cookie_smaps_matches(
     if (!stream || cookie == 0 || page_size < sizeof(uint32_t) ||
         !u64_add_checked(cookie, page_size, &cookie_end))
         return 0;
-    if (!bs_maps_line_reader_init(&reader, stream, line, sizeof(line)))
+    if (!bs_maps_line_reader_init(&reader, stream, buffer, sizeof(buffer)))
         return 0;
     for (uint64_t count = 0; count < BS_MAX_SMAPS_LINES; count++) {
         struct bs_maps_entry entry;
+        const unsigned char *line;
         size_t length;
         size_t prefix = 0;
         unsigned digit;
-        int status = bs_read_maps_line(&reader, &length);
+        int status = bs_read_maps_line(&reader, &line, &length);
 
         if (status == 0)
             return relevant && have_flags;

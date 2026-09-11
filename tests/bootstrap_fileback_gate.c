@@ -402,7 +402,19 @@ static int smaps_match_bytes(const void *bytes, size_t size,
 
 static int maps_line_reader_reuse_gate(void)
 {
-    unsigned char line[32];
+    static const struct {
+        const char *bytes;
+        size_t size;
+        int expected_status;
+        size_t expected_length;
+    } boundary_cases[] = {
+        {"123456\n", 7, 1, 6},
+        {"1234567", 7, 1, 7},
+        {"1234567\n", 8, -1, 0},
+        {"12345678", 8, -1, 0},
+    };
+    unsigned char buffer[32];
+    const unsigned char *line;
     struct bs_maps_line_reader reader;
     char ordinary[] = "a deliberately longer line\nx\nlast";
     const unsigned char embedded_nul[] = {'x', '\0', 'y', '\n'};
@@ -411,30 +423,52 @@ static int maps_line_reader_reuse_gate(void)
     int ok = 1;
 
     if (!stream ||
-        !bs_maps_line_reader_init(&reader, stream, line, sizeof(line))) {
+        !bs_maps_line_reader_init(
+            &reader, stream, buffer, sizeof(buffer))) {
         if (stream)
             fclose(stream);
         return 0;
     }
-    ok &= bs_read_maps_line(&reader, &length) == 1 &&
+    ok &= bs_read_maps_line(&reader, &line, &length) == 1 &&
           length == sizeof("a deliberately longer line") - 1 &&
           memcmp(line, "a deliberately longer line", length) == 0;
-    ok &= bs_read_maps_line(&reader, &length) == 1 && length == 1 &&
+    ok &= bs_read_maps_line(&reader, &line, &length) == 1 && length == 1 &&
           line[0] == 'x';
-    ok &= bs_read_maps_line(&reader, &length) == 1 && length == 4 &&
+    ok &= bs_read_maps_line(&reader, &line, &length) == 1 && length == 4 &&
           memcmp(line, "last", length) == 0;
-    ok &= bs_read_maps_line(&reader, &length) == 0;
+    ok &= bs_read_maps_line(&reader, &line, &length) == 0;
     fclose(stream);
 
     stream = fmemopen((void *)embedded_nul, sizeof(embedded_nul), "r");
     if (!stream ||
-        !bs_maps_line_reader_init(&reader, stream, line, sizeof(line))) {
+        !bs_maps_line_reader_init(
+            &reader, stream, buffer, sizeof(buffer))) {
         if (stream)
             fclose(stream);
         return 0;
     }
-    ok &= bs_read_maps_line(&reader, &length) == -1;
+    ok &= bs_read_maps_line(&reader, &line, &length) == -1;
     fclose(stream);
+    for (size_t i = 0;
+         i < sizeof(boundary_cases) / sizeof(boundary_cases[0]); i++) {
+        unsigned char bounded_buffer[8];
+        int status;
+
+        stream = fmemopen((void *)boundary_cases[i].bytes,
+                          boundary_cases[i].size, "r");
+        if (!stream || !bs_maps_line_reader_init(
+                &reader, stream, bounded_buffer,
+                sizeof(bounded_buffer))) {
+            if (stream)
+                fclose(stream);
+            return 0;
+        }
+        status = bs_read_maps_line(&reader, &line, &length);
+        ok &= status == boundary_cases[i].expected_status;
+        if (status == 1)
+            ok &= length == boundary_cases[i].expected_length;
+        fclose(stream);
+    }
     return ok;
 }
 
