@@ -4221,7 +4221,8 @@ static inline int
 dlfrz_glibc_x86_cpu_generic_kind(
     const unsigned char *code, size_t code_size, uint64_t code_vaddr,
     size_t code_file_offset, uint64_t cpu_vaddr, uint32_t *kind_out,
-    size_t *immediate_file_offset_out)
+    size_t *immediate_file_offset_out,
+    unsigned char *reachable_state_out, size_t reachable_state_size)
 {
     enum {
         DLFRZ_X86_KIND_MAX_ASSIGNMENTS = 96,
@@ -4245,7 +4246,9 @@ dlfrz_glibc_x86_cpu_generic_kind(
         size_t assignment;
         size_t target;
     } edges[DLFRZ_X86_KIND_MAX_EDGES];
-    unsigned char instruction_state[32769];
+    unsigned char local_instruction_state[32769];
+    unsigned char *instruction_state = reachable_state_out
+        ? reachable_state_out : local_instruction_state;
     uint16_t block_worklist[DLFRZ_X86_KIND_MAX_BLOCKS];
     size_t block_head = 0;
     size_t block_tail = 0;
@@ -4265,9 +4268,10 @@ dlfrz_glibc_x86_cpu_generic_kind(
      * unredirected builtin from an aggregate initializer while allowing the
      * direct loader's REP/STP implementation to clear this bounded scratch
      * area a word or cache line at a time. */
-    memset(instruction_state, 0, sizeof(instruction_state));
-    if (!code || code_size < 256 || code_size > 32768)
+    if (!code || code_size < 256 || code_size > 32768 ||
+        (reachable_state_out && reachable_state_size <= code_size))
         return 0;
+    memset(instruction_state, 0, code_size + 1);
     instruction_state[0] = DLFRZ_X86_INSN_START |
                            DLFRZ_X86_INSN_QUEUED;
     block_worklist[block_tail++] = 0;
@@ -4585,7 +4589,8 @@ dlfrz_glibc_x86_cpu_initializer_matches(
         DLFRZ_GLIBC_X86_CPU_CACHE_INFO_WORDS],
     size_t object_end_file_offsets[
         DLFRZ_GLIBC_X86_CPU_END_WRITERS_MAX],
-    size_t *object_end_file_offset_count)
+    size_t *object_end_file_offset_count,
+    const unsigned char *reachable_state, size_t reachable_state_size)
 {
     const int required_offsets[] = {
         layout->xsave_state_size,
@@ -4624,7 +4629,9 @@ dlfrz_glibc_x86_cpu_initializer_matches(
     size_t object_end_displacements[
         DLFRZ_GLIBC_X86_CPU_END_WRITERS_MAX] = {0};
     size_t object_end_writes = 0;
-    unsigned char instruction_state[32769];
+    unsigned char local_instruction_state[32769];
+    const unsigned char *instruction_state = reachable_state
+        ? reachable_state : local_instruction_state;
     size_t kind_writes = 0;
     size_t preferred_writes = 0;
     size_t data_cache_writes = 0;
@@ -4638,6 +4645,7 @@ dlfrz_glibc_x86_cpu_initializer_matches(
     uint64_t object_end_field;
 
     if (!code || !layout || code_size < 256 || code_size > 32768 ||
+        (reachable_state && reachable_state_size <= code_size) ||
         !dlfrz_glibc_x86_cpu_object_profile_complete(layout) ||
         layout->preferred < 0 || layout->data_cache_size < 0 ||
         layout->rep_stosb_threshold < 0 ||
@@ -4682,9 +4690,10 @@ dlfrz_glibc_x86_cpu_initializer_matches(
         return 0;
     object_end = cpu_vaddr + layout->object_size;
     object_end_field = object_end - UINT64_C(8);
-    if (!dlfrz_glibc_x86_reachable_instructions(
-            code, code_size, code_vaddr, instruction_state,
-            sizeof(instruction_state)))
+    if (!reachable_state &&
+        !dlfrz_glibc_x86_reachable_instructions(
+            code, code_size, code_vaddr, local_instruction_state,
+            sizeof(local_instruction_state)))
         return 0;
     for (size_t position = 0; position < code_size; position++) {
         struct dlfrz_glibc_x86_rip_write write;
@@ -4910,6 +4919,7 @@ dlfrz_glibc_x86_cpu_contract_valid(
     uint64_t initializer_size;
     uint32_t generic_kind;
     int32_t displacement;
+    unsigned char initializer_state[32769];
 
     /* Keep this an explicit call so loader.c's private memset redirection is
      * honored.  GCC may otherwise lower a large aggregate initializer to a
@@ -5022,7 +5032,8 @@ dlfrz_glibc_x86_cpu_contract_valid(
             initializer_code, (size_t)initializer_size,
             initializer_vaddr, initializer_offset, cpu_vaddr,
             &generic_kind,
-            &evidence.generic_kind_immediate_file_offset) ||
+            &evidence.generic_kind_immediate_file_offset,
+            initializer_state, sizeof(initializer_state)) ||
         !dlfrz_glibc_x86_cpu_initializer_matches(
             initializer_code, (size_t)initializer_size,
             initializer_vaddr, initializer_offset, cpu_vaddr, &profile,
@@ -5030,7 +5041,8 @@ dlfrz_glibc_x86_cpu_contract_valid(
             &evidence.tail_boundary_displacement_file_offset,
             evidence.cache_info_displacement_file_offsets,
             evidence.object_end_displacement_file_offsets,
-            &evidence.object_end_displacement_count))
+            &evidence.object_end_displacement_count,
+            initializer_state, sizeof(initializer_state)))
         return 0;
 
     /* The structurally distinct feature-array family must disagree with the
@@ -5102,7 +5114,8 @@ dlfrz_glibc_x86_cpu_contract_valid(
     if (dlfrz_glibc_x86_cpu_initializer_matches(
             initializer_code, (size_t)initializer_size,
             initializer_vaddr, initializer_offset, cpu_vaddr, &alternative,
-            NULL, NULL, NULL, NULL, NULL))
+            NULL, NULL, NULL, NULL, NULL,
+            initializer_state, sizeof(initializer_state)))
         return 0;
 
     contract.layout = profile;

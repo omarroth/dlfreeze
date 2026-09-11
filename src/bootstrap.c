@@ -4994,26 +4994,31 @@ static int bs_runtime_fork_cookie_smaps_matches(
  * No target resolver, constructor, or thread callback can run between them.
  * Keep madvise and the authenticated verification together: neither its
  * return value nor a child-only VMA flag establishes the parent's cookie. */
-static int bs_runtime_fork_cookie_establish(
-    volatile uint32_t *cookie, size_t page_size)
+static int bs_runtime_fork_cookie_establish_at(
+    volatile uint32_t *cookie, size_t page_size,
+    const struct bs_proc_self_context *context)
 {
-    struct bs_proc_self_context context = {.root_fd = -1, .self_fd = -1};
+    unsigned char stream_buffer[4096];
     struct stat status;
     FILE *stream = NULL;
     int fd = -1;
     int ready = 0;
 
-    if (!cookie || syscall(SYS_madvise, (void *)cookie, page_size,
-                            MADV_WIPEONFORK) != 0 ||
-        bs_proc_self_context_open_at("/proc", &context) < 0)
+    if (!cookie || !context || context->self_fd < 0 ||
+        syscall(SYS_madvise, (void *)cookie, page_size,
+                MADV_WIPEONFORK) != 0)
         goto out;
-    fd = openat(context.self_fd, "smaps", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (!bs_proc_entry_status(fd, context.device, S_IFREG, &status))
+    fd = openat(context->self_fd, "smaps",
+                O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (!bs_proc_entry_status(fd, context->device, S_IFREG, &status))
         goto out;
     stream = fdopen(fd, "r");
     if (!stream)
         goto out;
     fd = -1;
+    if (setvbuf(stream, (char *)stream_buffer, _IOFBF,
+                sizeof(stream_buffer)) != 0)
+        goto out;
     ready = bs_runtime_fork_cookie_smaps_matches(
         stream, (uintptr_t)cookie, page_size);
     if (fclose(stream) != 0)
@@ -5024,6 +5029,18 @@ out:
         fclose(stream);
     if (fd >= 0)
         close(fd);
+    return ready;
+}
+
+static int bs_runtime_fork_cookie_establish(
+    volatile uint32_t *cookie, size_t page_size)
+{
+    struct bs_proc_self_context context = {.root_fd = -1, .self_fd = -1};
+    int ready = 0;
+
+    if (bs_proc_self_context_open_at("/proc", &context) == 0)
+        ready = bs_runtime_fork_cookie_establish_at(
+            cookie, page_size, &context);
     bs_proc_self_context_close(&context);
     return ready;
 }
@@ -5117,6 +5134,7 @@ static void bs_startup_mremap_probe_child(
     uint64_t payload_foff, volatile uint32_t *runtime_fork_cookie,
     size_t page_size)
 {
+    unsigned char smaps_buffer[4096];
     struct bs_proc_self_context context = {
         .root_fd = -1,
         .self_fd = -1,
@@ -5129,13 +5147,15 @@ static void bs_startup_mremap_probe_child(
     int targets_reserved = 0;
     int ready = 0;
     int cookie_ready = 0;
+    int context_ready;
 
-    if (runtime_fork_cookie)
-        cookie_ready = bs_runtime_fork_cookie_establish(
-            runtime_fork_cookie, page_size);
+    context_ready = bs_proc_self_context_open_at("/proc", &context) == 0;
+    if (runtime_fork_cookie && context_ready)
+        cookie_ready = bs_runtime_fork_cookie_establish_at(
+            runtime_fork_cookie, page_size, &context);
 
     if (!plan || !plan->ranges || !plan->targets || plan->count == 0 ||
-        bs_proc_self_context_open_at("/proc", &context) < 0)
+        !context_ready)
         goto out;
     if (exact_clean_source) {
         if (source_fd < 0 || fstat(source_fd, &executable) < 0)
@@ -5188,6 +5208,9 @@ static void bs_startup_mremap_probe_child(
     if (!smaps)
         goto out;
     smaps_fd = -1;
+    if (setvbuf(smaps, (char *)smaps_buffer, _IOFBF,
+                sizeof(smaps_buffer)) != 0)
+        goto out;
     if (plan->kernel_premap) {
         /* Authenticate BOTH aliases in one smaps pass. A dirty/reconstructed
          * canonical payload is not interchangeable with a clean stage.

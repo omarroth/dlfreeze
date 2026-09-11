@@ -14585,11 +14585,7 @@ static void *stub_tls_get_addr_glibc_dtv8(struct tls_index *ti)
     uintptr_t tls_base;
     size_t capacity;
 
-    if (modid == 0)
-        goto slow;
     dtv = (uintptr_t *)arch_read_tp_offset(8);
-    if (!dtv)
-        goto slow;
     capacity = dtv[-2];
     if (capacity > MAX_TOTAL_OBJS || modid > capacity)
         goto slow;
@@ -30327,12 +30323,16 @@ static uint32_t relocation_definition_cache_hash(
 
     value ^= (uint64_t)requester_index << 32;
     value ^= (uint64_t)object_count << 48;
-    value ^= skip_requester ? UINT64_C(0x9e3779b97f4a7c15) : 0;
-    value ^= value >> 30;
-    value *= UINT64_C(0xbf58476d1ce4e5b9);
-    value ^= value >> 27;
-    value *= UINT64_C(0x94d049bb133111eb);
-    value ^= value >> 31;
+    value ^= skip_requester ? UINT64_C(0x8000000000000000) : 0;
+    /* The table is a work cache rather than lookup authority, but a public
+     * mixer still lets an ELF producer manufacture long probe clusters.
+     * Fold every tuple field into the low half, then use the already-proven
+     * startup randomness for a keyed permutation.  Exact tuple comparison
+     * remains authoritative at the selected entry. */
+    value ^= value >> 32;
+    value ^= g_vfs_hash_key[0];
+    value *= g_vfs_hash_key[1] | UINT64_C(1);
+    value ^= value >> 29;
     return (uint32_t)value;
 }
 

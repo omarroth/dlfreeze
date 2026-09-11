@@ -3506,14 +3506,15 @@ static int x86_cpu_kind_control_flow_selftest(void)
 
     if (!dlfrz_glibc_x86_cpu_generic_kind(
             code, sizeof(code), code_vaddr, 0, cpu_vaddr, &kind,
-            &immediate_offset) ||
+            &immediate_offset, NULL, 0) ||
         kind != 4 || immediate_offset != 21)
         return 0;
 
     /* The fallthrough assignment must reach the join without a return. */
     code[96] = 0xc3;
     if (dlfrz_glibc_x86_cpu_generic_kind(
-            code, sizeof(code), code_vaddr, 0, cpu_vaddr, NULL, NULL))
+            code, sizeof(code), code_vaddr, 0, cpu_vaddr, NULL, NULL,
+            NULL, 0))
         return 0;
     code[96] = 0x90;
 
@@ -3521,7 +3522,8 @@ static int x86_cpu_kind_control_flow_selftest(void)
     code[96] = 0xeb;
     code[97] = 12; /* target 110, bypassing the join at 100 */
     if (dlfrz_glibc_x86_cpu_generic_kind(
-            code, sizeof(code), code_vaddr, 0, cpu_vaddr, NULL, NULL))
+            code, sizeof(code), code_vaddr, 0, cpu_vaddr, NULL, NULL,
+            NULL, 0))
         return 0;
     code[96] = 0x90;
     code[97] = 0x90;
@@ -3530,7 +3532,8 @@ static int x86_cpu_kind_control_flow_selftest(void)
     memcpy(code + 21, &value, sizeof(value));
     memcpy(code + 193, &value, sizeof(value));
     return !dlfrz_glibc_x86_cpu_generic_kind(
-        code, sizeof(code), code_vaddr, 0, cpu_vaddr, NULL, NULL);
+        code, sizeof(code), code_vaddr, 0, cpu_vaddr, NULL, NULL,
+        NULL, 0);
 }
 
 /* Frozen copy of the previous independent-search implementation.  Keep this
