@@ -42,6 +42,8 @@ static void reset_gate_vfs(void)
 
 static int keyed_hash_gate(void)
 {
+    static const char stream_value[] =
+        "0123456789abcdefghijklmnopqrstuvwxyz";
     uint8_t key[16];
     uint64_t first;
 
@@ -55,6 +57,17 @@ static int keyed_hash_gate(void)
     if (vfs_seed_hash_key(key) < 0 ||
         vfs_hash_n("/adversarial/path", 17) == first)
         return -1;
+    for (size_t split = 0; split < sizeof(stream_value); split++) {
+        struct vfs_hash_state state;
+
+        vfs_hash_init(&state);
+        vfs_hash_update(&state, stream_value, split);
+        vfs_hash_update(&state, stream_value + split,
+                        sizeof(stream_value) - 1U - split);
+        if (vfs_hash_final(&state) !=
+            vfs_hash_n(stream_value, sizeof(stream_value) - 1U))
+            return -1;
+    }
     return 0;
 }
 

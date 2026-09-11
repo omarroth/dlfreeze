@@ -15802,8 +15802,26 @@ static void vfs_hash_update_byte(struct vfs_hash_state *state, uint8_t byte)
 static void vfs_hash_update(struct vfs_hash_state *state,
                             const char *bytes, size_t length)
 {
-    for (size_t i = 0; i < length; i++)
-        vfs_hash_update_byte(state, (uint8_t)bytes[i]);
+    size_t consumed = 0;
+
+    /* Preserve streaming semantics when a preceding update left a partial
+     * word, then consume complete words without rebuilding each one through
+     * eight byte-at-a-time shifts and length checks. */
+    while (consumed < length && state->tail_length != 0)
+        vfs_hash_update_byte(state, (uint8_t)bytes[consumed++]);
+    while (length - consumed >= sizeof(uint64_t)) {
+        uint64_t word;
+
+        memcpy(&word, bytes + consumed, sizeof(word));
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+        word = __builtin_bswap64(word);
+#endif
+        vfs_hash_compress(state, word);
+        state->length += sizeof(word);
+        consumed += sizeof(word);
+    }
+    while (consumed < length)
+        vfs_hash_update_byte(state, (uint8_t)bytes[consumed++]);
 }
 
 static uint64_t vfs_hash_final(const struct vfs_hash_state *input)
@@ -20705,6 +20723,7 @@ _Static_assert(RELOCATION_DEFINITION_CACHE_LIMIT >=
                "relocation cache growth must be bounded and power-of-two");
 
 struct relocation_definition_cache_ent {
+    uint64_t ordinary_value;
     uint32_t epoch;
     uint32_t reference_symbol_index;
     uint32_t definition_symbol_index;
@@ -20715,6 +20734,7 @@ struct relocation_definition_cache_ent {
     uint8_t found;
     uint8_t ifunc_classification_valid;
     uint8_t is_ifunc;
+    uint8_t ordinary_value_valid;
 };
 
 enum relocation_scope_immutability_state {
@@ -31035,7 +31055,9 @@ static const Elf64_Sym *lookup_relocation_definition(
 
 static int relocation_definition_cache_ifunc_lookup(
     struct loaded_obj *requester, uint32_t symbol_index,
-    struct loaded_obj *objs, int nobj, int *is_ifunc_out)
+    struct loaded_obj *objs, int nobj, int *is_ifunc_out,
+    int *ordinary_value_valid_out, uint64_t *ordinary_value_out,
+    struct relocation_definition_cache_ent **entry_out)
 {
     struct relocation_definition_cache_ent *entry;
     struct loaded_obj *owner;
@@ -31051,6 +31073,12 @@ static int relocation_definition_cache_ifunc_lookup(
     if (!entry->ifunc_classification_valid)
         return 0;
     *is_ifunc_out = entry->is_ifunc != 0;
+    if (ordinary_value_valid_out)
+        *ordinary_value_valid_out = entry->ordinary_value_valid != 0;
+    if (ordinary_value_out && entry->ordinary_value_valid)
+        *ordinary_value_out = entry->ordinary_value;
+    if (entry_out)
+        *entry_out = entry;
 #ifdef DLFREEZE_SYMBOL_LOOKUP_COMPLEXITY_GATE
     g_relocation_ifunc_cache_hits++;
 #endif
@@ -31059,7 +31087,8 @@ static int relocation_definition_cache_ifunc_lookup(
 
 static int relocation_definition_cache_ifunc_store(
     struct loaded_obj *requester, uint32_t symbol_index,
-    struct loaded_obj *objs, int nobj, int is_ifunc)
+    struct loaded_obj *objs, int nobj, int is_ifunc,
+    int ordinary_value_valid, uint64_t ordinary_value)
 {
     struct relocation_definition_cache_ent *entry;
     struct loaded_obj *owner;
@@ -31075,6 +31104,10 @@ static int relocation_definition_cache_ifunc_store(
     (void)definition;
     entry->is_ifunc = is_ifunc ? 1 : 0;
     entry->ifunc_classification_valid = 1;
+    if (!is_ifunc && ordinary_value_valid) {
+        entry->ordinary_value = ordinary_value;
+        entry->ordinary_value_valid = 1;
+    }
     return 1;
 }
 
@@ -31479,7 +31512,12 @@ static int relocation_symbol_ifunc_classification_with_value(
     const Elf64_Sym *definition;
     struct loaded_obj *owner = NULL;
     uint64_t special;
+    uint64_t ordinary_value = 0;
+    struct relocation_definition_cache_ent *classification_entry = NULL;
     int is_ifunc;
+    int ordinary_value_cacheable = 0;
+    int ordinary_value_valid = 0;
+    int ordinary_value_resolved = 0;
     int stable;
 
     if (stable_out)
@@ -31492,27 +31530,44 @@ static int relocation_symbol_ifunc_classification_with_value(
 #endif
 
     if (relocation_definition_cache_ifunc_lookup(
-            requester, sym_index, objs, nobj, &is_ifunc)) {
+            requester, sym_index, objs, nobj, &is_ifunc,
+            &ordinary_value_valid, &ordinary_value,
+            &classification_entry)) {
         if (!is_ifunc && ordinary_value_out) {
             struct loaded_obj *cached_owner = NULL;
             const Elf64_Sym *cached_definition = NULL;
+            int cache_value = 0;
 
-            special = lookup_relocation_special(
-                requester, sym_index, objs, nobj, 0);
-            if (special) {
-                *ordinary_value_out = special;
-            } else if (!relocation_definition_cache_lookup(
-                           requester, sym_index, objs, nobj, 0,
-                           &cached_owner, &cached_definition) ||
-                       !resolve_defined_symbol_address(
-                           cached_owner, cached_definition,
-                           ordinary_value_out, NULL) ||
-                       relocation_definition_requires_native_glibc_gmon(
-                           requester, sym_index, objs, nobj,
-                           cached_owner)) {
-                if (stable_out)
-                    *stable_out = 0;
-                return is_ifunc;
+            if (ordinary_value_valid) {
+                *ordinary_value_out = ordinary_value;
+            } else {
+                special = lookup_relocation_special(
+                    requester, sym_index, objs, nobj, 0);
+                if (special) {
+                    *ordinary_value_out = special;
+                    cache_value = 1;
+                } else if (!relocation_definition_cache_lookup(
+                               requester, sym_index, objs, nobj, 0,
+                               &cached_owner, &cached_definition) ||
+                           !resolve_defined_symbol_address(
+                               cached_owner, cached_definition,
+                               ordinary_value_out, &cache_value) ||
+                           relocation_definition_requires_native_glibc_gmon(
+                               requester, sym_index, objs, nobj,
+                               cached_owner)) {
+                    if (stable_out)
+                        *stable_out = 0;
+                    return is_ifunc;
+                }
+                /* Validation may have cached IFUNC classification before
+                 * the phase-plan builder requested a binding value.  Fill
+                 * that same admitted epoch entry now so later relocations
+                 * of the symbol retain the one-probe fast path too. */
+                if (cache_value) {
+                    classification_entry->ordinary_value =
+                        *ordinary_value_out;
+                    classification_entry->ordinary_value_valid = 1;
+                }
             }
         }
         if (stable_out)
@@ -31532,14 +31587,23 @@ static int relocation_symbol_ifunc_classification_with_value(
         is_ifunc = definition && owner &&
             ELF64_ST_TYPE(definition->st_info) == STT_GNU_IFUNC;
         if (definition && owner) {
+            if (!is_ifunc && ordinary_value_out &&
+                resolve_defined_symbol_address(
+                    owner, definition, &ordinary_value,
+                    &ordinary_value_cacheable) &&
+                !relocation_definition_requires_native_glibc_gmon(
+                    requester, sym_index, objs, nobj, owner)) {
+                ordinary_value_resolved = 1;
+                ordinary_value_valid = ordinary_value_cacheable;
+            }
             stable = relocation_definition_cache_ifunc_store(
-                requester, sym_index, objs, nobj, is_ifunc);
+                requester, sym_index, objs, nobj, is_ifunc,
+                ordinary_value_valid, ordinary_value);
             if (stable && !is_ifunc && ordinary_value_out &&
-                (!resolve_defined_symbol_address(
-                     owner, definition, ordinary_value_out, NULL) ||
-                 relocation_definition_requires_native_glibc_gmon(
-                     requester, sym_index, objs, nobj, owner)))
+                !ordinary_value_resolved)
                 stable = 0;
+            if (stable && ordinary_value_out)
+                *ordinary_value_out = ordinary_value;
             if (stable_out)
                 *stable_out = stable;
         }
@@ -31554,7 +31618,8 @@ static int relocation_symbol_ifunc_classification_with_value(
          * was cacheable, remember that the loader shim suppresses IFUNC
          * classification as part of this exact epoch too. */
         stable = relocation_definition_cache_ifunc_store(
-            requester, sym_index, objs, nobj, 0);
+            requester, sym_index, objs, nobj, 0,
+            ordinary_value_out != NULL, special);
         if (stable && ordinary_value_out)
             *ordinary_value_out = special;
         if (stable_out)
@@ -31567,14 +31632,23 @@ static int relocation_symbol_ifunc_classification_with_value(
     is_ifunc = definition && owner &&
         ELF64_ST_TYPE(definition->st_info) == STT_GNU_IFUNC;
     if (definition && owner) {
+        if (!is_ifunc && ordinary_value_out &&
+            resolve_defined_symbol_address(
+                owner, definition, &ordinary_value,
+                &ordinary_value_cacheable) &&
+            !relocation_definition_requires_native_glibc_gmon(
+                requester, sym_index, objs, nobj, owner)) {
+            ordinary_value_resolved = 1;
+            ordinary_value_valid = ordinary_value_cacheable;
+        }
         stable = relocation_definition_cache_ifunc_store(
-            requester, sym_index, objs, nobj, is_ifunc);
+            requester, sym_index, objs, nobj, is_ifunc,
+            ordinary_value_valid, ordinary_value);
         if (stable && !is_ifunc && ordinary_value_out &&
-            (!resolve_defined_symbol_address(
-                 owner, definition, ordinary_value_out, NULL) ||
-             relocation_definition_requires_native_glibc_gmon(
-                 requester, sym_index, objs, nobj, owner)))
+            !ordinary_value_resolved)
             stable = 0;
+        if (stable && ordinary_value_out)
+            *ordinary_value_out = ordinary_value;
         if (stable_out)
             *stable_out = stable;
     }

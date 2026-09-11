@@ -138,7 +138,7 @@ static int immutable_binding_cache_gate(void)
         return 0;
     g_relocation_definition_cache_queries = 0;
     relocation_definition_cache_ifunc_store(
-        &g_all_objs[0], 1, g_all_objs, 2, 0);
+        &g_all_objs[0], 1, g_all_objs, 2, 0, 0, 0);
     if (g_relocation_definition_cache_queries != 1)
         return 0;
     return 1;
@@ -147,6 +147,29 @@ static int immutable_binding_cache_gate(void)
 static int fused_classification_proof_gate(void)
 {
     int stable = -1;
+    uint64_t ordinary_value = 0;
+
+    initialize_symbol_scope();
+    provider_symbols[1].st_shndx = SHN_ABS;
+    provider_symbols[1].st_value = UINT64_C(0x123456789abcdef0);
+    if (relocation_symbol_ifunc_classification(
+            &g_all_objs[0], 1, g_all_objs, 2, &stable) || stable != 1)
+        return 0;
+    g_relocation_definition_cache_queries = 0;
+    if (relocation_symbol_ifunc_classification_with_value(
+            &g_all_objs[0], 1, g_all_objs, 2, &stable,
+            &ordinary_value) || stable != 1 ||
+        ordinary_value != provider_symbols[1].st_value ||
+        g_relocation_definition_cache_queries != 2)
+        return 0;
+    g_relocation_definition_cache_queries = 0;
+    ordinary_value = 0;
+    if (relocation_symbol_ifunc_classification_with_value(
+            &g_all_objs[0], 1, g_all_objs, 2, &stable,
+            &ordinary_value) || stable != 1 ||
+        ordinary_value != provider_symbols[1].st_value ||
+        g_relocation_definition_cache_queries != 1)
+        return 0;
 
     initialize_symbol_scope();
     if (relocation_symbol_ifunc_classification(
