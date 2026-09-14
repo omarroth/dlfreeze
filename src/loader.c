@@ -32209,7 +32209,8 @@ static int validate_relocation_record(struct loaded_obj *obj,
     if (name_query_out) {
         memset(name_query_out, 0, sizeof(*name_query_out));
         if (sidx != 0)
-            *name_query_out = name_query;
+            ldr_memcpy(name_query_out, &name_query,
+                       sizeof(*name_query_out));
     }
     return 0;
 }
@@ -32264,7 +32265,8 @@ static int admitted_prelinked_relocation_record(
     if (name_query_out) {
         memset(name_query_out, 0, sizeof(*name_query_out));
         if (sidx != 0)
-            *name_query_out = name_query;
+            ldr_memcpy(name_query_out, &name_query,
+                       sizeof(*name_query_out));
     }
     if (slot_out)
         *slot_out = type == 0
@@ -40497,6 +40499,7 @@ struct dl_manifest_path_source_slot {
     uint64_t path_hash;
     uint64_t data_offset;
     uint64_t data_size;
+    uint32_t flags;
     uint8_t directory;
     uint8_t negative;
     uint8_t virtual_entry;
@@ -40556,6 +40559,30 @@ static const char *dl_manifest_request_identity(
     return g_frozen_strtab + entry->dlopen_request_offset;
 }
 
+static int dl_manifest_path_source_matches(
+    const struct dl_manifest_path_source_slot *slot,
+    const struct dlfrz_entry *entry)
+{
+    const uint32_t metadata_mask = DLFRZ_FLAG_DATA_VIRTUAL |
+        DLFRZ_FLAG_DATA_NEGATIVE | DLFRZ_FLAG_DATA_DIRECTORY |
+        DLFRZ_FLAG_DATA_DIRENT_TYPED | DLFRZ_FLAG_DATA_DIRENT_TYPE_MASK;
+    int slot_has_payload = !(slot->flags & DLFRZ_FLAG_DATA) ||
+        !(slot->flags & (DLFRZ_FLAG_DATA_VIRTUAL |
+                         DLFRZ_FLAG_DATA_NEGATIVE |
+                         DLFRZ_FLAG_DATA_DIRECTORY));
+    int entry_has_payload = !(entry->flags & DLFRZ_FLAG_DATA) ||
+        !(entry->flags & (DLFRZ_FLAG_DATA_VIRTUAL |
+                          DLFRZ_FLAG_DATA_NEGATIVE |
+                          DLFRZ_FLAG_DATA_DIRECTORY));
+
+    if (slot_has_payload || entry_has_payload)
+        return slot_has_payload && entry_has_payload &&
+               slot->data_offset == entry->data_offset &&
+               slot->data_size == entry->data_size;
+    return (slot->flags & metadata_mask) ==
+           (entry->flags & metadata_mask);
+}
+
 static int dl_manifest_path_source_insert(
     struct dl_manifest_path_source_slot *slots, size_t capacity,
     const char *path, const struct dlfrz_entry *entry)
@@ -40581,6 +40608,7 @@ static int dl_manifest_path_source_insert(
             slot->path_hash = path_hash;
             slot->data_offset = entry->data_offset;
             slot->data_size = entry->data_size;
+            slot->flags = entry->flags;
             slot->directory =
                 (entry->flags & (DLFRZ_FLAG_DATA |
                                  DLFRZ_FLAG_DATA_DIRECTORY)) ==
@@ -40604,10 +40632,13 @@ static int dl_manifest_path_source_insert(
                 (DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_VIRTUAL);
 
             if (virtual_entry)
-                return 0;
+                return slot->virtual_entry
+                    ? (dl_manifest_path_source_matches(slot, entry) ? 0 : -1)
+                    : 0;
             if (slot->virtual_entry) {
                 slot->data_offset = entry->data_offset;
                 slot->data_size = entry->data_size;
+                slot->flags = entry->flags;
                 slot->directory =
                     (entry->flags & (DLFRZ_FLAG_DATA |
                                      DLFRZ_FLAG_DATA_DIRECTORY)) ==
@@ -40619,9 +40650,7 @@ static int dl_manifest_path_source_insert(
                 slot->virtual_entry = 0;
                 return 0;
             }
-            return slot->data_size != 0 && entry->data_size != 0 &&
-                   slot->data_offset == entry->data_offset &&
-                   slot->data_size == entry->data_size ? 0 : -1;
+            return dl_manifest_path_source_matches(slot, entry) ? 0 : -1;
         }
         slot_index = (slot_index + 1) & (capacity - 1);
     }
@@ -40653,14 +40682,33 @@ dl_manifest_path_source_find_hashed(
     return NULL;
 }
 
+static int dl_manifest_path_source_can_have_descendants(
+    const struct dl_manifest_path_source_slot *slot)
+{
+    uint32_t dirent_type;
+
+    if (!slot)
+        return 1;
+    if (slot->directory)
+        return 1;
+    if (!slot->virtual_entry ||
+        !(slot->flags & DLFRZ_FLAG_DATA_DIRENT_TYPED))
+        return 0;
+    dirent_type = (slot->flags & DLFRZ_FLAG_DATA_DIRENT_TYPE_MASK) >>
+        DLFRZ_FLAG_DATA_DIRENT_TYPE_SHIFT;
+    /* Linux d_type values: DT_UNKNOWN=0, DT_DIR=4, DT_LNK=10. */
+    return dirent_type == 0 || dirent_type == 4 || dirent_type == 10;
+}
+
 /* The embedded-ELF VFS exposes canonical, logical, and exact-request path
  * spellings in one namespace.  Validate that namespace independently of the
  * lookup indexes, which intentionally keep dependency-only basename
  * collisions representable.  Do not canonicalize or realpath these names:
  * pathful loader requests use their recorded spelling verbatim.  Every raw
  * component ancestor of a materialized node (including root and ancestors
- * before repeated slashes) must nevertheless be an explicit directory,
- * matching VFS parent derivation.  Captured misses materialize no node. */
+ * before repeated slashes) must nevertheless have a traversable captured
+ * identity, matching VFS parent derivation.  Captured misses materialize no
+ * node; directory, symlink, and unknown d_type entries can be traversable. */
 static int dl_manifest_path_sources_are_consistent(void)
 {
     struct dl_manifest_path_source_slot *slots = NULL;
@@ -40727,7 +40775,7 @@ static int dl_manifest_path_sources_are_consistent(void)
         /* A captured miss materializes no node and derives no directories.
          * Progressive probes such as X followed by X/child are therefore
          * coherent when the descendant is also negative.  Positive nodes
-         * still require every recorded component ancestor to be a directory,
+         * still require every recorded component ancestor to be traversable,
          * including when that ancestor itself is a captured miss. */
         if (entry->negative)
             continue;
@@ -40737,7 +40785,7 @@ static int dl_manifest_path_sources_are_consistent(void)
                 prefix = dl_manifest_path_source_find_hashed(
                     slots, capacity, entry->path, p,
                     vfs_hash_final(&path_hash));
-                if (prefix && !prefix->directory)
+                if (!dl_manifest_path_source_can_have_descendants(prefix))
                     goto out;
             }
             vfs_hash_update_byte(
@@ -40748,7 +40796,7 @@ static int dl_manifest_path_sources_are_consistent(void)
                 prefix = dl_manifest_path_source_find_hashed(
                     slots, capacity, entry->path, 1,
                     vfs_hash_final(&path_hash));
-                if (prefix && !prefix->directory)
+                if (!dl_manifest_path_source_can_have_descendants(prefix))
                     goto out;
             }
         }

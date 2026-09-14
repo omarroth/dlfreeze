@@ -9119,6 +9119,7 @@ struct packed_manifest_alias_ref {
     uint64_t data_offset;
     uint64_t data_size;
     uint32_t entry_index;
+    uint32_t flags;
     uint8_t domain;
     uint8_t request;
     uint8_t directory;
@@ -9138,6 +9139,12 @@ static int packed_manifest_alias_ref_cmp(const void *left_pointer,
     comparison = strcmp(left->name, right->name);
     if (comparison != 0)
         return comparison;
+    /* A materialized identity owns the exact pathname.  Keep it ahead of a
+     * readdir-only placeholder so prefix validation sees the same authority
+     * as open/stat regardless of manifest order. */
+    if (left->domain == PACKED_MANIFEST_ALIAS_EXACT_PATH &&
+        left->virtual_entry != right->virtual_entry)
+        return left->virtual_entry ? 1 : -1;
     if (left->request != right->request)
         return left->request < right->request ? -1 : 1;
     if (left->entry_index != right->entry_index)
@@ -9149,9 +9156,24 @@ static int packed_manifest_alias_source_matches(
     const struct packed_manifest_alias_ref *left,
     const struct packed_manifest_alias_ref *right)
 {
-    return left->data_size != 0 && right->data_size != 0 &&
-           left->data_offset == right->data_offset &&
-           left->data_size == right->data_size;
+    const uint32_t metadata_mask = DLFRZ_FLAG_DATA_VIRTUAL |
+        DLFRZ_FLAG_DATA_NEGATIVE | DLFRZ_FLAG_DATA_DIRECTORY |
+        DLFRZ_FLAG_DATA_DIRENT_TYPED | DLFRZ_FLAG_DATA_DIRENT_TYPE_MASK;
+    int left_has_payload = !(left->flags & DLFRZ_FLAG_DATA) ||
+        !(left->flags & (DLFRZ_FLAG_DATA_VIRTUAL |
+                         DLFRZ_FLAG_DATA_NEGATIVE |
+                         DLFRZ_FLAG_DATA_DIRECTORY));
+    int right_has_payload = !(right->flags & DLFRZ_FLAG_DATA) ||
+        !(right->flags & (DLFRZ_FLAG_DATA_VIRTUAL |
+                          DLFRZ_FLAG_DATA_NEGATIVE |
+                          DLFRZ_FLAG_DATA_DIRECTORY));
+
+    if (left_has_payload || right_has_payload)
+        return left_has_payload && right_has_payload &&
+               left->data_offset == right->data_offset &&
+               left->data_size == right->data_size;
+    return (left->flags & metadata_mask) ==
+           (right->flags & metadata_mask);
 }
 
 static void packed_manifest_alias_ref_add(
@@ -9160,7 +9182,7 @@ static void packed_manifest_alias_ref_add(
     const char *name, enum packed_manifest_alias_domain domain, int request)
 {
     refs[*count] = (struct packed_manifest_alias_ref) {
-        name, entry->data_offset, entry->data_size, entry_index,
+        name, entry->data_offset, entry->data_size, entry_index, entry->flags,
         (uint8_t)domain, (uint8_t)(request != 0),
         (uint8_t)((entry->flags & (DLFRZ_FLAG_DATA |
                                    DLFRZ_FLAG_DATA_DIRECTORY)) ==
@@ -9204,15 +9226,36 @@ packed_manifest_exact_alias_find(
     return &refs[low];
 }
 
+static int packed_manifest_alias_can_have_descendants(
+    const struct packed_manifest_alias_ref *ref)
+{
+    uint32_t dirent_type;
+
+    if (!ref)
+        return 1;
+    if (ref->directory)
+        return 1;
+    if (!ref->virtual_entry ||
+        !(ref->flags & DLFRZ_FLAG_DATA_DIRENT_TYPED))
+        return 0;
+    dirent_type = (ref->flags & DLFRZ_FLAG_DATA_DIRENT_TYPE_MASK) >>
+        DLFRZ_FLAG_DATA_DIRENT_TYPE_SHIFT;
+    /* Linux d_type values: DT_UNKNOWN=0, DT_DIR=4, DT_LNK=10.  A successful
+     * captured child proves that the traced path was traversable; these are
+     * the only directory-entry identities which do not contradict it. */
+    return dirent_type == 0 || dirent_type == 4 || dirent_type == 10;
+}
+
 /* A request spelling is stronger evidence than a dependency search alias:
  * it records the exact object selected by the native loader.  Refuse to
  * publish an artifact when the same lookup identity can select distinct byte
  * sources.  The exact-path domain also protects the application-facing ELF
  * VFS, where canonical, logical, and request spellings share one pathname
  * namespace even when a non-pathful dependency lookup uses only a basename.
- * A strict component ancestor in that namespace must be an explicit captured
- * directory: publishing a file at X while deriving X/child would otherwise
- * make open/stat and directory traversal disagree about X's type.
+ * A strict component ancestor in that namespace must be a traversable
+ * captured identity: publishing a file at X while deriving X/child would
+ * otherwise make open/stat and directory traversal disagree about X's type.
+ * Directories, symlinks, and unknown d_type placeholders can be traversable.
  *
  * Dependency-only basename collisions remain representable: caller search
  * scope and first-loaded order decide those at runtime. */
@@ -9297,14 +9340,24 @@ static int packed_manifest_aliases_are_consistent(
             end++;
         if (refs[begin].domain == PACKED_MANIFEST_ALIAS_EXACT_PATH) {
             const struct packed_manifest_alias_ref *source = NULL;
+            const struct packed_manifest_alias_ref *placeholder = NULL;
 
             for (size_t i = begin; i < end; i++) {
                 /* A directory-member placeholder has no byte or node
                  * authority.  A captured DATA file or ELF at the same exact
                  * path is the stronger identity used by open/stat, while the
                  * placeholder retains its observed readdir d_type. */
-                if (refs[i].virtual_entry)
+                if (refs[i].virtual_entry) {
+                    if (placeholder && !source &&
+                        !packed_manifest_alias_source_matches(
+                            placeholder, &refs[i])) {
+                        *conflict_out = refs[begin].name;
+                        errno = EEXIST;
+                        goto out;
+                    }
+                    placeholder = &refs[i];
                     continue;
+                }
                 if (source && !packed_manifest_alias_source_matches(
                                   source, &refs[i])) {
                     *conflict_out = refs[begin].name;
@@ -9364,7 +9417,7 @@ static int packed_manifest_aliases_are_consistent(
             if (path[0] == '/' && path_length > 1) {
                 prefix = packed_manifest_exact_alias_find(
                     refs, exact_count, "/", 1);
-                if (prefix && !prefix->directory) {
+                if (!packed_manifest_alias_can_have_descendants(prefix)) {
                     *conflict_out = prefix->name;
                     errno = EEXIST;
                     goto out;
@@ -9375,7 +9428,7 @@ static int packed_manifest_aliases_are_consistent(
                     continue;
                 prefix = packed_manifest_exact_alias_find(
                     refs, exact_count, path, p);
-                if (prefix && !prefix->directory) {
+                if (!packed_manifest_alias_can_have_descendants(prefix)) {
                     *conflict_out = prefix->name;
                     errno = EEXIST;
                     goto out;

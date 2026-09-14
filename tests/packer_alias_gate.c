@@ -1,3 +1,4 @@
+#include <dirent.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -88,7 +89,7 @@ static uint32_t alias_gate_append_string(
 
 static int manifest_alias_collision_gate(void)
 {
-    struct dlfrz_entry entries[2];
+    struct dlfrz_entry entries[3];
     char strings[512] = {0};
     size_t cursor = 1;
     const char *conflict = NULL;
@@ -148,8 +149,78 @@ static int manifest_alias_collision_gate(void)
             entries, 2, strings, &conflict) < 0)
         return 0;
 
+    /* Metadata-only nodes have semantic identity even though they carry no
+     * payload bytes.  Repeated directory observations are equivalent, and a
+     * zero-length captured file is still distinguished by its payload
+     * offset. */
+    memset(entries, 0, sizeof(entries));
+    entries[0].flags = DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_DIRECTORY;
+    entries[0].name_offset = node;
+    entries[1] = entries[0];
+    if (packed_manifest_aliases_are_consistent(
+            entries, 2, strings, &conflict) < 0)
+        return 0;
+    entries[1].flags = DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_NEGATIVE;
+    if (packed_manifest_aliases_are_consistent(
+            entries, 2, strings, &conflict) == 0)
+        return 0;
+    entries[0].flags = DLFRZ_FLAG_DATA;
+    entries[0].data_offset = UINT64_C(0x1800);
+    entries[1] = entries[0];
+    if (packed_manifest_aliases_are_consistent(
+            entries, 2, strings, &conflict) < 0)
+        return 0;
+    entries[1].data_offset = UINT64_C(0x2800);
+    if (packed_manifest_aliases_are_consistent(
+            entries, 2, strings, &conflict) == 0)
+        return 0;
+
+    /* A directory captured after its parent was enumerated supersedes the
+     * earlier virtual d_type placeholder for ancestor validation. */
+    memset(entries, 0, sizeof(entries));
+    entries[0].flags = DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_VIRTUAL |
+        DLFRZ_FLAG_DATA_DIRENT_TYPED |
+        ((uint32_t)DT_LNK << DLFRZ_FLAG_DATA_DIRENT_TYPE_SHIFT);
+    entries[0].name_offset = node;
+    entries[1].flags = DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_DIRECTORY;
+    entries[1].name_offset = node;
+    entries[2].flags = DLFRZ_FLAG_SHLIB | DLFRZ_FLAG_NEEDED_PATHFUL;
+    entries[2].name_offset = child;
+    entries[2].data_offset = UINT64_C(0x3800);
+    entries[2].data_size = UINT64_C(0x800);
+    if (packed_manifest_aliases_are_consistent(
+            entries, 3, strings, &conflict) < 0)
+        return 0;
+
+    /* A symlink (or unknown d_type) can validly be a lexical ancestor.  A
+     * regular-file directory entry cannot. */
+    memset(entries, 0, sizeof(entries));
+    entries[0].flags = DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_VIRTUAL |
+        DLFRZ_FLAG_DATA_DIRENT_TYPED |
+        ((uint32_t)DT_LNK << DLFRZ_FLAG_DATA_DIRENT_TYPE_SHIFT);
+    entries[0].name_offset = node;
+    entries[1].flags = DLFRZ_FLAG_SHLIB | DLFRZ_FLAG_NEEDED_PATHFUL;
+    entries[1].name_offset = child;
+    entries[1].data_offset = UINT64_C(0x4800);
+    entries[1].data_size = UINT64_C(0x800);
+    if (packed_manifest_aliases_are_consistent(
+            entries, 2, strings, &conflict) < 0)
+        return 0;
+    entries[0].flags = DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_VIRTUAL |
+        DLFRZ_FLAG_DATA_DIRENT_TYPED |
+        ((uint32_t)DT_REG << DLFRZ_FLAG_DATA_DIRENT_TYPE_SHIFT);
+    if (packed_manifest_aliases_are_consistent(
+            entries, 2, strings, &conflict) == 0)
+        return 0;
+
     /* DATA shadows frozen ELFs in open/stat.  A negative, virtual, or
      * directory record therefore cannot reuse an ELF path identity. */
+    memset(entries, 0, sizeof(entries));
+    entries[0].flags = DLFRZ_FLAG_SHLIB | DLFRZ_FLAG_DLOPEN;
+    entries[0].name_offset = request_source;
+    entries[0].dlopen_request_offset = exact_identity;
+    entries[0].data_offset = UINT64_C(0x1000);
+    entries[0].data_size = UINT64_C(0x800);
     memset(&entries[1], 0, sizeof(entries[1]));
     entries[1].flags = DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_NEGATIVE;
     entries[1].name_offset = exact_identity;

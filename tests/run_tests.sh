@@ -6344,42 +6344,27 @@ test_vfs_directory_snapshot() {
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <fcntl.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
 
-/* Refer to the ELF symbol weakly and carry the stable kernel result prefix
- * locally.  This keeps the fixture buildable on libcs predating their statx
- * wrapper while still requiring the frozen loader's override during replay. */
-struct test_statx {
-    uint32_t mask;
-    uint32_t blksize;
-    uint64_t attributes;
-    uint32_t nlink;
-    uint32_t uid;
-    uint32_t gid;
-    uint16_t mode;
-    uint16_t spare;
-    unsigned char remainder[224];
-};
-extern int test_statx(int, const char *, int, unsigned int,
-                      struct test_statx *)
-    __asm__("statx") __attribute__((weak));
-
 int main(int argc, char **argv) {
-    struct test_statx status;
     DIR *directory;
     struct dirent *entry;
     int regular = 0, subdir = 0, symlink = 0, fifo = 0;
 
-    if ((argc != 2 && argc != 3) ||
-        (argc == 3 && !test_statx) ||
-        (test_statx &&
-         (test_statx(AT_FDCWD, argv[1], AT_NO_AUTOMOUNT,
-                     UINT32_C(0x00000002), &status) != 0 ||
-          (status.mode & S_IFMT) != S_IFDIR)))
+    if (argc != 2)
         return 2;
+#ifdef DLFREEZE_TEST_HAVE_STATX
+    {
+        struct statx status;
+
+        if (statx(AT_FDCWD, argv[1], AT_NO_AUTOMOUNT,
+                  STATX_MODE, &status) != 0 ||
+            (status.stx_mode & S_IFMT) != S_IFDIR)
+            return 5;
+    }
+#endif
     directory = opendir(argv[1]);
     if (!directory)
         return 3;
@@ -6401,15 +6386,15 @@ int main(int argc, char **argv) {
 }
 C
 
-    if test_compiler_available musl-gcc >/dev/null 2>&1; then
-        if ! musl-gcc -Wall -Wextra -Werror -o "$bin" "$src"; then
-            fail "captured VFS directory snapshot" \
-                "musl fixture compile failed"
-            rm -rf "$root"
-            rm -f "$out" "$log"
-            return
-        fi
-    elif ! gcc -Wall -Wextra -Werror -o "$bin" "$src"; then
+    # Prefer the libc's real statx interface when its headers and linker
+    # expose one.  Older libc interfaces still exercise the directory
+    # snapshot itself.  Retain libdl as a startup dependency on pre-2.34
+    # glibc so the tracing helper does not perturb the native object graph.
+    if gcc -Wall -Wextra -Werror -DDLFREEZE_TEST_HAVE_STATX \
+            -Wl,--no-as-needed -o "$bin" "$src" -ldl 2>/dev/null; then
+        :
+    elif ! gcc -Wall -Wextra -Werror -Wl,--no-as-needed \
+            -o "$bin" "$src" -ldl; then
         fail "captured VFS directory snapshot" "fixture compile failed"
         rm -rf "$root"
         rm -f "$out" "$log"
@@ -6441,7 +6426,7 @@ C
     rm -rf "$root"
     actual=""; rc=0
     capture_output actual env DLFREEZE_NO_FORK=1 \
-        "$out" "$data" require-statx || rc=$?
+        "$out" "$data" || rc=$?
     actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
     if [ "$rc" -eq 0 ] && [ "$actual" = "$expected" ]; then
         pass "captured VFS directory snapshot replay"

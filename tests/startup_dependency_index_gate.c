@@ -419,6 +419,26 @@ int main(void)
             &g_dl_manifest_identity_index);
 
         entries[pathful_index].flags =
+            DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_VIRTUAL |
+            DLFRZ_FLAG_DATA_DIRENT_TYPED |
+            ((uint32_t)DT_LNK << DLFRZ_FLAG_DATA_DIRENT_TYPE_SHIFT);
+        if (dl_manifest_identity_index_build(
+                &g_dl_manifest_identity_index) < 0)
+            goto out;
+        dl_manifest_identity_index_release(
+            &g_dl_manifest_identity_index);
+        entries[pathful_index].flags =
+            DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_VIRTUAL |
+            DLFRZ_FLAG_DATA_DIRENT_TYPED |
+            ((uint32_t)DT_REG << DLFRZ_FLAG_DATA_DIRENT_TYPE_SHIFT);
+        if (dl_manifest_identity_index_build(
+                &g_dl_manifest_identity_index) == 0) {
+            dl_manifest_identity_index_release(
+                &g_dl_manifest_identity_index);
+            goto out;
+        }
+
+        entries[pathful_index].flags =
             DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_NEGATIVE;
         entries[bare_index].name_offset = lexical_neighbor_offset;
         if (dl_manifest_identity_index_build(
