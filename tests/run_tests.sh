@@ -331,132 +331,6 @@ test_bootstrap_secure_gate() {
     rm -f "$helper"
 }
 
-test_kernel_premap() {
-    echo "--- optional kernel pre-map layout ---"
-    local root="$BUILD/kernel_premap" actual="" stderr_out="" rc=0
-    local freeze_rc=0 phnum phoff
-    local lazy_lib="$root/libkernel_premap_lazy.so"
-    local lazy_main="$root/lazy-main"
-    local lazy_frozen="$root/lazy-main.frozen"
-    mkdir -p "$root"
-    if gcc -std=c11 -O2 -Wall -Wextra -Werror -Iinclude \
-           tests/kernel_premap_gate.c -o "$root/gate" &&
-       run_with_timeout_seconds 8 "$root/gate"; then
-        pass "kernel pre-map geometry, table ownership, 73-header limit"
-    else
-        fail "kernel pre-map geometry gate" "compile or admission mismatch"
-    fi
-    if ! gcc -O2 -Wall -Wextra -Werror tests/kernel_premap_program.c \
-             -o "$root/main"; then
-        fail "kernel pre-map fixture" "compile failed"
-        return
-    fi
-    freeze_require_direct "kernel pre-map direct target" \
-        "$root/freeze.log" "$root/main.frozen" -p -- "$root/main" || freeze_rc=$?
-    if [ "$freeze_rc" -eq 77 ]; then
-        skip "kernel pre-map direct target" "$DIRECT_FREEZE_REASON"
-    elif [ "$freeze_rc" -ne 0 ]; then
-        fail "kernel pre-map packing" "see $root/freeze.log"
-    else
-        phnum=$(od -An -tu2 -j56 -N2 "$root/main.frozen" | tr -d '[:space:]')
-        phoff=$(od -An -tu8 -j32 -N8 "$root/main.frozen" | tr -d '[:space:]')
-        if [[ "$phnum" =~ ^[0-9]+$ && "$phoff" =~ ^[0-9]+$ ]] &&
-           [ "$phnum" -le 73 ] && [ "$phoff" -gt 64 ] &&
-           grep -Eq 'pre-mapped[[:space:]]*: [1-9]' "$root/freeze.log"; then
-            pass "kernel pre-map emits relocated bounded header table"
-        else
-            fail "kernel pre-map outer ELF" "missing layout or excessive headers"
-        fi
-        capture_output_split actual stderr_out env DLFREEZE_DEBUG=1 \
-            "$root/main.frozen" || rc=$?
-        if [ "$rc" -eq 0 ] && [ "$actual" = kernel-premap-ok ]; then
-            pass "kernel pre-map startup, BSS, heap and stage cleanup"
-        else
-            fail "kernel pre-map startup" "exit=$rc output=$actual"
-        fi
-        if printf '%s\n' "$stderr_out" |
-                grep -Fq 'dlfreeze-bootstrap: kernel pre-map ready'; then
-            pass "kernel pre-map runtime selects verified fast path"
-        else
-            fail "kernel pre-map runtime fast path" \
-                "verified artifact silently selected copy fallback"
-        fi
-
-        if ! gcc -O2 -Wall -Wextra -Werror -fPIC -shared \
-                 tests/kernel_premap_lazy_plugin.c -o "$lazy_lib" ||
-           ! gcc -O2 -Wall -Wextra -Werror -rdynamic \
-                 tests/kernel_premap_lazy_program.c -ldl -o "$lazy_main"; then
-            fail "kernel pre-map dormant fixture" "compile failed"
-        else
-            freeze_rc=0
-            LD_LIBRARY_PATH="$root" freeze_require_direct \
-                "kernel pre-map dormant target" "$root/lazy-freeze.log" \
-                "$lazy_frozen" -p -t -- "$lazy_main" || freeze_rc=$?
-            actual=""; stderr_out=""; rc=0
-            if [ "$freeze_rc" -eq 77 ]; then
-                skip "kernel pre-map dormant target" "$DIRECT_FREEZE_REASON"
-            elif [ "$freeze_rc" -ne 0 ]; then
-                fail "kernel pre-map dormant packing" \
-                    "see $root/lazy-freeze.log"
-            else
-                capture_output_split actual stderr_out env -u LD_LIBRARY_PATH \
-                    DLFREEZE_DEBUG=1 DLFREEZE_TEST_PREMAP=1 \
-                    "$lazy_frozen" || rc=$?
-                if [ "$rc" -eq 0 ] &&
-                   [ "$actual" = kernel-premap-lazy-ok ] &&
-                   printf '%s\n' "$stderr_out" |
-                       grep -Fq 'kernel-staged dormant: '; then
-                    pass "kernel pre-map preserves dormant dlopen timing"
-                else
-                    fail "kernel pre-map dormant dlopen" \
-                        "exit=$rc output=$actual"
-                fi
-            fi
-        fi
-        actual=""; rc=0
-        capture_output actual env DLFREEZE_NO_FORK=1 "$root/main.frozen" || rc=$?
-        if [ "$rc" -eq 0 ] && [ "$actual" = kernel-premap-ok ]; then
-            pass "kernel pre-map no-fork copy fallback"
-        else
-            fail "kernel pre-map copy fallback" "exit=$rc output=$actual"
-        fi
-    fi
-    if run_freeze "$DLFREEZE" -p -x -o "$root/conflict" -- "$root/main" \
-          >"$root/conflict.log" 2>&1 || [ -e "$root/conflict" ] ||
-       ! grep -Fq -- '-p requires direct loading, not -x' "$root/conflict.log"; then
-        fail "kernel pre-map extraction conflict" "accepted or wrong diagnostic"
-    else
-        pass "kernel pre-map extraction conflict"
-    fi
-    if gcc -O2 -static tests/kernel_premap_program.c -o "$root/static" \
-             >"$root/static-build.log" 2>&1; then
-        cp "$root/main" "$root/rejected"
-        if run_freeze "$DLFREEZE" -p -o "$root/rejected" -- "$root/static" \
-               >"$root/static.log" 2>&1 ||
-           ! cmp -s "$root/main" "$root/rejected" ||
-           ! grep -Fq -- '-p requires a supported direct-load target' "$root/static.log"; then
-            fail "kernel pre-map unsupported target atomic refusal" "output changed or wrong error"
-        else
-            pass "kernel pre-map unsupported target atomic refusal"
-        fi
-    else
-        skip "kernel pre-map static-target refusal" "no static toolchain"
-    fi
-    if gcc -O2 -no-pie -Wl,-Ttext-segment=0x20000000 \
-             tests/kernel_premap_program.c -o "$root/collision" \
-             >"$root/collision-build.log" 2>&1; then
-        if run_freeze "$DLFREEZE" -p -o "$root/collision.frozen" -- "$root/collision" \
-               >"$root/collision.log" 2>&1 || [ -e "$root/collision.frozen" ] ||
-           ! grep -Fq -- 'cannot represent -p kernel staging layout' "$root/collision.log"; then
-            fail "kernel pre-map target collision refusal" "output published or wrong error"
-        else
-            pass "kernel pre-map target collision refusal"
-        fi
-    else
-        skip "kernel pre-map target collision refusal" "no fixed-address linker support"
-    fi
-}
-
 test_bootstrap_fileback_gate() {
     echo "--- bootstrap exact clean payload proof gate ---"
     local helper="$BUILD/bootstrap_fileback_gate"
@@ -1014,6 +888,7 @@ test_default_direct_policy() {
     local direct_out="$root/default.frozen" direct_log="$root/default.log"
     local extract_out="$root/extract.frozen" extract_log="$root/extract.log"
     local conflict_out="$root/conflict.frozen" conflict_log="$root/conflict.log"
+    local removed_out="$root/removed.frozen" removed_log="$root/removed.log"
     local actual="" size meta_off rc=0 freeze_rc=0
 
     rm -rf "$root"
@@ -1082,6 +957,20 @@ C
     else
         fail "conflicting runtime policy options" \
             "invocation failed for an unrelated reason"
+    fi
+
+    if run_freeze "$DLFREEZE" -p -o "$removed_out" -- "$bin" \
+            >"$removed_log" 2>&1; then
+        fail "removed performance layout option" \
+            "dlfreeze still accepts -p"
+    elif [ -e "$removed_out" ]; then
+        fail "removed performance layout option" \
+            "rejected invocation left an artifact"
+    elif grep -Eq '^[[:space:]]*-p([[:space:]]|$)' "$removed_log"; then
+        fail "removed performance layout option" \
+            "usage still advertises -p"
+    else
+        pass "removed performance layout option"
     fi
 
     rm -rf "$root"
@@ -32648,7 +32537,6 @@ test_supervisor_child_mask_restore_failure
 test_libc_semantics_gate
 test_bootstrap_secure_gate
 test_bootstrap_fileback_gate
-test_kernel_premap
 test_loader_fileback_gate
 test_packer_alias_gate
 test_packer_strict_alias_gate

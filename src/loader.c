@@ -1474,38 +1474,6 @@ static int g_perf_mode;
  * mapping.  The first kernel refusal disables subsequent attempts, avoiding
  * one denied syscall per segment on old kernels or RET_ERRNO seccomp. */
 static int g_startup_mremap_disabled;
-static struct dlfrz_premap_range g_kernel_premaps[DLFRZ_PREMAP_MAX_PHDRS];
-static size_t g_kernel_premap_count;
-static void release_kernel_premaps(void);
-
-int loader_install_kernel_premap(const struct dlfrz_premap_range *ranges,
-                                 size_t count)
-{
-    if (!ranges || count == 0 || count > DLFRZ_PREMAP_MAX_PHDRS ||
-        g_kernel_premap_count != 0)
-        return -1;
-    for (size_t i = 0; i < count; i++) {
-        if (!ranges[i].length || ranges[i].source < DLFRZ_PREMAP_LO ||
-            ranges[i].source >= DLFRZ_PREMAP_HI ||
-            ranges[i].length > DLFRZ_PREMAP_HI - ranges[i].source ||
-            ((ranges[i].source | ranges[i].target | ranges[i].length |
-              ranges[i].file_offset) & 4095U) ||
-            ranges[i].target > UINTPTR_MAX - ranges[i].length ||
-            ranges[i].file_offset > UINT64_MAX - ranges[i].length ||
-            (ranges[i].target < DLFRZ_PREMAP_HI &&
-             ranges[i].target + ranges[i].length > DLFRZ_PREMAP_LO))
-            return -1;
-        for (size_t j = 0; j < i; j++)
-            if ((ranges[i].source < ranges[j].source + ranges[j].length &&
-                 ranges[j].source < ranges[i].source + ranges[i].length) ||
-                (ranges[i].target < ranges[j].target + ranges[j].length &&
-                 ranges[j].target < ranges[i].target + ranges[i].length))
-                return -1;
-    }
-    memcpy(g_kernel_premaps, ranges, count * sizeof(*ranges));
-    g_kernel_premap_count = count;
-    return 0;
-}
 static int g_is_musl_runtime;
 static char g_glibc_cache_path[PATH_MAX];
 static char g_glibc_preload_path[PATH_MAX];
@@ -13247,16 +13215,6 @@ static int initialize_musl_target_contract(struct loaded_obj *objs,
 /* Global object table — populated by loader_run, extended by my_dlopen. */
 static struct loaded_obj g_all_objs[MAX_TOTAL_OBJS];
 static int g_nobj;
-/* -p may place the immutable file pages of traced lazy objects at their
- * final manifest-selected addresses before target handoff.  These records
- * are deliberately outside g_all_objs: mapping bytes must not publish an
- * object, alter lookup scope, allocate TLS, or advance native dlopen timing. */
-struct kernel_dormant_mapping {
-    struct loaded_obj object;
-    uint32_t owner_index_plus_one;
-};
-static struct kernel_dormant_mapping *g_kernel_dormant_mappings;
-static size_t g_kernel_dormant_mapping_count;
 static void *g_startup_lazy_plt_resolution_mapping;
 static size_t g_startup_lazy_plt_resolution_mapping_size;
 /* Unlike the live namespace, these startup dispatch records never grow or
@@ -15252,10 +15210,8 @@ static void release_frozen_source_fd_after_tls(void)
     /* The contained syscall proof covers only the inherited startup policy.
      * A program may install a stricter filter before a later dlopen, so never
      * issue this optional syscall after target TLS/application handoff. */
-    g_frozen_source_flags &= ~(DLFRZ_SOURCE_MREMAP_DONTUNMAP |
-                               DLFRZ_SOURCE_KERNEL_PREMAP);
+    g_frozen_source_flags &= ~DLFRZ_SOURCE_MREMAP_DONTUNMAP;
     g_startup_mremap_disabled = 1;
-    release_kernel_premaps();
     if (fd >= 0)
         (void)arch_raw_close(fd);
 }
@@ -23038,7 +22994,8 @@ static int gnu_unique_canonicalize(
     /* Promoted dormant objects are mapped and ordinarily relocated before
      * their logical dlopen.  They may consume an already-canonical startup
      * definition, but must not become the first process-wide owner merely by
-     * being pre-mapped.  A real transaction stages its invisible new maps. */
+     * being promoted at startup. A real transaction stages its invisible
+     * new maps. */
     if (!g_dl_transaction.active && !g_dormant_gnu_unique_activation &&
         !candidate_owner->visible)
         return 0;
@@ -24491,7 +24448,7 @@ static const Elf64_Sym *lookup_relocation_definition_uncached(
             requester->relocation_scope_root >= nobj)
             return NULL;
         lookup_root = requester->relocation_scope_root;
-        /* A pre-mapped dormant dependency keeps its startup-local scope at
+        /* A startup-promoted dormant dependency keeps its local scope at
          * rest.  During its first logical dlopen, however, native relocation
          * lookup uses the requesting root's complete group after preexisting
          * globals.  Select that root transiently instead of rewriting object
@@ -33449,24 +33406,10 @@ static int map_fileback_segment(void *target, size_t length, int prot,
     return 1;
 }
 
-/* Release only still-owned stages, never previously consumed holes. */
-static void release_kernel_premaps(void)
-{
-    for (size_t i = 0; i < g_kernel_premap_count; i++) {
-        if (g_kernel_premaps[i].length &&
-            munmap((void *)(uintptr_t)g_kernel_premaps[i].source,
-                   (size_t)g_kernel_premaps[i].length) < 0)
-            loader_exit(127);
-        g_kernel_premaps[i].length = 0;
-    }
-    g_kernel_premap_count = 0;
-}
-
-/* Transfer proven startup pages without retaining a source fd. The default
- * format uses DONTUNMAP on exact clean file VMAs; -p instead consumes its
- * independent staging aliases. Both forms preserve the canonical payload
- * for fallback. Recreate the destination as anonymous PROT_NONE before
- * copying, including after a partially processed mapping failure.
+/* Transfer proven startup pages without retaining a source fd. DONTUNMAP
+ * preserves the canonical payload for fallback. Recreate the destination as
+ * anonymous PROT_NONE before copying, including after a partially processed
+ * mapping failure.
  * Return 1 for transfer, 0 for restored copy fallback, -1 for lost ownership. */
 static int map_mapped_payload_segment(void *source, void *target,
                                       size_t length)
@@ -33475,30 +33418,7 @@ static int map_mapped_payload_segment(void *source, void *target,
 
     if (g_startup_mremap_disabled)
         return 0;
-    if (g_kernel_premap_count) {
-        struct dlfrz_premap_range *range = NULL;
-        for (size_t i = 0; i < g_kernel_premap_count; i++)
-            if (g_kernel_premaps[i].target == (uint64_t)(uintptr_t)target &&
-                g_kernel_premaps[i].length == length) {
-                range = &g_kernel_premaps[i];
-                break;
-            }
-        if (!range)
-            return 0;
-        /* A stage has exactly one consumer. Clear ownership before moving;
-         * never later unmap a hole that another loader allocation may use. */
-        void *stage = (void *)(uintptr_t)range->source;
-        range->length = 0;
-        mapping = loader_mremap_flags(stage, length, target, 0);
-        if (mapping != target) {
-            /* No intervening allocations: even a partial failed move leaves
-             * this original stage interval safe to discard immediately. */
-            if (munmap(stage, length) < 0)
-                return -1;
-        }
-    } else {
-        mapping = loader_mremap_flags(source, length, target, MREMAP_DONTUNMAP);
-    }
+    mapping = loader_mremap_flags(source, length, target, MREMAP_DONTUNMAP);
     if (mapping == target)
         return 1;
     if (mapping != MAP_FAILED)
@@ -33917,8 +33837,7 @@ static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
      * unproved caller (including format-gate fixtures) and an under-aligned
      * valid ELF retain the independently protected anonymous copy. */
     if (((source_flags & (DLFRZ_SOURCE_EXACT_CLEAN_FILE |
-                          DLFRZ_SOURCE_MREMAP_DONTUNMAP |
-                          DLFRZ_SOURCE_KERNEL_PREMAP)) != 0 ||
+                          DLFRZ_SOURCE_MREMAP_DONTUNMAP)) != 0 ||
          (mem == g_frozen_mem && g_frozen_phdr_source_admitted)) &&
         address_has_alignment(
             (uintptr_t)(elf_base + (size_t)ehdr->e_phoff),
@@ -33982,8 +33901,7 @@ static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         srcfd >= 0 &&
         (source_flags & DLFRZ_SOURCE_EXACT_CLEAN_FILE) != 0;
     mremap_mode =
-        (source_flags & (DLFRZ_SOURCE_MREMAP_DONTUNMAP |
-                         DLFRZ_SOURCE_KERNEL_PREMAP)) != 0;
+        (source_flags & DLFRZ_SOURCE_MREMAP_DONTUNMAP) != 0;
     anonymous_copy_mode = !fileback_mode && !mremap_mode;
     if (anonymous_copy_mode &&
         make_anonymous_load_runs_writable(
@@ -34164,207 +34082,6 @@ fail:
         obj->runtime_reservation_size = 0;
     }
     return -1;
-}
-
-static int kernel_premap_range_available(uint64_t target, size_t length)
-{
-    for (size_t i = 0; i < g_kernel_premap_count; i++)
-        if (g_kernel_premaps[i].length == length &&
-            g_kernel_premaps[i].target == target)
-            return 1;
-    return 0;
-}
-
-/* A raw dormant map is worthwhile only when every complete source-page run
- * can be consumed from a kernel stage.  The one possible terminal fragment
- * remains an ordinary bounded copy.  Re-derive the exact lengths used by
- * map_object so a partially emitted outer PHDR set never causes an otherwise
- * lazy object to be copied early merely because one small stage exists. */
-static int embedded_object_kernel_stages_complete(
-    const uint8_t *mem, uint64_t mem_foff,
-    const struct dlfrz_lib_meta *meta,
-    const struct dlfrz_entry *ent)
-{
-    Elf64_Ehdr ehdr;
-    const uint8_t *elf_base;
-    size_t entry_offset;
-    int saw_stage = 0;
-
-    if (!mem || !meta || !ent || ent->data_offset < mem_foff ||
-        ent->data_offset - mem_foff > SIZE_MAX)
-        return 0;
-    entry_offset = (size_t)(ent->data_offset - mem_foff);
-    elf_base = mem + entry_offset;
-    if (ent->data_size < sizeof(ehdr))
-        return 0;
-    memcpy(&ehdr, elf_base, sizeof(ehdr));
-    if (ehdr.e_phentsize != sizeof(Elf64_Phdr) ||
-        ehdr.e_phnum == 0 || ehdr.e_phnum == PN_XNUM ||
-        ehdr.e_phnum != meta->phdr_num ||
-        ehdr.e_phoff > ent->data_size ||
-        (uint64_t)ehdr.e_phnum >
-            (ent->data_size - ehdr.e_phoff) / sizeof(Elf64_Phdr))
-        return 0;
-
-    for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
-        Elf64_Phdr ph;
-        uint64_t seg_page_vaddr;
-        uint64_t seg_page_off;
-        uint64_t page_delta;
-        uint64_t map_input;
-        uint64_t map_len;
-        uint64_t safe_map_len;
-        uint64_t available;
-        uint64_t target;
-        uint64_t populated = 0;
-
-        memcpy(&ph, elf_base + ehdr.e_phoff +
-                         (size_t)i * sizeof(ph), sizeof(ph));
-        if (ph.p_type != PT_LOAD || ph.p_filesz == 0)
-            continue;
-        if (ph.p_offset > ent->data_size ||
-            ph.p_filesz > ent->data_size - ph.p_offset ||
-            (ph.p_vaddr - page_floor(ph.p_vaddr)) !=
-                (ph.p_offset - page_floor(ph.p_offset)))
-            return 0;
-        seg_page_vaddr = page_floor(ph.p_vaddr);
-        seg_page_off = page_floor(ph.p_offset);
-        page_delta = ph.p_vaddr - seg_page_vaddr;
-        if (!u64_add_checked(page_delta, ph.p_filesz, &map_input) ||
-            !u64_align_up_checked(map_input, g_page_size, &map_len) ||
-            seg_page_off > ent->data_size ||
-            !u64_add_checked(meta->base_addr, seg_page_vaddr, &target))
-            return 0;
-        available = ent->data_size - seg_page_off;
-        safe_map_len = map_len;
-        if (safe_map_len > available)
-            safe_map_len = page_floor(available);
-        if (safe_map_len > page_delta) {
-            if (safe_map_len > SIZE_MAX ||
-                !kernel_premap_range_available(
-                    target, (size_t)safe_map_len))
-                return 0;
-            populated = safe_map_len - page_delta;
-            if (populated > ph.p_filesz)
-                populated = ph.p_filesz;
-            saw_stage = 1;
-        }
-        if (ph.p_filesz - populated >= g_page_size)
-            return 0;
-    }
-    return saw_stage;
-}
-
-static int manifest_has_earlier_mapping_owner(
-    const struct dlfrz_entry *entries,
-    const struct dlfrz_lib_meta *metas, uint32_t index)
-{
-    for (uint32_t i = 0; i < index; i++)
-        if (metas[i].base_addr == metas[index].base_addr &&
-            dl_manifest_shlib_source_alias(entries, i, index))
-            return 1;
-    return 0;
-}
-
-/* Consume optional -p stages for traced lazy objects while bootstrap TLS and
- * the inherited syscall policy are still active.  map_object performs its
- * normal ELF/protection validation, but the resulting records stay outside
- * every loader namespace until their original dlopen transaction takes one.
- * Any optional allocation or mapping miss simply preserves lazy copy replay. */
-static void initialize_kernel_dormant_mappings(
-    const uint8_t *mem, uint64_t mem_foff, int srcfd,
-    uint32_t source_flags, const struct dlfrz_lib_meta *metas,
-    const struct dlfrz_entry *entries, const char *strtab,
-    uint32_t num_entries)
-{
-    struct kernel_dormant_mapping *records;
-    size_t allocation_size;
-
-    if (!g_kernel_premap_count ||
-        !(source_flags & DLFRZ_SOURCE_KERNEL_PREMAP) ||
-        g_kernel_dormant_mappings)
-        return;
-    /* Every accepted object consumes at least one stage, so the bounded
-     * stage count is also a tight allocation ceiling independent of a broad
-     * captured-data manifest. */
-    if (__builtin_mul_overflow(g_kernel_premap_count, sizeof(*records),
-                               &allocation_size))
-        return;
-    records = mmap(NULL, allocation_size, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (records == MAP_FAILED)
-        return;
-    ldr_memset(records, 0, allocation_size);
-
-    for (uint32_t i = 0; i < num_entries; i++) {
-        struct kernel_dormant_mapping *record;
-
-        if ((metas[i].flags &
-             (LDR_FLAG_DLOPEN | LDR_FLAG_DLOPEN_EARLY |
-              LDR_FLAG_DATA | LDR_FLAG_INTERP)) != LDR_FLAG_DLOPEN ||
-            manifest_has_earlier_mapping_owner(entries, metas, i) ||
-            !embedded_object_kernel_stages_complete(
-                mem, mem_foff, &metas[i], &entries[i]))
-            continue;
-        record = &records[g_kernel_dormant_mapping_count];
-        record->object.name = dl_manifest_logical_name(entries, strtab, i);
-        record->object.flags = metas[i].flags;
-        record->object.frozen_manifest_index_plus_one = i + 1;
-        if (map_object(mem, mem_foff, srcfd, source_flags,
-                       &metas[i], &entries[i], &record->object, 0) < 0) {
-            ldr_memset(&record->object, 0, sizeof(record->object));
-            continue;
-        }
-        record->owner_index_plus_one = i + 1;
-        g_kernel_dormant_mapping_count++;
-        if (g_debug) {
-            ldr_msg("[loader] kernel-staged dormant: ");
-            ldr_msg(record->object.name);
-            ldr_msg("\n");
-        }
-    }
-    if (!g_kernel_dormant_mapping_count) {
-        (void)munmap(records, allocation_size);
-        return;
-    }
-    g_kernel_dormant_mappings = records;
-    ldr_dbg_hex("[loader] kernel-staged dormant objects=0x",
-                g_kernel_dormant_mapping_count);
-}
-
-static int take_kernel_dormant_mapping(
-    uint32_t manifest_index, const struct dlfrz_lib_meta *meta,
-    struct loaded_obj *destination)
-{
-    struct object_reservation_bounds bounds;
-
-    if (!destination || !meta || !g_kernel_dormant_mappings ||
-        manifest_index >= g_frozen_num_entries ||
-        object_reservation_bounds_from_meta(meta, &bounds) < 0)
-        return 0;
-    for (size_t i = 0; i < g_kernel_dormant_mapping_count; i++) {
-        struct kernel_dormant_mapping *record =
-            &g_kernel_dormant_mappings[i];
-        uint32_t owner;
-
-        if (!record->owner_index_plus_one)
-            continue;
-        owner = record->owner_index_plus_one - 1;
-        if (owner >= g_frozen_num_entries ||
-            !dl_manifest_shlib_source_alias(
-                g_frozen_entries, owner, manifest_index) ||
-            record->object.base != meta->base_addr ||
-            record->object.runtime_reservation !=
-                (void *)(uintptr_t)bounds.start ||
-            record->object.runtime_reservation_size != bounds.size)
-            continue;
-        ldr_memcpy(destination, &record->object, sizeof(*destination));
-        ldr_memset(&record->object, 0, sizeof(record->object));
-        record->owner_index_plus_one = 0;
-        destination->frozen_manifest_index_plus_one = manifest_index + 1;
-        return 1;
-    }
-    return 0;
 }
 
 /* ==== Parse PT_DYNAMIC ================================================= */
@@ -39048,8 +38765,7 @@ static int initialize_target_tunable_service(
     /* The service copy is placed at a runtime-selected address which the
      * bootstrap could not exercise in its exact DONTUNMAP plan. */
     if (map_object(mem, mem_foff, srcfd,
-                   source_flags & ~(DLFRZ_SOURCE_MREMAP_DONTUNMAP |
-                                    DLFRZ_SOURCE_KERNEL_PREMAP),
+                   source_flags & ~DLFRZ_SOURCE_MREMAP_DONTUNMAP,
                    &service_meta, entry, obj, 1) < 0 ||
         revalidate_loaded_gnu_properties(obj) < 0)
         goto fail;
@@ -45362,9 +45078,9 @@ static int dl_transaction_commit(void)
     dl_transaction_gate_signal_stage("after_mprotect");
 #endif
 
-    /* The scope and all TLS state are now committed.  A pre-mapped dormant
-     * dependency joins the same publication point as newly mapped objects;
-     * its constructor is included in the dependency-first walk below. */
+    /* The scope and all TLS state are now committed. A startup-promoted
+     * dormant dependency joins the same publication point as newly mapped
+     * objects; its constructor is included in the dependency-first walk. */
     dl_debug_publication_begin(RT_ADD);
     for (uint16_t i = 0; i < scope_root->lookup_scope_count; i++)
         g_all_objs[scope_root->lookup_scope_indices[i]].visible = 1;
@@ -45947,17 +45663,7 @@ static struct loaded_obj *load_embedded_object(
     memset(obj, 0, sizeof(*obj));
     obj->frozen_manifest_index_plus_one = mi + 1;
 
-    /* -p may already have placed these still-unpublished bytes while the
-     * bootstrap syscall environment was available.  Taking that exact
-     * reservation changes no dlopen timing: dynamic parsing, dependency
-     * discovery, relocation, TLS publication, and constructors all remain
-     * in this transaction. */
-    int took_kernel_mapping =
-        take_kernel_dormant_mapping(mi, emeta, obj);
-
-    /* Otherwise map segments from the frozen image at the assigned base. */
-    if (!took_kernel_mapping &&
-        map_object(g_frozen_mem, g_frozen_mem_foff, g_frozen_srcfd,
+    if (map_object(g_frozen_mem, g_frozen_mem_foff, g_frozen_srcfd,
                    g_frozen_source_flags,
                    emeta, eent, obj, 0) < 0) {
         dl_set_error(ename, ": mmap failed");
@@ -49201,14 +48907,9 @@ static int embedded_glibc_config_paths(
 static int loader_source_contract_is_valid(int srcfd, uint32_t source_flags)
 {
     const uint32_t known = DLFRZ_SOURCE_EXACT_CLEAN_FILE |
-                           DLFRZ_SOURCE_MREMAP_DONTUNMAP |
-                           DLFRZ_SOURCE_KERNEL_PREMAP;
+                           DLFRZ_SOURCE_MREMAP_DONTUNMAP;
 
     if ((source_flags & ~known) != 0)
-        return 0;
-    if ((source_flags & DLFRZ_SOURCE_KERNEL_PREMAP) != 0 &&
-        (!g_kernel_premap_count ||
-         (source_flags & DLFRZ_SOURCE_MREMAP_DONTUNMAP)))
         return 0;
     /* At initial handoff an exact token must name the still-open descriptor
      * whose clean private view is byte-equivalent to mem.  The descriptor is
@@ -49272,8 +48973,7 @@ static int loader_run_impl(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     if (!loader_source_contract_is_valid(srcfd, source_flags))
         return -1;
     g_startup_mremap_disabled =
-        (source_flags & (DLFRZ_SOURCE_MREMAP_DONTUNMAP |
-                         DLFRZ_SOURCE_KERNEL_PREMAP)) == 0;
+        (source_flags & DLFRZ_SOURCE_MREMAP_DONTUNMAP) == 0;
 
     g_target_tls_active = 0;
     g_target_errno_ready = 0;
@@ -49640,8 +49340,7 @@ static int loader_run_impl(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     g_frozen_source_flags = source_flags;
     g_frozen_phdr_source_admitted =
         (source_flags & (DLFRZ_SOURCE_EXACT_CLEAN_FILE |
-                         DLFRZ_SOURCE_MREMAP_DONTUNMAP |
-                         DLFRZ_SOURCE_KERNEL_PREMAP)) != 0;
+                         DLFRZ_SOURCE_MREMAP_DONTUNMAP)) != 0;
     g_frozen_metas       = metas;
     g_frozen_entries     = entries;
     g_frozen_strtab      = strtab;
@@ -49778,9 +49477,6 @@ static int loader_run_impl(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         ldr_dbg(objs[i].name);
         ldr_dbg_hex("  base=0x", objs[i].base);
     }
-    initialize_kernel_dormant_mappings(
-        mem, mem_foff, srcfd, source_flags, metas, entries, strtab,
-        num_entries);
     if (!startup_gnu_properties_admitted(
             objs, nobj, g_kernel_hwcap, g_kernel_hwcap2)) {
         ldr_msg("dlfreeze: direct-load artifact requires unsupported "
