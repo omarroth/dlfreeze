@@ -17,6 +17,7 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <dirent.h>
 #include <elf.h>
 #include <link.h>
@@ -159,6 +160,9 @@ _Static_assert(PROT_BTI == DLFRZ_AARCH64_PROT_BTI,
 #ifndef AT_NO_AUTOMOUNT
 #define AT_NO_AUTOMOUNT 0x800
 #endif
+#ifndef AT_STATX_SYNC_TYPE
+#define AT_STATX_SYNC_TYPE 0x6000
+#endif
 #ifndef PT_GNU_PROPERTY
 #define PT_GNU_PROPERTY 0x6474e553
 #endif
@@ -167,6 +171,15 @@ _Static_assert(PROT_BTI == DLFRZ_AARCH64_PROT_BTI,
  * Keep direct loading buildable with libc headers older than Linux 5.8. */
 #if defined(__x86_64__) || defined(__aarch64__)
 #define SYS_faccessat2 439
+#endif
+#endif
+#ifndef SYS_statx
+/* Linux UAPI syscall numbers.  statx is architecture-wide on the two
+ * direct-loader targets even when older libc headers omit SYS_statx. */
+#if defined(__x86_64__)
+#define SYS_statx 332
+#elif defined(__aarch64__)
+#define SYS_statx 291
 #endif
 #endif
 #ifndef SYS_uname
@@ -16262,6 +16275,7 @@ struct vfs_dir_child {
     size_t name_length;
     ino_t inode;
     off_t d_off;
+    unsigned char type;
 };
 
 struct vfs_dir_child_candidate {
@@ -16270,6 +16284,7 @@ struct vfs_dir_child_candidate {
     size_t name_length;
     ino_t inode;
     off_t d_off;
+    unsigned char type;
 };
 
 static struct vfs_dir_entry *g_vfs_dirs;
@@ -16590,6 +16605,11 @@ static int vfs_data_child_candidate(
     if (parent_result <= 0)
         return parent_result;
     candidate->inode = entry->inode;
+    candidate->type = (entry->flags & DLFRZ_FLAG_DATA_DIRENT_TYPED)
+        ? (unsigned char)((entry->flags &
+                           DLFRZ_FLAG_DATA_DIRENT_TYPE_MASK) >>
+                          DLFRZ_FLAG_DATA_DIRENT_TYPE_SHIFT)
+        : DT_REG;
     if (vfs_dir_child_offset(
             VFS_DIR_CHILD_DATA, source_slot, &candidate->d_off) < 0)
         return -1;
@@ -16623,6 +16643,7 @@ static int vfs_directory_child_candidate(
         return 0;
     candidate->parent_index = entry->parent_index;
     candidate->inode = entry->inode;
+    candidate->type = DT_DIR;
     if (vfs_dir_child_offset(
             VFS_DIR_CHILD_DIRECTORY, source_slot,
             &candidate->d_off) < 0)
@@ -16656,6 +16677,7 @@ static int vfs_elf_child_candidate(
         entry->manifest_index >= g_frozen_num_entries)
         return -1;
     candidate->inode = g_frozen_elf_inodes[entry->manifest_index];
+    candidate->type = DT_REG;
     if (vfs_dir_child_offset(
             VFS_DIR_CHILD_ELF, source_slot, &candidate->d_off) < 0)
         return -1;
@@ -16708,6 +16730,7 @@ static int vfs_store_child_candidate(
     child->name_length = candidate->name_length;
     child->inode = candidate->inode;
     child->d_off = candidate->d_off;
+    child->type = candidate->type;
     return 0;
 }
 
@@ -18487,8 +18510,7 @@ static struct dirent *vfs_readdir_fake_locked(struct vfs_dir_handle *h)
                 h->result.d_ino = child->inode;
                 h->result.d_off = child->d_off;
                 h->result.d_reclen = sizeof(struct dirent);
-                h->result.d_type =
-                    h->phase == VFS_DIR_CHILD_DIRECTORY ? DT_DIR : DT_REG;
+                h->result.d_type = child->type;
                 if (name_length >= sizeof(h->result.d_name))
                     name_length = sizeof(h->result.d_name) - 1;
                 memcpy(h->result.d_name, child->name, name_length);
@@ -20422,6 +20444,121 @@ static int vfs_faccessat(int dirfd, const char *path, int amode, int flag)
     }
     return vfs_kernel_faccessat(
         kernel_dirfd, kernel_path, amode, flag);
+}
+
+static void vfs_statx_from_stat(const struct stat *status,
+                                struct statx *result)
+{
+    memset(result, 0, sizeof(*result));
+    result->stx_mask = STATX_BASIC_STATS;
+    result->stx_blksize = (uint32_t)status->st_blksize;
+    result->stx_nlink = (uint32_t)status->st_nlink;
+    result->stx_uid = status->st_uid;
+    result->stx_gid = status->st_gid;
+    result->stx_mode = (uint16_t)status->st_mode;
+    result->stx_ino = (uint64_t)status->st_ino;
+    result->stx_size = (uint64_t)status->st_size;
+    result->stx_blocks = (uint64_t)status->st_blocks;
+    result->stx_atime.tv_sec = (int64_t)status->st_atim.tv_sec;
+    result->stx_atime.tv_nsec = (uint32_t)status->st_atim.tv_nsec;
+    result->stx_mtime.tv_sec = (int64_t)status->st_mtim.tv_sec;
+    result->stx_mtime.tv_nsec = (uint32_t)status->st_mtim.tv_nsec;
+    result->stx_ctime.tv_sec = (int64_t)status->st_ctim.tv_sec;
+    result->stx_ctime.tv_nsec = (uint32_t)status->st_ctim.tv_nsec;
+    result->stx_dev_major = major(status->st_dev);
+    result->stx_dev_minor = minor(status->st_dev);
+    result->stx_rdev_major = major(status->st_rdev);
+    result->stx_rdev_minor = minor(status->st_rdev);
+}
+
+static int vfs_statx(int dirfd, const char *path, int flags,
+                     unsigned int mask, struct statx *result)
+{
+    char resolved[PATH_MAX];
+    const char *lookup_path = path;
+    const char *kernel_path = path;
+    int kernel_dirfd = dirfd;
+    struct stat status;
+
+    if (!result)
+        return (int)VFS_SYSCALL(
+            SYS_statx, dirfd, path, flags, mask, result);
+    /* Preserve kernel validation independently of whether a pathname happens
+     * to be captured.  Both synchronization modes together and the reserved
+     * mask bit are invalid Linux statx requests. */
+    if ((flags & ~(AT_EMPTY_PATH | AT_NO_AUTOMOUNT |
+                   AT_SYMLINK_NOFOLLOW | AT_STATX_SYNC_TYPE)) != 0 ||
+        (flags & AT_STATX_SYNC_TYPE) == AT_STATX_SYNC_TYPE ||
+        (mask & UINT32_C(0x80000000)) != 0) {
+        set_loader_errno(EINVAL);
+        return -1;
+    }
+
+    if ((!path || path[0] == '\0') && (flags & AT_EMPTY_PATH) &&
+        vfs_fd_hint_maybe_mapped(dirfd)) {
+        int found;
+        runtime_loader_lock_token lock_token = vfs_dirfd_lock();
+
+        found = vfs_fill_mapped_fd_stat_locked(dirfd, &status);
+        vfs_dirfd_unlock(lock_token);
+        if (found) {
+            vfs_statx_from_stat(&status, result);
+            return 0;
+        }
+    }
+
+    if (path && path[0] != '\0' && path[0] != '/') {
+        int resolution = resolve_vfs_path_at(
+            dirfd, path, resolved, sizeof(resolved));
+
+        if (resolution == VFS_PATH_REFUSED)
+            return -1;
+        if (resolution > 0)
+            lookup_path = resolved;
+        if (resolution == VFS_PATH_MAPPED_DIRFD) {
+            kernel_dirfd = AT_FDCWD;
+            kernel_path = resolved;
+        }
+    }
+
+    if (lookup_path && lookup_path[0] == '/') {
+        const struct vfs_entry *entry = vfs_lookup(lookup_path);
+
+        if (vfs_is_negative_entry(entry)) {
+            vfs_dbg_op("statx", lookup_path, "negative");
+            set_loader_errno(ENOENT);
+            return -1;
+        }
+        if (vfs_is_regular_entry(entry)) {
+            vfs_fill_regular_stat(entry, &status);
+            vfs_statx_from_stat(&status, result);
+            vfs_dbg_op("statx", lookup_path, "file");
+            return 0;
+        }
+        {
+            const struct vfs_dir_entry *directory =
+                vfs_dir_lookup(lookup_path);
+
+            if (directory) {
+                vfs_fill_directory_stat(directory, &status);
+                vfs_statx_from_stat(&status, result);
+                vfs_dbg_op("statx", lookup_path, "dir");
+                return 0;
+            }
+        }
+        {
+            int elf_index = frozen_elf_find(lookup_path);
+
+            if (elf_index >= 0) {
+                vfs_fill_elf_stat((uint32_t)elf_index, &status);
+                vfs_statx_from_stat(&status, result);
+                vfs_dbg_op("statx", lookup_path, "elf");
+                return 0;
+            }
+        }
+    }
+    return (int)VFS_SYSCALL(
+        SYS_statx, kernel_dirfd, kernel_path, flags, mask, result);
 }
 
 static int vfs_xstat(int ver, const char *path, struct stat *buf)
@@ -29692,6 +29829,7 @@ static const struct stub_sym g_vfs_overrides[] = {
     { "fstatat",         (void *)vfs_fstatat        },
     { "fstatat64",       (void *)vfs_fstatat        },
     { "newfstatat",      (void *)vfs_fstatat        },
+    { "statx",           (void *)vfs_statx          },
     { "__fxstatat",      (void *)vfs_fxstatat       },
     { "__fxstatat64",    (void *)vfs_fxstatat       },
     { "access",          (void *)vfs_access         },
@@ -40324,6 +40462,7 @@ struct dl_manifest_path_source_slot {
     uint64_t data_size;
     uint8_t directory;
     uint8_t negative;
+    uint8_t virtual_entry;
 };
 
 #ifdef DLFREEZE_MANIFEST_IDENTITY_GATE
@@ -40413,11 +40552,36 @@ static int dl_manifest_path_source_insert(
                 (entry->flags & (DLFRZ_FLAG_DATA |
                                  DLFRZ_FLAG_DATA_NEGATIVE)) ==
                 (DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_NEGATIVE);
+            slot->virtual_entry =
+                (entry->flags & (DLFRZ_FLAG_DATA |
+                                 DLFRZ_FLAG_DATA_VIRTUAL)) ==
+                (DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_VIRTUAL);
             return 0;
         }
         if (slot->path_hash == path_hash &&
             slot->path_length == path_length &&
             memcmp(slot->path, path, path_length) == 0) {
+            int virtual_entry =
+                (entry->flags & (DLFRZ_FLAG_DATA |
+                                 DLFRZ_FLAG_DATA_VIRTUAL)) ==
+                (DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_VIRTUAL);
+
+            if (virtual_entry)
+                return 0;
+            if (slot->virtual_entry) {
+                slot->data_offset = entry->data_offset;
+                slot->data_size = entry->data_size;
+                slot->directory =
+                    (entry->flags & (DLFRZ_FLAG_DATA |
+                                     DLFRZ_FLAG_DATA_DIRECTORY)) ==
+                    (DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_DIRECTORY);
+                slot->negative =
+                    (entry->flags & (DLFRZ_FLAG_DATA |
+                                     DLFRZ_FLAG_DATA_NEGATIVE)) ==
+                    (DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_NEGATIVE);
+                slot->virtual_entry = 0;
+                return 0;
+            }
             return slot->data_size != 0 && entry->data_size != 0 &&
                    slot->data_offset == entry->data_offset &&
                    slot->data_size == entry->data_size ? 0 : -1;

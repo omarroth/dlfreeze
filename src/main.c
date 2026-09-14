@@ -32,6 +32,7 @@
 #include <sys/auxv.h>
 
 #include "elf_parser.h"
+#include "common.h"
 #include "dep_resolver.h"
 #include "libc_semantics.h"
 #include "packer.h"
@@ -1016,12 +1017,164 @@ static int path_is_known_dep(const char *rpath, const char *exe_path,
     return 0;
 }
 
+struct file_trace_snapshot {
+    uint64_t device;
+    uint64_t inode;
+    uint64_t type;
+    uint64_t size;
+    uint64_t mtime_sec;
+    uint64_t mtime_nsec;
+    uint64_t ctime_sec;
+    uint64_t ctime_nsec;
+};
+
+static int file_trace_snapshot_matches_stat(
+    const struct file_trace_snapshot *snapshot, const struct stat *st,
+    int is_dir);
+
+static int path_matches_patterns(const char *path, const char **patterns,
+                                 int npatterns)
+{
+    for (int i = 0; i < npatterns; i++)
+        if (match_glob(patterns[i], path))
+            return 1;
+    return 0;
+}
+
+static unsigned char captured_dirent_type(int directory_fd,
+                                          const struct dirent *entry)
+{
+    struct stat status;
+
+    if (entry->d_type != DT_UNKNOWN)
+        return entry->d_type;
+    if (fstatat(directory_fd, entry->d_name, &status,
+                AT_SYMLINK_NOFOLLOW) < 0)
+        return DT_UNKNOWN;
+    if (S_ISREG(status.st_mode)) return DT_REG;
+    if (S_ISDIR(status.st_mode)) return DT_DIR;
+    if (S_ISLNK(status.st_mode)) return DT_LNK;
+    if (S_ISCHR(status.st_mode)) return DT_CHR;
+    if (S_ISBLK(status.st_mode)) return DT_BLK;
+    if (S_ISFIFO(status.st_mode)) return DT_FIFO;
+    if (S_ISSOCK(status.st_mode)) return DT_SOCK;
+    return DT_UNKNOWN;
+}
+
+/* Snapshot exactly the selected immediate members of a directory which the
+ * traced program successfully enumerated.  Member placeholders retain
+ * readdir identity and d_type only; bytes are embedded only when a member is
+ * itself opened or stat'ed during the trace. */
+static int snapshot_captured_directory(
+    const char *request_path, const char *source_path,
+    const char **patterns, int npatterns, struct data_file_list *out,
+    const struct file_trace_snapshot *trace_snapshot)
+{
+    struct stat before_status;
+    struct stat after_status;
+    DIR *directory = NULL;
+    int directory_fd;
+    int capture_all_members;
+    int retained_directory;
+    int read_error = 0;
+
+    directory_fd = open(source_path,
+                        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (directory_fd < 0 || fstat(directory_fd, &before_status) < 0 ||
+        !file_trace_snapshot_matches_stat(
+            trace_snapshot, &before_status, 1)) {
+        if (directory_fd >= 0)
+            close(directory_fd);
+        errno = ESTALE;
+        return -1;
+    }
+    directory = fdopendir(directory_fd);
+    if (!directory) {
+        close(directory_fd);
+        return -1;
+    }
+
+    capture_all_members = path_matches_patterns(
+        request_path, patterns, npatterns);
+    retained_directory = capture_all_members;
+    errno = 0;
+    for (;;) {
+        struct dirent *entry;
+        char request_child[PATH_MAX];
+        size_t request_length;
+        size_t name_length;
+        size_t separator_length;
+        unsigned char type;
+
+        errno = 0;
+        entry = readdir(directory);
+        if (!entry) {
+            read_error = errno;
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0)
+            continue;
+        request_length = strlen(request_path);
+        name_length = strlen(entry->d_name);
+        separator_length = request_length == 1 && request_path[0] == '/'
+            ? 0 : 1;
+        if (request_length > sizeof(request_child) - 1 ||
+            separator_length > sizeof(request_child) - 1 - request_length ||
+            name_length > sizeof(request_child) - 1 - request_length -
+                              separator_length) {
+            read_error = ENAMETOOLONG;
+            break;
+        }
+        memcpy(request_child, request_path, request_length);
+        if (separator_length)
+            request_child[request_length++] = '/';
+        memcpy(request_child + request_length, entry->d_name,
+               name_length + 1);
+        if (!capture_all_members &&
+            !path_matches_patterns(request_child, patterns, npatterns))
+            continue;
+
+        type = captured_dirent_type(directory_fd, entry);
+        if (!dlfrz_dirent_type_canonical(type)) {
+            read_error = EIO;
+            break;
+        }
+        if (type == DT_DIR)
+            data_file_list_add_directory(out, request_child);
+        else
+            data_file_list_add_virtual(out, request_child, type);
+        if (out->failed) {
+            read_error = ENOMEM;
+            break;
+        }
+        retained_directory = 1;
+    }
+
+    if (fstat(directory_fd, &after_status) < 0 ||
+        !file_trace_snapshot_matches_stat(
+            trace_snapshot, &after_status, 1)) {
+        if (!read_error)
+            read_error = ESTALE;
+    }
+    if (closedir(directory) < 0 && !read_error)
+        read_error = errno;
+    if (read_error) {
+        errno = read_error;
+        return -1;
+    }
+    if (retained_directory)
+        data_file_list_add_directory(out, request_path);
+    return out->failed ? -1 : 0;
+}
+
 static int process_captured_path(const char *exe_path, const char **patterns,
                                  int npatterns, struct data_file_list *out,
                                  struct dep_list *deps,
                                  const char *request_path,
                                  const char *source_path, int is_dir,
                                  const struct stat *source_st,
+                                 const struct file_trace_snapshot *trace_snapshot,
                                  const struct dep_file_snapshot *snapshot)
 {
     if (is_dir) {
@@ -1030,10 +1183,9 @@ static int process_captured_path(const char *exe_path, const char **patterns,
         if (!dir_matches_patterns(request_path, patterns, npatterns))
             return 0;
 
-        /* Preserve successful directory probes without bulk-pulling contents;
-         * traced file probes carry per-child existence semantics. */
-        data_file_list_add_directory(out, request_path);
-        return out->failed ? -1 : 0;
+        return snapshot_captured_directory(
+            request_path, source_path, patterns, npatterns, out,
+            trace_snapshot);
     }
 
     if (!source_st || !S_ISREG(source_st->st_mode) || !snapshot ||
@@ -1127,17 +1279,6 @@ static int file_trace_hex_decode(const char *hex, size_t hex_len,
     out[hex_len / 2] = '\0';
     return 0;
 }
-
-struct file_trace_snapshot {
-    uint64_t device;
-    uint64_t inode;
-    uint64_t type;
-    uint64_t size;
-    uint64_t mtime_sec;
-    uint64_t mtime_nsec;
-    uint64_t ctime_sec;
-    uint64_t ctime_nsec;
-};
 
 struct file_trace_pending_operation {
     uint64_t pid;
@@ -1265,7 +1406,12 @@ static int file_trace_snapshot_matches_stat(
         snapshot->inode != current.inode || snapshot->type != current.type)
         return 0;
     if (is_dir)
-        return snapshot->type == (uint64_t)S_IFDIR;
+        return snapshot->type == (uint64_t)S_IFDIR &&
+               snapshot->size == current.size &&
+               snapshot->mtime_sec == current.mtime_sec &&
+               snapshot->mtime_nsec == current.mtime_nsec &&
+               snapshot->ctime_sec == current.ctime_sec &&
+               snapshot->ctime_nsec == current.ctime_nsec;
     return snapshot->type == (uint64_t)S_IFREG &&
            snapshot->size == current.size &&
            snapshot->mtime_sec == current.mtime_sec &&
@@ -1703,7 +1849,8 @@ static int parse_preload_file_trace(int trace_fd, const char *exe_path,
                 resolved_snapshot_from_stat(&pack_snapshot, &source_st);
             if (process_captured_path(
                     exe_path, patterns, npatterns, out, deps, request, source,
-                    is_dir, &source_st, is_dir ? NULL : &pack_snapshot) < 0) {
+                    is_dir, &source_st, &trace_snapshot,
+                    is_dir ? NULL : &pack_snapshot) < 0) {
                 fprintf(stderr,
                         "dlfreeze: cannot retain captured source snapshot: "
                         "%s\n", source);

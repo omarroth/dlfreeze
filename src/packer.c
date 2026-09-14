@@ -212,6 +212,7 @@ void data_file_list_init(struct data_file_list *dl)
     dl->paths      = NULL;
     dl->source_paths = NULL;
     dl->kinds      = NULL;
+    dl->dirent_types = NULL;
     dl->snapshots  = NULL;
     dl->count      = 0;
     dl->capacity   = 0;
@@ -221,6 +222,7 @@ void data_file_list_init(struct data_file_list *dl)
 static void data_file_list_add_ex(struct data_file_list *dl, const char *path,
                                   const char *source_path,
                                   enum data_file_kind kind,
+                                  unsigned char dirent_type,
                                   const struct dep_file_snapshot *snapshot)
 {
     char *path_copy;
@@ -232,7 +234,10 @@ static void data_file_list_add_ex(struct data_file_list *dl, const char *path,
         return;
     if (!path ||
         (kind == DATA_FILE_KIND_REGULAR &&
-         (!source_path || !snapshot || !snapshot->valid))) {
+         (!source_path || !snapshot || !snapshot->valid)) ||
+        (kind == DATA_FILE_KIND_VIRTUAL
+             ? !dlfrz_dirent_type_canonical(dirent_type)
+             : dirent_type != 0)) {
         dl->failed = 1;
         return;
     }
@@ -242,12 +247,47 @@ static void data_file_list_add_ex(struct data_file_list *dl, const char *path,
     for (int i = 0; i < dl->count; i++) {
         if (strcmp(dl->paths[i], path) != 0)
             continue;
+        /* Directory enumeration creates metadata-only entries before a
+         * later traced stat/open may provide stronger identity.  Upgrade in
+         * either record order; never let a placeholder mask captured bytes
+         * or an explicit directory. */
+        if (dl->kinds[i] == DATA_FILE_KIND_VIRTUAL &&
+            (kind == DATA_FILE_KIND_REGULAR ||
+             kind == DATA_FILE_KIND_DIRECTORY)) {
+            char *replacement_source = NULL;
+
+            if (kind == DATA_FILE_KIND_REGULAR) {
+                replacement_source = strdup(source_path);
+                if (!replacement_source) {
+                    dl->failed = 1;
+                    return;
+                }
+            }
+            free(dl->source_paths[i]);
+            dl->source_paths[i] = replacement_source;
+            dl->kinds[i] = kind;
+            dl->dirent_types[i] = 0;
+            memset(&dl->snapshots[i], 0, sizeof(dl->snapshots[i]));
+            if (snapshot)
+                dl->snapshots[i] = *snapshot;
+            return;
+        }
+        if (kind == DATA_FILE_KIND_VIRTUAL &&
+            (dl->kinds[i] == DATA_FILE_KIND_REGULAR ||
+             dl->kinds[i] == DATA_FILE_KIND_DIRECTORY))
+            return;
         if (dl->kinds[i] != kind ||
             (kind == DATA_FILE_KIND_REGULAR &&
              (!dl->source_paths[i] ||
               strcmp(dl->source_paths[i], source_path) != 0 ||
-              !dep_file_snapshots_equal(&dl->snapshots[i], snapshot))))
+              !dep_file_snapshots_equal(&dl->snapshots[i], snapshot))) ||
+            (kind == DATA_FILE_KIND_VIRTUAL &&
+             dl->dirent_types[i] != dirent_type &&
+             dl->dirent_types[i] != 0 && dirent_type != 0))
             dl->failed = 1;
+        else if (kind == DATA_FILE_KIND_VIRTUAL &&
+                 dl->dirent_types[i] == 0)
+            dl->dirent_types[i] = dirent_type;
         return;
     }
 
@@ -256,6 +296,7 @@ static void data_file_list_add_ex(struct data_file_list *dl, const char *path,
         char **new_paths;
         char **new_sources;
         enum data_file_kind *new_kinds;
+        unsigned char *new_dirent_types;
         struct dep_file_snapshot *new_snapshots;
 
         if (dl->capacity > INT_MAX / 2) {
@@ -266,6 +307,7 @@ static void data_file_list_add_ex(struct data_file_list *dl, const char *path,
         if ((size_t)newcap > SIZE_MAX / sizeof(*new_paths) ||
             (size_t)newcap > SIZE_MAX / sizeof(*new_sources) ||
             (size_t)newcap > SIZE_MAX / sizeof(*new_kinds) ||
+            (size_t)newcap > SIZE_MAX / sizeof(*new_dirent_types) ||
             (size_t)newcap > SIZE_MAX / sizeof(*new_snapshots)) {
             dl->failed = 1;
             return;
@@ -273,11 +315,15 @@ static void data_file_list_add_ex(struct data_file_list *dl, const char *path,
         new_paths = malloc((size_t)newcap * sizeof(*new_paths));
         new_sources = calloc((size_t)newcap, sizeof(*new_sources));
         new_kinds = calloc((size_t)newcap, sizeof(*new_kinds));
+        new_dirent_types = calloc((size_t)newcap,
+                                  sizeof(*new_dirent_types));
         new_snapshots = calloc((size_t)newcap, sizeof(*new_snapshots));
-        if (!new_paths || !new_sources || !new_kinds || !new_snapshots) {
+        if (!new_paths || !new_sources || !new_kinds ||
+            !new_dirent_types || !new_snapshots) {
             free(new_paths);
             free(new_sources);
             free(new_kinds);
+            free(new_dirent_types);
             free(new_snapshots);
             dl->failed = 1;
             return;
@@ -289,16 +335,20 @@ static void data_file_list_add_ex(struct data_file_list *dl, const char *path,
                    (size_t)dl->count * sizeof(*new_sources));
             memcpy(new_kinds, dl->kinds,
                    (size_t)dl->count * sizeof(*new_kinds));
+            memcpy(new_dirent_types, dl->dirent_types,
+                   (size_t)dl->count * sizeof(*new_dirent_types));
             memcpy(new_snapshots, dl->snapshots,
                    (size_t)dl->count * sizeof(*new_snapshots));
         }
         free(dl->paths);
         free(dl->source_paths);
         free(dl->kinds);
+        free(dl->dirent_types);
         free(dl->snapshots);
         dl->paths = new_paths;
         dl->source_paths = new_sources;
         dl->kinds = new_kinds;
+        dl->dirent_types = new_dirent_types;
         dl->snapshots = new_snapshots;
         dl->capacity = newcap;
     }
@@ -315,6 +365,7 @@ static void data_file_list_add_ex(struct data_file_list *dl, const char *path,
     dl->paths[dl->count]      = path_copy;
     dl->source_paths[dl->count] = source_copy;
     dl->kinds[dl->count] = kind;
+    dl->dirent_types[dl->count] = dirent_type;
     if (snapshot)
         dl->snapshots[dl->count] = *snapshot;
     dl->count++;
@@ -325,22 +376,24 @@ void data_file_list_add(struct data_file_list *dl, const char *path,
                         const struct dep_file_snapshot *snapshot)
 {
     data_file_list_add_ex(dl, path, source_path, DATA_FILE_KIND_REGULAR,
-                          snapshot);
+                          0, snapshot);
 }
 
-void data_file_list_add_virtual(struct data_file_list *dl, const char *path)
+void data_file_list_add_virtual(struct data_file_list *dl, const char *path,
+                                unsigned char dirent_type)
 {
-    data_file_list_add_ex(dl, path, NULL, DATA_FILE_KIND_VIRTUAL, NULL);
+    data_file_list_add_ex(dl, path, NULL, DATA_FILE_KIND_VIRTUAL,
+                          dirent_type, NULL);
 }
 
 void data_file_list_add_negative(struct data_file_list *dl, const char *path)
 {
-    data_file_list_add_ex(dl, path, NULL, DATA_FILE_KIND_NEGATIVE, NULL);
+    data_file_list_add_ex(dl, path, NULL, DATA_FILE_KIND_NEGATIVE, 0, NULL);
 }
 
 void data_file_list_add_directory(struct data_file_list *dl, const char *path)
 {
-    data_file_list_add_ex(dl, path, NULL, DATA_FILE_KIND_DIRECTORY, NULL);
+    data_file_list_add_ex(dl, path, NULL, DATA_FILE_KIND_DIRECTORY, 0, NULL);
 }
 
 void data_file_list_free(struct data_file_list *dl)
@@ -352,10 +405,12 @@ void data_file_list_free(struct data_file_list *dl)
     free(dl->paths);
     free(dl->source_paths);
     free(dl->kinds);
+    free(dl->dirent_types);
     free(dl->snapshots);
     dl->paths = NULL;
     dl->source_paths = NULL;
     dl->kinds = NULL;
+    dl->dirent_types = NULL;
     dl->snapshots = NULL;
     dl->count = dl->capacity = dl->failed = 0;
 }
@@ -9068,6 +9123,7 @@ struct packed_manifest_alias_ref {
     uint8_t request;
     uint8_t directory;
     uint8_t negative;
+    uint8_t virtual_entry;
 };
 
 static int packed_manifest_alias_ref_cmp(const void *left_pointer,
@@ -9111,7 +9167,10 @@ static void packed_manifest_alias_ref_add(
                   (DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_DIRECTORY)),
         (uint8_t)((entry->flags & (DLFRZ_FLAG_DATA |
                                    DLFRZ_FLAG_DATA_NEGATIVE)) ==
-                  (DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_NEGATIVE))
+                  (DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_NEGATIVE)),
+        (uint8_t)((entry->flags & (DLFRZ_FLAG_DATA |
+                                   DLFRZ_FLAG_DATA_VIRTUAL)) ==
+                  (DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_VIRTUAL))
     };
     (*count)++;
 }
@@ -9237,13 +9296,22 @@ static int packed_manifest_aliases_are_consistent(
                strcmp(refs[end].name, refs[begin].name) == 0)
             end++;
         if (refs[begin].domain == PACKED_MANIFEST_ALIAS_EXACT_PATH) {
-            for (size_t i = begin + 1; i < end; i++) {
-                if (!packed_manifest_alias_source_matches(
-                        &refs[begin], &refs[i])) {
+            const struct packed_manifest_alias_ref *source = NULL;
+
+            for (size_t i = begin; i < end; i++) {
+                /* A directory-member placeholder has no byte or node
+                 * authority.  A captured DATA file or ELF at the same exact
+                 * path is the stronger identity used by open/stat, while the
+                 * placeholder retains its observed readdir d_type. */
+                if (refs[i].virtual_entry)
+                    continue;
+                if (source && !packed_manifest_alias_source_matches(
+                                  source, &refs[i])) {
                     *conflict_out = refs[begin].name;
                     errno = EEXIST;
                     goto out;
                 }
+                source = &refs[i];
             }
         } else {
             for (size_t i = begin; i < end; i++) {
@@ -9373,7 +9441,8 @@ int pack_frozen(const struct pack_options *opts)
          (opts->data_files->failed || opts->data_files->count < 0 ||
           (opts->data_files->count > 0 &&
            (!opts->data_files->paths || !opts->data_files->source_paths ||
-            !opts->data_files->kinds || !opts->data_files->snapshots))))) {
+            !opts->data_files->kinds || !opts->data_files->dirent_types ||
+            !opts->data_files->snapshots))))) {
         fprintf(stderr, "dlfreeze: incomplete file manifest\n");
         return -1;
     }
@@ -9385,6 +9454,10 @@ int pack_frozen(const struct pack_options *opts)
                 opts->data_files->paths[i][0] != '/' ||
                 kind < DATA_FILE_KIND_REGULAR ||
                 kind > DATA_FILE_KIND_DIRECTORY ||
+                (kind == DATA_FILE_KIND_VIRTUAL
+                     ? !dlfrz_dirent_type_canonical(
+                           opts->data_files->dirent_types[i])
+                     : opts->data_files->dirent_types[i] != 0) ||
                 (kind == DATA_FILE_KIND_REGULAR &&
                  (!opts->data_files->source_paths[i] ||
                   opts->data_files->source_paths[i][0] != '/' ||
@@ -9726,7 +9799,10 @@ int pack_frozen(const struct pack_options *opts)
 
         entries[eidx].flags       = DLFRZ_FLAG_DATA;
         if (kind == DATA_FILE_KIND_VIRTUAL)
-            entries[eidx].flags |= DLFRZ_FLAG_DATA_VIRTUAL;
+            entries[eidx].flags |= DLFRZ_FLAG_DATA_VIRTUAL |
+                DLFRZ_FLAG_DATA_DIRENT_TYPED |
+                ((uint32_t)opts->data_files->dirent_types[i] <<
+                 DLFRZ_FLAG_DATA_DIRENT_TYPE_SHIFT);
         else if (kind == DATA_FILE_KIND_NEGATIVE)
             entries[eidx].flags |= DLFRZ_FLAG_DATA_NEGATIVE;
         else if (kind == DATA_FILE_KIND_DIRECTORY)

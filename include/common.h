@@ -26,6 +26,20 @@
 #define DLFRZ_FLAG_NEEDED_PATHFUL 0x2000 /* manifest name is an exact pathful DT_NEEDED */
 #define DLFRZ_FLAG_DATA_DIRECTORY 0x4000 /* captured directory identity, not a file      */
 #define DLFRZ_FLAG_INTERP_KERNEL_ONLY 0x8000 /* PT_INTERP has no validated launcher ABI  */
+#define DLFRZ_FLAG_DATA_DIRENT_TYPE_SHIFT 16
+#define DLFRZ_FLAG_DATA_DIRENT_TYPE_MASK  0x000f0000U
+#define DLFRZ_FLAG_DATA_DIRENT_TYPED      0x00100000U
+
+/* Linux getdents64 d_type values are part of the kernel ABI and therefore do
+ * not depend on the libc which consumes the frozen manifest.  A virtual DATA
+ * entry records a directory member's observed type without embedding or
+ * pretending to make that member openable. */
+static inline int dlfrz_dirent_type_canonical(uint32_t type)
+{
+    return type == 0 || type == 1 || type == 2 || type == 4 ||
+           type == 6 || type == 8 || type == 10 || type == 12 ||
+           type == 14;
+}
 
 /* A traced request is an alias of an ELF object, not a statement about when
  * that object enters the process.  In particular, a startup DT_NEEDED object
@@ -47,7 +61,9 @@ static inline int dlfrz_manifest_entry_flags_canonical(
                                  DLFRZ_FLAG_DLOPEN_PATHFUL |
                                  DLFRZ_FLAG_NEEDED_PATHFUL |
                                  DLFRZ_FLAG_DATA_DIRECTORY |
-                                 DLFRZ_FLAG_INTERP_KERNEL_ONLY;
+                                 DLFRZ_FLAG_INTERP_KERNEL_ONLY |
+                                 DLFRZ_FLAG_DATA_DIRENT_TYPE_MASK |
+                                 DLFRZ_FLAG_DATA_DIRENT_TYPED;
     const uint32_t kind = flags & (DLFRZ_FLAG_MAIN_EXE |
                                    DLFRZ_FLAG_INTERP |
                                    DLFRZ_FLAG_SHLIB |
@@ -57,6 +73,9 @@ static inline int dlfrz_manifest_entry_flags_canonical(
                                          DLFRZ_FLAG_DATA_DIRECTORY);
     const int request = has_dlopen_request != 0;
     const int pathful_request = dlopen_request_is_pathful != 0;
+    const uint32_t dirent_type =
+        (flags & DLFRZ_FLAG_DATA_DIRENT_TYPE_MASK) >>
+        DLFRZ_FLAG_DATA_DIRENT_TYPE_SHIFT;
 
     return (flags & ~known_flags) == 0 &&
            (kind == DLFRZ_FLAG_MAIN_EXE ||
@@ -73,6 +92,10 @@ static inline int dlfrz_manifest_entry_flags_canonical(
             kind == DLFRZ_FLAG_INTERP) &&
            (!data_state || (flags & DLFRZ_FLAG_DATA)) &&
            (!data_state || !(data_state & (data_state - 1))) &&
+           ((flags & DLFRZ_FLAG_DATA_DIRENT_TYPED)
+                ? (flags & DLFRZ_FLAG_DATA_VIRTUAL) &&
+                  dlfrz_dirent_type_canonical(dirent_type)
+                : dirent_type == 0) &&
            (!request || (flags & DLFRZ_FLAG_SHLIB)) &&
            (!pathful_request || request) &&
            ((flags & DLFRZ_FLAG_DLOPEN_PATHFUL) != 0) ==

@@ -15,6 +15,7 @@ struct data_file_list {
     char **paths;      /* exact absolute request identities */
     char **source_paths; /* canonical sources for real entries, else NULL */
     enum data_file_kind *kinds;
+    unsigned char *dirent_types; /* Linux d_type for virtual directory members */
     struct dep_file_snapshot *snapshots; /* traced regular-file revisions */
     int    count;
     int    capacity;
@@ -25,7 +26,8 @@ void data_file_list_init(struct data_file_list *dl);
 void data_file_list_add(struct data_file_list *dl, const char *path,
                         const char *source_path,
                         const struct dep_file_snapshot *snapshot);
-void data_file_list_add_virtual(struct data_file_list *dl, const char *path);
+void data_file_list_add_virtual(struct data_file_list *dl, const char *path,
+                                unsigned char dirent_type);
 void data_file_list_add_negative(struct data_file_list *dl, const char *path);
 void data_file_list_add_directory(struct data_file_list *dl, const char *path);
 void data_file_list_free(struct data_file_list *dl);

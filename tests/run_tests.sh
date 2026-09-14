@@ -6316,6 +6316,113 @@ C
     rm -f "$out" "$log"
 }
 
+# A successful opendir is an observation of the directory entries returned to
+# the program, not merely proof that the directory inode exists.  Preserve the
+# selected names and Linux d_type values without embedding unopened contents,
+# and cover the statx probe modern coreutils performs before opendir.
+test_vfs_directory_snapshot() {
+    echo "--- captured VFS directory snapshot ---"
+    local root="$BUILD/vfs-directory-snapshot"
+    local data src bin out log actual expected="directory-snapshot-ok"
+    local rc=0 freeze_rc=0
+
+    rm -rf "$root"
+    rm -f "$BUILD/vfs-directory-snapshot.frozen" \
+          "$BUILD/vfs-directory-snapshot.log"
+    mkdir -p "$root/data/subdir"
+    root=$(realpath "$root")
+    data="$root/data"
+    src="$root/main.c"
+    bin="$root/program"
+    out="$BUILD/vfs-directory-snapshot.frozen"
+    log="$BUILD/vfs-directory-snapshot.log"
+    printf 'unopened\n' >"$data/regular"
+    ln -s regular "$data/symlink"
+    mkfifo "$data/fifo"
+
+    cat >"$src" <<'C'
+#define _GNU_SOURCE
+#include <dirent.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+
+int main(int argc, char **argv) {
+    struct statx status;
+    DIR *directory;
+    struct dirent *entry;
+    int regular = 0, subdir = 0, symlink = 0, fifo = 0;
+
+    if (argc != 2 || statx(AT_FDCWD, argv[1], AT_NO_AUTOMOUNT,
+                           STATX_MODE, &status) != 0 ||
+        (status.stx_mode & S_IFMT) != S_IFDIR)
+        return 2;
+    directory = opendir(argv[1]);
+    if (!directory)
+        return 3;
+    while ((entry = readdir(directory)) != NULL) {
+        if (strcmp(entry->d_name, "regular") == 0)
+            regular = entry->d_type == DT_REG;
+        else if (strcmp(entry->d_name, "subdir") == 0)
+            subdir = entry->d_type == DT_DIR;
+        else if (strcmp(entry->d_name, "symlink") == 0)
+            symlink = entry->d_type == DT_LNK;
+        else if (strcmp(entry->d_name, "fifo") == 0)
+            fifo = entry->d_type == DT_FIFO;
+    }
+    if (closedir(directory) != 0 ||
+        !regular || !subdir || !symlink || !fifo)
+        return 4;
+    puts("directory-snapshot-ok");
+    return 0;
+}
+C
+
+    if ! gcc -Wall -Wextra -Werror -o "$bin" "$src"; then
+        fail "captured VFS directory snapshot" "fixture compile failed"
+        rm -rf "$root"
+        rm -f "$out" "$log"
+        return
+    fi
+    capture_output actual "$bin" "$data" || rc=$?
+    if [ "$rc" -ne 0 ] || [ "$actual" != "$expected" ]; then
+        fail "native VFS directory snapshot control" \
+            "exit=$rc output=$actual"
+        rm -rf "$root"
+        rm -f "$out" "$log"
+        return
+    fi
+
+    freeze_require_direct "captured VFS directory snapshot" "$log" "$out" \
+        -t -f "$data/*" -- "$bin" "$data" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "captured VFS directory snapshot replay" \
+            "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        rm -f "$out" "$log"
+        return
+    elif [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        rm -f "$out" "$log"
+        return
+    fi
+
+    rm -rf "$root"
+    actual=""; rc=0
+    capture_output actual env DLFREEZE_NO_FORK=1 \
+        "$out" "$data" || rc=$?
+    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+    if [ "$rc" -eq 0 ] && [ "$actual" = "$expected" ]; then
+        pass "captured VFS directory snapshot replay"
+    else
+        fail "captured VFS directory snapshot replay" \
+            "exit=$rc output=$actual"
+    fi
+
+    rm -f "$out" "$log"
+}
+
 # Loader-owned directory streams must be identified by pointer ownership,
 # never by inspecting an opaque target-libc DIR representation.  Exercise
 # real and virtual streams concurrently, including dirfd/openat, fdopendir,
@@ -32580,6 +32687,7 @@ test_captured_files_require_direct
 test_runtime_relocation_vfs_fallthrough
 test_captured_file_request_identity_direct
 test_vfs_explicit_directory_kind
+test_vfs_directory_snapshot
 test_vfs_dir_handle_registry
 test_direct_handoff_once
 test_direct_inherited_posix_lock

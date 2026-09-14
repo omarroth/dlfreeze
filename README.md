@@ -85,7 +85,12 @@ When `-t` is used, `[args...]` are passed to the traced run so the program
 exercises the code paths that trigger `dlopen()` and resource access. The
 traced process remains in the foreground terminal process group, so prompts,
 line editing, Ctrl-C, and shell stop/continue job control retain their normal
-semantics.
+semantics. A selected directory which the program enumerates retains its
+selected immediate member names and `d_type` values. Unopened members remain
+metadata-only directory entries; their contents are embedded only if the
+trace opens or otherwise captures them. Shell quoting already protects `*`,
+so use `-f '/usr/*'`, not `-f '/usr/\*'` (the latter matches a literal
+asterisk).
 
 ## Building
 
