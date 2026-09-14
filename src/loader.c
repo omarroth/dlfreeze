@@ -182,6 +182,43 @@ _Static_assert(PROT_BTI == DLFRZ_AARCH64_PROT_BTI,
 #define SYS_statx 291
 #endif
 #endif
+/* Keep the loader's statx override independent of libc and kernel header
+ * vintages.  The syscall ABI has always used this 256-byte prefix layout;
+ * fields added after stx_dev_minor occupy the zeroed trailing reserve and
+ * are deliberately not claimed in stx_mask. */
+#define LDR_STATX_BASIC_STATS UINT32_C(0x000007ff)
+struct ldr_statx_timestamp {
+    int64_t tv_sec;
+    uint32_t tv_nsec;
+    int32_t reserved;
+};
+struct ldr_statx {
+    uint32_t stx_mask;
+    uint32_t stx_blksize;
+    uint64_t stx_attributes;
+    uint32_t stx_nlink;
+    uint32_t stx_uid;
+    uint32_t stx_gid;
+    uint16_t stx_mode;
+    uint16_t spare0;
+    uint64_t stx_ino;
+    uint64_t stx_size;
+    uint64_t stx_blocks;
+    uint64_t stx_attributes_mask;
+    struct ldr_statx_timestamp stx_atime;
+    struct ldr_statx_timestamp stx_btime;
+    struct ldr_statx_timestamp stx_ctime;
+    struct ldr_statx_timestamp stx_mtime;
+    uint32_t stx_rdev_major;
+    uint32_t stx_rdev_minor;
+    uint32_t stx_dev_major;
+    uint32_t stx_dev_minor;
+    uint64_t spare1[14];
+};
+_Static_assert(sizeof(struct ldr_statx_timestamp) == 16,
+               "Linux statx timestamp ABI changed");
+_Static_assert(sizeof(struct ldr_statx) == 256,
+               "Linux statx ABI changed");
 #ifndef SYS_uname
 /* Linux UAPI syscall numbers.  Some older libc header sets expose only the
  * architecture's __NR_uname spelling. */
@@ -20447,10 +20484,10 @@ static int vfs_faccessat(int dirfd, const char *path, int amode, int flag)
 }
 
 static void vfs_statx_from_stat(const struct stat *status,
-                                struct statx *result)
+                                struct ldr_statx *result)
 {
     memset(result, 0, sizeof(*result));
-    result->stx_mask = STATX_BASIC_STATS;
+    result->stx_mask = LDR_STATX_BASIC_STATS;
     result->stx_blksize = (uint32_t)status->st_blksize;
     result->stx_nlink = (uint32_t)status->st_nlink;
     result->stx_uid = status->st_uid;
@@ -20472,7 +20509,7 @@ static void vfs_statx_from_stat(const struct stat *status,
 }
 
 static int vfs_statx(int dirfd, const char *path, int flags,
-                     unsigned int mask, struct statx *result)
+                     unsigned int mask, struct ldr_statx *result)
 {
     char resolved[PATH_MAX];
     const char *lookup_path = path;
@@ -35333,7 +35370,7 @@ static int apply_relocs_rela(struct loaded_obj *obj,
         void *relocation_slot;
         int ifunc_classification_stable = 1;
         int symbolic_candidate = 0;
-        int symbolic_ifunc;
+        int symbolic_ifunc = 0;
         int gnu_unique_relocation = 0;
 
         if (!loaded_rela_read(obj, table, i, &relocation))

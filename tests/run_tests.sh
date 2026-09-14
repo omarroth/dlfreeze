@@ -6344,19 +6344,41 @@ test_vfs_directory_snapshot() {
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
 
+/* Refer to the ELF symbol weakly and carry the stable kernel result prefix
+ * locally.  This keeps the fixture buildable on libcs predating their statx
+ * wrapper while still requiring the frozen loader's override during replay. */
+struct test_statx {
+    uint32_t mask;
+    uint32_t blksize;
+    uint64_t attributes;
+    uint32_t nlink;
+    uint32_t uid;
+    uint32_t gid;
+    uint16_t mode;
+    uint16_t spare;
+    unsigned char remainder[224];
+};
+extern int test_statx(int, const char *, int, unsigned int,
+                      struct test_statx *)
+    __asm__("statx") __attribute__((weak));
+
 int main(int argc, char **argv) {
-    struct statx status;
+    struct test_statx status;
     DIR *directory;
     struct dirent *entry;
     int regular = 0, subdir = 0, symlink = 0, fifo = 0;
 
-    if (argc != 2 || statx(AT_FDCWD, argv[1], AT_NO_AUTOMOUNT,
-                           STATX_MODE, &status) != 0 ||
-        (status.stx_mode & S_IFMT) != S_IFDIR)
+    if ((argc != 2 && argc != 3) ||
+        (argc == 3 && !test_statx) ||
+        (test_statx &&
+         (test_statx(AT_FDCWD, argv[1], AT_NO_AUTOMOUNT,
+                     UINT32_C(0x00000002), &status) != 0 ||
+          (status.mode & S_IFMT) != S_IFDIR)))
         return 2;
     directory = opendir(argv[1]);
     if (!directory)
@@ -6379,7 +6401,15 @@ int main(int argc, char **argv) {
 }
 C
 
-    if ! gcc -Wall -Wextra -Werror -o "$bin" "$src"; then
+    if test_compiler_available musl-gcc >/dev/null 2>&1; then
+        if ! musl-gcc -Wall -Wextra -Werror -o "$bin" "$src"; then
+            fail "captured VFS directory snapshot" \
+                "musl fixture compile failed"
+            rm -rf "$root"
+            rm -f "$out" "$log"
+            return
+        fi
+    elif ! gcc -Wall -Wextra -Werror -o "$bin" "$src"; then
         fail "captured VFS directory snapshot" "fixture compile failed"
         rm -rf "$root"
         rm -f "$out" "$log"
@@ -6395,7 +6425,7 @@ C
     fi
 
     freeze_require_direct "captured VFS directory snapshot" "$log" "$out" \
-        -t -f "$data/*" -- "$bin" "$data" || freeze_rc=$?
+        -v -t -f "$data/*" -- "$bin" "$data" || freeze_rc=$?
     if [ "$freeze_rc" -eq 77 ]; then
         skip "captured VFS directory snapshot replay" \
             "$DIRECT_FREEZE_REASON"
@@ -6411,7 +6441,7 @@ C
     rm -rf "$root"
     actual=""; rc=0
     capture_output actual env DLFREEZE_NO_FORK=1 \
-        "$out" "$data" || rc=$?
+        "$out" "$data" require-statx || rc=$?
     actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
     if [ "$rc" -eq 0 ] && [ "$actual" = "$expected" ]; then
         pass "captured VFS directory snapshot replay"

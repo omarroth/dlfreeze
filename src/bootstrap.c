@@ -2713,6 +2713,7 @@ static int bs_parse_maps_entry(const unsigned char *line, size_t length,
 
 struct bs_maps_line_reader {
     FILE *stream;
+    int fd;
     unsigned char *buffer;
     size_t capacity;
     size_t begin;
@@ -2727,6 +2728,12 @@ static int bs_maps_line_reader_init(struct bs_maps_line_reader *reader,
     if (!reader || !stream || !buffer || capacity < 2)
         return 0;
     reader->stream = stream;
+    /* Procfs streams are consumed before stdio has buffered any bytes.  Use
+     * the kernel read ABI directly when the stream has a descriptor so the
+     * evidence path has identical syscall and failure semantics on glibc,
+     * musl, and other libcs.  Memory streams retain the stdio fallback used
+     * by the parser gates. */
+    reader->fd = fileno(stream);
     reader->buffer = buffer;
     reader->capacity = capacity;
     reader->begin = 0;
@@ -2787,7 +2794,20 @@ static int bs_read_maps_line(struct bs_maps_line_reader *reader,
         } else if (reader->end == reader->capacity) {
             return -1;
         }
-        {
+        if (reader->fd >= 0) {
+            ssize_t count;
+
+            do {
+                count = syscall(SYS_read, reader->fd,
+                                reader->buffer + reader->end,
+                                reader->capacity - reader->end);
+            } while (count < 0 && errno == EINTR);
+            if (count < 0)
+                return -1;
+            reader->end += (size_t)count;
+            if (count == 0)
+                reader->eof = 1;
+        } else {
             size_t count = fread(reader->buffer + reader->end, 1,
                                  reader->capacity - reader->end,
                                  reader->stream);
