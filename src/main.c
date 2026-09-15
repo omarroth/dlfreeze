@@ -30,6 +30,10 @@
 #include <inttypes.h>
 #include <sys/file.h>
 #include <sys/auxv.h>
+#include <sys/ptrace.h>
+#include <sys/syscall.h>
+#include <sys/mman.h>
+#include <sys/sysmacros.h>
 
 #include "elf_parser.h"
 #include "common.h"
@@ -38,6 +42,39 @@
 #include "packer.h"
 
 extern char **environ;
+
+/* musl deliberately exposes the ptrace request numbers without importing
+ * Linux's auxiliary UAPI header.  Keep this one stable kernel wire structure
+ * local so the static tool builds against either libc's headers. */
+#ifndef PTRACE_GET_SYSCALL_INFO
+#define PTRACE_GET_SYSCALL_INFO 0x420e
+#endif
+#define DLFRZ_PTRACE_SYSCALL_INFO_ENTRY 1
+#define DLFRZ_PTRACE_SYSCALL_INFO_EXIT  2
+struct dlfrz_ptrace_syscall_info {
+    uint8_t op;
+    uint8_t reserved;
+    uint16_t flags;
+    uint32_t arch;
+    uint64_t instruction_pointer;
+    uint64_t stack_pointer;
+    union {
+        struct {
+            uint64_t nr;
+            uint64_t args[6];
+        } entry;
+        struct {
+            int64_t rval;
+            uint8_t is_error;
+        } exit;
+        struct {
+            uint64_t nr;
+            uint64_t args[6];
+            uint32_t ret_data;
+            uint32_t reserved2;
+        } seccomp;
+    };
+};
 
 static int set_trace_owner_environment(void)
 {
@@ -119,6 +156,509 @@ static int set_trace_descriptor_environment(int fd, const char *fd_name,
  * the packer itself. */
 static volatile sig_atomic_t g_trace_child = -1;
 
+/* LD_PRELOAD interposition cannot observe private libc entry points which
+ * issue pathname syscalls through directly-bound aliases.  Keep the preload
+ * helper for its higher-level dlopen and transaction evidence, but augment
+ * libc file capture from the kernel boundary whenever ptrace is available. Each
+ * successful open is bound to the descriptor the kernel returned while the
+ * tracee is stopped, so a later pathname replacement cannot change which
+ * bytes are admitted. */
+struct kernel_file_observation {
+    struct kernel_file_observation *next;
+    char request[PATH_MAX];
+    char source[PATH_MAX];
+    struct stat status;
+    int is_directory;
+    int negative;
+};
+
+struct kernel_file_observation_list {
+    struct kernel_file_observation *head;
+    struct kernel_file_observation *tail;
+    const char **patterns;
+    int pattern_count;
+    dev_t libc_device;
+    ino_t libc_inode;
+    int libc_identity_ready;
+    int ptrace_started;
+    int ptrace_unavailable;
+};
+
+struct kernel_trace_thread {
+    struct kernel_trace_thread *next;
+    pid_t pid;
+    int pending;
+    int dirfd;
+    int flags;
+    char request[PATH_MAX];
+    char base_proc[64];
+    struct stat base_status;
+    int base_required;
+    uint64_t libc_exec_start;
+    uint64_t libc_exec_end;
+    int initial_attach_stop;
+};
+
+static int file_request_matches_patterns(const char *path, int is_dir,
+                                         const char **patterns,
+                                         int npatterns);
+
+static void kernel_file_observations_release(
+    struct kernel_file_observation_list *list)
+{
+    struct kernel_file_observation *entry;
+
+    if (!list)
+        return;
+    entry = list->head;
+    while (entry) {
+        struct kernel_file_observation *next = entry->next;
+
+        free(entry);
+        entry = next;
+    }
+    memset(list, 0, sizeof(*list));
+}
+
+static struct kernel_trace_thread *kernel_trace_thread_find(
+    struct kernel_trace_thread **threads, pid_t pid, int create)
+{
+    struct kernel_trace_thread *thread;
+
+    if (!threads || pid <= 0)
+        return NULL;
+    for (thread = *threads; thread; thread = thread->next)
+        if (thread->pid == pid)
+            return thread;
+    if (!create)
+        return NULL;
+    thread = calloc(1, sizeof(*thread));
+    if (!thread)
+        return NULL;
+    thread->pid = pid;
+    thread->next = *threads;
+    *threads = thread;
+    return thread;
+}
+
+static void kernel_trace_thread_remove(struct kernel_trace_thread **threads,
+                                       pid_t pid)
+{
+    struct kernel_trace_thread **link;
+
+    if (!threads)
+        return;
+    for (link = threads; *link; link = &(*link)->next) {
+        if ((*link)->pid == pid) {
+            struct kernel_trace_thread *removed = *link;
+
+            *link = removed->next;
+            free(removed);
+            return;
+        }
+    }
+}
+
+static void kernel_trace_threads_release(struct kernel_trace_thread *threads)
+{
+    while (threads) {
+        struct kernel_trace_thread *next = threads->next;
+
+        free(threads);
+        threads = next;
+    }
+}
+
+static int kernel_trace_read_string(pid_t pid, uintptr_t address,
+                                    char output[PATH_MAX])
+{
+    size_t position = 0;
+
+    if (pid <= 0 || address == 0 || !output)
+        return 0;
+    while (position < PATH_MAX) {
+        unsigned long word;
+        size_t available = PATH_MAX - position;
+        size_t count = available < sizeof(word) ? available : sizeof(word);
+
+        errno = 0;
+        word = (unsigned long)ptrace(
+            PTRACE_PEEKDATA, pid, (void *)(address + position), NULL);
+        if (word == (unsigned long)-1 && errno != 0)
+            return 0;
+        memcpy(output + position, &word, count);
+        for (size_t i = 0; i < count; i++) {
+            if (output[position + i] == '\0')
+                return position + i != 0;
+        }
+        position += count;
+    }
+    output[PATH_MAX - 1] = '\0';
+    return 0;
+}
+
+static int kernel_trace_proc_fd_path(char output[64], pid_t pid, int fd)
+{
+    int length;
+
+    if (!output || pid <= 0 || fd < 0)
+        return 0;
+    length = snprintf(output, 64, "/proc/%ld/fd/%d", (long)pid, fd);
+    return length > 0 && length < 64;
+}
+
+static int kernel_trace_base_snapshot(pid_t pid, int dirfd,
+                                      char proc_path[64],
+                                      char base[PATH_MAX],
+                                      struct stat *status)
+{
+    ssize_t length;
+
+    if (!proc_path || !base || !status || pid <= 0)
+        return 0;
+    if (dirfd == AT_FDCWD) {
+        int printed = snprintf(proc_path, 64, "/proc/%ld/cwd", (long)pid);
+
+        if (printed <= 0 || printed >= 64)
+            return 0;
+    } else if (!kernel_trace_proc_fd_path(proc_path, pid, dirfd)) {
+        return 0;
+    }
+    if (stat(proc_path, status) < 0 || !S_ISDIR(status->st_mode))
+        return 0;
+    length = readlink(proc_path, base, PATH_MAX - 1);
+    if (length <= 0 || length >= PATH_MAX - 1)
+        return 0;
+    base[length] = '\0';
+    return base[0] == '/';
+}
+
+static int kernel_trace_build_request(
+    pid_t pid, int dirfd, const char *path, char request[PATH_MAX],
+    char base_proc[64], struct stat *base_status, int *base_required)
+{
+    char base[PATH_MAX];
+    int length;
+
+    if (!path || !path[0] || !request || !base_proc || !base_status ||
+        !base_required)
+        return 0;
+    *base_required = 0;
+    base_proc[0] = '\0';
+    memset(base_status, 0, sizeof(*base_status));
+    if (path[0] == '/') {
+        size_t size = strnlen(path, PATH_MAX);
+
+        if (size == 0 || size == PATH_MAX)
+            return 0;
+        memcpy(request, path, size + 1);
+        return 1;
+    }
+    if (!kernel_trace_base_snapshot(
+            pid, dirfd, base_proc, base, base_status))
+        return 0;
+    length = snprintf(request, PATH_MAX, "%s/%s", base, path);
+    if (length <= 0 || length >= PATH_MAX)
+        return 0;
+    *base_required = 1;
+    return 1;
+}
+
+static int kernel_trace_same_identity(const struct stat *left,
+                                      const struct stat *right)
+{
+    return left && right && left->st_dev == right->st_dev &&
+           left->st_ino == right->st_ino &&
+           left->st_rdev == right->st_rdev &&
+           (left->st_mode & S_IFMT) == (right->st_mode & S_IFMT);
+}
+
+static int kernel_trace_open_is_capture_read(int flags)
+{
+#ifdef O_PATH
+    if (flags & O_PATH)
+        return 1;
+#endif
+    return (flags & O_ACCMODE) == O_RDONLY &&
+           !(flags & (O_CREAT | O_TRUNC)) &&
+           (flags & O_TMPFILE) != O_TMPFILE;
+}
+
+static int kernel_trace_ip_is_target_libc(
+    const struct kernel_file_observation_list *observations,
+    struct kernel_trace_thread *thread, uint64_t instruction_pointer)
+{
+    char maps_path[64];
+    char line[PATH_MAX + 256];
+    FILE *maps;
+    int result = 0;
+
+    if (!observations || !thread || !observations->libc_identity_ready ||
+        thread->pid <= 0 || instruction_pointer == 0)
+        return 0;
+    if (thread->libc_exec_start != 0)
+        return instruction_pointer >= thread->libc_exec_start &&
+               instruction_pointer < thread->libc_exec_end;
+    if (snprintf(maps_path, sizeof(maps_path), "/proc/%ld/maps",
+                 (long)thread->pid) <= 0)
+        return 0;
+    maps = fopen(maps_path, "r");
+    if (!maps)
+        return 0;
+    while (fgets(line, sizeof(line), maps)) {
+        unsigned long long start;
+        unsigned long long end;
+        unsigned long long offset;
+        unsigned long long inode;
+        unsigned int dev_major;
+        unsigned int dev_minor;
+        char permissions[5];
+
+        if (sscanf(line, "%llx-%llx %4s %llx %x:%x %llu",
+                   &start, &end, permissions, &offset,
+                   &dev_major, &dev_minor, &inode) != 7)
+            continue;
+        (void)offset;
+        if (instruction_pointer < start || instruction_pointer >= end)
+            continue;
+        result = strchr(permissions, 'x') != NULL &&
+                 (ino_t)inode == observations->libc_inode &&
+                 makedev(dev_major, dev_minor) ==
+                     observations->libc_device;
+        if (result) {
+            thread->libc_exec_start = start;
+            thread->libc_exec_end = end;
+        }
+        break;
+    }
+    fclose(maps);
+    return result;
+}
+
+static int kernel_file_observation_append(
+    struct kernel_file_observation_list *list, const char *request,
+    const char *source, const struct stat *status, int is_directory,
+    int negative)
+{
+    struct kernel_file_observation *entry;
+    size_t request_size;
+    size_t source_size = 0;
+
+    if (!list || !request || request[0] != '/' ||
+        (!negative && (!source || source[0] != '/' || !status)))
+        return -1;
+    request_size = strnlen(request, PATH_MAX);
+    if (request_size == 0 || request_size == PATH_MAX)
+        return -1;
+    if (!negative) {
+        source_size = strnlen(source, PATH_MAX);
+        if (source_size == 0 || source_size == PATH_MAX)
+            return -1;
+    }
+    for (entry = list->head; entry; entry = entry->next) {
+        if (entry->negative != negative ||
+            entry->is_directory != is_directory ||
+            strcmp(entry->request, request) != 0)
+            continue;
+        if (negative)
+            return 0;
+        if (strcmp(entry->source, source) == 0 &&
+            entry->status.st_dev == status->st_dev &&
+            entry->status.st_ino == status->st_ino &&
+            entry->status.st_size == status->st_size &&
+            entry->status.st_mtim.tv_sec == status->st_mtim.tv_sec &&
+            entry->status.st_mtim.tv_nsec == status->st_mtim.tv_nsec &&
+            entry->status.st_ctim.tv_sec == status->st_ctim.tv_sec &&
+            entry->status.st_ctim.tv_nsec == status->st_ctim.tv_nsec)
+            return 0;
+    }
+    entry = calloc(1, sizeof(*entry));
+    if (!entry)
+        return -1;
+    memcpy(entry->request, request, request_size + 1);
+    if (!negative) {
+        memcpy(entry->source, source, source_size + 1);
+        memcpy(&entry->status, status, sizeof(entry->status));
+    }
+    entry->is_directory = is_directory;
+    entry->negative = negative;
+    if (list->tail)
+        list->tail->next = entry;
+    else
+        list->head = entry;
+    list->tail = entry;
+    return 0;
+}
+
+static int kernel_trace_record_open_result(
+    struct kernel_file_observation_list *observations,
+    struct kernel_trace_thread *thread, int64_t result)
+{
+    struct stat base_now;
+
+    if (!observations || !thread || !thread->pending)
+        return 0;
+    thread->pending = 0;
+    if (thread->base_required &&
+        (stat(thread->base_proc, &base_now) < 0 ||
+         !kernel_trace_same_identity(&thread->base_status, &base_now)))
+        return 0;
+    if (result >= 0) {
+        char proc_path[64];
+        char source[PATH_MAX];
+        struct stat descriptor_status;
+        struct stat source_status;
+        char *canonical;
+
+        if (result > INT_MAX ||
+            !kernel_trace_proc_fd_path(
+                proc_path, thread->pid, (int)result) ||
+            stat(proc_path, &descriptor_status) < 0 ||
+            (!S_ISREG(descriptor_status.st_mode) &&
+             !S_ISDIR(descriptor_status.st_mode)))
+            return 0;
+        canonical = realpath(proc_path, NULL);
+        if (!canonical)
+            return 0;
+        if (canonical[0] != '/' || strlen(canonical) >= sizeof(source)) {
+            free(canonical);
+            return 0;
+        }
+        memcpy(source, canonical, strlen(canonical) + 1);
+        free(canonical);
+        if (stat(source, &source_status) < 0 ||
+            !kernel_trace_same_identity(
+                &descriptor_status, &source_status))
+            return 0;
+        if (!file_request_matches_patterns(
+                thread->request, S_ISDIR(descriptor_status.st_mode),
+                observations->patterns, observations->pattern_count))
+            return 0;
+        return kernel_file_observation_append(
+            observations, thread->request, source, &descriptor_status,
+            S_ISDIR(descriptor_status.st_mode), 0);
+    }
+    if (result == -ENOTDIR &&
+        file_request_matches_patterns(
+            thread->request, 0,
+            observations->patterns, observations->pattern_count)) {
+        char rooted[PATH_MAX];
+        char source[PATH_MAX];
+        char *canonical;
+        struct stat status;
+        int length = snprintf(rooted, sizeof(rooted), "/proc/%ld/root%s",
+                              (long)thread->pid, thread->request);
+
+        if (length > 0 && length < (int)sizeof(rooted) &&
+            (canonical = realpath(rooted, NULL)) != NULL) {
+            size_t size = strlen(canonical);
+
+            if (canonical[0] == '/' && size < sizeof(source) &&
+                stat(canonical, &status) == 0 && S_ISREG(status.st_mode)) {
+                memcpy(source, canonical, size + 1);
+                free(canonical);
+                return kernel_file_observation_append(
+                    observations, thread->request, source, &status, 0, 0);
+            }
+            free(canonical);
+        }
+    }
+    if ((result == -ENOENT || result == -ENOTDIR) &&
+        file_request_matches_patterns(
+            thread->request, (thread->flags & O_DIRECTORY) != 0,
+            observations->patterns, observations->pattern_count))
+        return kernel_file_observation_append(
+            observations, thread->request, NULL, NULL, 0, 1);
+    return 0;
+}
+
+static int kernel_trace_syscall_stop(
+    pid_t pid, struct kernel_trace_thread **threads,
+    struct kernel_file_observation_list *observations)
+{
+    struct dlfrz_ptrace_syscall_info info;
+    struct kernel_trace_thread *thread;
+    long length;
+
+    memset(&info, 0, sizeof(info));
+    length = ptrace(PTRACE_GET_SYSCALL_INFO, pid, sizeof(info), &info);
+    if (length < 0)
+        return -1;
+    thread = kernel_trace_thread_find(threads, pid, 1);
+    if (!thread)
+        return -1;
+    if (info.op == DLFRZ_PTRACE_SYSCALL_INFO_ENTRY) {
+        int dirfd;
+        int flags;
+        uintptr_t path_address;
+        char path[PATH_MAX];
+
+        thread->pending = 0;
+#ifdef SYS_open
+        if (info.entry.nr == SYS_open) {
+            dirfd = AT_FDCWD;
+            path_address = (uintptr_t)info.entry.args[0];
+            flags = (int)info.entry.args[1];
+        } else
+#endif
+        if (info.entry.nr == SYS_openat) {
+            dirfd = (int)info.entry.args[0];
+            path_address = (uintptr_t)info.entry.args[1];
+            flags = (int)info.entry.args[2];
+        } else {
+            return 0;
+        }
+        if (!kernel_trace_open_is_capture_read(flags) ||
+            !kernel_trace_ip_is_target_libc(
+                observations, thread, info.instruction_pointer) ||
+            !kernel_trace_read_string(pid, path_address, path) ||
+            !kernel_trace_build_request(
+                pid, dirfd, path, thread->request, thread->base_proc,
+                &thread->base_status, &thread->base_required))
+            return 0;
+        thread->dirfd = dirfd;
+        thread->flags = flags;
+        thread->pending = 1;
+    } else if (info.op == DLFRZ_PTRACE_SYSCALL_INFO_EXIT && thread->pending) {
+        if (kernel_trace_record_open_result(
+                observations, thread, info.exit.rval) < 0)
+            return -1;
+    }
+    return 0;
+}
+
+/* Ptrace reports both a signal-delivery-stop and the group-stop caused by
+ * SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU with the same wait status.  GETSIGINFO is
+ * defined to fail with EINVAL only for the latter.  Keeping that distinction
+ * is essential for a foreground trace: the outer shell must observe the
+ * dlfreeze supervisor stop along with its target, exactly as it would observe
+ * an ordinary foreground process group. */
+static int kernel_trace_group_stop(pid_t pid, int signal_number)
+{
+    siginfo_t info;
+
+    if (signal_number != SIGSTOP && signal_number != SIGTSTP &&
+        signal_number != SIGTTIN && signal_number != SIGTTOU)
+        return 0;
+    errno = 0;
+    if (ptrace(PTRACE_GETSIGINFO, pid, NULL, &info) == 0)
+        return 0;
+    if (errno == EINVAL)
+        return 1;
+    return -1;
+}
+
+static int kernel_trace_syscall_info_available(pid_t pid)
+{
+    struct dlfrz_ptrace_syscall_info info;
+
+    memset(&info, 0, sizeof(info));
+    /* A supported kernel returns the NONE record at this pre-exec SIGSTOP.
+     * Older kernels reject the request, which lets us detach before the
+     * target has executed and retain the preload-only compatibility path. */
+    return ptrace(PTRACE_GET_SYSCALL_INFO, pid, sizeof(info), &info) >= 0;
+}
+
 static const int g_trace_forward_signals[] = {
     SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGUSR1, SIGUSR2,
     SIGPIPE, SIGALRM, SIGCONT, SIGTSTP, SIGTTIN, SIGTTOU
@@ -180,10 +720,16 @@ static void restore_trace_signal_handlers(
         sigaction(g_trace_forward_signals[i], &old_actions[i], NULL);
 }
 
-static int supervise_trace_child(pid_t child, const sigset_t *forward_set,
-                                 const sigset_t *old_mask, int *status_out)
+static int supervise_trace_child(
+    pid_t child, const sigset_t *forward_set, const sigset_t *old_mask,
+    int *status_out, struct kernel_file_observation_list *observations)
 {
     struct sigaction old_actions[TRACE_FORWARD_SIGNAL_COUNT];
+    struct kernel_trace_thread *threads = NULL;
+    const unsigned long ptrace_options =
+        PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEFORK |
+        PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC;
+    int tracing = 0;
     int wait_failed = 0;
 
     g_trace_child = child;
@@ -210,7 +756,13 @@ static int supervise_trace_child(pid_t child, const sigset_t *forward_set,
 
     for (;;) {
         int status;
-        pid_t waited = waitpid(child, &status, WUNTRACED | WCONTINUED);
+        pid_t waited = waitpid(
+            tracing ? -1 : child, &status,
+            WUNTRACED | WCONTINUED
+#ifdef __WALL
+            | (tracing ? __WALL : 0)
+#endif
+        );
 
         if (waited < 0) {
             if (errno == EINTR)
@@ -219,6 +771,128 @@ static int supervise_trace_child(pid_t child, const sigset_t *forward_set,
             break;
         }
         if (WIFSTOPPED(status)) {
+            int stop_signal = WSTOPSIG(status);
+            unsigned int event = (unsigned int)status >> 16;
+
+            /* A cooperative pre-exec PTRACE_TRACEME stop is distinguishable
+             * from application job control because tracing has not started
+             * yet.  If ptrace was filtered out in the child, this stop never
+             * occurs and the established preload-only path remains usable. */
+            if (!tracing && waited == child && stop_signal == SIGSTOP) {
+                if (kernel_trace_syscall_info_available(child) &&
+                    ptrace(PTRACE_SETOPTIONS, child, NULL,
+                           (void *)ptrace_options) == 0 &&
+                    kernel_trace_thread_find(&threads, child, 1)) {
+                    tracing = 1;
+                    if (observations)
+                        observations->ptrace_started = 1;
+                    if (ptrace(PTRACE_SYSCALL, child, NULL, NULL) < 0) {
+                        wait_failed = 1;
+                        break;
+                    }
+                    continue;
+                }
+                if (observations)
+                    observations->ptrace_unavailable = 1;
+                if (ptrace(PTRACE_DETACH, child, NULL, NULL) < 0 &&
+                    kill(child, SIGCONT) < 0) {
+                    wait_failed = 1;
+                    break;
+                }
+                continue;
+            }
+            if (tracing && stop_signal == (SIGTRAP | 0x80)) {
+                if (kernel_trace_syscall_stop(
+                        waited, &threads, observations) < 0 ||
+                    ptrace(PTRACE_SYSCALL, waited, NULL, NULL) < 0) {
+                    wait_failed = 1;
+                    break;
+                }
+                continue;
+            }
+            if (tracing && stop_signal == SIGTRAP && event != 0) {
+                if (event == PTRACE_EVENT_FORK ||
+                    event == PTRACE_EVENT_VFORK ||
+                    event == PTRACE_EVENT_CLONE) {
+                    unsigned long new_pid = 0;
+                    struct kernel_trace_thread *new_thread;
+
+                    if (ptrace(PTRACE_GETEVENTMSG, waited, NULL,
+                               &new_pid) < 0 || new_pid == 0 ||
+                        new_pid > (unsigned long)INT_MAX ||
+                        !(new_thread = kernel_trace_thread_find(
+                            &threads, (pid_t)new_pid, 1))) {
+                        wait_failed = 1;
+                        break;
+                    }
+                    new_thread->initial_attach_stop = 1;
+                }
+                if (event == PTRACE_EVENT_EXEC) {
+                    struct kernel_trace_thread *thread =
+                        kernel_trace_thread_find(&threads, waited, 1);
+
+                    if (!thread) {
+                        wait_failed = 1;
+                        break;
+                    }
+                    thread->pending = 0;
+                    thread->libc_exec_start = 0;
+                    thread->libc_exec_end = 0;
+                }
+                if (ptrace(PTRACE_SYSCALL, waited, NULL, NULL) < 0) {
+                    wait_failed = 1;
+                    break;
+                }
+                continue;
+            }
+            if (tracing) {
+                struct kernel_trace_thread *thread =
+                    kernel_trace_thread_find(&threads, waited, 0);
+                int deliver = stop_signal;
+                int group_stop;
+
+                /* Newly attached fork/clone children first report a synthetic
+                 * SIGSTOP.  Track that one stop explicitly so a later real
+                 * SIGSTOP sent to a descendant retains its normal semantics. */
+                if (thread && thread->initial_attach_stop &&
+                    stop_signal == SIGSTOP) {
+                    thread->initial_attach_stop = 0;
+                    deliver = 0;
+                } else {
+                    group_stop = kernel_trace_group_stop(
+                        waited, stop_signal);
+                    if (group_stop < 0) {
+                        wait_failed = 1;
+                        break;
+                    }
+                    /* SIGSTOP cannot be terminal-generated and cannot be
+                     * caught by the supervisor.  It may be an internal
+                     * synchronization stop whose peer will issue SIGCONT;
+                     * mirroring it would suspend that peer's parent and
+                     * deadlock the protocol.  Foreground job control uses
+                     * TSTP/TTIN/TTOU, while a caller which explicitly stops
+                     * the whole process group stops us in the kernel too. */
+                    if (group_stop && stop_signal != SIGSTOP &&
+                        waited == child &&
+                        kill(getpid(), SIGSTOP) < 0) {
+                        wait_failed = 1;
+                        break;
+                    }
+                    /* A group-stop has already consumed its stopping signal;
+                     * reinjection would manufacture a second delivery-stop.
+                     * SIGCONT has reached the whole foreground group before
+                     * the supervisor returns from its own SIGSTOP. */
+                    if (group_stop)
+                        deliver = 0;
+                }
+
+                if (ptrace(PTRACE_SYSCALL, waited, NULL,
+                           (void *)(intptr_t)deliver) < 0) {
+                    wait_failed = 1;
+                    break;
+                }
+                continue;
+            }
             if (kill(getpid(), SIGSTOP) < 0) {
                 wait_failed = 1;
                 break;
@@ -227,14 +901,33 @@ static int supervise_trace_child(pid_t child, const sigset_t *forward_set,
         }
         if (WIFCONTINUED(status))
             continue;
+        if (tracing) {
+            kernel_trace_thread_remove(&threads, waited);
+            if (waited != child)
+                continue;
+        }
         *status_out = status;
         break;
     }
 
     if (wait_failed) {
         (void)kill(child, SIGKILL);
-        while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
+        while (waitpid(child, NULL,
+#ifdef __WALL
+                       __WALL
+#else
+                       0
+#endif
+                       ) < 0 && errno == EINTR) {}
+    } else if (tracing) {
+        /* The historical contract waits only for the trace owner.  Do not
+         * acquire ownership of a daemonized descendant merely because
+         * ptrace followed its open syscalls while the owner was live. */
+        for (struct kernel_trace_thread *thread = threads;
+             thread; thread = thread->next)
+            (void)ptrace(PTRACE_DETACH, thread->pid, NULL, NULL);
     }
+    kernel_trace_threads_release(threads);
 
     {
         int saved_errno = errno;
@@ -1463,7 +2156,7 @@ static void dump_trace_fd(int trace_fd, const char *heading)
 static int parse_preload_file_trace(int trace_fd, const char *exe_path,
                                     const char **patterns, int npatterns,
                                     struct data_file_list *out,
-                                    struct dep_list *deps, int verbose)
+                                    struct dep_list *deps)
 {
     FILE *tf = trace_fd >= 0 ? fdopen(trace_fd, "r") : NULL;
     char line[4 * PATH_MAX + 256];
@@ -1882,11 +2575,6 @@ malformed_success_record:
     }
 
     fclose(tf);
-    if (npatterns > 0 && out->count == 0)
-        fprintf(stderr,
-                "dlfreeze: warning: capture patterns selected no data paths; "
-                "uncaptured file accesses still use the host\n");
-    finish_captured_paths(out, verbose);
     return 0;
 }
 
@@ -2210,6 +2898,8 @@ static int capture_data_files(const char *exe_path, const char *exe_identity,
     int dtcollector = -1;
     int st;
     pid_t pid;
+    struct kernel_file_observation_list kernel_observations = {0};
+    volatile int *ptrace_state = NULL;
 
     /* -t promises complete runtime-loading discovery.  Syscall tracing can
      * identify opened ELF files, but cannot recover the caller's exact
@@ -2221,6 +2911,26 @@ static int capture_data_files(const char *exe_path, const char *exe_identity,
                 "complete -t tracing\n");
         errno = ENOTSUP;
         return -1;
+    }
+    kernel_observations.patterns = patterns;
+    kernel_observations.pattern_count = npatterns;
+    if (deps->runtime_family == DEP_RUNTIME_MUSL &&
+        deps->interp_snapshot.valid) {
+        kernel_observations.libc_device = deps->interp_snapshot.device;
+        kernel_observations.libc_inode = deps->interp_snapshot.inode;
+        kernel_observations.libc_identity_ready = 1;
+    } else if (deps->runtime_family == DEP_RUNTIME_GNU) {
+        for (int i = 0; i < deps->count; i++) {
+            if (!deps->libs[i].name ||
+                strcmp(deps->libs[i].name, "libc.so.6") != 0 ||
+                !deps->libs[i].snapshot.valid)
+                continue;
+            kernel_observations.libc_device =
+                deps->libs[i].snapshot.device;
+            kernel_observations.libc_inode = deps->libs[i].snapshot.inode;
+            kernel_observations.libc_identity_ready = 1;
+            break;
+        }
     }
 
     tfd = make_trace_tempfile(tracef, sizeof(tracef),
@@ -2254,9 +2964,21 @@ static int capture_data_files(const char *exe_path, const char *exe_identity,
 
     printf("Tracing dlopen calls and file access …\n");
 
+    if (npatterns > 0) {
+        ptrace_state = mmap(NULL, sizeof(*ptrace_state),
+                            PROT_READ | PROT_WRITE,
+                            MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        if (ptrace_state != MAP_FAILED)
+            *ptrace_state = 0;
+        else
+            ptrace_state = NULL;
+    }
+
     build_trace_signal_set(&forward_set);
     if (sigprocmask(SIG_BLOCK, &forward_set, &old_mask) < 0) {
         perror("sigprocmask");
+        if (ptrace_state)
+            munmap((void *)ptrace_state, sizeof(*ptrace_state));
         close(tfd);
         close(tcollector);
         close(dtfd);
@@ -2268,6 +2990,8 @@ static int capture_data_files(const char *exe_path, const char *exe_identity,
     if (pid < 0) {
         sigprocmask(SIG_SETMASK, &old_mask, NULL);
         perror("fork");
+        if (ptrace_state)
+            munmap((void *)ptrace_state, sizeof(*ptrace_state));
         close(tfd);
         close(tcollector);
         close(dtfd);
@@ -2305,6 +3029,18 @@ static int capture_data_files(const char *exe_path, const char *exe_identity,
         for (int i = tstart; i < argc; i++)
             tav[1 + i - tstart] = argv[i];
         tav[nargs] = NULL;
+        /* This is an optional completeness layer around the preload trace.
+         * A denied PTRACE_TRACEME leaves no stop for the parent and preserves
+         * the established interposition-only behavior on restricted kernels
+         * and syscall emulators. */
+        if (npatterns > 0 && ptrace_state) {
+            if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) == 0) {
+                *ptrace_state = 1;
+                raise(SIGSTOP);
+            } else {
+                *ptrace_state = -1;
+            }
+        }
         execve(exe_path, tav, environ);
         _exit(127);
     }
@@ -2312,17 +3048,28 @@ static int capture_data_files(const char *exe_path, const char *exe_identity,
     /* These are the helper's open file descriptions.  Keeping either copy in
      * the collector would make its later nonblocking flock unable to detect a
      * still-running fork descendant. */
-    close(tfd);
-    tfd = -1;
     close(dtfd);
     dtfd = -1;
 
-    if (supervise_trace_child(pid, &forward_set, &old_mask, &st) < 0) {
+    if (supervise_trace_child(
+            pid, &forward_set, &old_mask, &st,
+            &kernel_observations) < 0) {
         perror("waitpid");
+        close(tfd);
         close(tcollector);
         close(dtcollector);
+        if (ptrace_state)
+            munmap((void *)ptrace_state, sizeof(*ptrace_state));
+        kernel_file_observations_release(&kernel_observations);
         return -1;
     }
+    close(tfd);
+    tfd = -1;
+    if (npatterns > 0 && (!ptrace_state || *ptrace_state != 1))
+        kernel_observations.ptrace_unavailable = 1;
+    if (ptrace_state)
+        munmap((void *)ptrace_state, sizeof(*ptrace_state));
+    ptrace_state = NULL;
     if (verbose)
         printf("trace exit status: %d\n",
                WIFEXITED(st) ? WEXITSTATUS(st) : -1);
@@ -2330,6 +3077,7 @@ static int capture_data_files(const char *exe_path, const char *exe_identity,
         fprintf(stderr, "dlfreeze: traced execution did not exit normally\n");
         close(tcollector);
         close(dtcollector);
+        kernel_file_observations_release(&kernel_observations);
         return -1;
     }
 
@@ -2341,6 +3089,7 @@ static int capture_data_files(const char *exe_path, const char *exe_identity,
                 "target runtime or produced incomplete readiness records\n");
         close(tcollector);
         close(dtcollector);
+        kernel_file_observations_release(&kernel_observations);
         return -1;
     }
 
@@ -2349,6 +3098,7 @@ static int capture_data_files(const char *exe_path, const char *exe_identity,
     if (dep_add_dlopen_libs_fd(deps, dtcollector) < 0) {
         dtcollector = -1;
         close(tcollector);
+        kernel_file_observations_release(&kernel_observations);
         return -1;
     }
     dtcollector = -1;
@@ -2361,8 +3111,81 @@ static int capture_data_files(const char *exe_path, const char *exe_identity,
     }
 
     st = parse_preload_file_trace(tcollector, exe_path, patterns, npatterns,
-                                  out, deps, verbose);
+                                  out, deps);
     tcollector = -1;
+    if (st == 0) {
+        struct kernel_file_observation *observation;
+
+        for (observation = kernel_observations.head;
+             observation; observation = observation->next) {
+            struct file_trace_snapshot trace_snapshot;
+            struct dep_file_snapshot pack_snapshot = {0};
+            struct stat source_status;
+
+            if (!file_request_matches_patterns(
+                    observation->request, observation->is_directory,
+                    patterns, npatterns))
+                continue;
+            if (observation->negative) {
+                if (process_captured_negative_path(
+                        patterns, npatterns, out,
+                        observation->request) < 0) {
+                    fprintf(stderr,
+                            "dlfreeze: syscall-observed missing path changed "
+                            "after tracing: %s\n", observation->request);
+                    st = -1;
+                    break;
+                }
+                continue;
+            }
+            if (stat(observation->source, &source_status) < 0 ||
+                !kernel_trace_same_identity(
+                    &observation->status, &source_status)) {
+                fprintf(stderr,
+                        "dlfreeze: syscall-observed source changed after "
+                        "tracing: %s\n", observation->source);
+                st = -1;
+                break;
+            }
+            /* Native interpreters open DT_NEEDED objects through private
+             * syscalls too.  Their canonical revisions are already owned by
+             * the ELF dependency manifest; admitting the same inode again as
+             * DATA under a symlink request would create two authorities for
+             * one runtime object. */
+            if (path_is_known_dep(observation->source, exe_path, deps))
+                continue;
+            file_trace_snapshot_from_stat(
+                &trace_snapshot, &observation->status);
+            if (!observation->is_directory)
+                resolved_snapshot_from_stat(
+                    &pack_snapshot, &source_status);
+            if (process_captured_path(
+                    exe_path, patterns, npatterns, out, deps,
+                    observation->request, observation->source,
+                    observation->is_directory, &source_status,
+                    &trace_snapshot,
+                    observation->is_directory ? NULL : &pack_snapshot) < 0) {
+                fprintf(stderr,
+                        "dlfreeze: cannot retain syscall-observed source "
+                        "snapshot: %s\n", observation->source);
+                st = -1;
+                break;
+            }
+        }
+    }
+    if (verbose && npatterns > 0 &&
+        kernel_observations.ptrace_unavailable)
+        fprintf(stderr,
+                "dlfreeze: warning: kernel pathname tracing is unavailable; "
+                "private libc pathname capture is incomplete\n");
+    if (st == 0) {
+        if (npatterns > 0 && out->count == 0)
+            fprintf(stderr,
+                    "dlfreeze: warning: capture patterns selected no data "
+                    "paths; uncaptured file accesses still use the host\n");
+        finish_captured_paths(out, verbose);
+    }
+    kernel_file_observations_release(&kernel_observations);
     return st;
 }
 
@@ -2602,7 +3425,8 @@ int main(int argc, char **argv)
                         close(tfd);
                         tfd = -1;
                         if (supervise_trace_child(pid, &forward_set,
-                                                  &old_mask, &st) < 0) {
+                                                  &old_mask, &st,
+                                                  NULL) < 0) {
                             perror("waitpid");
                             close(collector_fd);
                             collector_fd = -1;

@@ -6209,6 +6209,110 @@ C
     rm -f "$src" "$bin" "$out" "$log" "$bad_manifest"
 }
 
+# A libc can bind its own private syscall wrappers directly, bypassing both
+# LD_PRELOAD at freeze time and ordinary ELF relocation interposition at
+# runtime.  Exercise the exact generic boundary with glibc's exported private
+# open entry, then remove the source and verify that no original-path syscall
+# reaches the kernel during replay.
+test_vfs_glibc_private_open_gateway() {
+    echo "--- glibc private-open VFS gateway ---"
+    local root="$BUILD/vfs-glibc-private-open"
+    local bin="$root/program" data="$root/data" out="$root/program.frozen"
+    local log="$root/freeze.log" syscall_log="$root/runtime.strace"
+    local expected="vfs-glibc-private-open-ok" actual=""
+    local rc=0 freeze_rc=0
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    root=$(realpath "$root")
+    bin="$root/program"
+    data="$root/data"
+    out="$root/program.frozen"
+    log="$root/freeze.log"
+    syscall_log="$root/runtime.strace"
+
+    if ! gcc -Wall -Wextra -Werror -o "$bin" \
+            tests/vfs_glibc_private_open.c -ldl -pthread; then
+        fail "glibc private-open VFS gateway" "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+    printf 'private-open-snapshot\n' >"$data"
+    capture_output actual "$bin" "$data" || rc=$?
+    if [ "$rc" -eq 77 ] &&
+       [ "$actual" = "glibc-private-open-unavailable" ]; then
+        skip "glibc private-open VFS gateway" \
+            "target libc does not export the GLIBC_PRIVATE entry"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$rc" -ne 0 ] || [ "$actual" != "$expected" ]; then
+        fail "glibc private-open VFS gateway" \
+            "native control exit=$rc output=$actual"
+        rm -rf "$root"
+        return
+    fi
+
+    freeze_require_direct "glibc private-open VFS gateway" "$log" "$out" \
+        -v -t -f "$data" -- "$bin" "$data" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "glibc private-open VFS gateway" "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    elif [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+    if grep -F 'kernel pathname tracing is unavailable' "$log" \
+            >/dev/null; then
+        skip "glibc private-open VFS gateway" \
+            "ptrace syscall observation is unavailable"
+        rm -rf "$root"
+        return
+    fi
+    if ! grep -F "    $data" "$log" >/dev/null; then
+        fail "glibc private-open VFS gateway" \
+            "private syscall path was not captured"
+        rm -rf "$root"
+        return
+    fi
+
+    mv "$data" "$data.host"
+    actual=""; rc=0
+    capture_output actual "$out" "$data" || rc=$?
+    actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+    if [ "$rc" -ne 0 ] || [ "$actual" != "$expected" ]; then
+        fail "glibc private-open VFS gateway" \
+            "replay exit=$rc output=$actual"
+        rm -rf "$root"
+        return
+    fi
+
+    if command -v strace >/dev/null 2>&1 &&
+       run_with_timeout strace -f -qq -e trace=file -o "$syscall_log" \
+           true >/dev/null 2>&1; then
+        rc=0
+        capture_output actual strace -f -qq -s 4096 -e trace=file \
+            -o "$syscall_log" "$out" "$data" || rc=$?
+        actual=$(printf '%s\n' "$actual" | strip_dlfreeze_warnings)
+        if [ "$rc" -ne 0 ] || [ "$actual" != "$expected" ]; then
+            fail "glibc private-open syscall isolation" \
+                "straced replay exit=$rc output=$actual"
+        elif grep -F "\"$data\"" "$syscall_log" |
+             grep -Ev 'execve(at)?\(' >/dev/null; then
+            fail "glibc private-open syscall isolation" \
+                "runtime issued the captured original pathname"
+        else
+            pass "glibc private-open syscall isolation"
+        fi
+    else
+        skip "glibc private-open syscall isolation" \
+            "strace/ptrace unavailable"
+    fi
+    pass "glibc private-open VFS gateway"
+    rm -rf "$root"
+}
+
 # Directory identity is a manifest kind, not a synthetic child pathname.
 # A real file named .dir must therefore remain visible and readable after the
 # traced filesystem tree has disappeared.
@@ -32701,6 +32805,7 @@ test_upx_payload_mapping
 test_captured_files_require_direct
 test_runtime_relocation_vfs_fallthrough
 test_captured_file_request_identity_direct
+test_vfs_glibc_private_open_gateway
 test_vfs_explicit_directory_kind
 test_vfs_directory_snapshot
 test_vfs_dir_handle_registry

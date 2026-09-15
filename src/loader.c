@@ -23826,6 +23826,173 @@ static void *vfs_libc_function(const struct loaded_obj *libc_obj,
     return vfs_libc_function_resolve(libc_obj, name, alias, NULL);
 }
 
+/* Relocation interposition covers calls which cross ELF symbol boundaries,
+ * but a libc is free to bind its own hidden aliases directly.  Glibc's
+ * locale loader, for example, enters the exported GLIBC_PRIVATE
+ * __open64_nocancel body without a dynamic relocation; musl uses the same
+ * direct-binding technique for several public/hidden aliases.  When a DATA
+ * overlay is active, replace the admitted libc's complete open entry points
+ * with tiny architecture ABI tail gateways to the generic VFS wrappers.
+ *
+ * This is deliberately symbol- and segment-driven, not a scan for syscall
+ * opcodes or an application/path special case.  A gateway is installed only
+ * for a unique ordinary function whose whole published range was already
+ * proven to belong to one file-backed executable PT_LOAD.  Target code has
+ * not started and no other target thread exists, so each page can make a
+ * W^X-preserving RX -> RW -> RX transition without racing execution. */
+static int vfs_patch_libc_open_gateway(const struct loaded_obj *libc_obj,
+                                       const char *name, void *target,
+                                       uintptr_t *patched,
+                                       size_t *patched_count,
+                                       size_t patched_capacity)
+{
+    const Elf64_Sym *symbol = NULL;
+    void *address = NULL;
+    void *file_address = NULL;
+    uintptr_t page_start;
+    uintptr_t page_end;
+    size_t gateway_size;
+    int symbol_status;
+    unsigned char gateway[32];
+
+    if (!libc_obj || !name || !target || !patched || !patched_count ||
+        !g_page_size || (g_page_size & (g_page_size - 1U)) != 0)
+        return -1;
+    symbol_status = unique_default_exported_symbol(
+        libc_obj, name, &symbol);
+    if (symbol_status == UNIQUE_DEFAULT_SYMBOL_ABSENT)
+        return 0;
+    if (symbol_status != UNIQUE_DEFAULT_SYMBOL_FOUND || !symbol ||
+        symbol->st_shndx == SHN_UNDEF ||
+        symbol->st_shndx >= SHN_LORESERVE ||
+        ELF64_ST_TYPE(symbol->st_info) != STT_FUNC ||
+        symbol->st_size == 0 || symbol->st_size > SIZE_MAX ||
+        !loaded_obj_vaddr_pointer(
+            libc_obj, symbol->st_value, (size_t)symbol->st_size,
+            PF_R | PF_X, &address) || !address ||
+        !loaded_obj_file_vaddr_pointer(
+            libc_obj, symbol->st_value, (size_t)symbol->st_size,
+            &file_address) || file_address != address)
+        return -1;
+    for (size_t i = 0; i < *patched_count; i++)
+        if (patched[i] == (uintptr_t)address)
+            return 1;
+
+#if defined(__x86_64__)
+    /* ENDBR64 keeps indirect callers valid under IBT; it is an ordinary NOP
+     * on processors which do not implement CET. */
+    static const unsigned char prefix[] = {
+        0xf3, 0x0f, 0x1e, 0xfa,       /* endbr64                 */
+        0x48, 0xb8                    /* movabs target,%rax       */
+    };
+    static const unsigned char suffix[] = {
+        0xff, 0xe0                    /* jmp *%rax                */
+    };
+
+    gateway_size = sizeof(prefix) + sizeof(uint64_t) + sizeof(suffix);
+    ldr_memcpy(gateway, prefix, sizeof(prefix));
+    {
+        uint64_t destination = (uint64_t)(uintptr_t)target;
+
+        ldr_memcpy(gateway + sizeof(prefix), &destination,
+                   sizeof(destination));
+    }
+    ldr_memcpy(gateway + sizeof(prefix) + sizeof(uint64_t),
+               suffix, sizeof(suffix));
+#elif defined(__aarch64__)
+    /* BTI C is a HINT on older CPUs.  The literal form has no branch-range
+     * assumption about the independently placed bootstrap and target libc. */
+    static const uint32_t instructions[] = {
+        UINT32_C(0xd503245f), /* bti c             */
+        UINT32_C(0x58000070), /* ldr x16, pc + 12  */
+        UINT32_C(0xd61f0200), /* br x16            */
+        UINT32_C(0xd503201f), /* nop/alignment      */
+    };
+
+    gateway_size = sizeof(instructions) + sizeof(uint64_t);
+    ldr_memcpy(gateway, instructions, sizeof(instructions));
+    {
+        uint64_t destination = (uint64_t)(uintptr_t)target;
+
+        ldr_memcpy(gateway + sizeof(instructions), &destination,
+                   sizeof(destination));
+    }
+#else
+    return -1;
+#endif
+    if ((size_t)symbol->st_size < gateway_size ||
+        (uintptr_t)address > UINTPTR_MAX - gateway_size)
+        return -1;
+    page_start = (uintptr_t)address & ~(uintptr_t)(g_page_size - 1U);
+    page_end = ((uintptr_t)address + gateway_size + g_page_size - 1U) &
+               ~(uintptr_t)(g_page_size - 1U);
+    if (page_end <= page_start || page_end - page_start > SIZE_MAX ||
+        *patched_count >= patched_capacity)
+        return -1;
+    if (VFS_SYSCALL(SYS_mprotect, page_start,
+                    (size_t)(page_end - page_start),
+                    PROT_READ | PROT_WRITE) < 0)
+        return -1;
+    ldr_memcpy(address, gateway, gateway_size);
+#if defined(__aarch64__)
+    __builtin___clear_cache((char *)address,
+                            (char *)address + gateway_size);
+#endif
+    if (VFS_SYSCALL(SYS_mprotect, page_start,
+                    (size_t)(page_end - page_start),
+                    PROT_READ | PROT_EXEC) < 0)
+        return -1;
+    patched[(*patched_count)++] = (uintptr_t)address;
+    return 1;
+}
+
+static int install_vfs_libc_open_gateways(struct loaded_obj *objs, int nobj)
+{
+    static const struct {
+        const char *name;
+        void *target;
+    } candidates[] = {
+        { "__open64_nocancel", (void *)vfs_open },
+        { "__open_nocancel",   (void *)vfs_open },
+        { "__open64",          (void *)vfs_open },
+        { "__open",            (void *)vfs_open },
+        { "open64",            (void *)vfs_open },
+        { "open",              (void *)vfs_open },
+        { "openat64",          (void *)vfs_openat },
+        { "openat",            (void *)vfs_openat },
+    };
+    const struct loaded_obj *libc_obj;
+    uintptr_t patched[sizeof(candidates) / sizeof(candidates[0])];
+    size_t patched_count = 0;
+    int have_path_gateway = 0;
+    int have_at_gateway = 0;
+
+    if (g_vfs_count == 0)
+        return 0;
+    libc_obj = vfs_target_libc(objs, nobj);
+    if (!libc_obj)
+        return -1;
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        int result = vfs_patch_libc_open_gateway(
+            libc_obj, candidates[i].name, candidates[i].target,
+            patched, &patched_count,
+            sizeof(patched) / sizeof(patched[0]));
+
+        if (result < 0)
+            return -1;
+        if (result > 0) {
+            if (candidates[i].target == (void *)vfs_openat)
+                have_at_gateway = 1;
+            else
+                have_path_gateway = 1;
+        }
+    }
+    /* At least one entry for each Linux open calling convention is required.
+     * Unknown libc symbol topology fails closed instead of silently restoring
+     * host-path leakage for an ostensibly captured VFS. */
+    return have_path_gateway && have_at_gateway ? 0 : -1;
+}
+
 static void *required_libc_function(const struct loaded_obj *libc_obj,
                                     const char *name)
 {
@@ -50147,6 +50314,12 @@ static int loader_run_impl(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     /* Target libc is now fully relocated, so VFS callbacks and subsequent
      * loader failures may safely publish errno through its TLS accessor. */
     g_target_errno_ready = 1;
+
+    if (install_vfs_libc_open_gateways(objs, nobj) < 0) {
+        ldr_err("target libc cannot route private opens through captured VFS",
+                NULL);
+        _exit(127);
+    }
 
     /* 6. Seal GNU_RELRO after every relocation pass.  map_object has already
      *    restored final PT_LOAD permissions for both mmap and memcpy paths. */
