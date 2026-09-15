@@ -6224,6 +6224,14 @@ test_vfs_glibc_private_open_gateway() {
 
     rm -rf "$root"
     mkdir -p "$root"
+
+    if ! getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
+        skip "glibc private-open VFS gateway" \
+            "host runtime is not glibc"
+        rm -rf "$root"
+        return
+    fi
+
     root=$(realpath "$root")
     bin="$root/program"
     data="$root/data"
