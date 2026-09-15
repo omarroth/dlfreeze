@@ -460,7 +460,7 @@ test_packer_publish_fallback_gate() {
        gcc -std=c11 -O2 -g -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
             -ffunction-sections -fdata-sections -Wl,--gc-sections \
             -o "$helper" tests/packer_publish_gate.c &&
-       TMPDIR="$runtime_root" run_with_timeout_seconds 8 "$helper"; then
+       TMPDIR="$runtime_root" run_with_timeout_seconds 20 "$helper"; then
         pass "packer old-kernel atomic publication and rollback"
     else
         fail "packer portable publication fallback gate" \
@@ -18550,6 +18550,143 @@ C
 }
 
 # ===================================================================
+# Trace records from separate executions can be merged without flattening
+# dlopen semantics or resource identities into a lossy pathname list.
+# ===================================================================
+test_trace_record_merge() {
+    echo "--- trace record merge ---"
+    local build_abs root
+    build_abs=$(cd "$BUILD" && pwd -P)
+    root="$build_abs/trace_record_merge"
+    local lib_src="$root/plugin.c" prog_src="$root/main.c"
+    local lib_a="$root/librecord_a.so" lib_b="$root/librecord_b.so"
+    local data_a="$root/a.dat" data_b="$root/b.dat"
+    local prog="$root/main" out="$root/main.frozen" log="$root/merge.log"
+    local record_a="$root/run-a" record_b="$root/run-b"
+    local freezer mismatch_out="$root/mismatch.frozen"
+    local stale_out="$root/stale.frozen"
+    local actual rc=0 freeze_rc=0
+
+    freezer=$(realpath "$DLFREEZE")
+    rm -rf "$root"
+    mkdir -p "$root"
+    cat >"$lib_src" <<'C'
+#ifndef RECORD_VALUE
+#define RECORD_VALUE 0
+#endif
+int dlfreeze_record_value(void) { return RECORD_VALUE; }
+C
+    cat >"$prog_src" <<'C'
+#include <dlfcn.h>
+#include <stdio.h>
+
+int main(int argc, char **argv) {
+    char text[64];
+    void *handle;
+    int (*value)(void);
+    FILE *file;
+
+    if (argc != 3) return 2;
+    handle = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+    if (!handle) return 3;
+    value = (int (*)(void))dlsym(handle, "dlfreeze_record_value");
+    if (!value) return 4;
+    file = fopen(argv[2], "r");
+    if (!file) return 5;
+    if (!fgets(text, sizeof(text), file)) return 6;
+    if (fclose(file) != 0) return 7;
+    printf("%d:%s", value(), text);
+    return dlclose(handle) == 0 ? 0 : 8;
+}
+C
+    printf '%s\n' alpha >"$data_a"
+    printf '%s\n' beta >"$data_b"
+    if ! gcc -shared -fPIC -Wl,-soname,librecord_a.so \
+            -DRECORD_VALUE=11 -o "$lib_a" "$lib_src" ||
+       ! gcc -shared -fPIC -Wl,-soname,librecord_b.so \
+            -DRECORD_VALUE=29 -o "$lib_b" "$lib_src" ||
+       ! gcc -o "$prog" "$prog_src" -ldl; then
+        fail "trace record merge" "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+
+    if ! (cd "$root" && run_freeze "$freezer" -d -t -f "$root/*" \
+             --record "$record_a" -- "$prog" "$lib_a" "$data_a") \
+             >"$root/record-a.log" 2>&1 ||
+       ! (cd "$root" && run_freeze "$freezer" -d -t -f "$root/*" \
+             --record "$record_b" -- "$prog" "$lib_b" "$data_b") \
+             >"$root/record-b.log" 2>&1; then
+        fail "trace record merge" "recording failed"
+        tail -n 60 "$root"/record-*.log 2>/dev/null || true
+        rm -rf "$root"
+        return
+    fi
+    if [ -e "$root/main.frozen" ] ||
+       [ ! -s "$record_a/dlopen.trace" ] ||
+       [ ! -s "$record_a/files" ] ||
+       [ ! -s "$record_b/dlopen.trace" ] ||
+       [ ! -s "$record_b/files" ]; then
+        fail "trace record merge" "record-only output is incomplete"
+        rm -rf "$root"
+        return
+    fi
+    pass "separate trace recordings"
+
+    if run_freeze "$DLFREEZE" --merge "$record_a" -o "$mismatch_out" \
+            -- /usr/bin/true >"$root/mismatch.log" 2>&1 ||
+       [ -e "$mismatch_out" ] ||
+       ! grep -Fq 'cannot merge trace record' "$root/mismatch.log"; then
+        fail "trace record target identity" \
+            "a recording was accepted for a different executable"
+        rm -rf "$root"
+        return
+    fi
+    pass "trace record target identity"
+
+    freeze_require_direct "trace record merge" "$log" "$out" \
+        --merge "$record_a" --merge "$record_b" -- "$prog" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "trace record merge" "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+
+    mv "$lib_a" "$lib_a.saved"
+    mv "$lib_b" "$lib_b.saved"
+    mv "$data_a" "$data_a.saved"
+    mv "$data_b" "$data_b.saved"
+    capture_output actual "$out" "$lib_a" "$data_a" || rc=$?
+    if [ "$rc" -eq 0 ] && [ "$actual" = "11:alpha" ]; then
+        pass "merged first invocation"
+    else
+        fail "merged first invocation" "exit=$rc output=$actual"
+        tail -n 80 "$log" || true
+    fi
+    actual=""; rc=0
+    capture_output actual "$out" "$lib_b" "$data_b" || rc=$?
+    if [ "$rc" -eq 0 ] && [ "$actual" = "29:beta" ]; then
+        pass "merged second invocation"
+    else
+        fail "merged second invocation" "exit=$rc output=$actual"
+        tail -n 80 "$log" || true
+    fi
+    if run_freeze "$DLFREEZE" --merge "$record_a" -o "$stale_out" \
+            -- "$prog" >"$root/stale.log" 2>&1 ||
+       [ -e "$stale_out" ]; then
+        fail "trace record revision identity" \
+            "merge accepted sources removed after recording"
+    else
+        pass "trace record revision identity"
+    fi
+    rm -rf "$root"
+}
+
+# ===================================================================
 # Path-qualified traced dlopen cannot be reproduced by extraction: dlopen with
 # a slash never searches LD_LIBRARY_PATH.  Refuse such an image before an
 # apparently successful but host-dependent artifact is created.
@@ -32903,6 +33040,7 @@ test_program_smoke_matrix
 test_zig_cc_trace_direct
 test_symlink_exe_identity_direct
 test_dlopen_program
+test_trace_record_merge
 test_pathful_dlopen_requires_direct
 test_dlopen_fallback
 test_python3

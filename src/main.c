@@ -989,14 +989,18 @@ static void usage(const char *prog)
         "  -x          Force extraction mode instead of direct loading\n"
         "  -t          Trace runtime loading by running the program (TTY preserved)\n"
         "  -f <glob>   Embed data files matching glob (requires -t, repeatable)\n"
+        "  --record <dir>  Trace one invocation into a reusable record directory\n"
+        "  --merge <dir>   Merge a trace record when packing (repeatable)\n"
         "  -v          Verbose\n"
         "  -h          Help\n\n"
         "Examples:\n"
         "  %s /bin/ls\n"
         "  %s -o frozen_ls /bin/ls\n"
         "  %s -t -o frozen_app -- myapp --load-plugins\n"
-        "  %s -t -f '/usr/share/myapp/*' -- myapp --self-test\n",
-        prog, prog, prog, prog, prog);
+        "  %s -t -f '/usr/share/myapp/*' -- myapp --self-test\n"
+        "  %s -t -f '/usr/share/myapp/*' --record run1 -- myapp --mode-a\n"
+        "  %s --merge run1 --merge run2 -o myapp.frozen -- myapp\n",
+        prog, prog, prog, prog, prog, prog, prog);
 }
 
 /* locate helper binaries next to our own executable */
@@ -2153,6 +2157,59 @@ static void dump_trace_fd(int trace_fd, const char *heading)
     }
 }
 
+struct trace_record_blob {
+    unsigned char *bytes;
+    size_t size;
+};
+
+static void trace_record_blob_free(struct trace_record_blob *blob)
+{
+    if (!blob)
+        return;
+    free(blob->bytes);
+    blob->bytes = NULL;
+    blob->size = 0;
+}
+
+static int trace_record_blob_read_fd(int fd, struct trace_record_blob *blob)
+{
+    struct stat status;
+    unsigned char *bytes = NULL;
+    size_t size;
+    size_t offset = 0;
+
+    if (fd < 0 || !blob || blob->bytes || blob->size != 0 ||
+        fstat(fd, &status) < 0 || !S_ISREG(status.st_mode) ||
+        status.st_size < 0 || (uintmax_t)status.st_size > SIZE_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
+    size = (size_t)status.st_size;
+    if (size > 0) {
+        bytes = malloc(size);
+        if (!bytes)
+            return -1;
+    }
+    while (offset < size) {
+        ssize_t count = pread(fd, bytes + offset, size - offset,
+                              (off_t)offset);
+
+        if (count > 0) {
+            offset += (size_t)count;
+            continue;
+        }
+        if (count < 0 && errno == EINTR)
+            continue;
+        free(bytes);
+        if (count == 0)
+            errno = EIO;
+        return -1;
+    }
+    blob->bytes = bytes;
+    blob->size = size;
+    return 0;
+}
+
 static int parse_preload_file_trace(int trace_fd, const char *exe_path,
                                     const char **patterns, int npatterns,
                                     struct data_file_list *out,
@@ -2887,7 +2944,8 @@ static int capture_data_files(const char *exe_path, const char *exe_identity,
                               int optind_val, const char **patterns,
                               int npatterns, struct data_file_list *out,
                               struct dep_list *deps, int verbose,
-                              const char *preload_path)
+                              const char *preload_path,
+                              struct trace_record_blob *record_trace)
 {
     char tracef[PATH_MAX];
     char dlopen_tracef[PATH_MAX];
@@ -3095,13 +3153,37 @@ static int capture_data_files(const char *exe_path, const char *exe_identity,
 
     if (verbose)
         dump_trace_fd(dtcollector, "dlopen traced:");
+    int record_fd = -1;
+
+    if (record_trace) {
+        record_fd = fcntl(dtcollector, F_DUPFD_CLOEXEC, 3);
+        if (record_fd < 0) {
+            perror("dlfreeze: cannot retain dlopen trace descriptor");
+            close(tcollector);
+            close(dtcollector);
+            kernel_file_observations_release(&kernel_observations);
+            return -1;
+        }
+    }
     if (dep_add_dlopen_libs_fd(deps, dtcollector) < 0) {
         dtcollector = -1;
+        if (record_fd >= 0)
+            close(record_fd);
         close(tcollector);
         kernel_file_observations_release(&kernel_observations);
         return -1;
     }
     dtcollector = -1;
+    if (record_fd >= 0) {
+        if (trace_record_blob_read_fd(record_fd, record_trace) < 0) {
+            perror("dlfreeze: cannot retain dlopen trace recording");
+            close(record_fd);
+            close(tcollector);
+            kernel_file_observations_release(&kernel_observations);
+            return -1;
+        }
+        close(record_fd);
+    }
     if (verbose) {
         printf("libraries after trace: %d\n", deps->count);
         for (int i = 0; i < deps->count; i++)
@@ -3189,14 +3271,515 @@ static int capture_data_files(const char *exe_path, const char *exe_identity,
     return st;
 }
 
+/* A recording deliberately retains dlfreeze's native trace wire format for
+ * loader operations and a small canonical projection for selected files.
+ * Raw strace pathnames are not sufficient here: they lose descriptor-bound
+ * identities, failed lookups, directory snapshots, and dlopen modes. */
+#define DLFRZ_RECORD_FILES_HEADER "#DLFREEZE_RECORD_FILES_V1"
+
+static int record_component_path(char out[PATH_MAX], const char *directory,
+                                 const char *component)
+{
+    int length;
+
+    if (!out || !directory || !directory[0] || !component ||
+        strchr(component, '/')) {
+        errno = EINVAL;
+        return -1;
+    }
+    length = snprintf(out, PATH_MAX, "%s/%s", directory, component);
+    if (length < 0 || length >= PATH_MAX) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
+static int write_all_fd(int fd, const void *buffer, size_t size)
+{
+    const unsigned char *cursor = buffer;
+
+    while (size > 0) {
+        ssize_t count = write(fd, cursor, size);
+
+        if (count > 0) {
+            cursor += (size_t)count;
+            size -= (size_t)count;
+            continue;
+        }
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (count == 0)
+            errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
+static int record_write_hex(FILE *file, const char *value)
+{
+    static const char digits[] = "0123456789abcdef";
+    const unsigned char *cursor = (const unsigned char *)value;
+
+    if (!file || !value)
+        return -1;
+    while (*cursor) {
+        if (fputc(digits[*cursor >> 4], file) == EOF ||
+            fputc(digits[*cursor & 15], file) == EOF)
+            return -1;
+        cursor++;
+    }
+    return 0;
+}
+
+static int record_write_snapshot(FILE *file,
+                                 const struct dep_file_snapshot *snapshot)
+{
+    if (!file || !snapshot || !snapshot->valid)
+        return -1;
+    return fprintf(file,
+                   " %016" PRIx64 " %016" PRIx64 " %016" PRIx64
+                   " %016" PRIx64 " %016" PRIx64 " %016" PRIx64
+                   " %016" PRIx64,
+                   (uint64_t)snapshot->device,
+                   (uint64_t)snapshot->inode,
+                   (uint64_t)snapshot->size,
+                   (uint64_t)snapshot->mtime_sec,
+                   (uint64_t)snapshot->mtime_nsec,
+                   (uint64_t)snapshot->ctime_sec,
+                   (uint64_t)snapshot->ctime_nsec) < 0 ? -1 : 0;
+}
+
+static int write_record_files(FILE *file, const char *exe_path,
+                              const struct dep_file_snapshot *main_snapshot,
+                              const struct data_file_list *data_files)
+{
+    if (!file || !exe_path || !main_snapshot || !data_files ||
+        fprintf(file, "%s\nT ", DLFRZ_RECORD_FILES_HEADER) < 0 ||
+        record_write_hex(file, exe_path) < 0 ||
+        record_write_snapshot(file, main_snapshot) < 0 ||
+        fputc('\n', file) == EOF)
+        return -1;
+
+    for (int i = 0; i < data_files->count; i++) {
+        switch (data_files->kinds[i]) {
+        case DATA_FILE_KIND_REGULAR:
+            if (fputs("R ", file) == EOF ||
+                record_write_hex(file, data_files->paths[i]) < 0 ||
+                fputc(' ', file) == EOF ||
+                record_write_hex(file, data_files->source_paths[i]) < 0 ||
+                record_write_snapshot(file, &data_files->snapshots[i]) < 0)
+                return -1;
+            break;
+        case DATA_FILE_KIND_VIRTUAL:
+            if (fprintf(file, "V %016" PRIx64 " ",
+                        (uint64_t)data_files->dirent_types[i]) < 0 ||
+                record_write_hex(file, data_files->paths[i]) < 0)
+                return -1;
+            break;
+        case DATA_FILE_KIND_NEGATIVE:
+            if (fputs("N ", file) == EOF ||
+                record_write_hex(file, data_files->paths[i]) < 0)
+                return -1;
+            break;
+        case DATA_FILE_KIND_DIRECTORY:
+            if (fputs("D ", file) == EOF ||
+                record_write_hex(file, data_files->paths[i]) < 0)
+                return -1;
+            break;
+        default:
+            errno = EINVAL;
+            return -1;
+        }
+        if (fputc('\n', file) == EOF)
+            return -1;
+    }
+    if (fprintf(file, "K %016" PRIx64 "\n",
+                (uint64_t)data_files->count) < 0)
+        return -1;
+    return ferror(file) ? -1 : 0;
+}
+
+static int write_trace_record(const char *directory, const char *exe_path,
+                              const struct dep_list *deps,
+                              const struct data_file_list *data_files,
+                              const struct trace_record_blob *trace)
+{
+    char trace_path[PATH_MAX];
+    char files_path[PATH_MAX];
+    int trace_fd = -1;
+    int files_fd = -1;
+    FILE *files = NULL;
+    int created_directory = 0;
+    int result = -1;
+
+    if (!directory || !exe_path || !deps || !data_files || !trace ||
+        !trace->bytes || trace->size == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (record_component_path(trace_path, directory, "dlopen.trace") < 0 ||
+        record_component_path(files_path, directory, "files") < 0)
+        return -1;
+    if (mkdir(directory, 0700) < 0)
+        return -1;
+    created_directory = 1;
+    trace_fd = open(trace_path,
+                    O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                    0600);
+    if (trace_fd < 0 || write_all_fd(trace_fd, trace->bytes, trace->size) < 0 ||
+        fsync(trace_fd) < 0) {
+        if (trace_fd >= 0)
+            close(trace_fd);
+        trace_fd = -1;
+        goto out;
+    }
+    if (close(trace_fd) < 0) {
+        trace_fd = -1;
+        goto out;
+    }
+    trace_fd = -1;
+
+    files_fd = open(files_path,
+                    O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                    0600);
+    if (files_fd < 0)
+        goto out;
+    files = fdopen(files_fd, "w");
+    if (!files)
+        goto out;
+    files_fd = -1;
+    if (write_record_files(files, exe_path, &deps->main_snapshot,
+                           data_files) < 0 || fflush(files) < 0 ||
+        fsync(fileno(files)) < 0 || fclose(files) < 0) {
+        files = NULL;
+        goto out;
+    }
+    files = NULL;
+    result = 0;
+
+out:
+    if (files)
+        fclose(files);
+    if (files_fd >= 0)
+        close(files_fd);
+    if (trace_fd >= 0)
+        close(trace_fd);
+    if (result < 0 && created_directory) {
+        int saved_errno = errno ? errno : EIO;
+
+        (void)unlink(files_path);
+        (void)unlink(trace_path);
+        (void)rmdir(directory);
+        errno = saved_errno;
+    }
+    return result;
+}
+
+static int record_split_line(char *line, char **fields, size_t capacity)
+{
+    char *save = NULL;
+    char *field;
+    size_t count = 0;
+
+    for (field = strtok_r(line, " ", &save); field;
+         field = strtok_r(NULL, " ", &save)) {
+        if (count >= capacity)
+            return -1;
+        fields[count++] = field;
+    }
+    return (int)count;
+}
+
+static int record_decode_path(const char *encoded, char path[PATH_MAX])
+{
+    return encoded &&
+           file_trace_hex_decode(encoded, strlen(encoded), path, PATH_MAX) == 0
+        ? 0 : -1;
+}
+
+static int record_decode_snapshot(char **fields,
+                                  struct dep_file_snapshot *snapshot)
+{
+    uint64_t values[7];
+
+    if (!fields || !snapshot)
+        return -1;
+    for (size_t i = 0; i < 7; i++)
+        if (file_trace_u64_decode(fields[i], &values[i]) < 0)
+            return -1;
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->device = (dev_t)values[0];
+    snapshot->inode = (ino_t)values[1];
+    snapshot->size = (off_t)values[2];
+    snapshot->mtime_sec = (time_t)values[3];
+    snapshot->mtime_nsec = (long)values[4];
+    snapshot->ctime_sec = (time_t)values[5];
+    snapshot->ctime_nsec = (long)values[6];
+    if ((uint64_t)snapshot->device != values[0] ||
+        (uint64_t)snapshot->inode != values[1] ||
+        (uint64_t)snapshot->size != values[2] ||
+        (uint64_t)snapshot->mtime_sec != values[3] ||
+        (uint64_t)snapshot->mtime_nsec != values[4] ||
+        (uint64_t)snapshot->ctime_sec != values[5] ||
+        (uint64_t)snapshot->ctime_nsec != values[6] ||
+        snapshot->mtime_nsec < 0 || snapshot->mtime_nsec > 999999999 ||
+        snapshot->ctime_nsec < 0 || snapshot->ctime_nsec > 999999999)
+        return -1;
+    snapshot->valid = 1;
+    return 0;
+}
+
+static int record_snapshots_equal(const struct dep_file_snapshot *left,
+                                  const struct dep_file_snapshot *right)
+{
+    return left && right && left->valid && right->valid &&
+           left->device == right->device && left->inode == right->inode &&
+           left->size == right->size &&
+           left->mtime_sec == right->mtime_sec &&
+           left->mtime_nsec == right->mtime_nsec &&
+           left->ctime_sec == right->ctime_sec &&
+           left->ctime_nsec == right->ctime_nsec;
+}
+
+static int merge_record_files(const char *directory, const char *exe_path,
+                              const struct dep_file_snapshot *main_snapshot,
+                              const struct dep_list *deps,
+                              struct data_file_list *data_files,
+                              int import_entries)
+{
+    char files_path[PATH_MAX];
+    char *line = NULL;
+    size_t line_capacity = 0;
+    FILE *file = NULL;
+    int fd = -1;
+    int saw_header = 0;
+    int saw_target = 0;
+    int saw_commit = 0;
+    uint64_t entry_count = 0;
+    int result = -1;
+
+    if (record_component_path(files_path, directory, "files") < 0)
+        return -1;
+    fd = open(files_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0)
+        return -1;
+    {
+        struct stat status;
+
+        if (fstat(fd, &status) < 0 || !S_ISREG(status.st_mode)) {
+            errno = EINVAL;
+            close(fd);
+            return -1;
+        }
+    }
+    file = fdopen(fd, "r");
+    if (!file) {
+        close(fd);
+        return -1;
+    }
+    fd = -1;
+
+    while (getline(&line, &line_capacity, file) >= 0) {
+        char *fields[12];
+        size_t length = strlen(line);
+        int count;
+
+        if (length == 0 || line[length - 1] != '\n') {
+            errno = EINVAL;
+            goto out;
+        }
+        if (length > 4U * PATH_MAX + 512U) {
+            errno = EOVERFLOW;
+            goto out;
+        }
+        line[--length] = '\0';
+        if (!saw_header) {
+            if (strcmp(line, DLFRZ_RECORD_FILES_HEADER) != 0) {
+                errno = EINVAL;
+                goto out;
+            }
+            saw_header = 1;
+            continue;
+        }
+        count = record_split_line(line, fields,
+                                  sizeof(fields) / sizeof(fields[0]));
+        if (count < 0) {
+            errno = EINVAL;
+            goto out;
+        }
+        if (count == 9 && strcmp(fields[0], "T") == 0) {
+            char recorded_path[PATH_MAX];
+            struct dep_file_snapshot recorded_snapshot;
+
+            if (saw_target ||
+                record_decode_path(fields[1], recorded_path) < 0 ||
+                record_decode_snapshot(&fields[2], &recorded_snapshot) < 0 ||
+                recorded_path[0] != '/' ||
+                strcmp(recorded_path, exe_path) != 0 ||
+                !record_snapshots_equal(&recorded_snapshot, main_snapshot)) {
+                errno = ESTALE;
+                goto out;
+            }
+            saw_target = 1;
+            continue;
+        }
+        if (!saw_target || saw_commit) {
+            errno = EINVAL;
+            goto out;
+        }
+        if (count == 2 && strcmp(fields[0], "K") == 0) {
+            uint64_t committed_count;
+
+            if (file_trace_u64_decode(fields[1], &committed_count) < 0 ||
+                committed_count != entry_count) {
+                errno = EINVAL;
+                goto out;
+            }
+            saw_commit = 1;
+            continue;
+        }
+        if (!import_entries) {
+            if (!((count == 10 && strcmp(fields[0], "R") == 0) ||
+                  (count == 3 && strcmp(fields[0], "V") == 0) ||
+                  (count == 2 && (strcmp(fields[0], "N") == 0 ||
+                                  strcmp(fields[0], "D") == 0)))) {
+                errno = EINVAL;
+                goto out;
+            }
+            entry_count++;
+            continue;
+        }
+        if (count == 10 && strcmp(fields[0], "R") == 0) {
+            char request[PATH_MAX];
+            char source[PATH_MAX];
+            struct dep_file_snapshot recorded_snapshot;
+            struct dep_file_snapshot current_snapshot;
+            struct stat status;
+
+            if (record_decode_path(fields[1], request) < 0 ||
+                record_decode_path(fields[2], source) < 0 ||
+                record_decode_snapshot(&fields[3], &recorded_snapshot) < 0 ||
+                request[0] != '/' || source[0] != '/' ||
+                stat(source, &status) < 0 || !S_ISREG(status.st_mode)) {
+                errno = ESTALE;
+                goto out;
+            }
+            resolved_snapshot_from_stat(&current_snapshot, &status);
+            if (!record_snapshots_equal(&recorded_snapshot,
+                                        &current_snapshot)) {
+                errno = ESTALE;
+                goto out;
+            }
+            if (path_is_known_dep(source, exe_path, deps)) {
+                entry_count++;
+                continue;
+            }
+            data_file_list_add(data_files, request, source,
+                               &current_snapshot);
+        } else if (count == 3 && strcmp(fields[0], "V") == 0) {
+            uint64_t type;
+            char request[PATH_MAX];
+
+            if (file_trace_u64_decode(fields[1], &type) < 0 || type > UCHAR_MAX ||
+                !dlfrz_dirent_type_canonical((unsigned char)type) ||
+                record_decode_path(fields[2], request) < 0 ||
+                request[0] != '/') {
+                errno = EINVAL;
+                goto out;
+            }
+            data_file_list_add_virtual(data_files, request,
+                                       (unsigned char)type);
+        } else if (count == 2 && strcmp(fields[0], "N") == 0) {
+            char request[PATH_MAX];
+            struct stat status;
+
+            if (record_decode_path(fields[1], request) < 0 ||
+                request[0] != '/' ||
+                stat(request, &status) == 0 ||
+                (errno != ENOENT && errno != ENOTDIR)) {
+                errno = ESTALE;
+                goto out;
+            }
+            data_file_list_add_negative(data_files, request);
+        } else if (count == 2 && strcmp(fields[0], "D") == 0) {
+            char request[PATH_MAX];
+
+            if (record_decode_path(fields[1], request) < 0 ||
+                request[0] != '/') {
+                errno = EINVAL;
+                goto out;
+            }
+            data_file_list_add_directory(data_files, request);
+        } else {
+            errno = EINVAL;
+            goto out;
+        }
+        if (data_files->failed) {
+            errno = EINVAL;
+            goto out;
+        }
+        entry_count++;
+    }
+    if (ferror(file) || !saw_header || !saw_target || !saw_commit) {
+        if (!errno)
+            errno = EINVAL;
+        goto out;
+    }
+    result = 0;
+
+out:
+    free(line);
+    if (file)
+        fclose(file);
+    if (fd >= 0)
+        close(fd);
+    return result;
+}
+
+static int merge_record_dlopen_trace(const char *directory,
+                                     struct dep_list *deps)
+{
+    char trace_path[PATH_MAX];
+    struct stat status;
+    int fd;
+
+    if (record_component_path(trace_path, directory, "dlopen.trace") < 0)
+        return -1;
+    fd = open(trace_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0)
+        return -1;
+    if (fstat(fd, &status) < 0 || !S_ISREG(status.st_mode)) {
+        int saved_errno = errno ? errno : EINVAL;
+
+        close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+    return dep_add_dlopen_libs_fd(deps, fd);
+}
+
 /* ------------------------------------------------------------------ */
 int main(int argc, char **argv)
 {
     const char *out_path = NULL;
+    const char *record_path = NULL;
     int do_trace = 0, verbose = 0, direct_load = 1;
     int direct_option = 0, extraction_option = 0;
     const char **file_patterns;
+    const char **merge_paths;
     int nfile_patterns = 0;
+    int nmerge_paths = 0;
+    struct trace_record_blob record_trace = {0};
+    enum {
+        OPT_RECORD = 256,
+        OPT_MERGE,
+    };
+    static const struct option long_options[] = {
+        { "record", required_argument, NULL, OPT_RECORD },
+        { "merge", required_argument, NULL, OPT_MERGE },
+        { NULL, 0, NULL, 0 },
+    };
 
     if (argc < 0 || (size_t)argc > SIZE_MAX / sizeof(*file_patterns)) {
         fprintf(stderr, "dlfreeze: invalid argument vector size\n");
@@ -3204,13 +3787,18 @@ int main(int argc, char **argv)
     }
     file_patterns = calloc(argc > 0 ? (size_t)argc : 1,
                            sizeof(*file_patterns));
-    if (!file_patterns) {
+    merge_paths = calloc(argc > 0 ? (size_t)argc : 1,
+                         sizeof(*merge_paths));
+    if (!file_patterns || !merge_paths) {
         fprintf(stderr, "dlfreeze: cannot allocate option storage\n");
+        free(file_patterns);
+        free(merge_paths);
         return 1;
     }
 
     int opt;
-    while ((opt = getopt(argc, argv, "+o:f:dtxvh")) != -1) {
+    while ((opt = getopt_long(argc, argv, "+o:f:dtxvh", long_options,
+                              NULL)) != -1) {
         switch (opt) {
         case 'o': out_path = optarg;  break;
         case 'd': direct_load = 1; direct_option = 1; break;
@@ -3219,26 +3807,66 @@ int main(int argc, char **argv)
         case 'f':
             file_patterns[nfile_patterns++] = optarg;
             break;
+        case OPT_RECORD:
+            if (record_path) {
+                fprintf(stderr,
+                        "dlfreeze: --record may be specified only once\n");
+                free(file_patterns);
+                free(merge_paths);
+                return 1;
+            }
+            record_path = optarg;
+            break;
+        case OPT_MERGE:
+            merge_paths[nmerge_paths++] = optarg;
+            break;
         case 'v': verbose  = 1;      break;
-        case 'h': usage(argv[0]); free(file_patterns); return 0;
-        default:  usage(argv[0]); free(file_patterns); return 1;
+        case 'h':
+            usage(argv[0]);
+            free(file_patterns);
+            free(merge_paths);
+            return 0;
+        default:
+            usage(argv[0]);
+            free(file_patterns);
+            free(merge_paths);
+            return 1;
         }
     }
     if (optind >= argc) {
         fprintf(stderr, "dlfreeze: no executable specified\n");
         usage(argv[0]);
         free(file_patterns);
+        free(merge_paths);
         return 1;
     }
     if (direct_option && extraction_option) {
         fprintf(stderr,
                 "dlfreeze: -d and -x select incompatible runtime modes\n");
         free(file_patterns);
+        free(merge_paths);
+        return 1;
+    }
+    if (record_path && (!do_trace || nmerge_paths > 0 || out_path)) {
+        fprintf(stderr,
+                "dlfreeze: --record requires -t and is incompatible with "
+                "--merge and -o\n");
+        free(file_patterns);
+        free(merge_paths);
+        return 1;
+    }
+    if (nmerge_paths > 0 && (do_trace || nfile_patterns > 0)) {
+        fprintf(stderr,
+                "dlfreeze: --merge consumes completed records and is "
+                "incompatible with -t and -f\n");
+        free(file_patterns);
+        free(merge_paths);
         return 1;
     }
     if (nfile_patterns > 0 && !do_trace) {
         fprintf(stderr, "dlfreeze: -f requires -t (tracing mode)\n");
         free(file_patterns);
+        free(merge_paths);
         return 1;
     }
     if (nfile_patterns > 0 && !direct_load) {
@@ -3246,6 +3874,7 @@ int main(int argc, char **argv)
                 "dlfreeze: captured files are incompatible with forced "
                 "extraction mode (-x)\n");
         free(file_patterns);
+        free(merge_paths);
         return 1;
     }
 
@@ -3257,6 +3886,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "dlfreeze: cannot find: %s\n", argv[optind]);
         free(exe_name);
         free(file_patterns);
+        free(merge_paths);
         return 1;
     }
     if (!exe_name)
@@ -3265,11 +3895,13 @@ int main(int argc, char **argv)
         fprintf(stderr, "dlfreeze: cannot allocate executable identity\n");
         free(exe_path);
         free(file_patterns);
+        free(merge_paths);
         return 1;
     }
     if (!elf_check(exe_path)) {
         fprintf(stderr, "dlfreeze: not an ELF: %s\n", exe_path);
-        free(exe_name); free(exe_path); free(file_patterns); return 1;
+        free(exe_name); free(exe_path); free(file_patterns);
+        free(merge_paths); return 1;
     }
 
     /* locate our helper binaries */
@@ -3277,13 +3909,15 @@ int main(int argc, char **argv)
     if (resolve_running_executable(argv[0], self) < 0) {
         perror("dlfreeze: cannot resolve its executable path");
         free(exe_name); free(exe_path); free(file_patterns);
+        free(merge_paths);
         return 1;
     }
 
     char *bootstrap = find_sibling(self, "dlfreeze-bootstrap");
     if (!bootstrap) {
         fprintf(stderr, "dlfreeze: cannot find dlfreeze-bootstrap\n");
-        free(exe_name); free(exe_path); free(file_patterns); return 1;
+        free(exe_name); free(exe_path); free(file_patterns);
+        free(merge_paths); return 1;
     }
 
     if (verbose)
@@ -3295,6 +3929,7 @@ int main(int argc, char **argv)
     if (dep_resolve(exe_path, &deps) < 0) {
         free(exe_name); free(exe_path); free(bootstrap);
         free(file_patterns);
+        free(merge_paths);
         return 1;
     }
 
@@ -3342,7 +3977,8 @@ int main(int argc, char **argv)
 
             trace_rc = capture_data_files(exe_path, exe_name, argc, argv,
                                           optind, file_patterns, nfile_patterns,
-                                          &data_files, &deps, verbose, preload);
+                                          &data_files, &deps, verbose, preload,
+                                          record_path ? &record_trace : NULL);
             free(preload);
             if (trace_rc < 0) {
                 data_file_list_free(&data_files);
@@ -3351,6 +3987,8 @@ int main(int argc, char **argv)
                 free(exe_path);
                 free(bootstrap);
                 free(file_patterns);
+                free(merge_paths);
+                trace_record_blob_free(&record_trace);
                 return 1;
             }
             preload = NULL;
@@ -3451,9 +4089,31 @@ int main(int argc, char **argv)
                                 close(collector_fd);
                                 collector_fd = -1;
                             } else {
-                                if (dep_add_dlopen_libs_fd(
-                                        &deps, collector_fd) < 0)
+                                int record_fd = -1;
+
+                                if (record_path)
+                                    record_fd = fcntl(
+                                        collector_fd, F_DUPFD_CLOEXEC, 3);
+                                if (record_path && record_fd < 0) {
+                                    perror("dlfreeze: cannot retain dlopen "
+                                           "trace descriptor");
+                                    close(collector_fd);
                                     trace_failed = 1;
+                                } else if (dep_add_dlopen_libs_fd(
+                                               &deps, collector_fd) < 0) {
+                                    if (record_fd >= 0)
+                                        close(record_fd);
+                                    trace_failed = 1;
+                                } else if (record_fd >= 0) {
+                                    if (trace_record_blob_read_fd(
+                                            record_fd,
+                                            &record_trace) < 0) {
+                                        perror("dlfreeze: cannot retain "
+                                               "dlopen trace recording");
+                                        trace_failed = 1;
+                                    }
+                                    close(record_fd);
+                                }
                                 collector_fd = -1;
                             }
                             if (verbose) {
@@ -3478,6 +4138,8 @@ int main(int argc, char **argv)
             free(exe_path);
             free(bootstrap);
             free(file_patterns);
+            free(merge_paths);
+            trace_record_blob_free(&record_trace);
             return 1;
         }
         if (data_files.failed) {
@@ -3489,8 +4151,79 @@ int main(int argc, char **argv)
             free(exe_path);
             free(bootstrap);
             free(file_patterns);
+            free(merge_paths);
+            trace_record_blob_free(&record_trace);
             return 1;
         }
+    }
+
+    if (record_path) {
+        int record_result = write_trace_record(
+            record_path, exe_path, &deps, &data_files, &record_trace);
+
+        if (record_result < 0)
+            perror("dlfreeze: cannot write trace record");
+        else
+            printf("Trace record: %s\n", record_path);
+        trace_record_blob_free(&record_trace);
+        data_file_list_free(&data_files);
+        dep_list_free(&deps);
+        free(exe_name);
+        free(exe_path);
+        free(bootstrap);
+        free(file_patterns);
+        free(merge_paths);
+        return record_result < 0 ? 1 : 0;
+    }
+
+    if (nmerge_paths > 0) {
+        int merge_failed = 0;
+
+        for (int i = 0; i < nmerge_paths; i++) {
+            if (merge_record_files(merge_paths[i], exe_path,
+                                   &deps.main_snapshot, &deps,
+                                   &data_files, 0) < 0 ||
+                merge_record_dlopen_trace(merge_paths[i], &deps) < 0) {
+                fprintf(stderr, "dlfreeze: cannot merge trace record: %s: %s\n",
+                        merge_paths[i], strerror(errno));
+                merge_failed = 1;
+                break;
+            }
+        }
+        for (int i = 0; !merge_failed && i < nmerge_paths; i++) {
+            if (merge_record_files(merge_paths[i], exe_path,
+                                   &deps.main_snapshot, &deps,
+                                   &data_files, 1) < 0) {
+                fprintf(stderr, "dlfreeze: cannot merge resource record: "
+                        "%s: %s\n", merge_paths[i], strerror(errno));
+                merge_failed = 1;
+            }
+        }
+        if (!merge_failed && data_files.failed) {
+            fprintf(stderr,
+                    "dlfreeze: merged trace records contain conflicting "
+                    "resource observations\n");
+            merge_failed = 1;
+        }
+        if (!merge_failed && data_files.count > 0 && !direct_load) {
+            fprintf(stderr,
+                    "dlfreeze: merged resource records are incompatible "
+                    "with forced extraction mode (-x)\n");
+            merge_failed = 1;
+        }
+        if (merge_failed) {
+            data_file_list_free(&data_files);
+            dep_list_free(&deps);
+            free(exe_name);
+            free(exe_path);
+            free(bootstrap);
+            free(file_patterns);
+            free(merge_paths);
+            return 1;
+        }
+        printf("Merged %d trace record%s\n", nmerge_paths,
+               nmerge_paths == 1 ? "" : "s");
+        finish_captured_paths(&data_files, verbose);
     }
 
     /* output path */
@@ -3508,6 +4241,7 @@ int main(int argc, char **argv)
             free(exe_path);
             free(bootstrap);
             free(file_patterns);
+            free(merge_paths);
             return 1;
         }
         out_path = outbuf;
@@ -3535,6 +4269,7 @@ int main(int argc, char **argv)
         free(exe_path);
         free(bootstrap);
         free(file_patterns);
+        free(merge_paths);
         return 1;
     }
     int rc = pack_frozen(&po);
@@ -3545,5 +4280,7 @@ int main(int argc, char **argv)
     free(exe_path);
     free(bootstrap);
     free(file_patterns);
+    free(merge_paths);
+    trace_record_blob_free(&record_trace);
     return rc < 0 ? 1 : 0;
 }

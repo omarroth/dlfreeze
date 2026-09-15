@@ -36,6 +36,24 @@ resource files:
 ./myapp.frozen --self-test
 ```
 
+To exercise separate command-line modes and merge their observed libraries,
+files, missing-path results, and directory views into one artifact, create one
+record per invocation and merge them when packing:
+
+```bash
+./build/dlfreeze -t -f '/usr/share/myapp/*' --record trace-a -- myapp --mode-a
+./build/dlfreeze -t -f '/usr/share/myapp/*' --record trace-b -- myapp --mode-b
+./build/dlfreeze --merge trace-a --merge trace-b -o myapp.frozen -- myapp
+```
+
+`--record` is record-only and does not produce a frozen executable. Each
+record retains dlfreeze's descriptor-bound file observations and complete
+`dlopen` transactions; it is intentionally not a wrapper around `strace`.
+The executable, shared libraries, and regular resources must still be the
+recorded revisions when `--merge` runs. Conflicting observations and changed
+inputs fail closed. The resulting frozen executable remains self-contained;
+the recording directories are build inputs only and are not a runtime cache.
+
 Interactive targets inherit dlfreeze's controlling terminal during tracing.
 Exercise the interactive path, then exit it normally so packing can finish.
 For example, this captures the Python standard-library files and extension
@@ -77,6 +95,8 @@ Options:
   -x          Force extraction mode instead of direct loading
   -t          Trace runtime loading by running the program (TTY preserved)
   -f <glob>   Embed data files matching glob (requires -t, repeatable)
+  --record <dir>  Trace one invocation into a reusable record directory
+  --merge <dir>   Merge a trace record when packing (repeatable)
   -v          Verbose
   -h          Help
 ```
@@ -91,6 +111,13 @@ metadata-only directory entries; their contents are embedded only if the
 trace opens or otherwise captures them. Shell quoting already protects `*`,
 so use `-f '/usr/*'`, not `-f '/usr/\*'` (the latter matches a literal
 asterisk).
+
+`--record <dir>` requires `-t` and cannot be combined with `-o` or
+`--merge`. `--merge <dir>` is repeatable and consumes completed records
+without rerunning their commands; it cannot be combined with `-t` or `-f`.
+All records in one merge must describe the exact executable revision being
+packed. Regular source files are revision-checked again during the merge,
+while recorded negative lookups must still be absent.
 
 ## Building
 
