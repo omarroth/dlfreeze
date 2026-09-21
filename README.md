@@ -112,6 +112,14 @@ trace opens or otherwise captures them. Shell quoting already protects `*`,
 so use `-f '/usr/*'`, not `-f '/usr/\*'` (the latter matches a literal
 asterisk).
 
+Tracing belongs to one executable image. A command runner that replaces
+itself with another program, such as `uvx`, cannot be frozen by naming the
+runner: dlfreeze rejects the incomplete first-image trace. Prepare a stable
+environment first, then name its final ELF interpreter or executable and
+pass the script or module arguments directly. Trace-time arguments and
+environment variables are not baked into the artifact; provide them again
+when running it. This rule also applies to shell launchers and other wrappers.
+
 `--record <dir>` requires `-t` and cannot be combined with `-o` or
 `--merge`. `--merge <dir>` is repeatable and consumes completed records
 without rerunning their commands; it cannot be combined with `-t` or `-f`.

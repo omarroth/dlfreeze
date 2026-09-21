@@ -141,6 +141,7 @@ static int phdr_byte_access_gate(void)
         return 0;
 
     object.base = (uintptr_t)mapped_bytes;
+    object.file_size = sizeof(mapped_bytes);
     object.phdr_base = phdr_storage + 1;
     object.phdr_num = 1;
     object.phdr_entsz = sizeof(Elf64_Phdr);

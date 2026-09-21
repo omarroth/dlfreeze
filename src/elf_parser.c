@@ -282,18 +282,21 @@ static int elf64_image_open(const uint8_t *data, size_t size,
                 const struct elf64_load_translation *previous =
                     &image->load_index[index - 1];
                 size_t widest_index = previous->widest_index;
-                const struct elf64_load_translation *widest =
+                struct elf64_load_translation *widest =
                     &image->load_index[widest_index];
                 uint64_t widest_end = widest->vaddr + widest->filesz;
                 uint64_t translation_end =
                     translation->vaddr + translation->filesz;
 
-                if (translation->vaddr < widest_end) {
+                if (translation->vaddr <= widest_end) {
                     uint64_t delta = translation->vaddr - widest->vaddr;
 
                     if (widest->offset > UINT64_MAX - delta ||
                         widest->offset + delta != translation->offset)
                         goto fail;
+                    if (translation_end > widest_end)
+                        widest->filesz = translation_end - widest->vaddr;
+                    translation->widest_index = widest_index;
                 }
                 if (translation_end <= widest_end)
                     translation->widest_index = widest_index;
@@ -1095,18 +1098,9 @@ static int parse_elf64(const uint8_t *data, size_t size, struct elf_info *info)
 
     /* Convert the dynamic string table VA to a bounded file view. */
     {
-        const struct elf64_load_translation *translation;
         const char *string_data;
-        uint64_t delta;
-        uint64_t available;
         uint64_t string_bytes;
 
-        translation = elf64_vaddr_translation(&image, strtab_addr, &delta);
-        if (!translation)
-            goto out;
-        available = translation->filesz - delta;
-        if (declared_strtab_size > available)
-            goto out;
         string_bytes = declared_strtab_size;
         string_data = elf64_vaddr_file(data, size, &image, strtab_addr,
                                       string_bytes);

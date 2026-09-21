@@ -6849,10 +6849,20 @@ static int loaded_obj_file_vaddr_pointer(const struct loaded_obj *obj,
                                          void **pointer_out)
 {
     void *pointer;
+    uint64_t file_offset;
 
     if (!loaded_obj_vaddr_pointer(obj, vaddr, size, 0, &pointer) ||
-        !loaded_obj_file_contains(obj, (uintptr_t)pointer, size))
-        return 0;
+        !loaded_obj_file_contains(obj, (uintptr_t)pointer, size)) {
+        if (!obj || !obj->phdr ||
+            vaddr > UINTPTR_MAX - obj->base ||
+            size > UINTPTR_MAX - (obj->base + vaddr) ||
+            !dlfrz_load_file_range(obj->phdr, obj->phdr_num,
+                                   vaddr, size, PF_R, &file_offset) ||
+            file_offset > obj->elf_size ||
+            size > obj->elf_size - (size_t)file_offset)
+            return 0;
+        pointer = (void *)(uintptr_t)(obj->base + vaddr);
+    }
     if (pointer_out)
         *pointer_out = pointer;
     return 1;

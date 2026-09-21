@@ -16307,6 +16307,68 @@ C
 }
 
 # ===================================================================
+# Adjacent, page-disjoint PT_LOADs may jointly back immutable ELF metadata.
+# The same file translation must be accepted by the parser, pre-linker, and
+# direct runtime; relocation destinations retain their stricter bounds.
+# ===================================================================
+test_split_dynamic_string_load() {
+    echo "--- split dynamic string load ---"
+    local root="$BUILD/split_dynamic_string_load"
+    local source="$root/main.c" native="$root/native" split="$root/split"
+    local mutator="$root/mutator" out="$root/split.frozen"
+    local log="$root/freeze.log" native_output="" actual=""
+    local padding freeze_rc=0 rc=0 native_rc=0
+
+    rm -rf "$root"
+    mkdir -p "$root"
+    printf '%s\n' '#include <stdio.h>' \
+        'int main(void) { puts("split-load-ok"); return 0; }' >"$source"
+    printf -v padding '%09000d' 1
+    if ! gcc -Wl,-rpath,"/dlfreeze-absent-$padding" \
+            -o "$native" "$source" ||
+       ! gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -Iinclude \
+            -o "$mutator" tests/split_dynamic_load.c; then
+        fail "split dynamic string load" "fixture compile failed"
+        rm -rf "$root"
+        return
+    fi
+    if ! "$mutator" "$native" "$split"; then
+        skip "split dynamic string load" \
+            "linker did not leave a page-spanning DT_STRTAB and spare PT_GNU_EH_FRAME"
+        rm -rf "$root"
+        return
+    fi
+    capture_output native_output "$split" || native_rc=$?
+    if [ "$native_rc" -ne 0 ] || [ "$native_output" != "split-load-ok" ]; then
+        fail "native split dynamic string control" \
+            "exit=$native_rc output=$native_output"
+        rm -rf "$root"
+        return
+    fi
+    pass "native split dynamic string control"
+    freeze_require_direct "split dynamic string load" "$log" "$out" \
+        "$split" || freeze_rc=$?
+    if [ "$freeze_rc" -eq 77 ]; then
+        skip "split dynamic string load" "$DIRECT_FREEZE_REASON"
+        rm -rf "$root"
+        return
+    fi
+    if [ "$freeze_rc" -ne 0 ]; then
+        rm -rf "$root"
+        return
+    fi
+    capture_output actual "$out" || rc=$?
+    if [ "$rc" -eq 0 ] && [ "$actual" = "$native_output" ]; then
+        pass "direct split dynamic string load"
+    else
+        fail "direct split dynamic string load" \
+            "exit=$rc expected=$native_output actual=$actual"
+        tail -n 60 "$log" || true
+    fi
+    rm -rf "$root"
+}
+
+# ===================================================================
 # Test 2h: ELF metadata strings are bounded by their mapped string table,
 # not by private parser buffers.
 # ===================================================================
@@ -33020,6 +33082,7 @@ test_needed_source_alias_identity
 test_pathful_glibc_direct_admission
 test_gnu_pack_cache_contract
 test_long_elf_metadata_strings
+test_split_dynamic_string_load
 test_vfs_hash_complexity_gate
 test_vfs_registry_fastpath_gate
 test_startup_dependency_index_gate

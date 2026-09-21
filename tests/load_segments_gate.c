@@ -13,6 +13,7 @@ static int check_small_tables(void)
 {
     Elf64_Phdr phdr[3] = {0};
     Elf64_Phdr subject = {0};
+    uint64_t offset;
 
     phdr[0].p_type = PT_LOAD;
     phdr[0].p_vaddr = 0x1000;
@@ -58,6 +59,36 @@ static int check_small_tables(void)
     subject.p_vaddr--;
     subject.p_memsz = 0x1801;
     if (dlfrz_segment_is_contained_by_load(phdr, 3, &subject))
+        return 1;
+
+    /* A metadata table can cross a page-disjoint load boundary only when
+     * both file translations agree.  A gap, alias, or unreadable tail must
+     * never be interpreted as one serialized table. */
+    memset(phdr, 0, sizeof(phdr));
+    phdr[0].p_type = PT_LOAD;
+    phdr[0].p_flags = PF_R | PF_W;
+    phdr[0].p_offset = 0x1000;
+    phdr[0].p_vaddr = 0x4000;
+    phdr[0].p_filesz = phdr[0].p_memsz = 0x1000;
+    phdr[1].p_type = PT_LOAD;
+    phdr[1].p_flags = PF_R;
+    phdr[1].p_offset = 0x2000;
+    phdr[1].p_vaddr = 0x5000;
+    phdr[1].p_filesz = phdr[1].p_memsz = 0x1000;
+    if (!dlfrz_load_file_range(phdr, 2, 0x4f00, 0x200,
+                               PF_R, &offset) || offset != 0x1f00)
+        return 1;
+    if (dlfrz_load_file_range(phdr, 2, 0x4f00, 0x200,
+                              PF_W, &offset))
+        return 1;
+    phdr[1].p_offset = 0x3000;
+    if (dlfrz_load_file_range(phdr, 2, 0x4f00, 0x200,
+                              PF_R, &offset))
+        return 1;
+    phdr[1].p_offset = 0x2000;
+    phdr[1].p_vaddr = 0x6000;
+    if (dlfrz_load_file_range(phdr, 2, 0x4f00, 0x200,
+                              PF_R, &offset))
         return 1;
     return 0;
 }

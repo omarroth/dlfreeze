@@ -335,6 +335,100 @@ out:
     return rc;
 }
 
+static int adjacent_load_dynamic_strings_accepted(const char *source)
+{
+    char path[PATH_MAX] = "";
+    struct mapped_elf mapped;
+    Elf64_Phdr *headers = NULL;
+    Elf64_Phdr second;
+    uint64_t strtab_vaddr = 0;
+    uint64_t strtab_size = 0;
+    int load_index = -1;
+    int spare_index = -1;
+    int result = -1;
+
+    if (copy_fixture(source, path) < 0 || map_fixture(path, &mapped) < 0)
+        goto out;
+    for (size_t i = 0; i < mapped.dynamic_count; i++) {
+        if (mapped.dynamic[i].d_tag == DT_NULL)
+            break;
+        if (mapped.dynamic[i].d_tag == DT_STRTAB)
+            strtab_vaddr = mapped.dynamic[i].d_un.d_ptr;
+        if (mapped.dynamic[i].d_tag == DT_STRSZ)
+            strtab_size = mapped.dynamic[i].d_un.d_val;
+    }
+    spare_index = spare_program_header(&mapped);
+    for (uint16_t i = 0; i < mapped.ehdr->e_phnum; i++) {
+        Elf64_Phdr *ph = &mapped.phdr[i];
+
+        if (ph->p_type == PT_LOAD && strtab_vaddr >= ph->p_vaddr &&
+            strtab_vaddr - ph->p_vaddr < ph->p_filesz &&
+            strtab_size > 2 &&
+            strtab_size <= ph->p_filesz -
+                (strtab_vaddr - ph->p_vaddr)) {
+            load_index = i;
+            break;
+        }
+    }
+    if (load_index < 0 || spare_index < 0 ||
+        spare_index == load_index)
+        goto unmap;
+    headers = malloc((size_t)mapped.ehdr->e_phnum * sizeof(*headers));
+    if (!headers)
+        goto unmap;
+    memcpy(headers, mapped.phdr,
+           (size_t)mapped.ehdr->e_phnum * sizeof(*headers));
+    {
+        Elf64_Phdr *first = &headers[load_index];
+        uint64_t delta = strtab_vaddr + 1 - first->p_vaddr;
+
+        if (delta >= first->p_filesz || delta >= first->p_memsz)
+            goto unmap;
+        second = *first;
+        second.p_vaddr += delta;
+        second.p_paddr += delta;
+        second.p_offset += delta;
+        second.p_filesz -= delta;
+        second.p_memsz -= delta;
+        second.p_align = 1;
+        first->p_filesz = delta;
+        first->p_memsz = delta;
+    }
+    /* Replace one optional header, then insert the new PT_LOAD immediately
+     * after its first half without disturbing the order of other loads. */
+    memmove(&headers[spare_index], &headers[spare_index + 1],
+            (size_t)(mapped.ehdr->e_phnum - spare_index - 1) *
+                sizeof(*headers));
+    if (spare_index < load_index)
+        load_index--;
+    memmove(&headers[load_index + 2], &headers[load_index + 1],
+            (size_t)(mapped.ehdr->e_phnum - load_index - 2) *
+                sizeof(*headers));
+    headers[load_index + 1] = second;
+    memcpy(mapped.phdr, headers,
+           (size_t)mapped.ehdr->e_phnum * sizeof(*headers));
+    if (msync(mapped.data, mapped.size, MS_SYNC) < 0)
+        goto unmap;
+    unmap_fixture(&mapped);
+    {
+        struct elf_info info;
+
+        if (!elf_check(path) || elf_parse(path, &info) < 0)
+            goto out;
+        elf_info_free(&info);
+    }
+    result = 0;
+    goto out;
+
+unmap:
+    unmap_fixture(&mapped);
+out:
+    free(headers);
+    if (path[0])
+        unlink(path);
+    return result;
+}
+
 enum admission_mutation {
     MUTATE_TYPE,
     MUTATE_CLASS,
@@ -662,6 +756,8 @@ int main(int argc, char **argv)
         return 4;
     if (ambiguous_vaddr_translation_rejected(argv[1]) < 0)
         return 9;
+    if (adjacent_load_dynamic_strings_accepted(argv[1]) < 0)
+        return 10;
     if (malformed_admission_rejected(argv[1], argv[0]) < 0)
         return 7;
     if (descriptor_parse_is_path_race_safe(argv[1]) < 0)

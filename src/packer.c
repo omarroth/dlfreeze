@@ -3475,6 +3475,7 @@ static int pl_vaddr_pointer(const struct prelink_obj *obj, uint64_t vaddr,
                             uint32_t required_flags, void **pointer_out)
 {
     uintptr_t pointer;
+    uint64_t file_offset;
 
     if (!obj || !obj->phdr_base || obj->phdr_entsz != sizeof(Elf64_Phdr) ||
         vaddr > UINTPTR_MAX || obj->base > UINTPTR_MAX - vaddr)
@@ -3496,6 +3497,16 @@ static int pl_vaddr_pointer(const struct prelink_obj *obj, uint64_t vaddr,
         delta = vaddr - ph.p_vaddr;
         if (delta > limit || size > limit - delta)
             continue;
+        if (pointer_out)
+            *pointer_out = (void *)pointer;
+        return 1;
+    }
+    if (file_backed && required_flags == PF_R &&
+        dlfrz_load_file_range_bytes(
+            obj->phdr_base, obj->phdr_num, obj->phdr_entsz,
+            vaddr, size, required_flags, &file_offset) &&
+        file_offset <= obj->file_size &&
+        size <= obj->file_size - (size_t)file_offset) {
         if (pointer_out)
             *pointer_out = (void *)pointer;
         return 1;
@@ -3597,7 +3608,11 @@ static int pl_vaddr_file_range(const struct prelink_obj *obj,
         found = 1;
     }
     if (!found)
-        return 0;
+        return dlfrz_load_file_range_bytes(
+                   obj->phdr_base, obj->phdr_num, obj->phdr_entsz,
+                   vaddr, size, required_flags, file_offset_out) &&
+               *file_offset_out <= obj->file_size &&
+               size <= obj->file_size - (size_t)*file_offset_out;
     *file_offset_out = selected;
     return 1;
 }
@@ -4232,20 +4247,42 @@ static int pl_file_bytes_available(const struct prelink_obj *obj,
         Elf64_Phdr ph;
         uint64_t delta;
         uint64_t available;
+        uint64_t file_offset;
+        size_t low;
+        size_t high;
 
         if (!pl_phdr_read(obj, i, &ph) || ph.p_type != PT_LOAD ||
             !(ph.p_flags & PF_R) || vaddr < ph.p_vaddr)
             continue;
         delta = vaddr - ph.p_vaddr;
-        if (delta > ph.p_filesz)
+        if (delta >= ph.p_filesz || ph.p_offset > UINT64_MAX - delta)
+            continue;
+        file_offset = ph.p_offset + delta;
+        if (file_offset >= obj->file_size)
             continue;
         available = ph.p_filesz - delta;
         if (available > SIZE_MAX)
             available = SIZE_MAX;
+        if (available > obj->file_size - (size_t)file_offset)
+            available = obj->file_size - (size_t)file_offset;
         if (!pl_vaddr_pointer(obj, vaddr, (size_t)available, 1, PF_R,
                               NULL))
             continue;
-        *available_out = (size_t)available;
+        low = (size_t)available;
+        high = obj->file_size - (size_t)file_offset;
+        while (low < high) {
+            size_t middle = low + (high - low) / 2 + 1;
+            uint64_t translated;
+
+            if (dlfrz_load_file_range_bytes(
+                    obj->phdr_base, obj->phdr_num, obj->phdr_entsz,
+                    vaddr, middle, PF_R, &translated) &&
+                translated == file_offset)
+                low = middle;
+            else
+                high = middle - 1;
+        }
+        *available_out = low;
         return 1;
     }
     return 0;
@@ -7322,8 +7359,42 @@ static int symtab_vaddr_file(const struct symtab_elf_view *view,
         }
         found = 1;
     }
+    if (!found && size != 0) {
+        uint64_t file_offset;
+
+        if (!dlfrz_load_file_range_bytes(
+                view->phdrs, view->phnum, sizeof(Elf64_Phdr),
+                address, size, PF_R, &file_offset) ||
+            !symtab_image_range(view->image, view->image_size,
+                                file_offset, size, &match))
+            return 0;
+        match_available = size;
+        found = 1;
+    }
     if (!found)
         return 0;
+    if (available_out) {
+        size_t low = match_available;
+        size_t high = view->image_size - (size_t)(match - view->image);
+        uint64_t expected_offset = (uint64_t)(match - view->image);
+
+        /* Hash-chain readers need the complete contiguous extent, not just
+         * the first segment's remainder.  Search only this uncommon query
+         * path; ordinary exact-sized metadata checks remain one scan. */
+        while (low < high) {
+            size_t middle = low + (high - low) / 2 + 1;
+            uint64_t translated;
+
+            if (dlfrz_load_file_range_bytes(
+                    view->phdrs, view->phnum, sizeof(Elf64_Phdr),
+                    address, middle, PF_R, &translated) &&
+                translated == expected_offset)
+                low = middle;
+            else
+                high = middle - 1;
+        }
+        match_available = low;
+    }
     if (bytes_out)
         *bytes_out = match;
     if (available_out)

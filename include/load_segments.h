@@ -66,6 +66,82 @@ static inline int dlfrz_segment_is_contained_by_load(
         (const uint8_t *)phdr, phnum, sizeof(*phdr), subject);
 }
 
+/* A file-backed metadata table may cross adjacent PT_LOADs when their
+ * address-to-file translations agree.  Keep the complete range contiguous
+ * in both coordinates and reject conflicting aliases or holes.  This does
+ * not authorize a relocation destination to cross segment boundaries. */
+static inline int dlfrz_load_file_range_bytes(
+    const uint8_t *phdr, size_t phnum, size_t phentsize,
+    uint64_t vaddr, size_t length, uint32_t required_flags,
+    uint64_t *file_offset_out)
+{
+    uint64_t end;
+    uint64_t file_offset = 0;
+    uint64_t covered = vaddr;
+    uint64_t previous_vaddr = 0;
+    int found = 0;
+    int saw_load = 0;
+
+    if (!phdr || !file_offset_out || length == 0 ||
+        phentsize != sizeof(Elf64_Phdr) ||
+        phnum > SIZE_MAX / phentsize ||
+        (uint64_t)length > UINT64_MAX - vaddr)
+        return 0;
+    end = vaddr + (uint64_t)length;
+
+    for (size_t i = 0; i < phnum; i++) {
+        Elf64_Phdr load;
+        uint64_t file_end;
+        uint64_t intersection;
+        uint64_t candidate;
+
+        memcpy(&load, phdr + i * phentsize, sizeof(load));
+        if (load.p_type != PT_LOAD)
+            continue;
+        if ((saw_load && load.p_vaddr < previous_vaddr) ||
+            load.p_filesz > load.p_memsz ||
+            load.p_vaddr > UINT64_MAX - load.p_filesz ||
+            load.p_offset > UINT64_MAX - load.p_filesz)
+            return 0;
+        previous_vaddr = load.p_vaddr;
+        saw_load = 1;
+        file_end = load.p_vaddr + load.p_filesz;
+        if (load.p_vaddr >= end || file_end <= vaddr)
+            continue;
+        if ((load.p_flags & required_flags) != required_flags)
+            return 0;
+        intersection = load.p_vaddr > vaddr ? load.p_vaddr : vaddr;
+        candidate = load.p_offset + (intersection - load.p_vaddr);
+        if (!found) {
+            if (intersection != vaddr)
+                return 0;
+            file_offset = candidate;
+            if (file_offset > UINT64_MAX - length)
+                return 0;
+            found = 1;
+        } else if (candidate != file_offset + (intersection - vaddr)) {
+            return 0;
+        }
+        if (intersection > covered)
+            return 0;
+        if (file_end > covered)
+            covered = file_end;
+    }
+    if (!found || covered < end)
+        return 0;
+    *file_offset_out = file_offset;
+    return 1;
+}
+
+static inline int dlfrz_load_file_range(
+    const Elf64_Phdr *phdr, size_t phnum, uint64_t vaddr,
+    size_t length, uint32_t required_flags, uint64_t *file_offset_out)
+{
+    return dlfrz_load_file_range_bytes(
+        (const uint8_t *)phdr, phnum, sizeof(*phdr), vaddr, length,
+        required_flags, file_offset_out);
+}
+
 /* The gABI requires PT_LOAD entries to appear in ascending p_vaddr order.
  * Sequential MAP_FIXED mappings are also order-dependent when distinct
  * entries cover the same runtime page: their file translations, BSS tails,
