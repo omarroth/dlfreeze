@@ -13,7 +13,9 @@ fall back to files on the host.
 The implementation is application-agnostic. It does not select behavior from
 an executable name or contain Python-, Ruby-, Zig-, or OpenSSL-specific loader
 paths. Those programs appear in the tests only as broad compatibility probes;
-the strict direct-loader contract is exercised by generic C fixtures.
+the strict direct-loader contract is exercised by generic C fixtures. CI also
+rejects application identities in production sources so compatibility fixes
+must be expressed as ELF, libc, kernel, or traced-resource semantics.
 
 ## Quick start
 

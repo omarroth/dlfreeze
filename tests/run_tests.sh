@@ -21,6 +21,26 @@ pass() { echo "${GRN}PASS${RST}: $1"; ((PASS++)) || true; }
 fail() { echo "${RED}FAIL${RST}: $1 — $2"; ((FAIL++)) || true; }
 skip() { echo "${YLW}SKIP${RST}: $1 — $2"; ((SKIP++)) || true; }
 
+# Production code must derive behavior from ELF/runtime contracts and traced
+# observations, never from the identity of a user application. Keep the names
+# used by compatibility smoke tests confined to tests and documentation. This
+# catches both executable dispatch and application environment/path workarounds,
+# including the forms removed from the early prototype.
+test_application_agnostic_source_gate() {
+    echo "--- application-agnostic production source gate ---"
+    local pattern hits
+
+    pattern='(^|[^[:alnum:]_])(python|ruby|zig|openssl|perl|nodejs|java|php|lua|git|curl|cmake|ffmpeg|sqlite|uvx|audible|busybox)([^[:alnum:]_]|$)'
+    hits=$(LC_ALL=C grep -Ein "$pattern" src/*.[chS] include/*.[ch] || true)
+    if [ -n "$hits" ]; then
+        fail "application-agnostic production source" \
+            "application identity appears in src/ or include/"
+        printf '%s\n' "$hits" >&2
+        return
+    fi
+    pass "application-agnostic production source"
+}
+
 # A private loader path replaces musl's system directories. Libcs with an
 # explicit SONAME need that dependency reachable there even for the native
 # control; the link must identify the fixture's copied interpreter itself.
@@ -32960,6 +32980,7 @@ echo "======== dlfreeze test suite ========"
 echo "build dir: $BUILD"
 
 TEST_FUNCTIONS=(
+test_application_agnostic_source_gate
 test_hello
 test_default_direct_policy
 test_packer_helper_discovery_without_proc
