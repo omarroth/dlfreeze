@@ -774,6 +774,10 @@ freeze_require_direct_invocation_with() {
     fi
     if [ "$direct_confirmed" -ne 1 ]; then
         fail "$label" "packer did not confirm direct-load mode"
+        if [ -s "$log" ]; then
+            echo "--- $label pack log (last 80 lines) ---" >&2
+            tail -n 80 "$log" >&2 || true
+        fi
         return 1
     fi
 
@@ -16343,7 +16347,10 @@ test_split_dynamic_string_load() {
     mkdir -p "$root"
     printf '%s\n' '#include <stdio.h>' \
         'int main(void) { puts("split-load-ok"); return 0; }' >"$source"
-    printf -v padding '%09000d' 1
+    # AArch64 linkers commonly use 64 KiB PT_LOAD alignment even when the
+    # build host uses smaller pages. Keep DT_STRTAB large enough to cross the
+    # stricter boundary selected by the mutator.
+    printf -v padding '%070000d' 1
     if ! gcc -Wl,-rpath,"/dlfreeze-absent-$padding" \
             -o "$native" "$source" ||
        ! gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -Iinclude \
@@ -18715,8 +18722,12 @@ C
     fi
     pass "separate trace recordings"
 
+    # Use the already-resolved freezer as the deliberately different ELF.
+    # /usr/bin/true is not a portable pathname (notably on Alpine and older
+    # non-usr-merged systems), and a missing target tests resolution failure
+    # rather than the record's executable-identity binding.
     if run_freeze "$DLFREEZE" --merge "$record_a" -o "$mismatch_out" \
-            -- /usr/bin/true >"$root/mismatch.log" 2>&1 ||
+            -- "$freezer" >"$root/mismatch.log" 2>&1 ||
        [ -e "$mismatch_out" ] ||
        ! grep -Fq 'cannot merge trace record' "$root/mismatch.log"; then
         fail "trace record target identity" \

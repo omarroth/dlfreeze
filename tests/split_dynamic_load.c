@@ -24,7 +24,9 @@ int main(int argc, char **argv)
     uint64_t strtab = 0;
     uint64_t strsz = 0;
     uint64_t split;
+    uint64_t split_alignment;
     size_t size = 0;
+    long host_page_size;
     int input = -1;
     int output = -1;
     int source_index = -1;
@@ -106,11 +108,7 @@ int main(int argc, char **argv)
         }
     }
     if (strtab == 0 || strsz < 8192 ||
-        strtab > UINT64_MAX - strsz ||
-        strtab > UINT64_MAX - 4095)
-        goto out;
-    split = (strtab + 4095) & ~UINT64_C(4095);
-    if (split <= strtab || split >= strtab + strsz)
+        strtab > UINT64_MAX - strsz)
         goto out;
     for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
         const Elf64_Phdr *load = &headers[i];
@@ -124,6 +122,22 @@ int main(int argc, char **argv)
         break;
     }
     if (source_index < 0 || source_index == spare_index)
+        goto out;
+    host_page_size = sysconf(_SC_PAGESIZE);
+    if (host_page_size <= 0 ||
+        ((uint64_t)host_page_size & ((uint64_t)host_page_size - 1)) != 0)
+        goto out;
+    split_alignment = headers[source_index].p_align;
+    if (split_alignment == 0)
+        split_alignment = 1;
+    if ((split_alignment & (split_alignment - 1)) != 0)
+        goto out;
+    if (split_alignment < (uint64_t)host_page_size)
+        split_alignment = (uint64_t)host_page_size;
+    if (strtab > UINT64_MAX - (split_alignment - 1))
+        goto out;
+    split = (strtab + split_alignment - 1) & ~(split_alignment - 1);
+    if (split <= strtab || split >= strtab + strsz)
         goto out;
     {
         Elf64_Phdr *first = &headers[source_index];
@@ -139,7 +153,6 @@ int main(int argc, char **argv)
         second.p_offset += delta;
         second.p_filesz -= delta;
         second.p_memsz -= delta;
-        second.p_align = 4096;
         first->p_filesz = delta;
         first->p_memsz = delta;
     }
