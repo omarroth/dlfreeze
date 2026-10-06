@@ -24,6 +24,7 @@ LS_BIN="${LS_BIN:-$(find_first_binary /bin/ls ls || true)}"
 PYTHON_BIN="${PYTHON_BIN:-$(find_first_binary python3 || true)}"
 CLANG_BIN="${CLANG_BIN:-$(find_first_binary clang clang-22 clang-21 clang-20 clang-19 clang-18 clang-17 clang-16 clang-15 || true)}"
 FFMPEG_BIN="${FFMPEG_BIN:-$(find_first_binary ffmpeg || true)}"
+KMAIL_BIN="${KMAIL_BIN:-$(find_first_binary kmail || true)}"
 PYTHON_DATA_GLOB="${PYTHON_DATA_GLOB:-/usr/lib/python3*}"
 PYTHON_IMPORT_EXPR="${PYTHON_IMPORT_EXPR:-import ctypes, json, sqlite3, ssl, zoneinfo; print(1)}"
 PYTHON_NUMPY_EXPR="${PYTHON_NUMPY_EXPR:-import numpy, numpy.linalg; print(int(numpy.arange(9).reshape(3, 3).trace()))}"
@@ -37,21 +38,27 @@ Environment overrides:
                      Default: ls python clang ffmpeg ffmpeg-traced
   BENCH_RUNS         Number of measured perf runs to average. Default: 1
   BENCH_WARM_CACHE   Run one untimed warm-up before measuring. Default: 1
-    BENCH_DIR          Output directory for frozen binaries/results.
-    LS_BIN             Native ls path.
-    PYTHON_BIN         Native python path.
-    PYTHON_DATA_GLOB   Data-file glob to embed for traced Python cases.
-    PYTHON_IMPORT_EXPR Python expression for the import-heavy traced case.
-    PYTHON_NUMPY_EXPR  Python expression for the numpy/native-extension case.
+  BENCH_DIR          Output directory for frozen binaries/results.
+  LS_BIN             Native ls path.
+  PYTHON_BIN         Native python path.
+  PYTHON_DATA_GLOB   Data-file glob to embed for traced Python cases.
+  PYTHON_IMPORT_EXPR Python expression for the import-heavy traced case.
+  PYTHON_NUMPY_EXPR  Python expression for the numpy/native-extension case.
   CLANG_BIN          Native clang path.
   FFMPEG_BIN         Native ffmpeg path.
+  KMAIL_BIN          Native kmail path (opt-in kmail --version workload).
 
 Examples:
-    make bench
-    BENCH_CASES=ffmpeg make bench
-    BENCH_CASES=python-imports make bench
-    BENCH_CASES=python-numpy make bench
+  make bench
+  BENCH_CASES=ffmpeg make bench
+  BENCH_CASES=python-imports make bench
+  BENCH_CASES=python-numpy make bench
+  BENCH_CASES=kmail make bench
   BENCH_RUNS=5 BENCH_CASES='clang ffmpeg' make bench
+
+Cases inherit the caller's environment; GUI-linked version commands may
+still need a working display. The summary records whether the freshly
+packed artifact contains direct-load metadata or uses extraction instead.
 EOF
     exit 0
 fi
@@ -183,6 +190,37 @@ ratio_string() {
     }'
 }
 
+# Inspect the fresh, uncompressed packer's footer rather than assuming that
+# a successful default/-d freeze means direct loading. Keep this independent
+# of verbose diagnostics, which are intended for people rather than parsers.
+artifact_mode() {
+    local path="$1" size magic meta_off payload_end
+
+    size="$(stat -c %s "$path")" || die "cannot stat artifact: $path"
+    [[ "$size" =~ ^[0-9]+$ && "$size" -ge 64 ]] || \
+        die "artifact has no complete footer: $path"
+    magic="$(od -An -tx1 -j "$((size - 64))" -N8 "$path" | tr -d '[:space:]')"
+    [[ "$magic" == 444c465245455a00 ]] || \
+        die "artifact has invalid footer magic: $path"
+    meta_off="$(od -An -tu8 -j "$((size - 24))" -N8 "$path" | tr -d '[:space:]')"
+    [[ "$meta_off" =~ ^[0-9]+$ ]] || \
+        die "artifact has invalid metadata offset: $path"
+    if [[ "$meta_off" == 0 ]]; then
+        printf 'extraction\n'
+        return
+    fi
+    payload_end="$((size - 64))"
+    # Compare unsigned offsets as decimal strings before shell arithmetic so
+    # even a corrupt uint64_t above INT64_MAX cannot wrap into a valid range.
+    # shellcheck disable=SC2071
+    if [[ "${#meta_off}" -gt "${#payload_end}" ]] ||
+       { [[ "${#meta_off}" -eq "${#payload_end}" ]] &&
+         [[ "$meta_off" > "$payload_end" || "$meta_off" == "$payload_end" ]]; }; then
+        die "artifact metadata offset lies outside payload: $path"
+    fi
+    printf 'direct\n'
+}
+
 run_case() {
     local case_id="$1"
     local desc=""
@@ -192,6 +230,7 @@ run_case() {
     local native_cycles native_faults native_ms native_wall_ms
     local frozen_cycles frozen_faults frozen_ms frozen_wall_ms
     local cycles_ratio faults_ratio ms_ratio wall_ratio
+    local mode
     local -a freeze_cmd=()
     local -a native_cmd=()
     local -a frozen_cmd=()
@@ -253,6 +292,14 @@ run_case() {
             native_cmd=("$bin" -version)
             frozen_cmd=("$out" -version)
             ;;
+        kmail)
+            desc="kmail --version"
+            bin="$KMAIL_BIN"
+            out="$BENCH_DIR/kmail.frozen"
+            freeze_cmd=("$DLFREEZE" -o "$out" "$bin")
+            native_cmd=("$bin" --version)
+            frozen_cmd=("$out" --version)
+            ;;
         *)
             die "unknown benchmark case: $case_id"
             ;;
@@ -273,6 +320,8 @@ run_case() {
     note "--- $case_id ---"
     note "freezing: $bin -> $out"
     "${freeze_cmd[@]}"
+    mode="$(artifact_mode "$out")"
+    note "artifact mode: $mode"
 
     native_metrics="$(measure_command "${native_cmd[@]}")"
     frozen_metrics="$(measure_command "${frozen_cmd[@]}")"
@@ -285,12 +334,13 @@ run_case() {
     ms_ratio="$(ratio_string "$frozen_ms" "$native_ms")"
     wall_ratio="$(ratio_string "$frozen_wall_ms" "$native_wall_ms")"
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$desc" \
         "$native_cycles" "$frozen_cycles" "$cycles_ratio" \
         "$native_faults" "$frozen_faults" "$faults_ratio" \
         "$native_ms" "$frozen_ms" "$ms_ratio" \
         "$native_wall_ms" "$frozen_wall_ms" "$wall_ratio" \
+        "$mode" \
         >> "$SUMMARY_FILE"
 }
 
@@ -302,7 +352,7 @@ mkdir -p "$BENCH_DIR"
 if ! perf stat -x, --no-big-num -o /dev/null -e cycles,page-faults,task-clock -- true >/dev/null 2>/dev/null; then
     die "perf stat failed; check perf permissions on this system"
 fi
-printf 'workload\tnative_cycles\tfrozen_cycles\tcycles_ratio\tnative_faults\tfrozen_faults\tfaults_ratio\tnative_task_ms\tfrozen_task_ms\ttask_ratio\tnative_wall_ms\tfrozen_wall_ms\twall_ratio\n' > "$SUMMARY_FILE"
+printf 'workload\tnative_cycles\tfrozen_cycles\tcycles_ratio\tnative_faults\tfrozen_faults\tfaults_ratio\tnative_task_ms\tfrozen_task_ms\ttask_ratio\tnative_wall_ms\tfrozen_wall_ms\twall_ratio\tartifact_mode\n' > "$SUMMARY_FILE"
 
 note "======== dlfreeze startup benchmarks ========"
 note "build dir       : $BUILD"
@@ -319,18 +369,18 @@ note
 note "Summary"
 awk -F '\t' '
     NR == 1 {
-        printf "%-24s %14s %14s %10s %14s %14s %10s %11s %11s %10s %11s %11s %10s\n",
+        printf "%-24s %14s %14s %10s %14s %14s %10s %11s %11s %10s %11s %11s %10s %12s\n",
             "workload",
             "native cycles", "frozen cycles", "ratio",
             "native faults", "frozen faults", "ratio",
             "native CPU", "frozen CPU", "ratio",
-            "native wall", "frozen wall", "ratio";
+            "native wall", "frozen wall", "ratio", "artifact";
         next;
     }
     {
-        printf "%-24s %14s %14s %10s %14s %14s %10s %11.3f %11.3f %10s %11.3f %11.3f %10s\n",
+        printf "%-24s %14s %14s %10s %14s %14s %10s %11.3f %11.3f %10s %11.3f %11.3f %10s %12s\n",
             $1, $2, $3, $4, $5, $6, $7, $8 + 0.0, $9 + 0.0, $10,
-            $11 + 0.0, $12 + 0.0, $13;
+            $11 + 0.0, $12 + 0.0, $13, $14;
     }
 ' "$SUMMARY_FILE"
 

@@ -321,6 +321,16 @@ capture_output_split() {
     return "$__rc"
 }
 
+test_benchmark_harness_gate() {
+    echo "--- startup benchmark harness gate ---"
+    if bash tests/benchmark_harness_gate.sh; then
+        pass "benchmark workloads and artifact-mode reporting"
+    else
+        fail "benchmark workloads and artifact-mode reporting" \
+            "mock invocation, environment, metrics or footer checks differed"
+    fi
+}
+
 test_libc_semantics_gate() {
     echo "--- libc semantics bounds gate ---"
     local helper="$BUILD/libc_semantics_gate"
@@ -32992,6 +33002,7 @@ echo "build dir: $BUILD"
 
 TEST_FUNCTIONS=(
 test_application_agnostic_source_gate
+test_benchmark_harness_gate
 test_hello
 test_default_direct_policy
 test_packer_helper_discovery_without_proc

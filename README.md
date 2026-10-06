@@ -175,13 +175,21 @@ unrelated aggregate direct-artifact count; direct-load tests still verify
 their individual artifacts strictly. An explicitly selected first-to-last
 range remains a full suite and retains the aggregate direct-coverage check.
 
-The benchmark harness can opt into larger traced runtime workloads when they
+The benchmark harness can opt into additional startup workloads when they
 are installed:
 
 ```bash
 BENCH_CASES=python-imports make bench
 BENCH_CASES=python-numpy make bench
+BENCH_RUNS=5 BENCH_CASES=kmail make bench
 ```
+
+The `kmail` case compares `kmail --version` with an untraced frozen artifact;
+it measures a large shared-library startup graph, not full GUI functionality
+or a fully captured runtime-plugin/data environment. Native and frozen runs
+inherit the same caller environment, including any display configuration.
+The summary's `artifact_mode` column distinguishes direct-load artifacts from
+extraction fallbacks; a successful freeze alone does not imply direct loading.
 
 Direct loading grows its relocation-definition cache on demand for large
 dependency graphs, up to 524,288 cached requester/symbol bindings. Small
