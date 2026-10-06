@@ -1512,7 +1512,6 @@ static void relocation_store_u64_pair(void *address,
 /* Debug verbosity — enabled by DLFREEZE_DEBUG=1 env var.
  * Set before TLS swap (getenv is safe in bootstrap's libc). */
 static int g_debug;
-static int g_glibc_early_init_done;
 
 /* Perf-friendly mode — enabled by DLFREEZE_PERF=1 env var.
  * Uses anonymous memory (memcpy) instead of file-backed mmap so that
@@ -2120,8 +2119,10 @@ static void ldr_err(const char *ctx, const char *detail)
 /* SIGSEGV handler for debugging */
 #include <signal.h>
 /* Saved guards are copied into each new x86-64 target thread. */
+#if defined(__x86_64__)
 static uintptr_t g_saved_stack_guard;
 static uintptr_t g_saved_ptr_guard;
+#endif
 
 /* Fatal signals that the loader temporarily owns while running init code. */
 static const int g_crash_signals[] = {
@@ -5839,7 +5840,6 @@ static struct musl_target_contract g_musl_contract;
  * releases, so only seed them after independently deriving their offsets
  * from the target pthread implementation. */
 static int g_musl_target_tid_known;
-static int g_musl_target_errno_known;
 static int g_musl_target_detach_known;
 static int g_musl_target_detach_value = 2;
 
@@ -5851,7 +5851,6 @@ static void select_musl_thread_layout(
      * direct startup will write. */
     memset(&g_musl_thread, 0, sizeof(g_musl_thread));
     g_musl_target_tid_known = 0;
-    g_musl_target_errno_known = 0;
     g_musl_target_detach_known = 0;
     g_musl_target_detach_value = layout->detach_initial;
 }
@@ -12888,7 +12887,6 @@ static int validate_musl_layout_from_target(const struct loaded_obj *libc_obj)
     uintptr_t target_tls_cnt = 0;
 
     g_musl_target_tid_known = 0;
-    g_musl_target_errno_known = 0;
     g_musl_target_detach_known = 0;
     g_musl_target_detach_value = g_musl_layout->detach_initial;
 #if defined(__x86_64__)
@@ -12928,7 +12926,6 @@ static int validate_musl_layout_from_target(const struct loaded_obj *libc_obj)
         decode_x86_64_musl_errno_offset((const uint8_t *)(uintptr_t)addr, 32,
                                         &off) &&
         off == g_musl_layout->thread_errno) {
-        g_musl_target_errno_known = 1;
         target_errno = off;
     } else {
         ldr_dbg("[loader] musl profile mismatch: errno\n");
@@ -13028,6 +13025,7 @@ static int validate_musl_layout_from_target(const struct loaded_obj *libc_obj)
     size_t function_len;
     uintptr_t copy_tls;
     size_t copy_dtv;
+    int target_errno_known = 0;
 
     if (!libc_obj)
         return 0;
@@ -13059,10 +13057,10 @@ static int validate_musl_layout_from_target(const struct loaded_obj *libc_obj)
             tp_rel + (int64_t)target_self_delta < MUSL_THREAD_PROBE_LIMIT) {
             off = (size_t)(tp_rel + (int64_t)target_self_delta);
             if (off == g_musl_layout->thread_errno)
-                g_musl_target_errno_known = 1;
+                target_errno_known = 1;
         }
     }
-    if (!g_musl_target_errno_known) {
+    if (!target_errno_known) {
         ldr_dbg("[loader] musl profile mismatch: errno\n");
         return 0;
     }
@@ -13228,7 +13226,6 @@ static void reset_musl_target_contract_candidate(void)
     memset(&g_musl_thread, 0, sizeof(g_musl_thread));
     memset(&g_musl_contract, 0, sizeof(g_musl_contract));
     g_musl_target_tid_known = 0;
-    g_musl_target_errno_known = 0;
     g_musl_target_detach_known = 0;
     g_musl_target_detach_value = 0;
 }
@@ -13288,7 +13285,6 @@ struct startup_lazy_plt_dispatch {
 static struct startup_lazy_plt_dispatch
     g_startup_lazy_plt_dispatch[MAX_TOTAL_OBJS];
 static volatile uint32_t g_startup_lazy_plt_dispatch_count;
-static int g_global_scope_root = -1;
 static uint16_t g_global_scope_indices[MAX_TOTAL_OBJS];
 static uint16_t g_global_scope_count;
 
@@ -16343,6 +16339,7 @@ static struct vfs_dir_child *g_vfs_dir_children;
 static size_t g_vfs_dir_child_count;
 #ifdef DLFREEZE_VFS_COMPLEXITY_GATE
 static size_t g_vfs_readdir_child_probes;
+static size_t g_vfs_directory_prefix_visits;
 #endif
 
 static int vfs_direct_child_span(const char *directory,
@@ -16490,6 +16487,9 @@ static int vfs_dir_insert_hashed(const char *path, size_t len, uint64_t hash,
     size_t slot;
     size_t probes;
 
+#ifdef DLFREEZE_VFS_COMPLEXITY_GATE
+    g_vfs_directory_prefix_visits++;
+#endif
     if (!path || !entry_out || !g_vfs_hash_key_ready)
         return -1;
     if (len == 1 && path[0] == '/')
@@ -16537,35 +16537,68 @@ static int vfs_dir_insert_hashed(const char *path, size_t len, uint64_t hash,
     return 0;
 }
 
-/* Insert every parent prefix while hashing the source path once.  Finalizing
- * a copied SipHash state is constant work per separator, so one deep path
- * costs O(path length) bytes and work rather than copying and re-hashing the
- * successively longer prefixes.  Stored spans borrow the immutable manifest
- * string that already owns their bytes. */
+/* Raw manifest spellings are intentional: repeated and trailing separators
+ * are not normalized here.  Root itself has no parent. */
+static size_t vfs_path_parent_length(const char *path, size_t path_length)
+{
+    size_t slash = path_length;
+
+    if (!path || path_length == 0)
+        return 0;
+    while (slash > 0 && path[slash - 1] != '/')
+        slash--;
+    if (slash == 0 || (slash == 1 && path_length == 1))
+        return 0;
+    return slash == 1 ? 1 : slash - 1;
+}
+
+/* Reuse an existing directory and its already-derived ancestor chain.  Most
+ * captured paths share parents, so walking every separator for each sibling
+ * repeats both keyed-hash finalization and full-prefix comparisons.  On a
+ * miss, stream the prefixes once: even one exceptionally deep path must stay
+ * linear in its byte length rather than re-hashing each ancestor.  Stored
+ * spans borrow the immutable manifest string that already owns their bytes. */
 static int vfs_insert_path_directories(const char *path,
+                                       size_t path_length,
                                        int include_explicit)
 {
     struct vfs_hash_state state;
     size_t parent_index = VFS_DIR_NO_PARENT;
+    size_t directory_length;
+    size_t directory_index;
+    uint64_t directory_hash;
     size_t length = 0;
 
     if (!path || !g_vfs_hash_key_ready)
         return -1;
-    if (path[0] == '/' && path[1] != '\0') {
-        struct vfs_hash_state root_state;
-
-        vfs_hash_init(&root_state);
-        vfs_hash_update_byte(&root_state, '/');
+    directory_length = include_explicit ? path_length :
+        vfs_path_parent_length(path, path_length);
+    if (directory_length == 0)
+        return 0;
+    directory_hash = vfs_hash_n(path, directory_length);
+#ifdef DLFREEZE_VFS_COMPLEXITY_GATE
+    g_vfs_directory_prefix_visits++;
+#endif
+    if (vfs_dir_lookup_hashed_index(
+            path, directory_length, directory_hash) != SIZE_MAX)
+        return 0;
+    if (path[0] == '/' && directory_length > 1) {
         if (vfs_dir_insert_hashed(
-                path, 1, vfs_hash_final(&root_state),
+                path, 1, vfs_hash_n(path, 1),
                 VFS_DIR_NO_PARENT, &parent_index) < 0)
             return -1;
     }
     vfs_hash_init(&state);
-    while (path[length] != '\0') {
-        if (length > 0 && path[length] == '/') {
-            size_t directory_index;
+    while (length < directory_length) {
+        const char *slash = memchr(
+            path + length, '/', directory_length - length);
+        size_t end = slash ? (size_t)(slash - path) : directory_length;
 
+        vfs_hash_update(&state, path + length, end - length);
+        length = end;
+        if (length == directory_length)
+            break;
+        if (length > 0) {
             if (vfs_dir_insert_hashed(
                     path, length, vfs_hash_final(&state), parent_index,
                     &directory_index) < 0)
@@ -16575,15 +16608,9 @@ static int vfs_insert_path_directories(const char *path,
         vfs_hash_update_byte(&state, (uint8_t)path[length]);
         length++;
     }
-    if (include_explicit) {
-        size_t directory_index;
-
-        if (vfs_dir_insert_hashed(
-                path, length, vfs_hash_final(&state), parent_index,
-                &directory_index) < 0)
-            return -1;
-    }
-    return 0;
+    return vfs_dir_insert_hashed(
+        path, directory_length, directory_hash, parent_index,
+        &directory_index);
 }
 
 static int vfs_dir_child_offset(unsigned int phase, size_t source_slot,
@@ -16919,6 +16946,7 @@ static void vfs_reset_dirs(void)
     g_vfs_dir_capacity = 0;
 #ifdef DLFREEZE_VFS_COMPLEXITY_GATE
     g_vfs_readdir_child_probes = 0;
+    g_vfs_directory_prefix_visits = 0;
 #endif
 }
 
@@ -16937,7 +16965,8 @@ static int vfs_init_dirs(void)
         if (g_vfs_table[i].flags & DLFRZ_FLAG_DATA_NEGATIVE) continue;
         const char *path = g_vfs_table[i].path;
         if (vfs_insert_path_directories(
-                path, vfs_is_directory_entry(&g_vfs_table[i])) < 0)
+                path, g_vfs_table[i].path_length,
+                vfs_is_directory_entry(&g_vfs_table[i])) < 0)
             goto fail;
     }
     /* File capture owns these directory views.  ELF-only parents added below
@@ -16957,7 +16986,7 @@ static int vfs_init_dirs(void)
                     g_frozen_entries, g_frozen_strtab, i);
 
                 if (path && path[0] == '/' &&
-                    vfs_insert_path_directories(path, 0) < 0)
+                    vfs_insert_path_directories(path, strlen(path), 0) < 0)
                     goto fail;
             }
             if (g_frozen_entries[i].dlopen_request_offset != 0) {
@@ -16965,7 +16994,8 @@ static int vfs_init_dirs(void)
                     g_frozen_entries[i].dlopen_request_offset;
 
                 if (request[0] == '/' &&
-                    vfs_insert_path_directories(request, 0) < 0)
+                    vfs_insert_path_directories(
+                        request, strlen(request), 0) < 0)
                     goto fail;
             }
         }
@@ -38093,7 +38123,6 @@ static int init_libc_process_state(struct loaded_obj *objs, int nobj,
      * function from the ABI-identified libc before installing target TLS. */
     ldr_dbg("[loader] calling __libc_early_init...\n");
     g_target_libc_early_init(true);
-    g_glibc_early_init_done = 1;
     ldr_dbg("[loader] __libc_early_init done\n");
     return 0;
 }
@@ -40686,6 +40715,7 @@ struct dl_manifest_path_source_slot {
 static size_t g_dl_manifest_identity_build_records;
 static size_t g_dl_manifest_identity_lookup_probes;
 static size_t g_dl_manifest_path_hash_bytes;
+static size_t g_dl_manifest_path_ancestor_probes;
 #define DL_MANIFEST_IDENTITY_COUNT(counter) ((counter)++)
 #define DL_MANIFEST_PATH_HASH_COUNT(bytes) do {                              \
         size_t dlfrz_hash_bytes = (bytes);                                   \
@@ -40841,6 +40871,9 @@ dl_manifest_path_source_find_hashed(
 {
     size_t slot_index;
 
+#ifdef DLFREEZE_MANIFEST_IDENTITY_GATE
+    g_dl_manifest_path_ancestor_probes++;
+#endif
     if (!slots || capacity == 0 || !path || path_length == 0)
         return NULL;
     slot_index = (size_t)path_hash & (capacity - 1);
@@ -40946,6 +40979,7 @@ static int dl_manifest_path_sources_are_consistent(void)
         const struct dl_manifest_path_source_slot *entry = &slots[i];
         const struct dl_manifest_path_source_slot *prefix;
         struct vfs_hash_state path_hash;
+        size_t parent_length;
 
         if (!entry->path)
             continue;
@@ -40956,6 +40990,24 @@ static int dl_manifest_path_sources_are_consistent(void)
          * including when that ancestor itself is a captured miss. */
         if (entry->negative)
             continue;
+        parent_length = vfs_path_parent_length(
+            entry->path, entry->path_length);
+        if (parent_length != 0) {
+            prefix = dl_manifest_path_source_find_hashed(
+                slots, capacity, entry->path, parent_length,
+                vfs_hash_n(entry->path, parent_length));
+            DL_MANIFEST_PATH_HASH_COUNT(parent_length);
+            /* Every positive source is checked by this loop.  If its direct
+             * parent is recorded, that parent's own check covers the rest
+             * of the chain, regardless of hash-table iteration order.  A
+             * strict prefix is shorter, so this delegation cannot cycle.
+             * Missing parents still need all raw ancestor probes below. */
+            if (prefix && !prefix->negative) {
+                if (!dl_manifest_path_source_can_have_descendants(prefix))
+                    goto out;
+                continue;
+            }
+        }
         vfs_hash_init(&path_hash);
         for (size_t p = 0; p < entry->path_length; p++) {
             if (p > 0 && entry->path[p] == '/') {
@@ -41069,6 +41121,7 @@ static int dl_manifest_identity_index_build(
     g_dl_manifest_identity_build_records = 0;
     g_dl_manifest_identity_lookup_probes = 0;
     g_dl_manifest_path_hash_bytes = 0;
+    g_dl_manifest_path_ancestor_probes = 0;
 #endif
     if (dl_manifest_path_sources_are_consistent() < 0)
         return -1;
@@ -41563,7 +41616,6 @@ static int dl_initialize_startup_lookup_scopes(struct loaded_obj *objs,
 
     if (objs != g_all_objs || nobj <= 0 || nobj > MAX_TOTAL_OBJS)
         return -1;
-    g_global_scope_root = -1;
     g_global_scope_count = 0;
     for (int i = 0; i < nobj; i++) {
         struct loaded_obj *obj = &objs[i];
@@ -41587,7 +41639,6 @@ static int dl_initialize_startup_lookup_scopes(struct loaded_obj *objs,
 
     if (!dl_object_is_visible(&objs[main_index]))
         return -1;
-    g_global_scope_root = main_index;
     for (int i = 0; i < nobj; i++) {
         if (!dl_object_is_visible(&objs[i]))
             continue;
@@ -49036,20 +49087,17 @@ static uintptr_t setup_tls(struct loaded_obj *objs, int nobj,
 
     /* Save target guards for new x86-64 threads.  musl and AArch64 do not
      * use this glibc TCB-header representation. */
-    if (!g_is_musl_runtime) {
 #if defined(__x86_64__)
+    if (!g_is_musl_runtime) {
         g_saved_stack_guard =
             *(uintptr_t *)(tp + GLIBC_TCB_OFF_STACK_GUARD);
         g_saved_ptr_guard = g_glibc_x86_pointer_guard_in_tcb
             ? *(uintptr_t *)(tp + GLIBC_TCB_OFF_PTR_GUARD) : 0;
-#else
-        g_saved_stack_guard = 0;
-        g_saved_ptr_guard = 0;
-#endif
     } else {
         g_saved_stack_guard = 0;
         g_saved_ptr_guard = 0;
     }
+#endif
 
     return tp;
 }
@@ -49551,7 +49599,6 @@ static int loader_run_impl(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     clear_resolution_caches();
     gnu_unique_registry_reset();
     gnu_loaded_name_registry_reset();
-    g_global_scope_root = -1;
     g_global_scope_count = 0;
     memset(g_runtime_tls_fast, 0, sizeof(g_runtime_tls_fast));
     g_init_order_count = 0;

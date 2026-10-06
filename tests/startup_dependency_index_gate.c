@@ -70,6 +70,86 @@ static int runtime_lookup_is(
                     ? 0 : expected_dlopen + 1);
 }
 
+static int shared_parent_validation_gate(void)
+{
+    enum { COMPONENTS = 64, FILES = 4096, STRIDE = 160,
+           ENTRY_COUNT = COMPONENTS + 1 + FILES };
+    const struct dlfrz_entry *saved_entries = g_frozen_entries;
+    const char *saved_strings = g_frozen_strtab;
+    uint32_t saved_count = g_frozen_num_entries;
+    struct dlfrz_entry *entries = calloc(ENTRY_COUNT, sizeof(*entries));
+    char *strings = calloc(ENTRY_COUNT, STRIDE);
+    char parent[STRIDE] = "/";
+    size_t parent_length = 1;
+    int result = -1;
+
+    if (!entries || !strings)
+        goto out;
+    for (size_t i = 0; i <= COMPONENTS; i++) {
+        size_t offset = i * STRIDE;
+
+        if (i != 0) {
+            if (i != 1)
+                parent[parent_length++] = '/';
+            parent[parent_length++] = 'd';
+            parent[parent_length] = '\0';
+        }
+        memcpy(strings + offset, parent, parent_length + 1);
+        entries[i].name_offset = (uint32_t)offset;
+        entries[i].flags = DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_DIRECTORY;
+    }
+    for (size_t i = COMPONENTS + 1; i < ENTRY_COUNT; i++) {
+        int length = snprintf(strings + i * STRIDE, STRIDE,
+                              "%s/file-%08zu", parent, i);
+
+        if (length <= 0 || length >= STRIDE)
+            goto out;
+        entries[i].name_offset = (uint32_t)(i * STRIDE);
+        entries[i].flags = DLFRZ_FLAG_DATA;
+    }
+    g_frozen_entries = entries;
+    g_frozen_strtab = strings;
+    g_frozen_num_entries = ENTRY_COUNT;
+    for (size_t order = 0; order < 2; order++) {
+        g_dl_manifest_path_ancestor_probes = 0;
+        if (dl_manifest_path_sources_are_consistent() < 0 ||
+            g_dl_manifest_path_ancestor_probes > ENTRY_COUNT)
+            goto out;
+        /* A child may delegate to a recorded directory, but a bad ancestor
+         * of that directory must still invalidate the complete namespace.
+         * Exercise both a missing node and a non-traversable virtual node. */
+        for (size_t kind = 0; kind < 2; kind++) {
+            size_t ancestor = order == 0 ? COMPONENTS / 2 :
+                ENTRY_COUNT - 1U - COMPONENTS / 2;
+            uint32_t saved_flags = entries[ancestor].flags;
+
+            entries[ancestor].flags = kind == 0 ?
+                DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_NEGATIVE :
+                DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_VIRTUAL |
+                DLFRZ_FLAG_DATA_DIRENT_TYPED |
+                ((uint32_t)DT_REG << DLFRZ_FLAG_DATA_DIRENT_TYPE_SHIFT);
+            if (dl_manifest_path_sources_are_consistent() == 0)
+                goto out;
+            entries[ancestor].flags = saved_flags;
+        }
+        for (size_t i = 0; i < ENTRY_COUNT / 2; i++) {
+            struct dlfrz_entry swap = entries[i];
+
+            entries[i] = entries[ENTRY_COUNT - 1U - i];
+            entries[ENTRY_COUNT - 1U - i] = swap;
+        }
+    }
+    result = 0;
+
+out:
+    g_frozen_entries = saved_entries;
+    g_frozen_strtab = saved_strings;
+    g_frozen_num_entries = saved_count;
+    free(strings);
+    free(entries);
+    return result;
+}
+
 int main(void)
 {
     const uint32_t deep_index = HIGH_MANIFEST_COUNT - 7;
@@ -552,6 +632,8 @@ int main(void)
         entries[2].data_offset = second_data_offset;
         entries[2].data_size = second_data_size;
     }
+    if (shared_parent_validation_gate() < 0)
+        goto out;
     result = 0;
 
 out:

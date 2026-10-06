@@ -353,7 +353,9 @@ static int shared_prefix_capacity_gate(void)
         g_vfs_dir_count != expected_directories ||
         g_vfs_dir_child_count != expected_children ||
         g_vfs_dir_table_size > 4U * expected_directories ||
-        g_vfs_dir_capacity >= 2U * expected_directories)
+        g_vfs_dir_capacity >= 2U * expected_directories ||
+        g_vfs_directory_prefix_visits >
+            SHARED_PREFIX_FILES + 2U * expected_directories)
         goto out;
     result = 0;
 
@@ -361,6 +363,70 @@ out:
     reset_gate_vfs();
     free(entries);
     free(strings);
+    return result;
+}
+
+static int raw_directory_spelling_gate(void)
+{
+    static const struct {
+        const char *path;
+        int explicit_directory;
+    } sources[] = {
+        { "/raw//nest/first", 0 },
+        { "rel/nest/first", 0 },
+        { "/raw//nest/", 1 },
+        { "/", 1 },
+        { "/leaf", 0 },
+        { "/raw//nest/second", 0 },
+        { "rel/nest/second", 0 },
+    };
+    static const struct {
+        const char *path;
+        const char *parent;
+    } expected[] = {
+        { "/", NULL },
+        { "/raw", "/" },
+        { "/raw/", "/raw" },
+        { "/raw//nest", "/raw/" },
+        { "/raw//nest/", "/raw//nest" },
+        { "rel", NULL },
+        { "rel/nest", "rel" },
+    };
+    int result = -1;
+
+    reset_gate_vfs();
+    g_vfs_next_inode = 1;
+    /* Repeat in reverse order to cover lookup hits for both explicit nodes
+     * and inferred parents without changing raw separator spellings. */
+    for (size_t pass = 0; pass < 2; pass++) {
+        for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
+            size_t index = pass == 0 ? i :
+                sizeof(sources) / sizeof(sources[0]) - 1U - i;
+
+            if (vfs_insert_path_directories(
+                    sources[index].path, strlen(sources[index].path),
+                    sources[index].explicit_directory) < 0)
+                goto out;
+        }
+        if (g_vfs_dir_count != sizeof(expected) / sizeof(expected[0]))
+            goto out;
+        for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); i++) {
+            const struct vfs_dir_entry *entry =
+                vfs_dir_lookup(expected[i].path);
+            size_t parent = expected[i].parent ?
+                vfs_dir_lookup_index_n(expected[i].parent,
+                                       strlen(expected[i].parent)) :
+                VFS_DIR_NO_PARENT;
+
+            if (!entry || entry->parent_index != parent ||
+                (expected[i].parent && parent == SIZE_MAX))
+                goto out;
+        }
+    }
+    result = 0;
+
+out:
+    reset_gate_vfs();
     return result;
 }
 
@@ -592,5 +658,7 @@ int main(void)
         return 6;
     if (sparse_directory_child_gate() < 0)
         return 7;
+    if (raw_directory_spelling_gate() < 0)
+        return 8;
     return 0;
 }
