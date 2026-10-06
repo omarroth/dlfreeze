@@ -72,6 +72,7 @@ static char *ldr_strrchr(const char *, int);
 #define DLFREEZE_ELF64_DYN_VIEW_STARTUP_CACHE 1
 
 #include "common.h"
+#include "loader_errors.h"
 #include "dynamic_semantics.h"
 #include "gnu_properties.h"
 #include "glibc_layout.h"
@@ -15468,8 +15469,13 @@ static int dl_manifest_startup_owners_build(
  * the target runtime's public pthread-key ABI and loader-owned mmap storage. */
 struct dl_error_state {
     int valid;
+    const char *missing_root; /* immutable manifest string, formatted lazily */
+    void *formatted_mapping;
+    size_t formatted_size;
     char message[512];
 };
+static char *(*g_target_strerror)(int);
+static char *(*g_target_dcgettext)(const char *, const char *, int);
 
 static pthread_key_t g_dlerror_key;
 static int g_dlerror_key_ready;
@@ -15639,6 +15645,7 @@ static size_t g_vfs_count;
  * trace captured no ordinary DATA entries: directory scanners and explicit
  * open/stat calls must still see the immutable ELF bytes in the manifest. */
 static int g_vfs_overrides_active;
+static int g_frozen_loader_misses;
 static struct vfs_regular_fd_map *g_vfs_regular_fd_maps;
 static size_t g_vfs_regular_fd_map_count;
 static size_t g_vfs_regular_fd_map_capacity;
@@ -16105,6 +16112,7 @@ static int vfs_init(const uint8_t *mem, uint64_t mem_foff,
     g_vfs_table_size = 0;
     g_vfs_count = 0;
     g_vfs_overrides_active = 0;
+    g_frozen_loader_misses = 0;
     frozen_elf_index_reset();
     vfs_reset_dirs();
     g_vfs_next_inode = 1;
@@ -16113,6 +16121,8 @@ static int vfs_init(const uint8_t *mem, uint64_t mem_foff,
         if (entries[i].flags & DLFRZ_FLAG_DATA) {
             data_count++;
             g_vfs_overrides_active = 1;
+            if (entries[i].flags & DLFRZ_FLAG_DLOPEN_MISS)
+                g_frozen_loader_misses = 1;
         } else if ((entries[i].flags & DLFRZ_FLAG_DLOPEN) &&
                    !(entries[i].flags & DLFRZ_FLAG_INTERP)) {
             const char *path =
@@ -16180,7 +16190,16 @@ static int vfs_init(const uint8_t *mem, uint64_t mem_foff,
         g_vfs_table[idx].path = path;
         g_vfs_table[idx].path_length = path_length;
         g_vfs_table[idx].path_hash = path_hash;
-        if (entries[i].flags & (DLFRZ_FLAG_DATA_VIRTUAL |
+        if (entries[i].flags & DLFRZ_FLAG_DLOPEN_MISS) {
+            struct dlfrz_loader_miss miss;
+            if (entries[i].data_offset < mem_foff ||
+                entries[i].data_size != sizeof(miss))
+                goto fail;
+            g_vfs_table[idx].data = mem + (entries[i].data_offset - mem_foff);
+            ldr_memcpy(&miss, g_vfs_table[idx].data, sizeof(miss));
+            if (!dlfrz_loader_miss_canonical(&miss, sizeof(miss)) || strchr(path, '$'))
+                goto fail;
+        } else if (entries[i].flags & (DLFRZ_FLAG_DATA_VIRTUAL |
                                 DLFRZ_FLAG_DATA_NEGATIVE |
                                 DLFRZ_FLAG_DATA_DIRECTORY)) {
             g_vfs_table[idx].data = NULL;
@@ -24150,6 +24169,8 @@ static int initialize_target_libc_helpers(struct loaded_obj *objs, int nobj)
         (g_is_musl_runtime ? !g_target_pthread_atfork :
                              !g_target_register_atfork))
         return -1;
+    if (g_is_musl_runtime && g_frozen_loader_misses)
+        return -1;
     if (g_is_musl_runtime) {
         g_startup_exit_addr =
             (uint64_t)(uintptr_t)required_libc_function(libc_obj, "exit");
@@ -24157,6 +24178,13 @@ static int initialize_target_libc_helpers(struct loaded_obj *objs, int nobj)
             return -1;
     }
     if (!g_is_musl_runtime) {
+        if (g_frozen_loader_misses) {
+            g_target_strerror = (char *(*)(int))required_libc_function(libc_obj, "strerror");
+            g_target_dcgettext = (char *(*)(const char *, const char *, int))
+                required_libc_function(libc_obj, "__dcgettext");
+            if (!g_target_strerror || !g_target_dcgettext)
+                return -1;
+        }
         g_target_glibc_start_main =
             (glibc_start_main_fn)required_libc_function(
                 libc_obj, "__libc_start_main");
@@ -39899,8 +39927,12 @@ static int dl_store_name(struct loaded_obj *obj, const char *s)
 
 static void dlerror_state_destructor(void *pointer)
 {
-    if (pointer)
+    if (pointer) {
+        struct dl_error_state *state = pointer;
+        if (state->formatted_mapping)
+            munmap(state->formatted_mapping, state->formatted_size);
         munmap(pointer, sizeof(struct dl_error_state));
+    }
 }
 
 static struct dl_error_state *dl_current_error_state(int create)
@@ -39929,8 +39961,14 @@ static void dl_clear_error(void)
 {
     struct dl_error_state *state = dl_current_error_state(0);
 
-    if (state)
+    if (state) {
+        if (state->formatted_mapping)
+            munmap(state->formatted_mapping, state->formatted_size);
+        state->formatted_mapping = NULL;
+        state->formatted_size = 0;
+        state->missing_root = NULL;
         state->valid = 0;
+    }
 }
 
 static int dl_error_is_valid(void)
@@ -39945,6 +39983,12 @@ static void dl_set_error(const char *a, const char *b)
     struct dl_error_state *state = dl_current_error_state(1);
     char *d = state->message;
     char *end = state->message + sizeof(state->message) - 1;
+
+    if (state->formatted_mapping)
+        munmap(state->formatted_mapping, state->formatted_size);
+    state->formatted_mapping = NULL;
+    state->formatted_size = 0;
+    state->missing_root = NULL;
 
     if (a) while (*a && d < end) *d++ = *a++;
     if (b) while (*b && d < end) *d++ = *b++;
@@ -40862,12 +40906,15 @@ static int dl_manifest_path_source_matches(
 {
     const uint32_t metadata_mask = DLFRZ_FLAG_DATA_VIRTUAL |
         DLFRZ_FLAG_DATA_NEGATIVE | DLFRZ_FLAG_DATA_DIRECTORY |
-        DLFRZ_FLAG_DATA_DIRENT_TYPED | DLFRZ_FLAG_DATA_DIRENT_TYPE_MASK;
-    int slot_has_payload = !(slot->flags & DLFRZ_FLAG_DATA) ||
+        DLFRZ_FLAG_DATA_DIRENT_TYPED | DLFRZ_FLAG_DATA_DIRENT_TYPE_MASK |
+        DLFRZ_FLAG_DLOPEN_MISS;
+    int slot_has_payload = (slot->flags & DLFRZ_FLAG_DLOPEN_MISS) ||
+        !(slot->flags & DLFRZ_FLAG_DATA) ||
         !(slot->flags & (DLFRZ_FLAG_DATA_VIRTUAL |
                          DLFRZ_FLAG_DATA_NEGATIVE |
                          DLFRZ_FLAG_DATA_DIRECTORY));
-    int entry_has_payload = !(entry->flags & DLFRZ_FLAG_DATA) ||
+    int entry_has_payload = (entry->flags & DLFRZ_FLAG_DLOPEN_MISS) ||
+        !(entry->flags & DLFRZ_FLAG_DATA) ||
         !(entry->flags & (DLFRZ_FLAG_DATA_VIRTUAL |
                           DLFRZ_FLAG_DATA_NEGATIVE |
                           DLFRZ_FLAG_DATA_DIRECTORY));
@@ -46546,7 +46593,15 @@ static void *my_dlopen_for_caller(const char *path, int flags,
                      "relocation", NULL);
         return NULL;
     }
-
+    if (path[0] == '/' && !g_is_musl_runtime) {
+        const struct vfs_entry *entry = vfs_lookup(path);
+        if (entry && (entry->flags & DLFRZ_FLAG_DLOPEN_MISS)) {
+            struct dl_error_state *state = dl_current_error_state(1);
+            state->missing_root = entry->path;
+            state->valid = 1;
+            return NULL;
+        }
+    }
     /* Search ancestry and dependency-discovery state live in the bounded
      * process-lifetime transaction object.  A caller may legitimately use a
      * pthread stack much smaller than MAX_TOTAL_OBJS times PATH_MAX. */
@@ -46661,6 +46716,7 @@ static void *my_dlopen_serialized(const char *path, int flags,
                                   void *return_address)
 {
     void *result;
+    int saved_errno = loader_errno_value();
     runtime_loader_lock_token lock_token =
         runtime_loader_lock_acquire();
 
@@ -46675,6 +46731,11 @@ static void *my_dlopen_serialized(const char *path, int flags,
         _exit(127);
     }
     runtime_loader_lock_release(lock_token);
+    if (!result) {
+        struct dl_error_state *state = dl_current_error_state(0);
+        if (state && state->valid && state->missing_root)
+            set_loader_errno(saved_errno);
+    }
     return result;
 }
 
@@ -47950,6 +48011,7 @@ static int my_dlclose(void *handle)
 static char *my_dlerror(void)
 {
     char *result = NULL;
+    int missing_error = 0;
     struct dl_error_state *state;
     runtime_loader_lock_token lock_token =
         runtime_loader_lock_acquire();
@@ -47957,9 +48019,49 @@ static char *my_dlerror(void)
     state = dl_current_error_state(0);
     if (state && state->valid) {
         state->valid = 0;
-        result = state->message;
+        if (state->missing_root && g_target_strerror && g_target_dcgettext) {
+            const char *reason = g_target_dcgettext("libc", DLFRZ_LOADER_MISS_REASON, LC_MESSAGES);
+            const char *error = g_target_strerror(ENOENT);
+            size_t root_size = strlen(state->missing_root);
+            size_t reason_size = strlen(reason), error_size = strlen(error);
+            size_t size = 0;
+            char *message = MAP_FAILED;
+            if (reason_size <= SIZE_MAX - 5 &&
+                root_size <= SIZE_MAX - reason_size - 5 &&
+                error_size <= SIZE_MAX - root_size - reason_size - 5) {
+                size = root_size + reason_size + error_size + 5;
+                message = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            }
+            if (message != MAP_FAILED) {
+                char *cursor = message;
+                ldr_memcpy(cursor, state->missing_root, root_size); cursor += root_size;
+                *cursor++ = ':'; *cursor++ = ' ';
+                ldr_memcpy(cursor, reason, reason_size); cursor += reason_size;
+                *cursor++ = ':'; *cursor++ = ' ';
+                ldr_memcpy(cursor, error, error_size); cursor += error_size;
+                *cursor = '\0';
+                state->formatted_mapping = message;
+                state->formatted_size = size;
+                result = message;
+            } else {
+                dl_set_error(DLFRZ_LOADER_MISS_REASON, NULL);
+                state->valid = 0;
+                result = state->message;
+            }
+            missing_error = 1;
+        } else {
+            result = state->message;
+        }
+    } else if (state && state->formatted_mapping) {
+        munmap(state->formatted_mapping, state->formatted_size);
+        state->formatted_mapping = NULL;
+        state->formatted_size = 0;
+        state->missing_root = NULL;
     }
     runtime_loader_lock_release(lock_token);
+    if (missing_error)
+        set_loader_errno(ENOENT);
     return result;
 }
 
@@ -47994,6 +48096,10 @@ static void glibc_hook_save_error(struct glibc_hook_error_snapshot *snapshot)
     snapshot->present = state != NULL;
     if (state)
         ldr_memcpy(&snapshot->value, state, sizeof(snapshot->value));
+    if (state) {
+        state->formatted_mapping = NULL;
+        state->formatted_size = 0;
+    }
 }
 
 static void glibc_hook_restore_error(
@@ -48001,6 +48107,7 @@ static void glibc_hook_restore_error(
 {
     struct dl_error_state *state = dl_current_error_state(0);
 
+    dl_clear_error();
     if (snapshot->present) {
         if (!state)
             state = dl_current_error_state(1);
@@ -49554,6 +49661,8 @@ static int loader_run_impl(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     g_target_malloc = NULL;
     g_target_free = NULL;
     g_target_pthread_key_create = NULL;
+    g_target_strerror = NULL;
+    g_target_dcgettext = NULL;
     g_target_pthread_getspecific = NULL;
     g_target_pthread_setspecific = NULL;
     g_target_pthread_atfork = NULL;

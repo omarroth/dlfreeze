@@ -32,6 +32,7 @@
 #include "common.h"
 #include "load_segments.h"
 #include "loader.h"
+#include "loader_errors.h"
 
 /* Some standalone musl sysroots intentionally omit Linux kernel headers. */
 #ifndef PROC_SUPER_MAGIC
@@ -3538,7 +3539,12 @@ static int manifest_is_valid(const struct dlfrz_footer *footer,
         } else if (!dlfrz_manifest_entry_flags_canonical(flags, 0, 0)) {
             goto out;
         }
-        if ((data_state != 0)
+        if (flags & DLFRZ_FLAG_DLOPEN_MISS) {
+            if (entries[i].data_size != sizeof(struct dlfrz_loader_miss) ||
+                !payload_range_valid(entries[i].data_offset, entries[i].data_size,
+                                     payload_offset, payload_size))
+                goto out;
+        } else if ((data_state != 0)
                  ? (entries[i].data_offset != 0 ||
                     entries[i].data_size != 0)
                  : !payload_range_valid(entries[i].data_offset,

@@ -71,12 +71,17 @@ struct dep_list {
      * and unload/reload cycles still mean only startup ownership proves that
      * an object is already visible before a traced call. */
     int traced_requires_native_lazy_semantics;
-    /* A failed dlopen/dlmopen has no link-map identity to replay and its
+    /* An unclassified failed dlopen/dlmopen has no link-map identity to replay and its
      * loader-owned error state is observable through dlerror().  Direct mode
      * cannot infer that native result from a successful-object manifest, so
      * a complete trace must retain the call and select native-loader
-     * semantics regardless of the target libc family. */
+     * semantics regardless of the target libc family. Verified missing-root
+     * witnesses below are the only exception, with their own error contract. */
     int traced_requires_native_loader_semantics;
+    /* Verified GNU missing absolute roots, not arbitrary loader failures. */
+    char **dlopen_missing_roots;
+    int dlopen_missing_count;
+    int dlopen_missing_capacity;
 };
 
 /* Resolve all shared-library dependencies of an ELF binary (BFS). */

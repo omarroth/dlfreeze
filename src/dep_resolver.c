@@ -3450,7 +3450,7 @@ out:
 /* ------------------------------------------------------------------ */
 /*  Merge dlopen-traced libraries                                     */
 /* ------------------------------------------------------------------ */
-#define DLOPEN_TRACE_READY "#DLFREEZE_DLOPEN_TRACE_V8"
+#define DLOPEN_TRACE_READY "#DLFREEZE_DLOPEN_TRACE_V9"
 #define DLOPEN_TRACE_OLD_READY "#DLFREEZE_DLOPEN_TRACE_V7"
 #define DLOPEN_TRACE_LEGACY_READY "#DLFREEZE_DLOPEN_TRACE_V6"
 #define DLOPEN_TRACE_LINE_SIZE (6U * PATH_MAX + 196U)
@@ -3674,6 +3674,7 @@ static int dep_add_dlopen_libs_internal(
 
     char line[DLOPEN_TRACE_LINE_SIZE];
     int saw_header = 0;
+    int supports_missing_witness = 0;
     int saw_owner = 0;
     int saw_initial_begin = 0;
     int saw_initial_commit = 0;
@@ -3699,7 +3700,8 @@ static int dep_add_dlopen_libs_internal(
             return -1;
         }
         line[--len] = '\0';
-        if (strcmp(line, DLOPEN_TRACE_READY) == 0) {
+        if (strcmp(line, DLOPEN_TRACE_READY) == 0 ||
+            strcmp(line, "#DLFREEZE_DLOPEN_TRACE_V8") == 0) {
             if (saw_header) {
                 fprintf(stderr,
                         "dlfreeze: duplicate dlopen trace version header\n");
@@ -3708,6 +3710,7 @@ static int dep_add_dlopen_libs_internal(
                 return -1;
             }
             saw_header = 1;
+            supports_missing_witness = strcmp(line, DLOPEN_TRACE_READY) == 0;
             continue;
         }
         if (strcmp(line, DLOPEN_TRACE_OLD_READY) == 0) {
@@ -4024,6 +4027,61 @@ static int dep_add_dlopen_libs_internal(
             elf_info_free(&info);
             free(resolved);
             continue;
+        }
+        /* H is narrower than F: an unconsumed GNU error was safely observed
+         * to name this absent absolute root. Recheck absence when importing
+         * a recording; do not turn a missing dependency into a root miss. */
+        if (saw_header && saw_owner && saw_initial_commit &&
+            len > 0 && line[0] == 'H') {
+            struct stat status;
+            int duplicate = 0;
+            if (!supports_missing_witness || trace_split_fields(line, fields, 5) < 0 ||
+                strcmp(fields[0], "H") != 0 ||
+                trace_u64_hex_decode(fields[1], strlen(fields[1]), &record_pid) < 0 ||
+                record_pid == 0 ||
+                trace_u64_hex_decode(fields[2], strlen(fields[2]), &operation_attempt) < 0 ||
+                operation_attempt == 0 ||
+                trace_u32_hex_decode(fields[3], strlen(fields[3]), &mode) < 0 ||
+                !dlfrz_dlopen_mode_is_supported(mode) ||
+                (mode & DLFRZ_RTLD_NOLOAD) != 0 ||
+                deps->runtime_family != DEP_RUNTIME_GNU ||
+                trace_hex_decode(fields[4], strlen(fields[4]), request, sizeof(request)) < 0 ||
+                request[0] != '/' || strchr(request, '$') ||
+                stat(request, &status) == 0 || errno != ENOENT ||
+                bfs_loader_operation_commit(&q, record_pid, operation_attempt, 'B', 0) < 0) {
+                fprintf(stderr, "dlfreeze: invalid or changed missing-loader root witness\n");
+                fclose(f);
+                bfs_free(&q);
+                return -1;
+            }
+            for (int i = 0; i < deps->dlopen_missing_count; i++)
+                if (strcmp(deps->dlopen_missing_roots[i], request) == 0)
+                    duplicate = 1;
+            if (!duplicate) {
+                if (deps->dlopen_missing_count == deps->dlopen_missing_capacity) {
+                    int capacity = deps->dlopen_missing_capacity;
+                    char **roots;
+                    if (capacity > INT_MAX / 2)
+                        goto missing_allocation_failed;
+                    capacity = capacity ? capacity * 2 : 16;
+                    roots = realloc(deps->dlopen_missing_roots,
+                                    (size_t)capacity * sizeof(*roots));
+                    if (!roots)
+                        goto missing_allocation_failed;
+                    deps->dlopen_missing_roots = roots;
+                    deps->dlopen_missing_capacity = capacity;
+                }
+                char *copy = strdup(request);
+                if (!copy)
+                    goto missing_allocation_failed;
+                deps->dlopen_missing_roots[deps->dlopen_missing_count++] = copy;
+            }
+            saw_call = 1;
+            continue;
+missing_allocation_failed:
+            fclose(f);
+            bfs_free(&q);
+            return -1;
         }
         /* Failed-load records intentionally carry no pathname: there is no
          * successful link_map identity to package, and direct replay cannot
@@ -4566,6 +4624,9 @@ void dep_list_free(struct dep_list *deps)
         free(deps->libs[i].dlopen_request);
     }
     free(deps->libs);
+    for (int i = 0; i < deps->dlopen_missing_count; i++)
+        free(deps->dlopen_missing_roots[i]);
+    free(deps->dlopen_missing_roots);
     free(deps->interp_path);
     free(deps->interp_soname);
     free(deps->gnu_platform);

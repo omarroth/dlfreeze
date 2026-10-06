@@ -7,6 +7,7 @@
 #include "glibc_layout.h"
 #include "musl_layout.h"
 #include "load_segments.h"
+#include "loader_errors.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9316,12 +9317,15 @@ static int packed_manifest_alias_source_matches(
 {
     const uint32_t metadata_mask = DLFRZ_FLAG_DATA_VIRTUAL |
         DLFRZ_FLAG_DATA_NEGATIVE | DLFRZ_FLAG_DATA_DIRECTORY |
-        DLFRZ_FLAG_DATA_DIRENT_TYPED | DLFRZ_FLAG_DATA_DIRENT_TYPE_MASK;
-    int left_has_payload = !(left->flags & DLFRZ_FLAG_DATA) ||
+        DLFRZ_FLAG_DATA_DIRENT_TYPED | DLFRZ_FLAG_DATA_DIRENT_TYPE_MASK |
+        DLFRZ_FLAG_DLOPEN_MISS;
+    int left_has_payload = (left->flags & DLFRZ_FLAG_DLOPEN_MISS) ||
+        !(left->flags & DLFRZ_FLAG_DATA) ||
         !(left->flags & (DLFRZ_FLAG_DATA_VIRTUAL |
                          DLFRZ_FLAG_DATA_NEGATIVE |
                          DLFRZ_FLAG_DATA_DIRECTORY));
-    int right_has_payload = !(right->flags & DLFRZ_FLAG_DATA) ||
+    int right_has_payload = (right->flags & DLFRZ_FLAG_DLOPEN_MISS) ||
+        !(right->flags & DLFRZ_FLAG_DATA) ||
         !(right->flags & (DLFRZ_FLAG_DATA_VIRTUAL |
                           DLFRZ_FLAG_DATA_NEGATIVE |
                           DLFRZ_FLAG_DATA_DIRECTORY));
@@ -9645,8 +9649,11 @@ int pack_frozen(const struct pack_options *opts)
     int has_pathful_needed = 0;
     int has_pathful_traced_dlopen = 0;
     int has_unreproducible_bare_dlopen = 0;
+    int nmiss = 0;
 
     if (!opts || !opts->deps || !opts->exe_path || !opts->output_path ||
+        opts->deps->dlopen_missing_count < 0 ||
+        (opts->deps->dlopen_missing_count && !opts->deps->dlopen_missing_roots) ||
         !opts->bootstrap_path ||
         (opts->data_files &&
          (opts->data_files->failed || opts->data_files->count < 0 ||
@@ -9708,6 +9715,9 @@ int pack_frozen(const struct pack_options *opts)
     direct_supported = opts->direct_load &&
                        !traced_requires_native_loader_semantics &&
                        direct_runtime_supported(opts, &dep_source_plan);
+    /* Extraction keeps the native loader's error behavior. Only the direct
+     * format carries replayable negative-root witnesses. */
+    nmiss = direct_supported ? opts->deps->dlopen_missing_count : 0;
     for (int i = 0; i < opts->deps->count; i++) {
         const struct resolved_lib *lib = &opts->deps->libs[i];
 
@@ -9773,6 +9783,15 @@ int pack_frozen(const struct pack_options *opts)
             return -1;
         }
     }
+    for (int i = 0; i < opts->deps->dlopen_missing_count; i++) {
+        struct stat status;
+        const char *root = opts->deps->dlopen_missing_roots[i];
+        if (stat(root, &status) == 0 || errno != ENOENT) {
+            fprintf(stderr, "dlfreeze: missing-loader root changed before packing: %s\n", root);
+            packed_dep_source_plan_free(&dep_source_plan);
+            return -1;
+        }
+    }
     if (validate_output_aliases(opts) < 0) {
         packed_dep_source_plan_free(&dep_source_plan);
         return -1;
@@ -9812,7 +9831,8 @@ int pack_frozen(const struct pack_options *opts)
         goto fail;
     }
     nent_size = 1U + (opts->deps->interp_path ? 1U : 0U) +
-                (size_t)opts->deps->count + (size_t)ndata;
+                (size_t)opts->deps->count + (size_t)ndata +
+                (size_t)nmiss;
     if (nent_size > UINT32_MAX || nent_size > INT_MAX ||
         nent_size > SIZE_MAX / sizeof(struct dlfrz_entry) ||
         nent_size > SIZE_MAX / sizeof(struct dlfrz_lib_meta) ||
@@ -9864,6 +9884,10 @@ int pack_frozen(const struct pack_options *opts)
             fprintf(stderr, "dlfreeze: manifest string table is too large\n");
             goto fail2;
         }
+    }
+    for (int i = 0; i < nmiss; i++) {
+        if (string_table_size_add(&strsz, opts->deps->dlopen_missing_roots[i], 1) < 0)
+            goto fail2;
     }
 
     strtab = calloc(1, strsz);
@@ -10007,6 +10031,18 @@ int pack_frozen(const struct pack_options *opts)
     for (int i = 0; i < ndata; i++) {
         enum data_file_kind kind = opts->data_files->kinds
             ? opts->data_files->kinds[i] : DATA_FILE_KIND_REGULAR;
+        int witnessed = 0;
+        for (int j = 0; j < nmiss; j++)
+            if (strcmp(opts->data_files->paths[i], opts->deps->dlopen_missing_roots[j]) == 0)
+                witnessed = 1;
+        if (witnessed) {
+            if (kind != DATA_FILE_KIND_NEGATIVE) {
+                fprintf(stderr, "dlfreeze: conflicting missing-loader root: %s\n",
+                        opts->data_files->paths[i]);
+                goto fail2;
+            }
+            continue; /* Emit the richer negative witness once below. */
+        }
 
         entries[eidx].flags       = DLFRZ_FLAG_DATA;
         if (kind == DATA_FILE_KIND_VIRTUAL)
@@ -10045,6 +10081,26 @@ int pack_frozen(const struct pack_options *opts)
         if (size_add_assign(&off, written) < 0)
             goto fail2;
         eidx++;
+    }
+
+    for (int i = 0; i < nmiss; i++) {
+        const struct dlfrz_loader_miss miss = {
+            DLFRZ_LOADER_MISS_MAGIC, DLFRZ_LOADER_MISS_GNU, ENOENT, 0
+        };
+        const char *root = opts->deps->dlopen_missing_roots[i];
+        if (write_pad(out, &off, 8) < 0)
+            goto fail2;
+        entries[eidx].flags = DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_NEGATIVE |
+                              DLFRZ_FLAG_DLOPEN_MISS;
+        entries[eidx].name_offset = stroff;
+        strcpy(strtab + stroff, root);
+        stroff += strlen(root) + 1;
+        entries[eidx].data_offset = off;
+        entries[eidx].data_size = sizeof(miss);
+        if (fwrite(&miss, 1, sizeof(miss), out) != sizeof(miss) ||
+            size_add_assign(&off, sizeof(miss)) < 0)
+            goto fail2;
+        src_paths[eidx++] = root;
     }
 
     /* Resolution and ABI admission happened before packing.  Re-parse the
@@ -10327,7 +10383,7 @@ int pack_frozen(const struct pack_options *opts)
         }
     }
 
-    if (ndata > 0 && !metas) {
+    if ((ndata > 0 || nmiss > 0) && !metas) {
         fprintf(stderr,
                 "dlfreeze: captured-file manifest has no usable direct-load "
                 "metadata\n");
@@ -10431,7 +10487,7 @@ int pack_frozen(const struct pack_options *opts)
             printf("  pre-linked : no (resource/address miss; using runtime "
                    "relocation)\n");
         } else if (prelink_result == PRELINK_UNSUPPORTED) {
-            if (ndata > 0 || has_pathful_needed ||
+            if (ndata > 0 || nmiss > 0 || has_pathful_needed ||
                 has_pathful_traced_dlopen ||
                 has_unreproducible_bare_dlopen) {
                 fprintf(stderr,

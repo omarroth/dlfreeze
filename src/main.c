@@ -1284,7 +1284,7 @@ static int preload_target_score(const char *path, struct dep_list *deps,
          * Resolving the helper alone can therefore name a different file
          * even though that file will never be mapped.  The traced child is
          * still the authoritative strong-import/relocation check: a helper
-         * whose name-only imports are absent cannot publish V8 readiness and
+         * whose name-only imports are absent cannot publish V9 readiness and
          * the trace fails without producing an artifact. */
         if (deps->runtime_family == DEP_RUNTIME_MUSL &&
             !strchr(info.needed[i], '/')) {
@@ -3141,7 +3141,7 @@ static int capture_data_files(const char *exe_path, const char *exe_identity,
 
     if (!trace_fd_has_header(tcollector, "#DLFREEZE_PRELOAD_TRACE_V9") ||
         !trace_fd_has_header(dtcollector,
-                             "#DLFREEZE_DLOPEN_TRACE_V8")) {
+                             "#DLFREEZE_DLOPEN_TRACE_V9")) {
         fprintf(stderr,
                 "dlfreeze: preload trace helper is incompatible with the "
                 "target runtime or produced incomplete readiness records\n");
@@ -4078,12 +4078,12 @@ int main(int argc, char **argv)
                             if (!WIFEXITED(st) ||
                                 !trace_fd_has_header(
                                     collector_fd,
-                                    "#DLFREEZE_DLOPEN_TRACE_V8")) {
+                                    "#DLFREEZE_DLOPEN_TRACE_V9")) {
                                 fprintf(
                                     stderr,
                                     "dlfreeze: preload trace helper is "
                                     "incompatible with the target runtime "
-                                    "or produced no valid V8 readiness "
+                                    "or produced no valid V9 readiness "
                                     "record\n");
                                 trace_failed = 1;
                                 close(collector_fd);

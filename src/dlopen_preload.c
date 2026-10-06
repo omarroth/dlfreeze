@@ -27,8 +27,11 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
+#include <sys/uio.h>
 
 #include "dynamic_semantics.h"
+#include "glibc_error_layout.h"
+#include "loader_errors.h"
 #include "linux_syscalls.h"
 
 #if defined(__GLIBC__)
@@ -136,6 +139,11 @@ static struct trace_fd_identity g_dlopen_trace_identity;
 static struct trace_fd_identity g_file_trace_identity;
 
 static _Atomic(void *(*)(const char *, int)) real_dlopen;
+static _Atomic(char *(*)(void)) real_dlerror;
+static _Atomic int g_native_error_layout_ready;
+static _Atomic intptr_t g_native_error_tls_offset;
+static void initialize_native_error_layout(void);
+static int raw_fstatat(int, const char *, struct stat *, int);
 #if defined(LM_ID_BASE) && defined(LM_ID_NEWLM)
 #define DLFREEZE_HAVE_DLMOPEN 1
 _Static_assert(sizeof(Lmid_t) <= sizeof(uint64_t),
@@ -229,7 +237,7 @@ static pid_t g_trace_owner_pid;
 static pid_t g_trace_participant_pid;
 
 #define PRELOAD_TRACE_READY "#DLFREEZE_PRELOAD_TRACE_V9"
-#define DLOPEN_TRACE_READY  "#DLFREEZE_DLOPEN_TRACE_V8"
+#define DLOPEN_TRACE_READY  "#DLFREEZE_DLOPEN_TRACE_V9"
 #define TRACE_OWNER_ENV     "DLFREEZE_TRACE_OWNER_PID"
 #define DLOPEN_TRACE_FD_ENV "DLFREEZE_TRACE_FD"
 #define FILE_TRACE_FD_ENV   "DLFREEZE_FILE_TRACE_FD"
@@ -904,6 +912,8 @@ static void resolve_symbols(void)
     g_trace_depth++;
     if (!real_dlopen)
         real_dlopen = dlsym(RTLD_NEXT, "dlopen");
+    if (!real_dlerror)
+        real_dlerror = dlsym(RTLD_NEXT, "dlerror");
 #if DLFREEZE_HAVE_DLMOPEN
     if (!real_dlmopen)
         real_dlmopen = dlsym(RTLD_NEXT, "dlmopen");
@@ -1004,10 +1014,148 @@ static void resolve_symbols(void)
         real_fchdir = dlsym(RTLD_NEXT, "fchdir");
     if (!real_chroot)
         real_chroot = dlsym(RTLD_NEXT, "chroot");
+    initialize_native_error_layout();
     atomic_store_explicit(&g_symbols_resolved, 1, memory_order_release);
     g_trace_depth--;
     g_symbols_resolving = 0;
     errno = saved_errno;
+}
+
+/* Optional observation must never dereference an unadmitted private pointer
+ * or fault under a changed ABI. A denied/unsupported self-read simply keeps
+ * the existing native-loader fallback for failed calls. */
+static int read_native_error_memory(void *unused, uintptr_t address,
+                                     void *output, size_t size)
+{
+    int saved_errno = errno;
+    int result = 0;
+    (void)unused;
+#if defined(SYS_process_vm_readv)
+    struct iovec local = {output, size};
+    struct iovec remote = {(void *)address, size};
+    long bytes;
+    do {
+        bytes = syscall(SYS_process_vm_readv, trace_current_pid(),
+                         &local, 1, &remote, 1, 0);
+    } while (bytes < 0 && errno == EINTR);
+    result = bytes >= 0 && (size_t)bytes == size;
+#else
+    (void)address; (void)output; (void)size;
+#endif
+    errno = saved_errno;
+    return result;
+}
+
+static uintptr_t native_error_thread_pointer(void)
+{
+    uintptr_t pointer;
+#if defined(__x86_64__)
+    __asm__ volatile("mov %%fs:0, %0" : "=r"(pointer));
+#elif defined(__aarch64__)
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(pointer));
+#else
+    pointer = 0;
+#endif
+    return pointer;
+}
+
+static void initialize_native_error_layout(void)
+{
+#if defined(__GLIBC__) && defined(__x86_64__)
+    Dl_info info;
+    Elf64_Sym *symbol = NULL;
+    char *(*forward)(void) = atomic_load_explicit(&real_dlerror,
+                                                 memory_order_acquire);
+    unsigned char code[2048];
+    uintptr_t address = (uintptr_t)forward;
+    size_t size;
+
+    if (!forward || !dladdr1((void *)address, &info,
+                             (void **)&symbol, RTLD_DL_SYMENT) || !symbol ||
+        ELF64_ST_TYPE(symbol->st_info) != STT_FUNC ||
+        symbol->st_size == 0 || symbol->st_size > sizeof(code) ||
+        (uintptr_t)info.dli_fbase > UINTPTR_MAX - symbol->st_value ||
+        (uintptr_t)info.dli_fbase + symbol->st_value != address)
+        return;
+    size = (size_t)symbol->st_size;
+    if (!read_native_error_memory(NULL, address, code, size))
+        return;
+    for (size_t position = 0; position < size;) {
+        intptr_t offset = 0;
+        uintptr_t got = 0;
+        int candidate = 0;
+        struct dlfrz_glibc_x86_instruction instruction;
+        const unsigned char *bytes = code + position;
+        size_t remaining = size - position;
+        if (!dlfrz_glibc_x86_instruction(bytes, remaining, &instruction))
+            return;
+        if (remaining >= 7 && bytes[0] >= 0x48 && bytes[0] <= 0x4f &&
+            bytes[1] == 0x8b && (bytes[2] & 0xc7) == 0x05) {
+            int32_t displacement;
+            uint64_t target;
+            memcpy(&displacement, bytes + 3, sizeof(displacement));
+            if (dlfrz_glibc_add_signed_u64(address + position + 7,
+                                           displacement, &target)) {
+                got = (uintptr_t)target;
+                candidate = 1;
+            }
+        }
+        position += instruction.length;
+        if (!candidate || !read_native_error_memory(
+                NULL, got, &offset, sizeof(offset)) ||
+            offset < -65536 || offset > 65536)
+            continue;
+        if (!dlfrz_glibc_x86_error_layout(code, size, address, offset,
+                                         read_native_error_memory, NULL))
+            continue;
+        g_native_error_tls_offset = offset;
+        atomic_store_explicit(&g_native_error_layout_ready, 1,
+                              memory_order_release);
+        return;
+    }
+#endif
+}
+
+static int native_missing_root_witness(const char *request)
+{
+    uintptr_t result;
+    unsigned char state[24];
+    uintptr_t object_name, reason;
+    int32_t error_code;
+    char name[PATH_MAX];
+    char message[sizeof(DLFRZ_LOADER_MISS_REASON)];
+    struct stat status;
+    size_t length;
+    int saved_errno = errno;
+    int accepted = 0;
+
+    if (!request || request[0] != '/' ||
+        !bounded_string_length(request, sizeof(name), &length) ||
+        !atomic_load_explicit(&g_native_error_layout_ready,
+                               memory_order_acquire))
+        return 0;
+    if (!read_native_error_memory(NULL,
+            native_error_thread_pointer() + (uintptr_t)g_native_error_tls_offset,
+            &result, sizeof(result)) || !result || result == UINTPTR_MAX ||
+        !read_native_error_memory(NULL, result, state, sizeof(state)))
+        goto out;
+    memcpy(&error_code, state, sizeof(error_code));
+    memcpy(&object_name, state + 8, sizeof(object_name));
+    memcpy(&reason, state + 16, sizeof(reason));
+    if (error_code != ENOENT || state[4] > 1 || state[5] != 0 ||
+        !read_native_error_memory(NULL, object_name, name, length + 1) ||
+        memcmp(name, request, length + 1) != 0 ||
+        !read_native_error_memory(NULL, reason, message, sizeof(message)) ||
+        memcmp(message, DLFRZ_LOADER_MISS_REASON, sizeof(message)) != 0)
+        goto out;
+    /* Recheck the physical root as well: a missing dependency, invalid ELF,
+     * permission failure, or replaced pathname is not a frozen root miss. */
+    if (raw_fstatat(AT_FDCWD, request, &status, 0) < 0 &&
+        errno == ENOENT)
+        accepted = 1;
+out:
+    errno = saved_errno;
+    return accepted;
 }
 
 static int raw_fstat(int fd, struct stat *st)
@@ -2641,7 +2789,8 @@ static void write_trace_owner_record(enum trace_stream_kind stream)
  * N/P distinguish a NULL filename from a non-NULL filename. */
 static void write_failed_load_record(char api, int filename_present,
                                      uint64_t namespace_id, int mode,
-                                     uint64_t attempt)
+                                     uint64_t attempt, const char *request,
+                                     int preserves_errno)
 {
     int saved_errno = errno;
     char record[66];
@@ -2652,6 +2801,34 @@ static void write_failed_load_record(char api, int filename_present,
     if ((api != 'D' && api != 'M') ||
         (api == 'D' && namespace_id != 0) || attempt == 0)
         trace_write_failure();
+    if (api == 'D' && filename_present && request && preserves_errno &&
+        dlfrz_dlopen_mode_is_supported(mode) &&
+        ((uint32_t)mode & DLFRZ_RTLD_NOLOAD) == 0 &&
+        native_missing_root_witness(request)) {
+        char missing_record[2 * PATH_MAX + 64];
+        size_t missing_pos = 0;
+        size_t length = strlen(request);
+        static const char hex[] = "0123456789abcdef";
+
+        missing_record[missing_pos++] = 'H';
+        missing_record[missing_pos++] = ' ';
+        append_u64_hex(missing_record, &missing_pos,
+                       (uint64_t)trace_current_pid());
+        missing_record[missing_pos++] = ' ';
+        append_u64_hex(missing_record, &missing_pos, attempt);
+        missing_record[missing_pos++] = ' ';
+        append_u32_hex(missing_record, &missing_pos, (uint32_t)mode);
+        missing_record[missing_pos++] = ' ';
+        for (size_t i = 0; i < length; i++) {
+            unsigned char byte = (unsigned char)request[i];
+            missing_record[missing_pos++] = hex[byte >> 4];
+            missing_record[missing_pos++] = hex[byte & 15];
+        }
+        missing_record[missing_pos++] = '\n';
+        trace_write_exact(TRACE_STREAM_DLOPEN, missing_record, missing_pos);
+        errno = saved_errno;
+        return;
+    }
     record[pos++] = 'F';
     record[pos++] = ' ';
     append_u64_hex(record, &pos,
@@ -2996,7 +3173,7 @@ static void cancel_owner_exec_attempt(uint64_t attempt)
     write_exec_attempt_record(TRACE_STREAM_FILE, 'C', attempt);
 }
 
-/* A successful non-NULL dlopen must yield either a complete V8 record or a
+/* A successful non-NULL dlopen must yield either a complete V9 record or a
  * record that makes the packer fail closed.  In particular, alternate libcs
  * are not required to provide a usable RTLD_DI_LINKMAP result. */
 static void write_dlopen_failure(const char *reason)
@@ -3498,6 +3675,7 @@ void *dlopen(const char *filename, int flags)
     pid_t observation_pid = 0;
     uint64_t attempt = 0;
     int result_errno;
+    int call_errno;
 
     ensure_trace_initialized();
     resolve_symbols();
@@ -3559,6 +3737,7 @@ void *dlopen(const char *filename, int flags)
             write_loader_control_record('B', attempt, 0);
     }
     begin_file_trace_transaction(&file_transaction, observing);
+    call_errno = errno;
     h = real_dlopen(filename, flags);
     result_errno = errno;
 
@@ -3587,7 +3766,9 @@ void *dlopen(const char *filename, int flags)
     else if (h && filename == NULL)
         write_loader_control_record('Q', attempt, 0);
     else if (!h && !unsupported_request)
-        write_failed_load_record('D', filename != NULL, 0, flags, attempt);
+        write_failed_load_record('D', filename != NULL, 0, flags, attempt,
+                                 request_is_bounded ? trace_request : NULL,
+                                 call_errno == result_errno);
     else if (!unsupported_request)
         trace_successful_dlopen(h, trace_request, lookup_cwd, flags,
                                 &before, baseline_valid, attempt);
@@ -3699,7 +3880,8 @@ void *dlmopen(Lmid_t namespace_id, const char *filename, int flags)
     if (!handle) {
         if (!unsupported_request)
             write_failed_load_record('M', filename != NULL,
-                                     (uint64_t)namespace_id, flags, attempt);
+                                     (uint64_t)namespace_id, flags, attempt,
+                                     NULL, 0);
         finish_file_trace_transaction(&file_transaction);
         mapped_identity_set_free(&before);
         if (observing)

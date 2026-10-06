@@ -97,7 +97,7 @@ exec {filetrace_fd}>&-
 late_hex=$(printf '%s' "$library" | od -An -tx1 | tr -d ' \n')
 if [ "$traced_rc" -ne 0 ] ||
    [ "$traced_output" != "startup-ifunc-native-load-ok" ] ||
-   [ "$(sed -n '1p' "$dltrace")" != '#DLFREEZE_DLOPEN_TRACE_V8' ] ||
+   [ "$(sed -n '1p' "$dltrace")" != '#DLFREEZE_DLOPEN_TRACE_V9' ] ||
    [ "$(sed -n '1p' "$filetrace")" != '#DLFREEZE_PRELOAD_TRACE_V9' ] ||
    [ "$(grep -Ec '^O [0-9a-f]{16}$' "$dltrace")" -ne 1 ] ||
    [ "$(grep -Ec '^A [0-9a-f]{16} [0-9a-f]{16}$' "$dltrace")" -ne 1 ] ||

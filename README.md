@@ -136,6 +136,15 @@ All records in one merge must describe the exact executable revision being
 packed. Regular source files are revision-checked again during the merge,
 while recorded negative lookups must still be absent.
 
+Direct tracing can retain verified missing absolute library roots as frozen
+negative lookups. On supported x86_64 GNU libc layouts, a read-only witness
+checks the unconsumed native loader error without calling `dlerror()`.
+Replay preserves `errno` and thread-local, consume-once errors, formatting
+messages through the embedded libc in the current locale. Unknown layouts,
+denied inspection, missing dependencies, and other failure classes keep the
+native-loader fallback; this is not an application-specific plugin rule.
+New recordings use dlopen trace V9; completed V8 recordings remain readable.
+
 ## Building
 
 Requires Linux, a compiler capable of producing static executables, and

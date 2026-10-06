@@ -10,9 +10,10 @@ int main(int argc, char **argv)
     struct dep_list deps;
     int expected_lazy_semantics = -1;
     int expected_native_loader_semantics = -1;
+    int expected_missing_roots = -1;
     int status = 1;
 
-    if (argc < 4 || argc > 6)
+    if (argc < 4 || argc > 7)
         return 2;
     if (argc >= 5) {
         if (strcmp(argv[4], "0") == 0)
@@ -22,13 +23,19 @@ int main(int argc, char **argv)
         else
             return 2;
     }
-    if (argc == 6) {
+    if (argc >= 6) {
         if (strcmp(argv[5], "0") == 0)
             expected_native_loader_semantics = 0;
         else if (strcmp(argv[5], "1") == 0)
             expected_native_loader_semantics = 1;
         else
             return 2;
+    }
+    if (argc == 7) {
+        if (strcmp(argv[6], "0") == 0) expected_missing_roots = 0;
+        else if (strcmp(argv[6], "1") == 0) expected_missing_roots = 1;
+        else if (strcmp(argv[6], "2") == 0) expected_missing_roots = 2;
+        else return 2;
     }
     if (dep_resolve(argv[1], &deps) < 0)
         return 1;
@@ -50,6 +57,10 @@ int main(int argc, char **argv)
     }
     if (dep_add_dlopen_libs(&deps, argv[2]) < 0)
         goto out;
+    if (expected_missing_roots >= 0 && deps.dlopen_missing_count != expected_missing_roots) {
+        fprintf(stderr, "missing-loader root count differs\n");
+        goto out;
+    }
     if (expected_lazy_semantics >= 0 &&
         deps.traced_requires_native_lazy_semantics !=
             expected_lazy_semantics) {
