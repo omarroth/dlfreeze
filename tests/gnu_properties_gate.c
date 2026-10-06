@@ -77,13 +77,15 @@ static int reject_fixture(struct property_fixture *fixture)
     struct dlfrz_gnu_property_profile profile = {0};
 
     profile.feature_1 = UINT32_MAX;
+    profile.needed_1 = UINT32_MAX;
     profile.feature_1_seen = UINT8_MAX;
     profile.stack_size = UINT64_MAX;
     profile.stack_size_seen = UINT8_MAX;
 
     if (parse_fixture(fixture, &profile))
         return 0;
-    return profile.feature_1 == 0 && !profile.feature_1_seen &&
+    return profile.needed_1 == 0 &&
+           profile.feature_1 == 0 && !profile.feature_1_seen &&
            profile.stack_size == 0 && !profile.stack_size_seen;
 }
 
@@ -207,7 +209,7 @@ static int generic_rejection_gate(void)
                      &value, sizeof(value)) ||
         !reject_fixture(&fixture))
         return 0;
-    value = 1;
+    value = 2;
     if (!fixture_init(&fixture) ||
         !fixture_add(&fixture, DLFRZ_GNU_PROPERTY_1_NEEDED,
                      &value, sizeof(value)) ||
@@ -219,6 +221,51 @@ static int generic_rejection_gate(void)
         !reject_fixture(&fixture))
         return 0;
     return 1;
+}
+
+static int indirect_external_access_gate(void)
+{
+    struct property_fixture fixture;
+    struct dlfrz_gnu_property_profile profile = {0};
+    const uint32_t indirect =
+        DLFRZ_GNU_PROPERTY_1_NEEDED_INDIRECT_EXTERN_ACCESS;
+    Elf64_Sym reference = {0};
+    Elf64_Sym definition = {0};
+
+    if (!fixture_init(&fixture) ||
+        !fixture_add(&fixture, DLFRZ_GNU_PROPERTY_1_NEEDED,
+                     &indirect, sizeof(indirect)) ||
+        !parse_fixture(&fixture, &profile) || profile.needed_1 != indirect)
+        return 0;
+    definition.st_other = STV_PROTECTED;
+    reference.st_shndx = SHN_UNDEF;
+    if (!dlfrz_gnu_property_binding_supported(
+            indirect, indirect, 1, &reference, &definition, 0) ||
+        dlfrz_gnu_property_binding_supported(
+            indirect, 0, 1, &reference, NULL, 1) ||
+        dlfrz_gnu_property_binding_supported(
+            0, indirect, 1, &reference, &definition, 1))
+        return 0;
+    reference.st_value = 16;
+    if (dlfrz_gnu_property_binding_supported(
+            0, indirect, 1, &reference, &definition, 0) ||
+        !dlfrz_gnu_property_binding_supported(
+            0, 0, 1, &reference, &definition, 0) ||
+        !dlfrz_gnu_property_binding_supported(
+            0, indirect, 0, &reference, &definition, 0))
+        return 0;
+    definition.st_other = STV_DEFAULT;
+    if (dlfrz_gnu_property_binding_supported(
+            0, indirect, 1, &reference, &definition, 0))
+        return 0;
+    reference.st_value = 0;
+    if (!dlfrz_gnu_property_binding_supported(
+            0, indirect, 1, &reference, &definition, 0))
+        return 0;
+    definition.st_other = STV_PROTECTED;
+    reference.st_shndx = 1;
+    return dlfrz_gnu_property_binding_supported(
+        indirect, indirect, 1, &reference, &definition, 0);
 }
 
 static int stack_size_correlation_gate(void)
@@ -606,5 +653,6 @@ int main(void)
     if (!aarch64_bti_mapping_policy_gate()) return 6;
     if (!ordering_and_unknown_gate()) return 7;
     if (!malformed_note_gate()) return 8;
+    if (!indirect_external_access_gate()) return 9;
     return 0;
 }

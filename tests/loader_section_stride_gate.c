@@ -1999,6 +1999,29 @@ int main(void)
     if (parse_loaded_gnu_properties(&object) != 0)
         return 121;
 
+    /* A needed binding property must survive all mapping paths and cannot
+     * be changed after admission, even when the replacement is supported. */
+    property_type = DLFRZ_GNU_PROPERTY_1_NEEDED;
+    property_size = sizeof(uint32_t);
+    {
+        uint32_t needed =
+            DLFRZ_GNU_PROPERTY_1_NEEDED_INDIRECT_EXTERN_ACCESS;
+        memcpy(image + 256 + 16, &property_type, sizeof(property_type));
+        memcpy(image + 256 + 20, &property_size, sizeof(property_size));
+        memcpy(image + 256 + 24, &needed, sizeof(needed));
+        if (parse_loaded_gnu_properties(&object) != 0 ||
+            object.gnu_property_needed_1 != needed ||
+            revalidate_loaded_gnu_properties(&object) != 0)
+            return 122;
+        needed = 0;
+        memcpy(image + 256 + 24, &needed, sizeof(needed));
+        if (revalidate_loaded_gnu_properties(&object) == 0)
+            return 123;
+        if (parse_loaded_gnu_properties(&object) != 0 ||
+            object.gnu_property_needed_1 != 0)
+            return 124;
+    }
+
     property_value = UINT32_C(0x80000000);
     memcpy(image + 256 + 40, &property_value, sizeof(property_value));
     if (parse_loaded_gnu_properties(&object) == 0)

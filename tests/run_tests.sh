@@ -27649,6 +27649,109 @@ test_direct_x86_cet_state() {
 }
 
 # ===================================================================
+# GNU indirect external access admission and binding identities
+# ===================================================================
+test_indirect_external_access_direct() {
+    echo "--- GNU indirect external access bindings ---"
+    local root="$BUILD/indirect_external_access"
+    local library="$root/libindirect_access.so"
+    local startup="$root/startup" late="$root/late"
+    local legacy="$root/legacy"
+    local out="$root/main.frozen" log="$root/freeze.log"
+    local label native actual native_rc rc mode freeze_rc
+
+    mkdir -p "$root"
+    if ! gcc -Wall -Wextra -Werror -shared -fPIC \
+            -Wl,-soname,libindirect_access.so -o "$library" \
+            tests/indirect_external_access_lib.c tests/indirect_external_access_note.S ||
+       ! gcc -Wall -Wextra -Werror -fPIC -pie -o "$startup" \
+            tests/indirect_external_access_main.c tests/indirect_external_access_note.S \
+            -L"$root" -lindirect_access -Wl,-rpath,'$ORIGIN' ||
+       ! gcc -Wall -Wextra -Werror -fPIC -pie -DINDIRECT_LATE_LOAD \
+            -o "$late" tests/indirect_external_access_main.c \
+            tests/indirect_external_access_note.S -ldl; then
+        fail "indirect external access fixtures" "compile failed"
+        rm -rf "$root"
+        return
+    fi
+    for mode in startup late; do
+        label="indirect external access $mode"
+        native=""; native_rc=0
+        if [ "$mode" = startup ]; then
+            capture_output native "$startup" || native_rc=$?
+            freeze_rc=0
+            freeze_require_direct "$label" "$log" "$out" "$startup" || freeze_rc=$?
+            if [ "$freeze_rc" -ne 0 ]; then
+                if [ "$freeze_rc" -eq 77 ]; then
+                    skip "$label" "$DIRECT_FREEZE_REASON"
+                fi
+                continue
+            fi
+            actual=""; rc=0
+            capture_output actual env DLFREEZE_NO_FORK=1 "$out" || rc=$?
+        else
+            capture_output native "$late" "$library" || native_rc=$?
+            freeze_rc=0
+            freeze_require_direct "$label" "$log" "$out" -t -- \
+                "$late" "$library" || freeze_rc=$?
+            if [ "$freeze_rc" -ne 0 ]; then
+                if [ "$freeze_rc" -eq 77 ]; then
+                    skip "$label" "$DIRECT_FREEZE_REASON"
+                fi
+                continue
+            fi
+            actual=""; rc=0
+            capture_output actual env DLFREEZE_NO_FORK=1 "$out" "$library" || rc=$?
+        fi
+        if [ "$native_rc" -eq 0 ] && [ "$rc" -eq 0 ] &&
+           [ "$native" = "indirect external access identities preserved" ] &&
+           [ "$actual" = "$native" ]; then
+            pass "$label"
+        else
+            fail "$label" "native=$native_rc/$native direct=$rc/$actual"
+        fi
+    done
+    # x86-64 non-PIE function pointers can name the executable's PLT via a
+    # nonzero SHN_UNDEF dynsym value. Native lookup can use that canonical
+    # alias; the direct loader deliberately declines the mixed contract.
+    case "$(gcc -dumpmachine)" in
+        x86_64*)
+            label="indirect external access legacy PLT fallback"
+            if ! gcc -Wall -Wextra -Werror -shared -fPIC \
+                    -DINDIRECT_DEFAULT_EXPORTS -Wl,-soname,libindirect_legacy.so \
+                    -o "$root/libindirect_legacy.so" \
+                    tests/indirect_external_access_lib.c \
+                    tests/indirect_external_access_note.S ||
+               ! gcc -Wall -Wextra -Werror -fno-pic -fno-PIE -no-pie \
+                    -o "$legacy" tests/indirect_external_access_main.c \
+                    -L"$root" -lindirect_legacy -Wl,-rpath,'$ORIGIN'; then
+                fail "$label" "fixture compile failed"
+            else
+                native=""; native_rc=0
+                capture_output native "$legacy" || native_rc=$?
+                if ! run_freeze "$DLFREEZE" -d -o "$out" "$legacy" \
+                        >"$log" 2>&1 ||
+                   ! grep -q 'unsupported direct contract; using extraction' "$log"; then
+                    fail "$label" "packer did not select native semantics"
+                    tail -n 40 "$log" || true
+                else
+                    actual=""; rc=0
+                    capture_output actual "$out" || rc=$?
+                    if [ "$native_rc" -eq 0 ] && [ "$rc" -eq 0 ] &&
+                       [ "$native" = "indirect external access identities preserved" ] &&
+                       [ "$actual" = "$native" ]; then
+                        pass "$label"
+                    else
+                        fail "$label" "native=$native_rc/$native frozen=$rc/$actual"
+                    fi
+                fi
+            fi
+            ;;
+    esac
+    rm -rf "$root"
+}
+
+# ===================================================================
 # Test 9k: runtime dlopen consumes format-bounded PHDR/DYNAMIC tables
 # ===================================================================
 test_direct_runtime_parser_bounds() {
@@ -33203,6 +33306,7 @@ test_direct_dlopen_embedded_static_tls
 test_direct_dlopen_startup_owned_ie
 test_direct_x86_cet_state
 test_direct_runtime_parser_bounds
+test_indirect_external_access_direct
 test_unaligned_relocation_destinations
 test_direct_dlopen_fallback
 test_direct_runtime_truncate_snapshot

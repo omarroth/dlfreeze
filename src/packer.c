@@ -3385,6 +3385,7 @@ struct pl_control_writable_view {
 struct prelink_obj {
     uint64_t          base;
     uint32_t          flags;
+    uint32_t          gnu_property_needed_1;
     size_t            file_size;
     const uint8_t    *phdr_base;
     uint16_t          phdr_num;
@@ -5354,6 +5355,11 @@ static int pl_validate_rela_record(const struct prelink_obj *obj,
     case ARCH_RELOC_COPY:
         if (!symbol || symbol->st_size > SIZE_MAX)
             return PL_ADMISSION_INVALID;
+        if (!dlfrz_gnu_property_binding_supported(
+                obj->gnu_property_needed_1, 0,
+                (obj->flags & DLFRZ_FLAG_MAIN_EXE) != 0,
+                symbol, NULL, 1))
+            return PL_ADMISSION_UNSUPPORTED;
         width = (size_t)symbol->st_size;
         break;
     case ARCH_RELOC_TLSDESC:
@@ -5753,11 +5759,12 @@ out:
 
 static int pl_collect_object_control_ranges(
     FILE *file, const struct dlfrz_entry *entry, const Elf64_Ehdr *ehdr,
-    const struct prelink_obj *obj,
+    struct prelink_obj *obj,
     struct pl_control_range_builder *builder)
 {
     size_t phdr_size;
     unsigned int property_segments = 0;
+    struct dlfrz_gnu_property_profile profile = {0};
 
     if (!file || !entry || !ehdr || !obj || !builder ||
         obj->phdr_num == 0)
@@ -5774,6 +5781,7 @@ static int pl_collect_object_control_ranges(
 
     for (uint16_t i = 0; i < obj->phdr_num; i++) {
         Elf64_Phdr ph;
+        void *property_bytes;
 
         if (!pl_phdr_read(obj, i, &ph))
             return 0;
@@ -5786,9 +5794,14 @@ static int pl_collect_object_control_ranges(
                 PL_CONTROL_GNU_PROPERTY) ||
             !pl_control_range_builder_add_vaddr(
                 obj, builder, ph.p_vaddr, (size_t)ph.p_filesz,
-                PL_CONTROL_GNU_PROPERTY))
+                PL_CONTROL_GNU_PROPERTY) ||
+            !pl_vaddr_pointer(obj, ph.p_vaddr, (size_t)ph.p_filesz,
+                              1, PF_R, &property_bytes) ||
+            !dlfrz_gnu_property_segment_parse(
+                property_bytes, (size_t)ph.p_filesz, &profile))
             return 0;
     }
+    obj->gnu_property_needed_1 = profile.needed_1;
     return 1;
 }
 
@@ -6205,6 +6218,77 @@ static enum prelink_result prelink_admit_all_object_sources(
     return PRELINK_APPLIED;
 }
 
+/* Prelink does not select final versions/scopes. Conservatively leave a
+ * graph to its native loader if an executable's legacy COPY/PLT reference
+ * could bind incompatibly to an indirect-access export. Runtime checks use
+ * the exact selected provider, before any target resolver can run. */
+static int pl_indirect_access_bindings_supported(
+    struct prelink_obj *objs, int nobj)
+{
+    int needed = 0;
+
+    for (int i = 0; i < nobj; i++)
+        needed |= (objs[i].gnu_property_needed_1 &
+                   DLFRZ_GNU_PROPERTY_1_NEEDED_INDIRECT_EXTERN_ACCESS) != 0;
+    if (!needed)
+        return 1;
+    for (int oi = 0; oi < nobj; oi++) {
+        const struct prelink_obj *obj = &objs[oi];
+        const Elf64_Rela *tables[] = {obj->rela, obj->jmprel};
+        const size_t counts[] = {obj->rela_count, obj->jmprel_count};
+
+        if ((obj->flags & DLFRZ_FLAG_MAIN_EXE) == 0)
+            continue;
+        for (size_t table = 0; table < 2; table++) {
+            for (size_t i = 0; i < counts[table]; i++) {
+                Elf64_Rela relocation;
+                const Elf64_Sym *reference;
+                const char *name;
+                uint32_t index;
+                int is_copy;
+
+                memcpy(&relocation, &tables[table][i], sizeof(relocation));
+                index = ELF64_R_SYM(relocation.r_info);
+                if (index == 0)
+                    continue;
+                reference = pl_dynsym(obj, index);
+                if (!reference || !(name = pl_symbol_name(obj, reference)))
+                    return 0;
+                is_copy = ELF64_R_TYPE(relocation.r_info) == ARCH_RELOC_COPY;
+                if (!is_copy && (reference->st_shndx != SHN_UNDEF ||
+                                 reference->st_value == 0))
+                    continue;
+                for (int pi = 0; pi < nobj; pi++) {
+                    const struct prelink_obj *provider = &objs[pi];
+
+                    if (pi == oi || provider->gnu_property_needed_1 == 0)
+                        continue;
+                    for (uint32_t si = 1; si < provider->dynsym_count; si++) {
+                        const Elf64_Sym *definition = pl_dynsym(provider, si);
+                        const char *definition_name;
+
+                        if (!definition || definition->st_shndx == SHN_UNDEF ||
+                            ELF64_ST_BIND(definition->st_info) == STB_LOCAL ||
+                            (ELF64_ST_VISIBILITY(definition->st_other) != STV_PROTECTED &&
+                             ELF64_ST_VISIBILITY(definition->st_other) != STV_DEFAULT))
+                            continue;
+                        definition_name = pl_symbol_name(provider, definition);
+                        if (!definition_name)
+                            return 0;
+                        if (strcmp(name, definition_name) == 0 &&
+                            !dlfrz_gnu_property_binding_supported(
+                                obj->gnu_property_needed_1,
+                                provider->gnu_property_needed_1, 1,
+                                reference, definition, is_copy))
+                            return 0;
+                    }
+                }
+            }
+        }
+    }
+    return 1;
+}
+
 static enum prelink_result prelink_objects(
     const char *output_path, const struct dlfrz_entry *entries,
     struct dlfrz_lib_meta *metas, const int *startup_aliases,
@@ -6494,6 +6578,9 @@ static enum prelink_result prelink_objects(
             break;
         }
     }
+
+    if (!pl_indirect_access_bindings_supported(objs, nobj))
+        _exit(PRELINK_UNSUPPORTED);
 
     /* 3. Pre-apply only RELA RELATIVE relocations.  Their explicit addends
      * make the serialized bytes safe to hand to a native loader, which will

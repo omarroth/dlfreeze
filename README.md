@@ -86,6 +86,13 @@ the payload lives in a `PT_LOAD` segment, and a `DLFRZLDR` descriptor in
 EOF. UPX is one tested consumer of that ABI; the runtime does not select a
 code path by compressor name.
 
+Direct loading supports the ELF `GNU_PROPERTY_1_NEEDED_INDIRECT_EXTERN_ACCESS`
+contract used by newer toolchains. Protected data and function identities are
+preserved; incompatible executable COPY relocations and legacy PLT-address
+references are rejected before target resolvers run. Unknown needed-property
+bits still require native-loader semantics. This does not relax the separate
+trace admission policy for failed dynamic-loader calls.
+
 ## Usage
 
 ```

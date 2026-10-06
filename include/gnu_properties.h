@@ -12,6 +12,7 @@
 #define DLFRZ_GNU_PROPERTY_STACK_SIZE UINT32_C(1)
 #define DLFRZ_GNU_PROPERTY_NO_COPY_ON_PROTECTED UINT32_C(2)
 #define DLFRZ_GNU_PROPERTY_1_NEEDED UINT32_C(0xb0008000)
+#define DLFRZ_GNU_PROPERTY_1_NEEDED_INDIRECT_EXTERN_ACCESS UINT32_C(1)
 
 #define DLFRZ_GNU_PROPERTY_X86_FEATURE_2_NEEDED UINT32_C(0xc0008001)
 #define DLFRZ_GNU_PROPERTY_X86_ISA_1_NEEDED UINT32_C(0xc0008002)
@@ -36,11 +37,38 @@
 #define DLFRZ_AARCH64_PROT_BTI   UINT32_C(0x10)
 
 struct dlfrz_gnu_property_profile {
+    uint32_t needed_1;
     uint32_t feature_1;
     uint8_t feature_1_seen;
     uint64_t stack_size;
     uint8_t stack_size_seen;
 };
+
+/* INDIRECT_EXTERN_ACCESS is a binding contract, not an ISA requirement.
+ * Protected definitions keep their own storage/function identity. Legacy
+ * nonzero undefined-symbol PLT aliases also require a lookup model which
+ * direct mode does not implement, even for preemptible definitions. Unknown
+ * property bits remain unsupported at the note parser. Shared by prelink
+ * and runtime admission. */
+static inline int dlfrz_gnu_property_binding_supported(
+    uint32_t requester_needed_1, uint32_t provider_needed_1,
+    int requester_is_executable, const Elf64_Sym *reference,
+    const Elf64_Sym *definition, int is_copy)
+{
+    const uint32_t indirect =
+        DLFRZ_GNU_PROPERTY_1_NEEDED_INDIRECT_EXTERN_ACCESS;
+
+    if (is_copy && (requester_needed_1 & indirect) != 0)
+        return 0;
+    if (!requester_is_executable || !definition ||
+        (provider_needed_1 & indirect) == 0)
+        return 1;
+    if (reference && reference->st_shndx == SHN_UNDEF &&
+        reference->st_value != 0)
+        return 0;
+    return !is_copy ||
+           ELF64_ST_VISIBILITY(definition->st_other) != STV_PROTECTED;
+}
 
 static inline int dlfrz_aarch64_bti_mapping_required(
     const struct dlfrz_gnu_property_profile *profile, uint64_t hwcap2)
@@ -187,8 +215,9 @@ static inline int dlfrz_gnu_property_segment_parse(
             return 0;
         } else if (type == DLFRZ_GNU_PROPERTY_1_NEEDED) {
             if (!dlfrz_gnu_property_u32(data, data_size, &value) ||
-                value != 0)
+                (value & ~DLFRZ_GNU_PROPERTY_1_NEEDED_INDIRECT_EXTERN_ACCESS) != 0)
                 return 0;
+            profile.needed_1 = value;
 #if defined(__x86_64__)
         } else if (type == DLFRZ_GNU_PROPERTY_X86_FEATURE_1_AND) {
             if (!dlfrz_gnu_property_u32(data, data_size, &value) ||

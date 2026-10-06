@@ -745,6 +745,14 @@ static int section_and_property_control_gate(void)
     phdrs[1].p_vaddr = 900;
     phdrs[1].p_filesz = 16;
     phdrs[1].p_memsz = 16;
+    {
+        Elf64_Nhdr note = {
+            .n_namesz = 4, .n_descsz = 0,
+            .n_type = DLFRZ_NT_GNU_PROPERTY_TYPE_0
+        };
+        memcpy(image + 900, &note, sizeof(note));
+        memcpy(image + 900 + sizeof(note), "GNU\0", 4);
+    }
     memcpy(image + sizeof(Elf64_Ehdr), phdrs, sizeof(phdrs));
 
     memcpy(ehdr->e_ident, ELFMAG, SELFMAG);
@@ -1203,6 +1211,68 @@ static int lazy_relocation_validation_gate(void)
     return after == before;
 }
 
+static int indirect_access_binding_gate(void)
+{
+    _Alignas(Elf64_Rela) unsigned char images[2][TEST_IMAGE_SIZE] = {{0}};
+    struct prelink_obj objs[2];
+    Elf64_Phdr phdrs[2];
+    Elf64_Sym *symbols[2];
+    Elf64_Rela *relocation;
+
+    for (int i = 0; i < 2; i++) {
+        initialize_object(&objs[i], images[i], &phdrs[i], 1);
+        initialize_load(&phdrs[i], PF_R | PF_W, 0, 0, TEST_IMAGE_SIZE);
+        symbols[i] = (Elf64_Sym *)(images[i] + 1024);
+        objs[i].dynsym = symbols[i];
+        objs[i].dynsym_count = 2;
+        objs[i].dynstr = (char *)images[i] + 1500;
+        objs[i].dynstr_size = 32;
+        memcpy((char *)objs[i].dynstr, "\0indirect_binding\0", 18);
+        objs[i].dynstr_suffixes_bounded = 1;
+        symbols[i][1].st_name = 1;
+        symbols[i][1].st_info = ELF64_ST_INFO(STB_GLOBAL, STT_OBJECT);
+        symbols[i][1].st_shndx = 1;
+        symbols[i][1].st_size = sizeof(uint64_t);
+        symbols[i][1].st_value = TEST_DATA_OFFSET;
+    }
+    objs[0].flags = DLFRZ_FLAG_MAIN_EXE;
+    objs[1].gnu_property_needed_1 =
+        DLFRZ_GNU_PROPERTY_1_NEEDED_INDIRECT_EXTERN_ACCESS;
+    symbols[1][1].st_other = STV_PROTECTED;
+    relocation = (Elf64_Rela *)(images[0] + TEST_RELA_OFFSET);
+    relocation->r_info = ELF64_R_INFO(1, ARCH_RELOC_COPY);
+    relocation->r_offset = TEST_DATA_OFFSET;
+    objs[0].rela = relocation;
+    objs[0].rela_count = 1;
+    if (pl_indirect_access_bindings_supported(objs, 2))
+        return 0;
+    symbols[1][1].st_other = STV_DEFAULT;
+    if (!pl_indirect_access_bindings_supported(objs, 2))
+        return 0;
+    objs[0].gnu_property_needed_1 = objs[1].gnu_property_needed_1;
+    if (pl_validate_runtime_rela(&objs[0], relocation, 1) !=
+        PL_ADMISSION_UNSUPPORTED)
+        return 0;
+
+    relocation->r_info = ELF64_R_INFO(1, ARCH_RELOC_GLOB_DAT);
+    symbols[0][1].st_shndx = SHN_UNDEF;
+    symbols[0][1].st_value = 0;
+    symbols[0][1].st_info = ELF64_ST_INFO(STB_GLOBAL, STT_FUNC);
+    symbols[1][1].st_other = STV_PROTECTED;
+    symbols[1][1].st_info = ELF64_ST_INFO(STB_GLOBAL, STT_FUNC);
+    if (!pl_indirect_access_bindings_supported(objs, 2) ||
+        pl_validate_runtime_rela(&objs[0], relocation, 1) != PL_ADMISSION_OK)
+        return 0;
+    symbols[0][1].st_value = 16;
+    if (pl_indirect_access_bindings_supported(objs, 2))
+        return 0;
+    symbols[1][1].st_other = STV_DEFAULT;
+    if (pl_indirect_access_bindings_supported(objs, 2))
+        return 0;
+    objs[1].gnu_property_needed_1 = 0;
+    return pl_indirect_access_bindings_supported(objs, 2);
+}
+
 int main(void)
 {
     if (!overlap_component_alias_gate()) return 1;
@@ -1223,5 +1293,6 @@ int main(void)
     if (!lazy_relocation_validation_gate()) return 16;
     if (!aarch64_dynamic_semantics_gate()) return 17;
     if (!all_source_selection_gate()) return 18;
+    if (!indirect_access_binding_gate()) return 19;
     return 0;
 }

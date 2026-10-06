@@ -6450,6 +6450,7 @@ struct loaded_obj {
      * and therefore the natural "none" value. */
     uint32_t          eager_glibc_start_main_symbol;
     uint8_t           gnu_property_feature_1_seen;
+    uint32_t          gnu_property_needed_1;
     uint32_t          gnu_property_feature_1;
     uint64_t          gnu_property_stack_size;
     uint8_t           gnu_property_stack_size_seen;
@@ -7267,6 +7268,7 @@ static int parse_loaded_gnu_properties(struct loaded_obj *obj)
     if (!obj)
         return -1;
     obj->gnu_property_feature_1_seen = 0;
+    obj->gnu_property_needed_1 = 0;
     obj->gnu_property_feature_1 = 0;
     obj->gnu_property_stack_size = 0;
     obj->gnu_property_stack_size_seen = 0;
@@ -7297,6 +7299,7 @@ static int parse_loaded_gnu_properties(struct loaded_obj *obj)
             obj->phdr_num, sizeof(Elf64_Phdr), &profile))
         return -1;
     obj->gnu_property_feature_1_seen = profile.feature_1_seen;
+    obj->gnu_property_needed_1 = profile.needed_1;
     obj->gnu_property_feature_1 = profile.feature_1;
     obj->gnu_property_stack_size = profile.stack_size;
     obj->gnu_property_stack_size_seen = profile.stack_size_seen;
@@ -7312,17 +7315,20 @@ static int revalidate_loaded_gnu_properties(struct loaded_obj *obj)
     uint8_t expected_seen;
     uint8_t expected_stack_size_seen;
     uint32_t expected_feature_1;
+    uint32_t expected_needed_1;
     uint64_t expected_stack_size;
 
     if (!obj)
         return -1;
     expected_seen = obj->gnu_property_feature_1_seen;
+    expected_needed_1 = obj->gnu_property_needed_1;
     expected_feature_1 = obj->gnu_property_feature_1;
     expected_stack_size = obj->gnu_property_stack_size;
     expected_stack_size_seen = obj->gnu_property_stack_size_seen;
     if (parse_loaded_gnu_properties(obj) < 0)
         return -1;
     return obj->gnu_property_feature_1_seen == expected_seen &&
+           obj->gnu_property_needed_1 == expected_needed_1 &&
            obj->gnu_property_feature_1 == expected_feature_1 &&
            obj->gnu_property_stack_size == expected_stack_size &&
            obj->gnu_property_stack_size_seen == expected_stack_size_seen
@@ -31652,6 +31658,17 @@ static int resolve_requester_writable_object(
                                       address_out);
 }
 
+static int indirect_access_binding_supported(
+    const struct loaded_obj *requester, const Elf64_Sym *reference,
+    const struct loaded_obj *owner, const Elf64_Sym *definition, int is_copy)
+{
+    return requester && dlfrz_gnu_property_binding_supported(
+        requester->gnu_property_needed_1,
+        owner ? owner->gnu_property_needed_1 : 0,
+        (requester->flags & LDR_FLAG_MAIN_EXE) != 0,
+        reference, definition, is_copy);
+}
+
 static int resolve_relocation_symbol(struct loaded_obj *requester,
                                      uint32_t sym_index,
                                      struct loaded_obj *objs, int nobj,
@@ -31686,8 +31703,12 @@ static int resolve_relocation_symbol(struct loaded_obj *requester,
 
     sym = lookup_relocation_definition(requester, sym_index, objs, nobj, 0,
                                        &owner);
-    if (!sym || !owner ||
-        !resolve_defined_symbol_address(owner, sym, &addr, NULL))
+    if (!sym || !owner)
+        return 0;
+    if (!indirect_access_binding_supported(
+            requester, reference, owner, sym, 0))
+        return -1;
+    if (!resolve_defined_symbol_address(owner, sym, &addr, NULL))
         return 0;
     if (selected_definition_requires_native_glibc_gmon(owner, query))
         return -1;
@@ -32354,6 +32375,9 @@ static int validate_relocation_record_core(
     } else if (type == ARCH_RELOC_COPY) {
         if (!reference || reference->st_size > SIZE_MAX)
             return -1;
+        if (!indirect_access_binding_supported(
+                obj, reference, NULL, NULL, 1))
+            return -1;
         width = (size_t)reference->st_size;
     } else if (type == ARCH_RELOC_TLSDESC) {
         width = 2 * sizeof(uint64_t);
@@ -32533,6 +32557,63 @@ static int relocation_destination_overlaps_tls_template(
             return 1;
         if (offset < tls_end && ph->p_vaddr < relocation_end)
             return 1;
+    }
+    return 0;
+}
+
+/* Check executable references before any IFUNC/constructor effects, including
+ * lazy PLT entries which the resolver-destination pass deliberately skips.
+ * Ordinary zero-valued imports need no extra lookup. */
+static int preflight_indirect_access_bindings(
+    struct loaded_obj *targets, int ntargets,
+    struct loaded_obj *scope, int nscope)
+{
+    int needed = 0;
+
+    for (int i = 0; i < nscope; i++)
+        needed |= (scope[i].gnu_property_needed_1 &
+                   DLFRZ_GNU_PROPERTY_1_NEEDED_INDIRECT_EXTERN_ACCESS) != 0;
+    if (!needed)
+        return 0;
+    for (int oi = 0; oi < ntargets; oi++) {
+        struct loaded_obj *obj = &targets[oi];
+
+        if ((obj->flags & LDR_FLAG_MAIN_EXE) == 0)
+            continue;
+        for (enum loaded_rela_table table = LOADED_RELA_DYNAMIC;
+             table < LOADED_RELA_TABLE_COUNT; table++) {
+            size_t count = loaded_rela_table_count(obj, table);
+
+            for (size_t i = 0; i < count; i++) {
+                Elf64_Rela relocation;
+                const Elf64_Sym *reference;
+                const Elf64_Sym *definition;
+                struct loaded_obj *owner = NULL;
+                uint32_t index;
+                int is_copy;
+
+                if (!loaded_rela_read(obj, table, i, &relocation))
+                    return -1;
+                index = ELF64_R_SYM(relocation.r_info);
+                if (index == 0)
+                    continue;
+                reference = loaded_dynsym(obj, index);
+                if (!reference)
+                    return -1;
+                is_copy = ELF64_R_TYPE(relocation.r_info) == ARCH_RELOC_COPY;
+                if (!is_copy && (reference->st_shndx != SHN_UNDEF ||
+                                 reference->st_value == 0))
+                    continue;
+                definition = lookup_relocation_definition(
+                    obj, index, scope, nscope, is_copy, &owner);
+                if (!indirect_access_binding_supported(
+                        obj, reference, owner, definition, is_copy)) {
+                    ldr_err("incompatible indirect external access binding in",
+                            obj->name);
+                    return -1;
+                }
+            }
+        }
     }
     return 0;
 }
@@ -32747,6 +32828,11 @@ static int apply_copy_relocation(struct loaded_obj *obj,
 
     definition = lookup_relocation_definition(obj,
         ELF64_R_SYM(rel->r_info), objs, nobj, 1, &owner);
+    if (!indirect_access_binding_supported(
+            obj, reference, owner, definition, 1)) {
+        ldr_err("COPY violates indirect external access in", obj->name);
+        return -1;
+    }
     if (!definition || !owner) {
         const char *canonical_name = NULL;
         const void *fake_source;
@@ -34432,6 +34518,7 @@ static int map_object(const uint8_t *mem, uint64_t mem_foff, int srcfd,
     obj->elf_type = ehdr->e_type;
     obj->phdr_num = meta->phdr_num;
     obj->gnu_property_feature_1_seen = property_profile.feature_1_seen;
+    obj->gnu_property_needed_1 = property_profile.needed_1;
     obj->gnu_property_feature_1 = property_profile.feature_1;
     obj->gnu_property_stack_size = property_profile.stack_size;
     obj->gnu_property_stack_size_seen = property_profile.stack_size_seen;
@@ -37077,6 +37164,9 @@ static int select_lazy_plt_target(
         requester, symbol_index, g_all_objs, g_nobj, 0, &owner);
     if (!definition || !owner)
         return ELF64_ST_BIND(reference->st_info) == STB_WEAK ? 1 : 0;
+    if (!indirect_access_binding_supported(
+            requester, reference, owner, definition, 0))
+        return -1;
     if (selected_definition_requires_native_glibc_gmon(owner, query_out))
         return -1;
     if (ELF64_ST_TYPE(definition->st_info) == STT_GNU_IFUNC) {
@@ -45884,6 +45974,7 @@ static struct loaded_obj *load_elf_from_file_fd(
     property_profile.feature_1_seen =
         property_view.gnu_property_feature_1_seen;
     property_profile.feature_1 = property_view.gnu_property_feature_1;
+    property_profile.needed_1 = property_view.gnu_property_needed_1;
     property_profile.stack_size = property_view.gnu_property_stack_size;
     property_profile.stack_size_seen =
         property_view.gnu_property_stack_size_seen;
@@ -45950,6 +46041,7 @@ static struct loaded_obj *load_elf_from_file_fd(
     obj->phdr_num = ehdr.e_phnum;
     obj->gnu_property_feature_1_seen = property_profile.feature_1_seen;
     obj->gnu_property_feature_1 = property_profile.feature_1;
+    obj->gnu_property_needed_1 = property_profile.needed_1;
     obj->gnu_property_stack_size = property_profile.stack_size;
     obj->gnu_property_stack_size_seen = property_profile.stack_size_seen;
     obj->map_start = base + lo;
@@ -49993,6 +50085,8 @@ static int loader_run_impl(const uint8_t *mem, uint64_t mem_foff, int srcfd,
         ldr_err("malformed startup dependency graph", NULL);
         RETURN_BEFORE_TARGET_TLS();
     }
+    if (preflight_indirect_access_bindings(objs, nobj, objs, nobj) < 0)
+        RETURN_BEFORE_TARGET_TLS();
 
     if (!is_musl_runtime &&
         initialize_glibc_thread_contract(objs, nobj) < 0) {
