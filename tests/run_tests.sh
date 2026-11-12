@@ -41,6 +41,15 @@ test_application_agnostic_source_gate() {
     pass "application-agnostic production source"
 }
 
+test_build_stamp_stability() {
+    echo "--- locale-independent build stamp ---"
+    if bash tests/build-stamp-gate.sh "$BUILD"; then
+        pass "build stamp is stable across locales and unchanged builds"
+    else
+        fail "build stamp stability" "fingerprint or invalidation contract differed"
+    fi
+}
+
 # A private loader path replaces musl's system directories. Libcs with an
 # explicit SONAME need that dependency reachable there even for the native
 # control; the link must identify the fixture's copied interpreter itself.
@@ -33304,6 +33313,7 @@ echo "build dir: $BUILD"
 
 TEST_FUNCTIONS=(
 test_application_agnostic_source_gate
+test_build_stamp_stability
 test_benchmark_harness_gate
 test_hello
 test_default_direct_policy

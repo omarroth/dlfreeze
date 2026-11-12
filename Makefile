@@ -11,7 +11,7 @@ BOOTSTRAP_CPPFLAGS ?=
 
 BUILD    = build
 SRC      = src
-BUILD_TRIPLE := $(shell $(CC) -dumpmachine 2>/dev/null || uname -m)
+BUILD_TRIPLE := $(shell LC_ALL=C $(CC) -dumpmachine 2>/dev/null || uname -m)
 # Compare compiler targets by admitted ELF architecture, not by vendor/libc
 # components of the triple (x86_64-linux-musl and x86_64-linux-gnu are
 # intentionally compatible here).
@@ -27,12 +27,14 @@ comma := ,
 supported_static_link_option = $(shell printf 'int main(void){return 0;}' | $(1) -static $(LDFLAGS) $(2) -x c - -x none -o /dev/null >/dev/null 2>&1 && printf '%s' '$(2)')
 BUILD_ARCH := $(call triple_arch,$(BUILD_TRIPLE))
 BUILD_OS := $(shell if [ -r /etc/os-release ]; then . /etc/os-release; fi; printf '%s:%s' "$${ID:-unknown}" "$${VERSION_ID:-unknown}")
-BUILD_LIBC := $(shell ldd --version 2>&1 | head -n 1 || true)
-BUILD_CC_VERSION := $(shell $(CC) --version 2>/dev/null | head -n 1 || true)
-BUILD_SOURCE_HASH := $(shell find src include -type f \( -name '*.c' -o -name '*.h' -o -name '*.S' \) -print 2>/dev/null | sort | xargs sha256sum 2>/dev/null | sha256sum 2>/dev/null | awk '{print $$1}')
+BUILD_LIBC := $(shell LC_ALL=C ldd --version 2>&1 | head -n 1 || true)
+BUILD_CC_VERSION := $(shell LC_ALL=C $(CC) --version 2>/dev/null | head -n 1 || true)
+# A fingerprint describes bytes, not the invoking shell's collation policy.
+# Keep the ordering locale-independent and filenames intact through xargs.
+BUILD_SOURCE_HASH := $(shell LC_ALL=C; export LC_ALL; find src include -type f \( -name '*.c' -o -name '*.h' -o -name '*.S' \) -print0 2>/dev/null | sort -z | xargs -0 sha256sum 2>/dev/null | sha256sum 2>/dev/null | awk '{print $$1}')
 BUILD_RECIPE_HASH := $(shell sha256sum Makefile 2>/dev/null | awk '{print $$1}')
 MUSL_CC := $(shell command -v musl-gcc 2>/dev/null || true)
-MUSL_CC_TRIPLE := $(shell if [ -n '$(MUSL_CC)' ]; then '$(MUSL_CC)' -dumpmachine 2>/dev/null; fi)
+MUSL_CC_TRIPLE := $(shell if [ -n '$(MUSL_CC)' ]; then LC_ALL=C '$(MUSL_CC)' -dumpmachine 2>/dev/null; fi)
 MUSL_CC_ARCH := $(call triple_arch,$(MUSL_CC_TRIPLE))
 can_link_static = $(shell printf 'int main(void){return 0;}' | $(1) -static $(LDFLAGS) -x c - -x none -o /dev/null >/dev/null 2>&1 && printf yes)
 AUTO_STATIC_CC := $(if $(and $(MUSL_CC),$(filter $(BUILD_ARCH),$(MUSL_CC_ARCH)),$(call can_link_static,$(MUSL_CC))),$(MUSL_CC),$(CC))
@@ -40,9 +42,9 @@ AUTO_STATIC_CC := $(if $(and $(MUSL_CC),$(filter $(BUILD_ARCH),$(MUSL_CC_ARCH)),
 # only when it targets the same ELF architecture as CC; silently mixing a host
 # musl-gcc into a cross build would produce an unusable tool/bootstrap pair.
 STATIC_CC ?= $(AUTO_STATIC_CC)
-STATIC_CC_TRIPLE := $(shell $(STATIC_CC) -dumpmachine 2>/dev/null || true)
+STATIC_CC_TRIPLE := $(shell LC_ALL=C $(STATIC_CC) -dumpmachine 2>/dev/null || true)
 STATIC_CC_ARCH := $(call triple_arch,$(STATIC_CC_TRIPLE))
-STATIC_CC_STAMP := $(shell printf '%s:%s:%s' '$(STATIC_CC)' "$$($(STATIC_CC) -dumpmachine 2>/dev/null || true)" "$$($(STATIC_CC) --version 2>/dev/null | head -n 1 || true)")
+STATIC_CC_STAMP := $(shell printf '%s:%s:%s' '$(STATIC_CC)' "$$(LC_ALL=C $(STATIC_CC) -dumpmachine 2>/dev/null || true)" "$$(LC_ALL=C $(STATIC_CC) --version 2>/dev/null | head -n 1 || true)")
 # GNU BFD, LLD, and mold accept --image-base; GNU gold instead accepts
 # -Ttext-segment for the same fixed ET_EXEC placement required by prelinking.
 STATIC_IMAGE_BASE_PRIMARY := $(call supported_static_link_option,$(STATIC_CC),-Wl$(comma)--image-base=0x40000000)
