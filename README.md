@@ -143,7 +143,18 @@ Replay preserves `errno` and thread-local, consume-once errors, formatting
 messages through the embedded libc in the current locale. Unknown layouts,
 denied inspection, missing dependencies, and other failure classes keep the
 native-loader fallback; this is not an application-specific plugin rule.
-New recordings use dlopen trace V9; completed V8 recordings remain readable.
+Caller-scoped witnesses also retain bare-name misses and `RTLD_NOLOAD`
+probes which return NULL without setting a loader error. Replay checks loaded
+objects first, including captured inode aliases, then preserves the observed
+probe result, `errno`, and consume-once diagnostic. Probe metadata is not a
+captured filesystem path. Importing or packing a recording rechecks its caller
+revision and search result; unknown failure classes still require native
+semantics. New recordings use dlopen trace V10; completed V8/V9 recordings
+remain readable.
+
+A captured regular file and a dormant library can share their original ELF
+payload when their exact source revisions match. Startup/prelinked sources
+are excluded, so file reads never expose pre-applied relocation bytes.
 
 ## Building
 

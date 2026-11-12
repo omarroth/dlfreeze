@@ -144,6 +144,7 @@ static _Atomic int g_native_error_layout_ready;
 static _Atomic intptr_t g_native_error_tls_offset;
 static void initialize_native_error_layout(void);
 static int raw_fstatat(int, const char *, struct stat *, int);
+static int absolute_link_map_name(const char *, const char *, char [PATH_MAX]);
 #if defined(LM_ID_BASE) && defined(LM_ID_NEWLM)
 #define DLFREEZE_HAVE_DLMOPEN 1
 _Static_assert(sizeof(Lmid_t) <= sizeof(uint64_t),
@@ -237,7 +238,7 @@ static pid_t g_trace_owner_pid;
 static pid_t g_trace_participant_pid;
 
 #define PRELOAD_TRACE_READY "#DLFREEZE_PRELOAD_TRACE_V9"
-#define DLOPEN_TRACE_READY  "#DLFREEZE_DLOPEN_TRACE_V9"
+#define DLOPEN_TRACE_READY  "#DLFREEZE_DLOPEN_TRACE_V10"
 #define TRACE_OWNER_ENV     "DLFREEZE_TRACE_OWNER_PID"
 #define DLOPEN_TRACE_FD_ENV "DLFREEZE_TRACE_FD"
 #define FILE_TRACE_FD_ENV   "DLFREEZE_FILE_TRACE_FD"
@@ -1116,7 +1117,9 @@ static void initialize_native_error_layout(void)
 #endif
 }
 
-static int native_missing_root_witness(const char *request)
+/* 0: unknown, 1: silent NOLOAD miss, 2: missing root with a native ENOENT
+ * diagnostic. Never consume dlerror or replace its thread-local state. */
+static int native_probe_witness(const char *request, int no_load)
 {
     uintptr_t result;
     unsigned char state[24];
@@ -1129,14 +1132,21 @@ static int native_missing_root_witness(const char *request)
     int saved_errno = errno;
     int accepted = 0;
 
-    if (!request || request[0] != '/' ||
+    if (!request || !request[0] || strchr(request, '$') ||
+        (request[0] != '/' && strchr(request, '/')) ||
         !bounded_string_length(request, sizeof(name), &length) ||
         !atomic_load_explicit(&g_native_error_layout_ready,
                                memory_order_acquire))
         return 0;
     if (!read_native_error_memory(NULL,
             native_error_thread_pointer() + (uintptr_t)g_native_error_tls_offset,
-            &result, sizeof(result)) || !result || result == UINTPTR_MAX ||
+            &result, sizeof(result)))
+        goto out;
+    if (!result) {
+        accepted = no_load ? 1 : 0;
+        goto out;
+    }
+    if (result == UINTPTR_MAX ||
         !read_native_error_memory(NULL, result, state, sizeof(state)))
         goto out;
     memcpy(&error_code, state, sizeof(error_code));
@@ -1150,9 +1160,9 @@ static int native_missing_root_witness(const char *request)
         goto out;
     /* Recheck the physical root as well: a missing dependency, invalid ELF,
      * permission failure, or replaced pathname is not a frozen root miss. */
-    if (raw_fstatat(AT_FDCWD, request, &status, 0) < 0 &&
-        errno == ENOENT)
-        accepted = 1;
+    if (request[0] != '/' ||
+        (raw_fstatat(AT_FDCWD, request, &status, 0) < 0 && errno == ENOENT))
+        accepted = 2;
 out:
     errno = saved_errno;
     return accepted;
@@ -2689,6 +2699,66 @@ static int snapshot_mapped_address(
     return 1;
 }
 
+static int write_probe_record(const char *request, int mode, uint64_t attempt,
+                              int witness, uintptr_t caller, const char *cwd)
+{
+    Dl_info info;
+    struct mapped_file_identity identity;
+    struct file_trace_snapshot snapshot;
+    char *record;
+    size_t position = 0;
+    const size_t capacity = 6U * PATH_MAX + 256U;
+    const size_t allocation = capacity + 2U * PATH_MAX;
+    char *logical, *source;
+    int admitted;
+
+    /* Keep pathname scratch out of application thread stacks. A failed
+     * optional observation can always retain the ordinary F fallback. */
+    record = allocate_trace_record(allocation);
+    if (!record)
+        return 0;
+    logical = record + capacity;
+    source = logical + PATH_MAX;
+    g_trace_depth++;
+    admitted = caller && dladdr((void *)caller, &info) &&
+        absolute_link_map_name(info.dli_fname, cwd, logical) &&
+        snapshot_mapped_address(caller, &identity, source, &snapshot);
+    g_trace_depth--;
+    if (!admitted) {
+        release_trace_record(record, allocation);
+        return 0;
+    }
+    record[position++] = 'J'; record[position++] = ' ';
+    append_u64_hex(record, &position, (uint64_t)trace_current_pid());
+    record[position++] = ' ';
+    append_u64_hex(record, &position, attempt);
+    record[position++] = ' ';
+    append_u32_hex(record, &position, (uint32_t)mode);
+    record[position++] = ' ';
+    record[position++] = witness == 1 ? 'N' : 'M';
+    const char *paths[] = {request, logical, source};
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+        record[position++] = ' ';
+        for (const unsigned char *p = (const unsigned char *)paths[i]; *p; p++) {
+            record[position++] = hex_digit(*p >> 4);
+            record[position++] = hex_digit(*p);
+        }
+    }
+    const uint64_t fields[] = {
+        snapshot.device, snapshot.inode, snapshot.type, snapshot.size,
+        snapshot.mtime_sec, snapshot.mtime_nsec,
+        snapshot.ctime_sec, snapshot.ctime_nsec
+    };
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+        record[position++] = ' ';
+        append_u64_hex(record, &position, fields[i]);
+    }
+    record[position++] = '\n';
+    trace_write_exact(TRACE_STREAM_DLOPEN, record, position);
+    release_trace_record(record, allocation);
+    return 1;
+}
+
 struct initial_evidence_context {
     uint64_t attempt;
     uint64_t count;
@@ -2790,7 +2860,8 @@ static void write_trace_owner_record(enum trace_stream_kind stream)
 static void write_failed_load_record(char api, int filename_present,
                                      uint64_t namespace_id, int mode,
                                      uint64_t attempt, const char *request,
-                                     int preserves_errno)
+                                     int preserves_errno, uintptr_t caller,
+                                     const char *lookup_cwd)
 {
     int saved_errno = errno;
     char record[66];
@@ -2801,10 +2872,17 @@ static void write_failed_load_record(char api, int filename_present,
     if ((api != 'D' && api != 'M') ||
         (api == 'D' && namespace_id != 0) || attempt == 0)
         trace_write_failure();
-    if (api == 'D' && filename_present && request && preserves_errno &&
-        dlfrz_dlopen_mode_is_supported(mode) &&
-        ((uint32_t)mode & DLFRZ_RTLD_NOLOAD) == 0 &&
-        native_missing_root_witness(request)) {
+    int witness = api == 'D' && filename_present && request && preserves_errno &&
+        dlfrz_dlopen_mode_is_supported(mode)
+        ? native_probe_witness(request, (uint32_t)mode & DLFRZ_RTLD_NOLOAD) : 0;
+    if (witness && (request[0] != '/' ||
+                    ((uint32_t)mode & DLFRZ_RTLD_NOLOAD))) {
+        if (write_probe_record(request, mode, attempt, witness,
+                                caller, lookup_cwd)) {
+            errno = saved_errno;
+            return;
+        }
+    } else if (witness == 2) {
         char missing_record[2 * PATH_MAX + 64];
         size_t missing_pos = 0;
         size_t length = strlen(request);
@@ -3173,7 +3251,7 @@ static void cancel_owner_exec_attempt(uint64_t attempt)
     write_exec_attempt_record(TRACE_STREAM_FILE, 'C', attempt);
 }
 
-/* A successful non-NULL dlopen must yield either a complete V9 record or a
+/* A successful non-NULL dlopen must yield either a complete V10 record or a
  * record that makes the packer fail closed.  In particular, alternate libcs
  * are not required to provide a usable RTLD_DI_LINKMAP result. */
 static void write_dlopen_failure(const char *reason)
@@ -3768,7 +3846,9 @@ void *dlopen(const char *filename, int flags)
     else if (!h && !unsupported_request)
         write_failed_load_record('D', filename != NULL, 0, flags, attempt,
                                  request_is_bounded ? trace_request : NULL,
-                                 call_errno == result_errno);
+                                 call_errno == result_errno,
+                                 (uintptr_t)__builtin_extract_return_addr(
+                                     __builtin_return_address(0)), lookup_cwd);
     else if (!unsupported_request)
         trace_successful_dlopen(h, trace_request, lookup_cwd, flags,
                                 &before, baseline_valid, attempt);
@@ -3881,7 +3961,7 @@ void *dlmopen(Lmid_t namespace_id, const char *filename, int flags)
         if (!unsupported_request)
             write_failed_load_record('M', filename != NULL,
                                      (uint64_t)namespace_id, flags, attempt,
-                                     NULL, 0);
+                                     NULL, 0, 0, NULL);
         finish_file_trace_transaction(&file_transaction);
         mapped_identity_set_free(&before);
         if (observing)

@@ -15469,6 +15469,7 @@ static int dl_manifest_startup_owners_build(
  * the target runtime's public pthread-key ABI and loader-owned mmap storage. */
 struct dl_error_state {
     int valid;
+    int probe_preserves_errno;
     const char *missing_root; /* immutable manifest string, formatted lazily */
     void *formatted_mapping;
     size_t formatted_size;
@@ -15646,6 +15647,12 @@ static size_t g_vfs_count;
  * open/stat calls must still see the immutable ELF bytes in the manifest. */
 static int g_vfs_overrides_active;
 static int g_frozen_loader_misses;
+struct frozen_loader_probe {
+    const char *request;
+    struct dlfrz_loader_probe witness;
+};
+static struct frozen_loader_probe *g_loader_probes;
+static size_t g_loader_probe_count;
 static struct vfs_regular_fd_map *g_vfs_regular_fd_maps;
 static size_t g_vfs_regular_fd_map_count;
 static size_t g_vfs_regular_fd_map_capacity;
@@ -16113,11 +16120,19 @@ static int vfs_init(const uint8_t *mem, uint64_t mem_foff,
     g_vfs_count = 0;
     g_vfs_overrides_active = 0;
     g_frozen_loader_misses = 0;
+    free(g_loader_probes);
+    g_loader_probes = NULL;
+    g_loader_probe_count = 0;
     frozen_elf_index_reset();
     vfs_reset_dirs();
     g_vfs_next_inode = 1;
 
     for (uint32_t i = 0; i < num_entries; i++) {
+        if (entries[i].flags & DLFRZ_FLAG_LOADER_PROBE) {
+            g_loader_probe_count++;
+            g_frozen_loader_misses = 1;
+            continue;
+        }
         if (entries[i].flags & DLFRZ_FLAG_DATA) {
             data_count++;
             g_vfs_overrides_active = 1;
@@ -16140,6 +16155,41 @@ static int vfs_init(const uint8_t *mem, uint64_t mem_foff,
         }
     }
 
+    if (g_loader_probe_count) {
+        size_t count = 0;
+        g_loader_probes = calloc(g_loader_probe_count, sizeof(*g_loader_probes));
+        if (!g_loader_probes)
+            goto fail;
+        for (uint32_t i = 0; i < num_entries; i++) {
+            const struct dlfrz_entry *entry = &entries[i];
+            if (!(entry->flags & DLFRZ_FLAG_LOADER_PROBE))
+                continue;
+            struct frozen_loader_probe *probe = &g_loader_probes[count++];
+            if (entry->data_offset < mem_foff ||
+                entry->data_size != sizeof(probe->witness))
+                goto fail;
+            ldr_memcpy(&probe->witness, mem + (entry->data_offset - mem_foff),
+                       sizeof(probe->witness));
+            probe->request = strtab + entry->name_offset;
+            if (!dlfrz_loader_probe_canonical(&probe->witness, sizeof(probe->witness)) ||
+                !probe->request[0] || strchr(probe->request, '$') ||
+                (strchr(probe->request, '/') && probe->request[0] != '/') ||
+                probe->witness.caller_index >= num_entries ||
+                (entries[probe->witness.caller_index].flags & DLFRZ_FLAG_DATA) ||
+                (probe->witness.provider_index != UINT32_MAX &&
+                 (probe->witness.provider_index >= num_entries ||
+                  (entries[probe->witness.provider_index].flags & DLFRZ_FLAG_DATA))))
+                goto fail;
+            for (size_t j = 0; j + 1 < count; j++)
+                if (entries[g_loader_probes[j].witness.caller_index].data_offset ==
+                        entries[probe->witness.caller_index].data_offset &&
+                    entries[g_loader_probes[j].witness.caller_index].data_size ==
+                        entries[probe->witness.caller_index].data_size &&
+                    g_loader_probes[j].witness.mode == probe->witness.mode &&
+                    strcmp(g_loader_probes[j].request, probe->request) == 0)
+                    goto fail;
+        }
+    }
     if (data_count != 0 && !g_vfs_hash_key_ready)
         return -1;
     if (frozen_elf_index_init(entries, strtab, num_entries) < 0)
@@ -16157,7 +16207,8 @@ static int vfs_init(const uint8_t *mem, uint64_t mem_foff,
     for (uint32_t i = 0; i < num_entries; i++) {
         uint32_t data_state;
 
-        if (!(entries[i].flags & DLFRZ_FLAG_DATA)) continue;
+        if (!(entries[i].flags & DLFRZ_FLAG_DATA) ||
+            (entries[i].flags & DLFRZ_FLAG_LOADER_PROBE)) continue;
         if (!dlfrz_manifest_entry_timestamps_canonical(&entries[i]))
             goto fail;
         data_state = entries[i].flags & (DLFRZ_FLAG_DATA_VIRTUAL |
@@ -16228,6 +16279,9 @@ static int vfs_init(const uint8_t *mem, uint64_t mem_foff,
     return 0;
 
 fail:
+    free(g_loader_probes);
+    g_loader_probes = NULL;
+    g_loader_probe_count = 0;
     free(g_vfs_table);
     g_vfs_table = NULL;
     g_vfs_table_size = 0;
@@ -39968,6 +40022,7 @@ static void dl_clear_error(void)
         state->formatted_size = 0;
         state->missing_root = NULL;
         state->valid = 0;
+        state->probe_preserves_errno = 0;
     }
 }
 
@@ -39989,6 +40044,7 @@ static void dl_set_error(const char *a, const char *b)
     state->formatted_mapping = NULL;
     state->formatted_size = 0;
     state->missing_root = NULL;
+    state->probe_preserves_errno = 0;
 
     if (a) while (*a && d < end) *d++ = *a++;
     if (b) while (*b && d < end) *d++ = *b++;
@@ -41068,6 +41124,8 @@ static int dl_manifest_path_sources_are_consistent(void)
         const struct dlfrz_entry *entry = &g_frozen_entries[i];
         const char *paths[3];
 
+        if (entry->flags & DLFRZ_FLAG_LOADER_PROBE)
+            continue;
         paths[0] = g_frozen_strtab + entry->name_offset;
         paths[1] = !(entry->flags & DLFRZ_FLAG_DATA) &&
                    entry->logical_name_offset != 0
@@ -41098,6 +41156,8 @@ static int dl_manifest_path_sources_are_consistent(void)
         const struct dlfrz_entry *entry = &g_frozen_entries[i];
         const char *paths[3];
 
+        if (entry->flags & DLFRZ_FLAG_LOADER_PROBE)
+            continue;
         paths[0] = g_frozen_strtab + entry->name_offset;
         paths[1] = !(entry->flags & DLFRZ_FLAG_DATA) &&
                    entry->logical_name_offset != 0
@@ -46451,6 +46511,33 @@ static int dl_record_musl_dlopen_root_loader(
     return 0;
 }
 
+static int dl_probe_source_matches(const struct loaded_obj *object,
+                                   uint32_t manifest_index)
+{
+    if (!object || !object->frozen_manifest_index_plus_one ||
+        manifest_index >= g_frozen_num_entries)
+        return 0;
+    uint32_t owner = object->frozen_manifest_index_plus_one - 1;
+    return owner < g_frozen_num_entries &&
+        g_frozen_entries[owner].data_offset == g_frozen_entries[manifest_index].data_offset &&
+        g_frozen_entries[owner].data_size == g_frozen_entries[manifest_index].data_size;
+}
+
+static const struct frozen_loader_probe *dl_find_loader_probe(
+    const struct loaded_obj *caller, const char *request, int mode)
+{
+    if (g_is_musl_runtime || !caller)
+        return NULL;
+    for (size_t i = 0; i < g_loader_probe_count; i++) {
+        const struct frozen_loader_probe *probe = &g_loader_probes[i];
+        if (probe->witness.mode == (uint32_t)mode &&
+            dl_probe_source_matches(caller, probe->witness.caller_index) &&
+            strcmp(probe->request, request) == 0)
+            return probe;
+    }
+    return NULL;
+}
+
 static void *my_dlopen_for_caller(const char *path, int flags,
                                   void *return_address)
 {
@@ -46469,6 +46556,7 @@ static void *my_dlopen_for_caller(const char *path, int flags,
     int pathful;
     int publish_global;
     int request_identity_status;
+    const struct frozen_loader_probe *probe;
 
     dl_clear_error();
 
@@ -46496,6 +46584,7 @@ static void *my_dlopen_for_caller(const char *path, int flags,
     }
 
     caller = dl_object_for_address(return_address);
+    probe = dl_find_loader_probe(caller, path, flags);
     top_loader = caller;
     pathful = dl_path_has_slash(path);
 
@@ -46522,7 +46611,11 @@ static void *my_dlopen_for_caller(const char *path, int flags,
     }
 
     for (int i = 0; i < g_nobj; i++) {
-        if (request_identity_status > 0) {
+        if (probe && probe->witness.provider_index != UINT32_MAX &&
+            dl_probe_source_matches(&g_all_objs[i], probe->witness.provider_index)) {
+            /* A later load through a different pathname can make a formerly
+             * silent NOLOAD probe succeed. Inode/source identity wins. */
+        } else if (request_identity_status > 0) {
             if (!dl_loaded_request_slot_matches(
                     &g_all_objs[i], request_identity))
                 continue;
@@ -46530,7 +46623,7 @@ static void *my_dlopen_for_caller(const char *path, int flags,
             continue;
         }
         if (!dl_object_is_visible(&g_all_objs[i])) {
-            if (no_load)
+            if (no_load || (probe && probe->witness.error_code))
                 continue;
             if (phase != RUNTIME_LOADER_PHASE_RUNNING) {
                 dl_set_error("dlopen: object activation is unavailable "
@@ -46585,12 +46678,27 @@ static void *my_dlopen_for_caller(const char *path, int flags,
             return &g_all_objs[i];
     }
     if (no_load) {
+        if (probe && phase == RUNTIME_LOADER_PHASE_RUNNING) {
+            struct dl_error_state *state = dl_current_error_state(1);
+            state->probe_preserves_errno = 1;
+            if (probe->witness.error_code) {
+                state->missing_root = probe->request;
+                state->valid = 1;
+            }
+            return NULL;
+        }
         dl_set_error(path, ": object is not loaded");
         return NULL;
     }
     if (phase != RUNTIME_LOADER_PHASE_RUNNING) {
         dl_set_error("dlopen: object loading is unavailable during startup "
                      "relocation", NULL);
+        return NULL;
+    }
+    if (probe && probe->witness.error_code) {
+        struct dl_error_state *state = dl_current_error_state(1);
+        state->missing_root = probe->request;
+        state->valid = 1;
         return NULL;
     }
     if (path[0] == '/' && !g_is_musl_runtime) {
@@ -46733,7 +46841,8 @@ static void *my_dlopen_serialized(const char *path, int flags,
     runtime_loader_lock_release(lock_token);
     if (!result) {
         struct dl_error_state *state = dl_current_error_state(0);
-        if (state && state->valid && state->missing_root)
+        if (state && ((state->valid && state->missing_root) ||
+                      state->probe_preserves_errno))
             set_loader_errno(saved_errno);
     }
     return result;

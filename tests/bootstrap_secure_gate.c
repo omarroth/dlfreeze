@@ -585,6 +585,32 @@ out:
     return ok;
 }
 
+static int immutable_data_alias_gate(void)
+{
+    struct direct_test_elf image;
+    struct dlfrz_entry entries[2] = {{0}};
+    struct dlfrz_lib_meta metas[2] = {{0}};
+
+    initialize_direct_test_elf(&image, 0);
+    initialize_direct_test_record(&entries[0], &metas[0], 0,
+                                  UINT64_C(0x280000000),
+                                  DLFRZ_FLAG_SHLIB | DLFRZ_FLAG_DLOPEN);
+    entries[1].flags = DLFRZ_FLAG_DATA;
+    entries[1].data_size = entries[0].data_size;
+    metas[1].flags = DLFRZ_FLAG_DATA;
+    if (!direct_metadata_is_valid((const uint8_t *)&image, 0, metas, entries, 2, 0))
+        return 0;
+    entries[0].flags &= ~DLFRZ_FLAG_DLOPEN;
+    metas[0].flags &= ~DLFRZ_FLAG_DLOPEN;
+    if (direct_metadata_is_valid((const uint8_t *)&image, 0, metas, entries, 2, 0))
+        return 0;
+    entries[0].flags |= DLFRZ_FLAG_DLOPEN;
+    metas[0].flags |= DLFRZ_FLAG_DLOPEN | DLFRZ_FLAG_PRELINKED;
+    if (direct_metadata_is_valid((const uint8_t *)&image, 0, metas, entries, 2, 0))
+        return 0;
+    return 1;
+}
+
 static int alias_metadata_gate(void)
 {
     struct dlfrz_entry entries[2] = {{0}};
@@ -677,6 +703,8 @@ int main(void)
         return 10;
     if (!alias_metadata_gate())
         return 13;
+    if (!immutable_data_alias_gate())
+        return 22;
     if (!manifest_string_complexity_gate())
         return 14;
     if (!direct_alias_complexity_gate())

@@ -3450,7 +3450,7 @@ out:
 /* ------------------------------------------------------------------ */
 /*  Merge dlopen-traced libraries                                     */
 /* ------------------------------------------------------------------ */
-#define DLOPEN_TRACE_READY "#DLFREEZE_DLOPEN_TRACE_V9"
+#define DLOPEN_TRACE_READY "#DLFREEZE_DLOPEN_TRACE_V10"
 #define DLOPEN_TRACE_OLD_READY "#DLFREEZE_DLOPEN_TRACE_V7"
 #define DLOPEN_TRACE_LEGACY_READY "#DLFREEZE_DLOPEN_TRACE_V6"
 #define DLOPEN_TRACE_LINE_SIZE (6U * PATH_MAX + 196U)
@@ -3675,6 +3675,7 @@ static int dep_add_dlopen_libs_internal(
     char line[DLOPEN_TRACE_LINE_SIZE];
     int saw_header = 0;
     int supports_missing_witness = 0;
+    int supports_loader_probes = 0;
     int saw_owner = 0;
     int saw_initial_begin = 0;
     int saw_initial_commit = 0;
@@ -3701,6 +3702,7 @@ static int dep_add_dlopen_libs_internal(
         }
         line[--len] = '\0';
         if (strcmp(line, DLOPEN_TRACE_READY) == 0 ||
+            strcmp(line, "#DLFREEZE_DLOPEN_TRACE_V9") == 0 ||
             strcmp(line, "#DLFREEZE_DLOPEN_TRACE_V8") == 0) {
             if (saw_header) {
                 fprintf(stderr,
@@ -3710,7 +3712,9 @@ static int dep_add_dlopen_libs_internal(
                 return -1;
             }
             saw_header = 1;
-            supports_missing_witness = strcmp(line, DLOPEN_TRACE_READY) == 0;
+            supports_loader_probes = strcmp(line, DLOPEN_TRACE_READY) == 0;
+            supports_missing_witness = supports_loader_probes ||
+                strcmp(line, "#DLFREEZE_DLOPEN_TRACE_V9") == 0;
             continue;
         }
         if (strcmp(line, DLOPEN_TRACE_OLD_READY) == 0) {
@@ -4027,6 +4031,95 @@ static int dep_add_dlopen_libs_internal(
             elf_info_free(&info);
             free(resolved);
             continue;
+        }
+        /* J observes either a silent NOLOAD result or an ENOENT root error,
+         * without consuming dlerror. Preserve the caller source separately
+         * from the requested name: search contexts are not interchangeable. */
+        if (len && line[0] == 'J') {
+            struct dep_file_snapshot snapshot = {0};
+            struct elf_info info = {0};
+            char *resolved = NULL;
+            int duplicate = 0;
+            if (!supports_loader_probes || !saw_owner || !saw_initial_commit ||
+                trace_split_fields(line, fields, 16) < 0 ||
+                strcmp(fields[0], "J") ||
+                trace_u64_hex_decode(fields[1], strlen(fields[1]), &record_pid) < 0 ||
+                !record_pid ||
+                trace_u64_hex_decode(fields[2], strlen(fields[2]), &operation_attempt) < 0 ||
+                !operation_attempt ||
+                trace_u32_hex_decode(fields[3], strlen(fields[3]), &mode) < 0 ||
+                !dlfrz_dlopen_mode_is_supported(mode) ||
+                (strcmp(fields[4], "M") && strcmp(fields[4], "N")) ||
+                (fields[4][0] == 'N' && !(mode & DLFRZ_RTLD_NOLOAD)) ||
+                deps->runtime_family != DEP_RUNTIME_GNU ||
+                trace_hex_decode(fields[5], strlen(fields[5]), request, sizeof(request)) < 0 ||
+                !request[0] || strchr(request, '$') ||
+                (strchr(request, '/') && request[0] != '/') ||
+                trace_hex_decode(fields[6], strlen(fields[6]), logical, sizeof(logical)) < 0 ||
+                trace_hex_decode(fields[7], strlen(fields[7]), source, sizeof(source)) < 0)
+                goto invalid_probe;
+            for (size_t i = 0; i < 8; i++)
+                if (trace_u64_hex_decode(fields[8 + i], strlen(fields[8 + i]),
+                                         &trace_snapshot[i]) < 0)
+                    goto invalid_probe;
+            resolved = validate_traced_elf_object(
+                deps, logical, source, trace_snapshot, &snapshot, &info);
+            elf_info_free(&info);
+            if (!resolved || bfs_loader_operation_commit(
+                    &q, record_pid, operation_attempt, 'B', 0) < 0) {
+                free(resolved);
+                goto invalid_probe;
+            }
+            uint32_t error_code = fields[4][0] == 'M' ? ENOENT : 0;
+            for (int i = 0; i < deps->loader_probe_count; i++) {
+                struct dep_loader_probe *probe = &deps->loader_probes[i];
+                if (probe->mode != mode || strcmp(probe->request, request) ||
+                    probe->caller_snapshot.device != snapshot.device ||
+                    probe->caller_snapshot.inode != snapshot.inode)
+                    continue;
+                if (probe->error_code != error_code ||
+                    strcmp(probe->caller_logical, logical) ||
+                    !trace_snapshots_equal(&probe->caller_snapshot, &snapshot)) {
+                    free(resolved);
+                    goto invalid_probe;
+                }
+                duplicate = 1;
+            }
+            if (!duplicate) {
+                if (deps->loader_probe_count == deps->loader_probe_capacity) {
+                    int capacity = deps->loader_probe_capacity;
+                    if (capacity > INT_MAX / 2) {
+                        free(resolved);
+                        goto invalid_probe;
+                    }
+                    capacity = capacity ? capacity * 2 : 16;
+                    struct dep_loader_probe *probes = realloc(
+                        deps->loader_probes, (size_t)capacity * sizeof(*probes));
+                    if (!probes) {
+                        free(resolved);
+                        goto invalid_probe;
+                    }
+                    deps->loader_probes = probes;
+                    deps->loader_probe_capacity = capacity;
+                }
+                char *name = strdup(request), *caller = strdup(logical);
+                if (!name || !caller) {
+                    free(name); free(caller); free(resolved);
+                    goto invalid_probe;
+                }
+                deps->loader_probes[deps->loader_probe_count++] =
+                    (struct dep_loader_probe){name, resolved, caller, snapshot,
+                                               mode, error_code};
+            } else {
+                free(resolved);
+            }
+            saw_call = 1;
+            continue;
+invalid_probe:
+            fprintf(stderr, "dlfreeze: invalid or conflicting loader-probe witness\n");
+            fclose(f);
+            bfs_free(&q);
+            return -1;
         }
         /* H is narrower than F: an unconsumed GNU error was safely observed
          * to name this absent absolute root. Recheck absence when importing
@@ -4383,6 +4476,42 @@ missing_allocation_failed:
     fclose(f);
 
     bfs_free(&q);
+    for (int i = 0; i < deps->loader_probe_count; i++) {
+        char *provider = NULL;
+        if (dep_validate_loader_probe(deps, &deps->loader_probes[i], &provider) < 0)
+            return -1;
+        free(provider);
+    }
+    return 0;
+}
+
+int dep_validate_loader_probe(struct dep_list *deps,
+                              const struct dep_loader_probe *probe,
+                              char **provider_out)
+{
+    struct stat status;
+    int found;
+    if (provider_out) *provider_out = NULL;
+    if (!deps || !probe || !provider_out ||
+        stat(probe->caller_path, &status) < 0 ||
+        !dep_snapshot_matches_stat(&probe->caller_snapshot, &status) ||
+        stat(probe->caller_logical, &status) < 0 ||
+        !dep_snapshot_matches_stat(&probe->caller_snapshot, &status))
+        return -1;
+    /* GNU derives the main executable's ORIGIN from its kernel executable
+     * identity, not an argv[0]/symlink spelling returned by dladdr. DSOs
+     * retain their first loader-visible names, as in ordinary resolution. */
+    const char *requester = trace_snapshots_equal(&probe->caller_snapshot,
+                                                 &deps->main_snapshot)
+        ? probe->caller_path : probe->caller_logical;
+    found = dep_resolve_aux_dependency(deps, requester,
+                                       probe->request, provider_out);
+    if (found < 0 || (found != 0) != (probe->error_code == 0)) {
+        fprintf(stderr, "dlfreeze: loader-probe search result changed or is unsupported: %s\n",
+                probe->request);
+        free(*provider_out); *provider_out = NULL;
+        return -1;
+    }
     return 0;
 }
 
@@ -4627,6 +4756,12 @@ void dep_list_free(struct dep_list *deps)
     for (int i = 0; i < deps->dlopen_missing_count; i++)
         free(deps->dlopen_missing_roots[i]);
     free(deps->dlopen_missing_roots);
+    for (int i = 0; i < deps->loader_probe_count; i++) {
+        free(deps->loader_probes[i].request);
+        free(deps->loader_probes[i].caller_path);
+        free(deps->loader_probes[i].caller_logical);
+    }
+    free(deps->loader_probes);
     free(deps->interp_path);
     free(deps->interp_soname);
     free(deps->gnu_platform);

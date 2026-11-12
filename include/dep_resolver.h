@@ -41,6 +41,15 @@ enum dep_runtime_family {
     DEP_RUNTIME_MUSL,
 };
 
+struct dep_loader_probe {
+    char *request;
+    char *caller_path;
+    char *caller_logical;
+    struct dep_file_snapshot caller_snapshot;
+    uint32_t mode;
+    uint32_t error_code;
+};
+
 struct dep_list {
     struct resolved_lib *libs;
     int    count;
@@ -76,12 +85,15 @@ struct dep_list {
      * cannot infer that native result from a successful-object manifest, so
      * a complete trace must retain the call and select native-loader
      * semantics regardless of the target libc family. Verified missing-root
-     * witnesses below are the only exception, with their own error contract. */
+     * and caller-scoped probe witnesses have their own narrower contracts. */
     int traced_requires_native_loader_semantics;
     /* Verified GNU missing absolute roots, not arbitrary loader failures. */
     char **dlopen_missing_roots;
     int dlopen_missing_count;
     int dlopen_missing_capacity;
+    struct dep_loader_probe *loader_probes;
+    int loader_probe_count;
+    int loader_probe_capacity;
 };
 
 /* Resolve all shared-library dependencies of an ELF binary (BFS). */
@@ -107,6 +119,12 @@ int dep_mark_dlopen_early_closures(struct dep_list *deps);
 int dep_resolve_aux_dependency(struct dep_list *deps,
                                const char *requester_path,
                                const char *name, char **path_out);
+
+/* Recheck a recorded caller revision and its search result. On success,
+ * provider_out owns the resolved NOLOAD candidate, or is NULL for a miss. */
+int dep_validate_loader_probe(struct dep_list *deps,
+                              const struct dep_loader_probe *probe,
+                              char **provider_out);
 
 /* Free all resources in a dep_list. */
 void dep_list_free(struct dep_list *deps);

@@ -9447,6 +9447,8 @@ static int packed_manifest_aliases_are_consistent(
         const char *name;
         const char *request = NULL;
 
+        if (entry->flags & DLFRZ_FLAG_LOADER_PROBE)
+            continue;
         name = strtab + entry->name_offset;
         if (strchr(name, '/'))
             packed_manifest_alias_ref_add(
@@ -9650,10 +9652,13 @@ int pack_frozen(const struct pack_options *opts)
     int has_pathful_traced_dlopen = 0;
     int has_unreproducible_bare_dlopen = 0;
     int nmiss = 0;
+    int nprobe = 0;
 
     if (!opts || !opts->deps || !opts->exe_path || !opts->output_path ||
         opts->deps->dlopen_missing_count < 0 ||
         (opts->deps->dlopen_missing_count && !opts->deps->dlopen_missing_roots) ||
+        opts->deps->loader_probe_count < 0 ||
+        (opts->deps->loader_probe_count && !opts->deps->loader_probes) ||
         !opts->bootstrap_path ||
         (opts->data_files &&
          (opts->data_files->failed || opts->data_files->count < 0 ||
@@ -9718,6 +9723,7 @@ int pack_frozen(const struct pack_options *opts)
     /* Extraction keeps the native loader's error behavior. Only the direct
      * format carries replayable negative-root witnesses. */
     nmiss = direct_supported ? opts->deps->dlopen_missing_count : 0;
+    nprobe = direct_supported ? opts->deps->loader_probe_count : 0;
     for (int i = 0; i < opts->deps->count; i++) {
         const struct resolved_lib *lib = &opts->deps->libs[i];
 
@@ -9832,7 +9838,7 @@ int pack_frozen(const struct pack_options *opts)
     }
     nent_size = 1U + (opts->deps->interp_path ? 1U : 0U) +
                 (size_t)opts->deps->count + (size_t)ndata +
-                (size_t)nmiss;
+                (size_t)nmiss + (size_t)nprobe;
     if (nent_size > UINT32_MAX || nent_size > INT_MAX ||
         nent_size > SIZE_MAX / sizeof(struct dlfrz_entry) ||
         nent_size > SIZE_MAX / sizeof(struct dlfrz_lib_meta) ||
@@ -9889,6 +9895,9 @@ int pack_frozen(const struct pack_options *opts)
         if (string_table_size_add(&strsz, opts->deps->dlopen_missing_roots[i], 1) < 0)
             goto fail2;
     }
+    for (int i = 0; i < nprobe; i++)
+        if (string_table_size_add(&strsz, opts->deps->loader_probes[i].request, 1) < 0)
+            goto fail2;
 
     strtab = calloc(1, strsz);
     if (!strtab)
@@ -10028,6 +10037,7 @@ int pack_frozen(const struct pack_options *opts)
     }
 
     /* 4b. data files ----------------------------------------------- */
+    int elf_entry_count = eidx;
     for (int i = 0; i < ndata; i++) {
         enum data_file_kind kind = opts->data_files->kinds
             ? opts->data_files->kinds[i] : DATA_FILE_KIND_REGULAR;
@@ -10057,6 +10067,7 @@ int pack_frozen(const struct pack_options *opts)
         entries[eidx].name_offset = stroff;
         const char *request_path = opts->data_files->paths[i];
         const char *source_path = opts->data_files->source_paths[i];
+        int immutable_alias = -1;
         strcpy(strtab + stroff, request_path);
         stroff += strlen(request_path) + 1;
         if (kind != DATA_FILE_KIND_REGULAR) {
@@ -10066,19 +10077,51 @@ int pack_frozen(const struct pack_options *opts)
             entries[eidx].data_offset = 0;
             written = 0;
         } else {
-            if (write_pad(out, &off, 8) < 0)
-                goto fail2;
-            entries[eidx].data_offset = off;
-            if (append_file(out, source_path,
-                            &opts->data_files->snapshots[i], &written,
-                            &src_snapshots[eidx]) < 0 ||
-                publish_captured_data_timestamps(
+            /* Dormant/early DLOPEN sources are never patched by prelinking.
+             * A captured file view can reuse those exact immutable bytes,
+             * retaining DATA timestamps without creating conflicting path
+             * authorities. Never share a source with a startup owner. */
+            if (direct_supported) {
+                for (int j = 0; j < elf_entry_count; j++)
+                    if ((entries[j].flags & DLFRZ_FLAG_DLOPEN) &&
+                        src_snapshots[j].valid &&
+                        resolved_snapshot_matches(&opts->data_files->snapshots[i],
+                                                   &src_snapshots[j].st)) {
+                        immutable_alias = j;
+                        break;
+                    }
+                if (immutable_alias >= 0) {
+                    for (int j = 0; j < elf_entry_count; j++)
+                        if (entries[j].data_offset == entries[immutable_alias].data_offset &&
+                            !(entries[j].flags & DLFRZ_FLAG_DLOPEN)) {
+                            immutable_alias = -1;
+                            break;
+                        }
+                }
+            }
+            if (immutable_alias >= 0) {
+                if (validate_input_snapshot(source_path, &src_snapshots[immutable_alias],
+                                             "during captured-library aliasing") < 0)
+                    goto fail2;
+                entries[eidx].data_offset = entries[immutable_alias].data_offset;
+                written = entries[immutable_alias].data_size;
+                src_snapshots[eidx] = src_snapshots[immutable_alias];
+            } else {
+                if (write_pad(out, &off, 8) < 0)
+                    goto fail2;
+                entries[eidx].data_offset = off;
+                if (append_file(out, source_path,
+                                &opts->data_files->snapshots[i], &written,
+                                &src_snapshots[eidx]) < 0)
+                    goto fail2;
+            }
+            if (publish_captured_data_timestamps(
                     &entries[eidx], &src_snapshots[eidx], source_path) < 0)
                 goto fail2;
         }
         entries[eidx].data_size = written;
         src_paths[eidx] = source_path ? source_path : request_path;
-        if (size_add_assign(&off, written) < 0)
+        if (immutable_alias < 0 && size_add_assign(&off, written) < 0)
             goto fail2;
         eidx++;
     }
@@ -10101,6 +10144,52 @@ int pack_frozen(const struct pack_options *opts)
             size_add_assign(&off, sizeof(miss)) < 0)
             goto fail2;
         src_paths[eidx++] = root;
+    }
+
+    for (int i = 0; i < nprobe; i++) {
+        const struct dep_loader_probe *probe = &opts->deps->loader_probes[i];
+        struct dlfrz_loader_probe packed = {
+            DLFRZ_LOADER_PROBE_MAGIC, DLFRZ_LOADER_MISS_GNU,
+            probe->error_code, probe->mode, UINT32_MAX, UINT32_MAX, {0, 0}
+        };
+        char *provider = NULL;
+        struct stat provider_status;
+        if (dep_validate_loader_probe(opts->deps, probe, &provider) < 0)
+            goto fail2;
+        if (provider && stat(provider, &provider_status) < 0) {
+            free(provider);
+            goto fail2;
+        }
+        for (int j = 0; j < eidx; j++) {
+            if (entries[j].flags & DLFRZ_FLAG_DATA)
+                continue;
+            if (src_snapshots[j].valid &&
+                resolved_snapshot_matches(&probe->caller_snapshot, &src_snapshots[j].st) &&
+                packed.caller_index == UINT32_MAX)
+                packed.caller_index = (uint32_t)j;
+            if (provider && input_snapshot_matches(&src_snapshots[j], &provider_status) &&
+                packed.provider_index == UINT32_MAX)
+                packed.provider_index = (uint32_t)j;
+        }
+        free(provider);
+        if (packed.caller_index == UINT32_MAX) {
+            fprintf(stderr, "dlfreeze: loader-probe caller is not in the frozen closure: %s\n",
+                    probe->caller_path);
+            goto fail2;
+        }
+        if (write_pad(out, &off, 8) < 0)
+            goto fail2;
+        entries[eidx].flags = DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_NEGATIVE |
+                              DLFRZ_FLAG_LOADER_PROBE;
+        entries[eidx].name_offset = stroff;
+        strcpy(strtab + stroff, probe->request);
+        stroff += strlen(probe->request) + 1;
+        entries[eidx].data_offset = off;
+        entries[eidx].data_size = sizeof(packed);
+        if (fwrite(&packed, 1, sizeof(packed), out) != sizeof(packed) ||
+            size_add_assign(&off, sizeof(packed)) < 0)
+            goto fail2;
+        src_paths[eidx++] = probe->request;
     }
 
     /* Resolution and ABI admission happened before packing.  Re-parse the
@@ -10383,7 +10472,7 @@ int pack_frozen(const struct pack_options *opts)
         }
     }
 
-    if ((ndata > 0 || nmiss > 0) && !metas) {
+    if ((ndata > 0 || nmiss > 0 || nprobe > 0) && !metas) {
         fprintf(stderr,
                 "dlfreeze: captured-file manifest has no usable direct-load "
                 "metadata\n");
@@ -10487,7 +10576,7 @@ int pack_frozen(const struct pack_options *opts)
             printf("  pre-linked : no (resource/address miss; using runtime "
                    "relocation)\n");
         } else if (prelink_result == PRELINK_UNSUPPORTED) {
-            if (ndata > 0 || nmiss > 0 || has_pathful_needed ||
+            if (ndata > 0 || nmiss > 0 || nprobe > 0 || has_pathful_needed ||
                 has_pathful_traced_dlopen ||
                 has_unreproducible_bare_dlopen) {
                 fprintf(stderr,

@@ -30,7 +30,7 @@ test_application_agnostic_source_gate() {
     echo "--- application-agnostic production source gate ---"
     local pattern hits
 
-    pattern='(^|[^[:alnum:]_])(python|ruby|zig|openssl|perl|nodejs|java|php|lua|git|curl|cmake|ffmpeg|sqlite|uvx|audible|busybox|kmail|qt|qt6|kde)([^[:alnum:]_]|$)'
+    pattern='(^|[^[:alnum:]_])(python|ruby|zig|openssl|perl|nodejs|java|php|lua|git|curl|cmake|ffmpeg|sqlite|uvx|audible|busybox|kmail|qt|qt6|kde|doubletake|gstreamer|libsoup)([^[:alnum:]_]|$)'
     hits=$(LC_ALL=C grep -Ein "$pattern" src/*.[chS] include/*.[ch] || true)
     if [ -n "$hits" ]; then
         fail "application-agnostic production source" \
@@ -210,7 +210,7 @@ create_dlopen_trace_baseline() {
         -u DLFREEZE_FILE_TRACE_IDENTITY -u DLFREEZE_FILE_TRACE_FILE \
         LD_PRELOAD="$helper" DLFREEZE_TRACE_FILE="$trace" \
         "$@" >/dev/null 2>&1 &&
-        [ "$(sed -n '1p' "$trace")" = '#DLFREEZE_DLOPEN_TRACE_V9' ] &&
+        [ "$(sed -n '1p' "$trace")" = '#DLFREEZE_DLOPEN_TRACE_V10' ] &&
         grep -Eq '^O [0-9a-f]{16}$' "$trace" &&
         grep -Eq '^A [0-9a-f]{16} [0-9a-f]{16}$' "$trace" &&
         grep -Eq '^K [0-9a-f]{16} [0-9a-f]{16} [0-9a-f]{16}$' "$trace"
@@ -3256,7 +3256,7 @@ C
         fi
 
         cp "$trace_base" "$trace"
-        printf '#DLFREEZE_DLOPEN_TRACE_V9\n' >>"$trace"
+        printf '#DLFREEZE_DLOPEN_TRACE_V10\n' >>"$trace"
         if ! "$gate" "$bin" "$trace" "$alias_abs" >"$gate_log" 2>&1 &&
            grep -Fq 'duplicate dlopen trace version header' "$gate_log"; then
             pass "duplicate V8 dlopen header fails closed"
@@ -3597,7 +3597,7 @@ test_failed_loader_trace_records() {
         if [ "$actual_rc" -eq "$expect_rc" ] &&
            [ "$actual" = "$expect" ] &&
            [ "$(sed -n '1p' "$trace" 2>/dev/null || true)" = \
-                '#DLFREEZE_DLOPEN_TRACE_V9' ] &&
+                '#DLFREEZE_DLOPEN_TRACE_V10' ] &&
            [[ "$owner_pid" =~ ^[0-9a-f]{16}$ ]] &&
            [[ "$trace_attempt" =~ ^[0-9a-f]{16}$ ]] &&
            [ "$trace_begin" = "B $owner_pid $trace_attempt" ] &&
@@ -3689,7 +3689,7 @@ test_loader_missing_root_replay() {
     local mutation rejected=1
     for mutation in relative token nul flags begin version; do
         awk -v mutation="$mutation" '
-            mutation == "version" && /^#DLFREEZE_DLOPEN_TRACE/ { sub(/V9$/, "V8") }
+            mutation == "version" && /^#DLFREEZE_DLOPEN_TRACE/ { sub(/V10$/, "V8") }
             mutation == "begin" && /^B / { next }
             /^H / {
                 if (mutation == "relative") $5 = "72656c6174697665"
@@ -3721,6 +3721,116 @@ test_loader_missing_root_replay() {
         pass "missing loader-root immutable replay and thread isolation"
     else
         fail "missing loader-root replay" "exit=$rc output=$actual expected=$expect"
+    fi
+    rm -rf "$root"
+}
+
+test_loader_probe_replay() {
+    echo "--- caller-scoped loader probes ---"
+    local root="$BUILD/loader_probes" probe trace log out expected actual rc=0
+    local helper="$BUILD/dlfreeze-preload.so"
+    root=$(realpath -m "$root")
+    probe="$root/main"; trace="$root/trace"; log="$root/freeze.log"; out="$root/main.frozen"
+    rm -rf "$root"
+    mkdir -p "$root/providers" "$root/other"
+    if ! gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -Iinclude \
+            -ffunction-sections -fdata-sections -fno-stack-protector \
+            -Wl,--gc-sections -o "$root/manifest-gate" \
+            tests/loader_probe_manifest_gate.c src/lazy_trampoline.S -ldl -pthread ||
+       ! run_with_timeout "$root/manifest-gate"; then
+        fail "loader-probe metadata admission" "gate failed"
+        rm -rf "$root"; return
+    fi
+    pass "loader-probe metadata bounds, caller isolation and VFS separation"
+    if ! gcc -dM -E -include features.h - </dev/null | grep '__GLIBC__' >/dev/null; then
+        skip "GNU loader probes" "native GNU error contract required"
+        rm -rf "$root"; return
+    fi
+    if ! gcc -Wall -Wextra -Werror -O2 -o "$probe" tests/loader_probe_gate.c \
+            -Wl,--disable-new-dtags,-rpath,'$ORIGIN/providers' -ldl ||
+       ! gcc -shared -fPIC -Wl,-soname,libprobe_owner.so \
+            -o "$root/providers/libprobe_available.so" tests/dlopen_missing_root_library.c ||
+       ! ln -s libprobe_available.so "$root/providers/alias.so" ||
+       ! gcc -shared -fPIC -Wl,-soname,libprobe_context_owner.so \
+            -o "$root/other/libprobe_context.so" tests/dlopen_missing_root_library.c ||
+       ! gcc -shared -fPIC \
+            -o "$root/caller.so" tests/loader_probe_caller.c -ldl; then
+        fail "loader-probe fixtures" "compile failed"
+        rm -rf "$root"; return
+    fi
+    printf 'x\n' >"$root/data"
+    local -a args=("$root/providers/alias.so" "$root/caller.so" "$root/absolute-missing.so" "$root/data" "$root/other/libprobe_context.so")
+    capture_output expected "$probe" "${args[@]}" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        fail "loader-probe native control" "exit=$rc output=$expected"
+        rm -rf "$root"; return
+    fi
+    capture_output actual env LD_PRELOAD="$helper" DLFREEZE_TRACE_FILE="$trace" \
+        "$probe" "${args[@]}" || rc=$?
+    if [ "$rc" -ne 0 ] || [ "$actual" != "$expected" ]; then
+        fail "loader-probe recording" "exit=$rc output=$actual"
+        rm -rf "$root"; return
+    fi
+    if ! grep -q '^J ' "$trace"; then
+        skip "loader-probe direct replay" "native layout or inspection unsupported"
+        rm -rf "$root"; return
+    fi
+    pass "loader-probe recording preserves native errors and silent results"
+    local gate="$root/parser" mutation
+    if ! gcc -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
+            -o "$gate" tests/dep_interpreter_trace_gate.c src/dep_resolver.c src/elf_parser.c ||
+       ! "$gate" "$probe" "$trace" /no-alias 0 0 0 8; then
+        fail "loader-probe parser" "valid witnesses rejected"
+        rm -rf "$root"; return
+    fi
+    # A different argv[0] directory must not replace the GNU main object's
+    # canonical ORIGIN when importing caller-scoped probe records.
+    mkdir -p "$root/argv-dir/providers"
+    ln -s ../main "$root/argv-dir/main"
+    cp "$root/providers/libprobe_available.so" "$root/argv-dir/providers/libprobe_available.so"
+    rc=0
+    capture_output actual env LD_PRELOAD="$helper" \
+        DLFREEZE_TRACE_FILE="$root/symlink.trace" \
+        "$root/argv-dir/main" "${args[@]}" || rc=$?
+    if [ "$rc" -ne 0 ] || [ "$actual" != "$expected" ] ||
+       ! "$gate" "$probe" "$root/symlink.trace" /no-alias 0 0 0 8 \
+            "$root/providers/libprobe_available.so"; then
+        fail "loader-probe main ORIGIN" "symlink invocation changed probe resolution"
+        rm -rf "$root"; return
+    fi
+    pass "loader-probe main ORIGIN ignores argv symlink directories"
+    for mutation in version flags relative nul caller begin; do
+        awk -v mutation="$mutation" '
+            mutation == "version" && /^#DLFREEZE_DLOPEN_TRACE/ { sub(/V10$/, "V9") }
+            mutation == "begin" && /^B / { next }
+            /^J / {
+                if (mutation == "flags") $4 = "00000002"
+                if (mutation == "relative") $6 = "2e2f78"
+                if (mutation == "nul") $6 = $6 "00"
+                if (mutation == "caller") $10 = "0000000000000000"
+            }
+            { print }
+        ' "$trace" >"$root/mutated"
+        if "$gate" "$probe" "$root/mutated" /no-alias 0 0 0 8 >"$root/parser.log" 2>&1; then
+            fail "loader-probe $mutation grammar" "invalid witness accepted"
+        else
+            pass "loader-probe $mutation grammar fails closed"
+        fi
+    done
+    if ! freeze_require_direct "loader-probe packaging" "$log" "$out" \
+            -t -f "$root/*" -- "$probe" "${args[@]}"; then
+        tail -40 "$log"; rm -rf "$root"; return
+    fi
+    cp "$root/providers/libprobe_available.so" "$root/providers/libprobe_absent.so"
+    cp "$root/providers/libprobe_available.so" "$root/absolute-missing.so"
+    rm -f "$probe" "$root/providers/libprobe_available.so" "$root/providers/alias.so" \
+        "$root/caller.so" "$root/other/libprobe_context.so" "$root/data"
+    rc=0
+    capture_output actual "$out" "${args[@]}" || rc=$?
+    if [ "$rc" -eq 0 ] && [ "$actual" = "$expected" ]; then
+        pass "loader probes replay errno, diagnostics, caller scopes and inode aliases"
+    else
+        fail "loader-probe direct replay" "exit=$rc output=$actual expected=$expected"
     fi
     rm -rf "$root"
 }
@@ -8800,9 +8910,9 @@ test_preload_helper_constructor_order() {
     if [ "$rc" -eq 0 ] &&
        [ "$actual" = preload-early-constructor-ok ] &&
        [ -r "$trace" ] && [ -r "$file_trace" ] &&
-       [ "$(sed -n '1p' "$trace")" = "#DLFREEZE_DLOPEN_TRACE_V9" ] &&
+       [ "$(sed -n '1p' "$trace")" = "#DLFREEZE_DLOPEN_TRACE_V10" ] &&
        [ "$(sed -n '1p' "$file_trace")" = "#DLFREEZE_PRELOAD_TRACE_V9" ] &&
-       [ "$(grep -Fxc '#DLFREEZE_DLOPEN_TRACE_V9' "$trace")" -eq 1 ] &&
+       [ "$(grep -Fxc '#DLFREEZE_DLOPEN_TRACE_V10' "$trace")" -eq 1 ] &&
        [ "$(grep -Fxc '#DLFREEZE_PRELOAD_TRACE_V9' "$file_trace")" -eq 1 ] &&
        grep -Eq "^P [0-9a-f]{16} [0-9a-f]{16} [0-9a-f]{16} 00000002 $dlopen_hex $dlopen_hex $dlopen_hex( [0-9a-f]{16}){8}$" "$trace" &&
        grep -Eq "^F [0-9a-f]{16} $open_hex $open_hex( [0-9a-f]{16}){8}$" "$file_trace"; then
@@ -8932,7 +9042,7 @@ C
             fi
         elif [ "$rc" -eq 0 ] && [ -z "$actual" ] &&
              [ "$(sed -n '1p' "$dltrace" 2>/dev/null || true)" = \
-                  '#DLFREEZE_DLOPEN_TRACE_V9' ] &&
+                  '#DLFREEZE_DLOPEN_TRACE_V10' ] &&
              [ "$(sed -n '1p' "$filetrace" 2>/dev/null || true)" = \
                   '#DLFREEZE_PRELOAD_TRACE_V9' ] &&
              ! grep -q '^! ' "$dltrace" && ! grep -q '^! ' "$filetrace"; then
@@ -9122,7 +9232,7 @@ MAP
     elif [ "$runtime_family" = musl ] &&
          grep -Fq "trace helper candidate: $helper" "$log" &&
          ! grep -Fq 'target ABI mismatch' "$log" &&
-         grep -Fq 'no valid V9 readiness' "$log" && [ ! -e "$out" ]; then
+         grep -Fq 'no valid V10 readiness' "$log" && [ ! -e "$out" ]; then
         pass "musl trace helper uses name-only version semantics"
     elif [ "$runtime_family" != musl ] &&
          grep -Fq 'trace helper rejected:' "$log" &&
@@ -9387,7 +9497,7 @@ C
                 >"$bad_log" 2>&1; then
             fail "incompatible trace helper refusal" \
                 "packaging unexpectedly succeeded"
-        elif grep -Fq 'produced no valid V9 readiness record' "$bad_log" &&
+        elif grep -Fq 'produced no valid V10 readiness record' "$bad_log" &&
              [ ! -e "$bad_out" ]; then
             pass "incompatible trace helper fails closed"
         else
@@ -9705,7 +9815,7 @@ test_trace_descriptor_lifecycle() {
          [ "$(cat "$unshare_replacement" 2>/dev/null || true)" = \
               $'application-main-ok\napplication-worker-ok' ] &&
          [ "$(sed -n '1p' "$dltrace" 2>/dev/null || true)" = \
-              '#DLFREEZE_DLOPEN_TRACE_V9' ] &&
+              '#DLFREEZE_DLOPEN_TRACE_V10' ] &&
          [ "$(sed -n '1p' "$filetrace" 2>/dev/null || true)" = \
               '#DLFREEZE_PRELOAD_TRACE_V9' ] &&
          [ "$(grep -Ec '^O [0-9a-f]{16}$' "$dltrace")" -eq 1 ] &&
@@ -9794,7 +9904,7 @@ test_trace_cwd_overlap() {
         "$target" "$new" input.txt ./libcwd-overlap.so || rc=$?
     if [ "$rc" -eq 0 ] && [ "$actual" = cwd-overlap-ok ] &&
        [ "$(sed -n '1p' "$dltrace" 2>/dev/null || true)" = \
-            '#DLFREEZE_DLOPEN_TRACE_V9' ] &&
+            '#DLFREEZE_DLOPEN_TRACE_V10' ] &&
        [ "$(sed -n '1p' "$filetrace" 2>/dev/null || true)" = \
             '#DLFREEZE_PRELOAD_TRACE_V9' ] &&
        grep -Eq '^! [0-9a-f]{16} pre-dlopen-cwd-is-unstable$' \
@@ -24981,7 +25091,7 @@ C
             LD_LIBRARY_PATH="$root" \
             "$DLFREEZE" -d -t -o "$missing_out" -- \
             "$prog" optional "$missing_name" >"$missing_log" 2>&1; then
-        fail "GNU failed optional RTLD_LAZY extraction fallback" \
+        fail "GNU optional RTLD_LAZY trace admission" \
             "dlfreeze failed"
         tail -n 80 "$missing_log" || true
         rm -rf "$root"
@@ -24989,10 +25099,10 @@ C
     fi
     if [ ! -x "$missing_out" ] ||
        ! grep -Eq \
-            'failed traced dynamic-loader call.*creating an extraction-mode binary' \
+            'failed traced dynamic-loader call.*creating an extraction-mode binary|mode[[:space:]]*: direct-load' \
             "$missing_log"; then
-        fail "GNU failed optional RTLD_LAZY extraction fallback" \
-            "failed-load marker did not select extraction mode"
+        fail "GNU optional RTLD_LAZY trace admission" \
+            "neither verified direct replay nor native fallback was selected"
         tail -n 80 "$missing_log" || true
         rm -rf "$root"
         return
@@ -33226,6 +33336,7 @@ test_musl_default_stack_direct
 test_renamed_runtime_identity
 test_failed_loader_trace_records
 test_loader_missing_root_replay
+test_loader_probe_replay
 test_static_compiler_selection
 test_loader_post_tls_import_gate
 test_bootstrap_cet_isolation

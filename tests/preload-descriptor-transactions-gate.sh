@@ -44,7 +44,7 @@ output=$(run_with_timeout env \
     "$target" callbacks "$filetrace")
 test "$output" = descriptor-transactions-ok
 
-test "$(sed -n '1p' "$dltrace")" = '#DLFREEZE_DLOPEN_TRACE_V9'
+test "$(sed -n '1p' "$dltrace")" = '#DLFREEZE_DLOPEN_TRACE_V10'
 test "$(sed -n '1p' "$filetrace")" = '#DLFREEZE_PRELOAD_TRACE_V9'
 for trace in "$dltrace" "$filetrace"; do
     ! grep -q '^! ' "$trace"

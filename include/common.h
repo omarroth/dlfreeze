@@ -30,6 +30,7 @@
 #define DLFRZ_FLAG_DATA_DIRENT_TYPE_MASK  0x000f0000U
 #define DLFRZ_FLAG_DATA_DIRENT_TYPED      0x00100000U
 #define DLFRZ_FLAG_DLOPEN_MISS            0x00200000U /* negative GNU loader-root witness */
+#define DLFRZ_FLAG_LOADER_PROBE           0x00400000U /* caller-scoped loader metadata, not a VFS path */
 
 /* Linux getdents64 d_type values are part of the kernel ABI and therefore do
  * not depend on the libc which consumes the frozen manifest.  A virtual DATA
@@ -65,7 +66,8 @@ static inline int dlfrz_manifest_entry_flags_canonical(
                                  DLFRZ_FLAG_INTERP_KERNEL_ONLY |
                                  DLFRZ_FLAG_DATA_DIRENT_TYPE_MASK |
                                  DLFRZ_FLAG_DATA_DIRENT_TYPED |
-                                 DLFRZ_FLAG_DLOPEN_MISS;
+                                 DLFRZ_FLAG_DLOPEN_MISS |
+                                 DLFRZ_FLAG_LOADER_PROBE;
     const uint32_t kind = flags & (DLFRZ_FLAG_MAIN_EXE |
                                    DLFRZ_FLAG_INTERP |
                                    DLFRZ_FLAG_SHLIB |
@@ -96,6 +98,9 @@ static inline int dlfrz_manifest_entry_flags_canonical(
            (!data_state || !(data_state & (data_state - 1))) &&
            (!(flags & DLFRZ_FLAG_DLOPEN_MISS) ||
             (kind == DLFRZ_FLAG_DATA && data_state == DLFRZ_FLAG_DATA_NEGATIVE)) &&
+           (!(flags & DLFRZ_FLAG_LOADER_PROBE) ||
+            flags == (DLFRZ_FLAG_DATA | DLFRZ_FLAG_DATA_NEGATIVE |
+                      DLFRZ_FLAG_LOADER_PROBE)) &&
            ((flags & DLFRZ_FLAG_DATA_DIRENT_TYPED)
                 ? (flags & DLFRZ_FLAG_DATA_VIRTUAL) &&
                   dlfrz_dirent_type_canonical(dirent_type)

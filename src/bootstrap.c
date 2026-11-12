@@ -3457,7 +3457,11 @@ static int manifest_strings_are_valid(
             switch ((enum manifest_string_role)refs[i].role) {
             case MANIFEST_STRING_NAME:
                 if (!nonempty ||
-                    ((flags & DLFRZ_FLAG_DATA) && value[0] != '/') ||
+                    ((flags & DLFRZ_FLAG_DATA) &&
+                     !(flags & DLFRZ_FLAG_LOADER_PROBE) && value[0] != '/') ||
+                    ((flags & DLFRZ_FLAG_LOADER_PROBE) &&
+                     (memchr(value, '$', (size_t)(terminator - value)) ||
+                      (has_slash && value[0] != '/'))) ||
                     (!(flags & (DLFRZ_FLAG_DATA |
                                 DLFRZ_FLAG_NEEDED_PATHFUL)) &&
                      !valid_embedded_name) ||
@@ -3539,8 +3543,10 @@ static int manifest_is_valid(const struct dlfrz_footer *footer,
         } else if (!dlfrz_manifest_entry_flags_canonical(flags, 0, 0)) {
             goto out;
         }
-        if (flags & DLFRZ_FLAG_DLOPEN_MISS) {
-            if (entries[i].data_size != sizeof(struct dlfrz_loader_miss) ||
+        if (flags & (DLFRZ_FLAG_DLOPEN_MISS | DLFRZ_FLAG_LOADER_PROBE)) {
+            size_t witness_size = flags & DLFRZ_FLAG_LOADER_PROBE
+                ? sizeof(struct dlfrz_loader_probe) : sizeof(struct dlfrz_loader_miss);
+            if (entries[i].data_size != witness_size ||
                 !payload_range_valid(entries[i].data_offset, entries[i].data_size,
                                      payload_offset, payload_size))
                 goto out;
@@ -4159,19 +4165,46 @@ static int direct_metadata_is_valid(const uint8_t *mem, uint64_t mem_foff,
                refs[end].data_size == refs[begin].data_size)
             end++;
 
-        /* One musl file may serve as both PT_INTERP and libc SHLIB.  Exact
-         * nonempty ranges may otherwise alias only SHLIB identities; MAIN,
-         * DATA, combined roles, and all unrelated kinds remain distinct. */
+        /* DATA may share only an unmodified dormant/early DLOPEN payload.
+         * It has no mapping geometry or lifecycle of its own. Startup ELF
+         * sources can be prelinked, so their captured file views must never
+         * alias the bytes which prelinking replaces. */
+        int has_data = 0;
+        for (size_t i = begin; i < end; i++) {
+            uint32_t index = refs[i].entry_index;
+            if (entries[index].flags & DLFRZ_FLAG_DATA)
+                has_data = 1;
+            else if (entries[reference].flags & DLFRZ_FLAG_DATA)
+                reference = index;
+        }
+        if (has_data && end - begin > 1) {
+            if (entries[reference].flags & DLFRZ_FLAG_DATA)
+                goto out;
+            for (size_t i = begin; i < end; i++) {
+                uint32_t flags = entries[refs[i].entry_index].flags;
+                if (flags & DLFRZ_FLAG_DATA) {
+                    if (flags != DLFRZ_FLAG_DATA) goto out;
+                } else if (!(flags & DLFRZ_FLAG_DLOPEN)) {
+                    goto out;
+                }
+            }
+        }
+
+        /* One musl file may serve as both PT_INTERP and libc SHLIB. Other
+         * ELF aliases retain the existing exact-source role contract. */
         if (end - begin > 1) {
-            for (size_t i = begin + 1; i < end; i++)
+            for (size_t i = begin; i < end; i++) {
+                if (refs[i].entry_index == reference ||
+                    (entries[refs[i].entry_index].flags & DLFRZ_FLAG_DATA))
+                    continue;
                 if (!direct_object_source_alias(
                         entries, reference, refs[i].entry_index))
                     goto out;
+            }
         }
 
-        /* A nonempty regular DATA entry participates above only so exact
-         * aliasing with an ELF role is rejected.  It is not an ELF object and
-         * has no reserved virtual-address interval of its own. */
+        /* A DATA-only group has no ELF mapping or reserved virtual-address
+         * interval. Mixed groups use the immutable ELF representative. */
         if (entries[reference].flags & DLFRZ_FLAG_DATA) {
             begin = end;
             continue;
@@ -4181,6 +4214,8 @@ static int direct_metadata_is_valid(const uint8_t *mem, uint64_t mem_foff,
             uint32_t index = refs[i].entry_index;
             const struct dlfrz_lib_meta *meta = &metas[index];
 
+            if (entries[index].flags & DLFRZ_FLAG_DATA)
+                continue;
             if (!direct_alias_geometry_matches(&metas[reference], meta))
                 goto out;
             if (meta->flags & DLFRZ_FLAG_INTERP) {
