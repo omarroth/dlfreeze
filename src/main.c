@@ -197,6 +197,8 @@ struct kernel_trace_thread {
     uint64_t libc_exec_start;
     uint64_t libc_exec_end;
     int initial_attach_stop;
+    int resume_pending;
+    int resume_signal;
 };
 
 static int file_request_matches_patterns(const char *path, int is_dir,
@@ -257,6 +259,37 @@ static void kernel_trace_thread_remove(struct kernel_trace_thread **threads,
             return;
         }
     }
+}
+
+static int kernel_trace_queue_resume(struct kernel_trace_thread **threads,
+                                      pid_t pid, int signal_number)
+{
+    struct kernel_trace_thread *thread =
+        kernel_trace_thread_find(threads, pid, 1);
+
+    if (!thread)
+        return -1;
+    thread->resume_signal = signal_number;
+    thread->resume_pending = 1;
+    return 0;
+}
+
+static int kernel_trace_resume_pending(struct kernel_trace_thread *threads)
+{
+    for (struct kernel_trace_thread *thread = threads;
+         thread; thread = thread->next) {
+        if (!thread->resume_pending)
+            continue;
+        thread->resume_pending = 0;
+        if (ptrace(PTRACE_SYSCALL, thread->pid, NULL,
+                   (void *)(intptr_t)thread->resume_signal) < 0 &&
+            errno != ESRCH)
+            return -1;
+        /* A group exit can kill another stopped thread before its queued
+         * resume. Drain its eventual exit status instead of treating ESRCH
+         * as a new tracing failure. */
+    }
+    return 0;
 }
 
 static void kernel_trace_threads_release(struct kernel_trace_thread *threads)
@@ -756,13 +789,29 @@ static int supervise_trace_child(
 
     for (;;) {
         int status;
-        pid_t waited = waitpid(
-            tracing ? -1 : child, &status,
-            WUNTRACED | WCONTINUED
+        int wait_options = WUNTRACED | WCONTINUED
 #ifdef __WALL
             | (tracing ? __WALL : 0)
 #endif
-        );
+            ;
+        pid_t waited;
+
+        if (tracing) {
+            /* waitpid(-1) does not promise fairness. Immediately resuming
+             * each busy syscall thread can make it win every subsequent
+             * wait, starving a sibling's pending signal or shutdown work.
+             * Drain the ready stops before waking any of their tracees. */
+            waited = waitpid(-1, &status, wait_options | WNOHANG);
+            if (waited == 0) {
+                if (kernel_trace_resume_pending(threads) < 0) {
+                    wait_failed = 1;
+                    break;
+                }
+                waited = waitpid(-1, &status, wait_options);
+            }
+        } else {
+            waited = waitpid(child, &status, wait_options);
+        }
 
         if (waited < 0) {
             if (errno == EINTR)
@@ -786,7 +835,7 @@ static int supervise_trace_child(
                     tracing = 1;
                     if (observations)
                         observations->ptrace_started = 1;
-                    if (ptrace(PTRACE_SYSCALL, child, NULL, NULL) < 0) {
+                    if (kernel_trace_queue_resume(&threads, child, 0) < 0) {
                         wait_failed = 1;
                         break;
                     }
@@ -804,7 +853,7 @@ static int supervise_trace_child(
             if (tracing && stop_signal == (SIGTRAP | 0x80)) {
                 if (kernel_trace_syscall_stop(
                         waited, &threads, observations) < 0 ||
-                    ptrace(PTRACE_SYSCALL, waited, NULL, NULL) < 0) {
+                    kernel_trace_queue_resume(&threads, waited, 0) < 0) {
                     wait_failed = 1;
                     break;
                 }
@@ -839,7 +888,7 @@ static int supervise_trace_child(
                     thread->libc_exec_start = 0;
                     thread->libc_exec_end = 0;
                 }
-                if (ptrace(PTRACE_SYSCALL, waited, NULL, NULL) < 0) {
+                if (kernel_trace_queue_resume(&threads, waited, 0) < 0) {
                     wait_failed = 1;
                     break;
                 }
@@ -886,8 +935,7 @@ static int supervise_trace_child(
                         deliver = 0;
                 }
 
-                if (ptrace(PTRACE_SYSCALL, waited, NULL,
-                           (void *)(intptr_t)deliver) < 0) {
+                if (kernel_trace_queue_resume(&threads, waited, deliver) < 0) {
                     wait_failed = 1;
                     break;
                 }
@@ -925,7 +973,9 @@ static int supervise_trace_child(
          * ptrace followed its open syscalls while the owner was live. */
         for (struct kernel_trace_thread *thread = threads;
              thread; thread = thread->next)
-            (void)ptrace(PTRACE_DETACH, thread->pid, NULL, NULL);
+            (void)ptrace(PTRACE_DETACH, thread->pid, NULL,
+                          (void *)(intptr_t)(thread->resume_pending
+                              ? thread->resume_signal : 0));
     }
     kernel_trace_threads_release(threads);
 

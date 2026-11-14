@@ -5,12 +5,15 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <termios.h>
@@ -21,8 +24,20 @@
 #define SIGNAL_SETTLE_MS 250
 #define MAX_TRANSCRIPT (1024U * 1024U)
 
-static volatile sig_atomic_t signal_count;
+static _Atomic int signal_count;
 static int signal_pipe_write = -1;
+#define BUSY_THREADS 12
+static pthread_barrier_t busy_barrier;
+static _Atomic int busy_stop;
+
+static void *busy_syscalls(void *unused)
+{
+    (void)unused;
+    (void)pthread_barrier_wait(&busy_barrier);
+    while (!atomic_load_explicit(&busy_stop, memory_order_relaxed))
+        (void)syscall(SYS_getpid);
+    return NULL;
+}
 
 static void handle_sigint(int signal_number)
 {
@@ -35,6 +50,20 @@ static void handle_sigint(int signal_number)
     if (signal_pipe_write >= 0)
         (void)write(signal_pipe_write, &marker, sizeof(marker));
     errno = saved_errno;
+}
+
+static void *busy_signal_waiter(void *unused)
+{
+    sigset_t set;
+    (void)unused;
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+    while (!atomic_load_explicit(&busy_stop, memory_order_relaxed)) {
+        struct timespec interval = {0, 10000000};
+        if (sigtimedwait(&set, NULL, &interval) == SIGINT)
+            handle_sigint(SIGINT);
+    }
+    return NULL;
 }
 
 static int64_t monotonic_milliseconds(void)
@@ -134,7 +163,7 @@ static void settle_sigint_delivery(int fd)
     }
 }
 
-static int run_target(void)
+static int run_target(int busy)
 {
     static const char expected_line[] = "dlfreeze-pty-line\n";
     static const char expected_resume[] = "dlfreeze-pty-resume\n";
@@ -143,6 +172,9 @@ static int run_target(void)
     char line[128];
     int signal_pipe[2] = { -1, -1 };
     int flags;
+    pthread_t workers[BUSY_THREADS];
+    pthread_t signal_waiter;
+    sigset_t busy_old_mask;
 
     if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO) ||
         !isatty(STDERR_FILENO)) {
@@ -184,11 +216,39 @@ static int run_target(void)
     if (sigaction(SIGINT, &action, NULL) < 0)
         return 18;
 
+    if (busy) {
+        sigset_t blocked;
+        sigemptyset(&blocked);
+        sigaddset(&blocked, SIGINT);
+        if (pthread_sigmask(SIG_BLOCK, &blocked, &busy_old_mask) != 0 ||
+            pthread_barrier_init(&busy_barrier, NULL, BUSY_THREADS + 1) != 0)
+            return 24;
+        /* Put the signal consumer in a separate, older thread. A tracer
+         * must not leave it stopped while newer syscall workers run. */
+        if (pthread_create(&signal_waiter, NULL, busy_signal_waiter, NULL) != 0)
+            return 26;
+        for (int i = 0; i < BUSY_THREADS; i++)
+            if (pthread_create(&workers[i], NULL, busy_syscalls, NULL) != 0)
+                return 25;
+    }
+
     if (write_all(STDOUT_FILENO, "PTY_GATE_INT_READY\n", 19) < 0)
         return 19;
+    if (busy)
+        (void)pthread_barrier_wait(&busy_barrier);
     if (wait_for_first_sigint(signal_pipe[0], 5000) < 0) {
         dprintf(STDERR_FILENO, "PTY_GATE_ERROR no-sigint\n");
         return 20;
+    }
+    if (busy) {
+        atomic_store_explicit(&busy_stop, 1, memory_order_relaxed);
+        for (int i = 0; i < BUSY_THREADS; i++)
+            if (pthread_join(workers[i], NULL) != 0)
+                return 27;
+        if (pthread_join(signal_waiter, NULL) != 0 ||
+            pthread_sigmask(SIG_SETMASK, &busy_old_mask, NULL) != 0)
+            return 28;
+        pthread_barrier_destroy(&busy_barrier);
     }
     settle_sigint_delivery(signal_pipe[0]);
     signal_pipe_write = -1;
@@ -334,9 +394,9 @@ static int spawn_pty_child(char **command, int *master_out, pid_t *child_out)
     return 0;
 }
 
-static int run_driver(char **command);
+static int run_driver(char **command, int directed_interrupt);
 
-static int run_driver_isolated(char **command)
+static int run_driver_isolated(char **command, int directed_interrupt)
 {
     int status;
     pid_t worker = fork();
@@ -348,7 +408,7 @@ static int run_driver_isolated(char **command)
     }
     if (worker == 0) {
         (void)signal(SIGHUP, SIG_IGN);
-        _exit(run_driver(command));
+        _exit(run_driver(command, directed_interrupt));
     }
     while (waitpid(worker, &status, 0) < 0) {
         if (errno != EINTR) {
@@ -365,7 +425,7 @@ static int run_driver_isolated(char **command)
     return 1;
 }
 
-static int run_driver(char **command)
+static int run_driver(char **command, int directed_interrupt)
 {
     static const char line_ready[] = "PTY_GATE_LINE_READY";
     static const char line_ok[] = "PTY_GATE_LINE_OK";
@@ -456,7 +516,13 @@ static int run_driver(char **command)
             }
             if (state == 2 && strstr(transcript, int_ready)) {
                 const unsigned char interrupt = 3;
-                if (write_all(master, &interrupt, sizeof(interrupt)) < 0)
+                struct timespec settle = {0, 100000000};
+                /* Let a busy target enter its syscall storm before sending
+                 * the interrupt; otherwise a fast PTY reader can win the
+                 * scheduling race and bypass the starvation regression. */
+                while (nanosleep(&settle, &settle) < 0 && errno == EINTR) {}
+                if ((directed_interrupt ? kill(child, SIGINT)
+                     : write_all(master, &interrupt, sizeof(interrupt))) < 0)
                     state = -1;
                 else
                     state = 3;
@@ -544,18 +610,21 @@ static int run_driver(char **command)
 static void usage(const char *program)
 {
     fprintf(stderr,
-            "usage: %s --target\n"
-            "       %s --run -- command [argument ...]\n",
+            "usage: %s --target|--target-busy\n"
+            "       %s --run|--run-directed -- command [argument ...]\n",
             program, program);
 }
 
 int main(int argc, char **argv)
 {
     if (argc == 2 && strcmp(argv[1], "--target") == 0)
-        return run_target();
-    if (argc >= 4 && strcmp(argv[1], "--run") == 0 &&
+        return run_target(0);
+    if (argc == 2 && strcmp(argv[1], "--target-busy") == 0)
+        return run_target(1);
+    if (argc >= 4 && (strcmp(argv[1], "--run") == 0 ||
+                     strcmp(argv[1], "--run-directed") == 0) &&
         strcmp(argv[2], "--") == 0)
-        return run_driver_isolated(&argv[3]);
+        return run_driver_isolated(&argv[3], strcmp(argv[1], "--run-directed") == 0);
     usage(argv[0]);
     return 2;
 }

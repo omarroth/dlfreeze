@@ -8516,7 +8516,7 @@ test_direct_pty_interaction() {
         "$supervised_log" "$strict_log" "$trace_out" "$trace_log"
     if ! gcc -Wall -Wextra -Werror -D_GNU_SOURCE \
             -o "$helper" tests/pty_interaction_gate.c \
-            -Wl,--no-as-needed -ldl; then
+            -Wl,--no-as-needed -ldl -pthread; then
         fail "direct PTY interaction" "PTY helper compile failed"
         return
     fi
@@ -8582,6 +8582,58 @@ test_direct_pty_interaction() {
 
     rm -f "$helper" "$out" "$pack_log" "$native_log" \
         "$supervised_log" "$strict_log" "$trace_out" "$trace_log"
+}
+
+# Busy syscall workers must not starve a sibling's signal-consumption stop.
+# The same fixture checks terminal/process-directed SIGINT exactly once and
+# foreground stop/resume, with both tracing backends and frozen execution.
+test_trace_signal_fairness() {
+    echo "--- traced multithreaded signal fairness ---"
+    local root="$BUILD/trace_signal_fairness" helper out log mode delivery driver
+    mkdir -p "$root"
+    helper="$root/target"
+    if ! gcc -Wall -Wextra -Werror -D_GNU_SOURCE -o "$helper" \
+            tests/pty_interaction_gate.c -ldl -pthread; then
+        fail "trace signal fairness" "fixture compile failed"
+        rm -rf "$root"; return
+    fi
+    if ! PTY_GATE_TIMEOUT_MS=12000 "$helper" --run -- "$helper" --target-busy \
+            >"$root/native.log" 2>&1; then
+        if grep -q 'could not create controlling PTY' "$root/native.log"; then
+            skip "trace signal fairness" "controlling PTYs unavailable"
+        else
+            fail "trace signal fairness native control" "signal protocol failed"
+            tail -n 40 "$root/native.log" || true
+        fi
+        rm -rf "$root"; return
+    fi
+    pass "native busy-thread signal waiter and job control"
+    for mode in preload kernel; do
+        local -a capture=()
+        if [ "$mode" = kernel ]; then capture=(-f "$root/no-match/*"); fi
+        for delivery in terminal directed; do
+            driver=--run
+            if [ "$delivery" = directed ]; then driver=--run-directed; fi
+            out="$root/$mode-$delivery.frozen"; log="$root/$mode-$delivery.log"
+            if run_freeze env PTY_GATE_TIMEOUT_MS=20000 "$helper" "$driver" -- \
+                    "$DLFREEZE" -d -t "${capture[@]}" -o "$out" -- \
+                    "$helper" --target-busy >"$log" 2>&1 && [ -x "$out" ]; then
+                pass "$mode trace preserves busy-thread $delivery SIGINT and job control"
+            else
+                fail "$mode trace busy-thread $delivery SIGINT" "signal protocol failed"
+                tail -n 60 "$log" || true
+                continue
+            fi
+            if run_with_timeout env PTY_GATE_TIMEOUT_MS=15000 "$helper" "$driver" -- \
+                    "$out" --target-busy >"$root/runtime.log" 2>&1; then
+                pass "frozen busy-thread $mode/$delivery signal behavior"
+            else
+                fail "frozen busy-thread $mode/$delivery" "signal protocol failed"
+                tail -n 60 "$root/runtime.log" || true
+            fi
+        done
+    done
+    rm -rf "$root"
 }
 
 # ===================================================================
@@ -33379,6 +33431,7 @@ test_supervisor_signal_forwarding
 test_supervisor_inherited_sigchld
 test_direct_cpu_probe_seccomp_fallback
 test_direct_pty_interaction
+test_trace_signal_fairness
 test_preload_helper_compile_matrix
 test_preload_fortified_open_entrypoints
 test_preload_helper_initialization_race
