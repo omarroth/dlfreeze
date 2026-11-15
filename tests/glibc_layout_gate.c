@@ -447,11 +447,6 @@ static int patch_rtld_global_size(uint8_t *elf, size_t elf_size)
 
     if (!dlfrz_glibc_rtld_identity(
             elf, elf_size, &original_identity) ||
-        dlfrz_glibc_layout_lookup(
-            original_identity.machine,
-            original_identity.global_ro_size,
-            original_identity.global_size) ==
-            DLFRZ_GLIBC_LAYOUT_UNKNOWN ||
         elf_size < sizeof(Elf64_Ehdr))
         return -1;
     ehdr = (Elf64_Ehdr *)elf;
@@ -508,15 +503,24 @@ static int patch_rtld_global_size(uint8_t *elf, size_t elf_size)
                 /* Public symbol extents can have exact, validated aliases
                  * for one private layout.  Select and prove an actually
                  * unadmitted extent instead of assuming a fixed delta is
-                 * unknown on every distribution build. */
-                for (uint64_t delta = 1; delta <= UINT64_C(4096);
+                 * unknown on every distribution build. Try shrinking too:
+                 * the original object can fill its writable mapping exactly.
+                 * Its original layout need not itself be supported. */
+                for (uint64_t delta = 1; delta <= UINT64_C(8192);
                      delta++) {
                     struct dlfrz_glibc_rtld_identity mutated_identity;
                     uint64_t candidate;
 
-                    if (original_size > UINT64_MAX - delta)
-                        break;
-                    candidate = original_size + delta;
+                    uint64_t distance = (delta + 1) / 2;
+                    if (delta & 1) {
+                        if (original_size > UINT64_MAX - distance)
+                            continue;
+                        candidate = original_size + distance;
+                    } else {
+                        if (original_size <= distance)
+                            continue;
+                        candidate = original_size - distance;
+                    }
                     syms[j].st_size = candidate;
                     if (dlfrz_glibc_rtld_identity(
                             elf, elf_size, &mutated_identity) &&

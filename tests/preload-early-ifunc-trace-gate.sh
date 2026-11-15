@@ -26,6 +26,15 @@ if [ ! -r "$helper" ] || ! command -v readelf >/dev/null 2>&1; then
     exit 77
 fi
 
+# This is also a structural requirement on runtimes whose DTV happens to be
+# ready early enough to hide the bug. The preload helper's own state must not
+# need a dynamic TLS lookup or allocation from a startup resolver.
+relocations=$(LC_ALL=C readelf -rW "$helper")
+if grep -Eq 'DTPMOD|DTPOFF|DTPREL|TLSDESC|__tls_get_addr' <<<"$relocations"; then
+    echo "FAIL: preload helper requires dynamic TLS during startup"
+    exit 1
+fi
+
 root=$(mktemp -d "${TMPDIR:-/tmp}/dlfreeze-preload-early-ifunc.XXXXXX")
 trap 'rm -rf "$root"' EXIT
 library="$root/libdlfreeze-preload-early-ifunc-late.so"

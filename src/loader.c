@@ -9740,6 +9740,15 @@ static int x86_64_musl_vector_field_store(
     else if (i + 4 <= len && (code[i] & 0xf0) == 0x40 &&
              code[i + 1] == 0x0f && code[i + 2] == 0x11)
         opcode_len = 3;
+    else if (i + 4 <= len && code[i] == 0xc5 &&
+             ((code[i + 1] & 0x7f) == 0x79 ||
+              (code[i + 1] & 0x7f) == 0x7a) && code[i + 2] == 0x7f)
+        opcode_len = 3; /* VEX.128 MOVDQA/MOVDQU store */
+    else if (i + 5 <= len && code[i] == 0xc4 &&
+             (code[i + 1] & 0x1f) == 1 &&
+             ((code[i + 2] & 0x7f) == 0x79 ||
+              (code[i + 2] & 0x7f) == 0x7a) && code[i + 3] == 0x7f)
+        opcode_len = 4;
     else
         return 0;
     if ((code[i + opcode_len] >> 6) == 3)
@@ -9762,6 +9771,18 @@ static int x86_64_musl_simd_preserves_gprs(
     uint8_t modrm;
     size_t end;
 
+    /* VEX.128 MOVDQA/MOVDQU, as emitted by AVX-enabled libc builds.
+     * Require the reserved vvvv field and L=0, and decode the complete
+     * addressing operand so displacement bytes cannot become instructions.
+     * These are the same vector-only moves admitted below for legacy SSE. */
+    if (p + 4 <= len && code[p] == 0xc5 &&
+        ((code[p + 1] & 0x7f) == 0x79 ||
+         (code[p + 1] & 0x7f) == 0x7a) &&
+        (code[p + 2] == 0x6f || code[p + 2] == 0x7f) &&
+        x86_64_modrm_end(code, len, p + 3, &end)) {
+        *end_out = end;
+        return 1;
+    }
     if (p >= len || code[p++] != 0x66)
         return 0;
     if (p < len && (code[p] & 0xf0) == 0x40)
@@ -10741,6 +10762,9 @@ static int decode_x86_64_mem_disp(const uint8_t *code, size_t len,
         return 0;
     if (opcode_len > 1 && (code[i] & 0xf0) == 0x40)
         rex = code[i];
+    else if (opcode_len == 4 && code[i] == 0xc4)
+        rex = (uint8_t)((((code[i + 1] ^ 0xff) >> 5) & 1) |
+                         ((((code[i + 1] ^ 0xff) >> 6) & 1) << 1));
     modrm = code[i + opcode_len];
     mod = modrm >> 6;
     if (mod > 2)
@@ -10754,7 +10778,8 @@ static int decode_x86_64_mem_disp(const uint8_t *code, size_t len,
         sib = code[displacement++];
         /* Accept the RSP/R12 encoding only when the SIB has no index.  An
          * indexed address is not a direct struct pthread field access. */
-        if (((sib >> 3) & 7) != 4 || (mod == 0 && (sib & 7) == 5))
+        if (((sib >> 3) & 7) != 4 || (rex & 2) ||
+            (mod == 0 && (sib & 7) == 5))
             return 0;
         base = (sib & 7) | ((rex & 1) ? 8 : 0);
     } else {

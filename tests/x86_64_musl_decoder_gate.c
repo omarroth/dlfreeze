@@ -930,6 +930,65 @@ static int test_pthread_geometry(void)
 
 /* A volatile TLS pointer is authoritative only across proven spill/reload
  * paths. These mutations exercise both branch successors and stack aliases. */
+static int test_vex_thread_list(void)
+{
+    /* AVX-enabled builds spill a vector self-link and reload it between
+     * the scalar peer loads and reciprocal stores. No AVX execution is
+     * needed to prove these byte streams, even on a baseline test host. */
+    uint8_t unlink_code[] =
+        "\x64\x48\x8b\x1c\x25\0\0\0\0"
+        "\x48\x8b\x53\x18\x48\x8b\x43\x10"
+        "\xc5\xf9\x6f\x95\x30\xff\xff\xff"
+        "\x48\x89\x42\x10\x48\x8b\x53\x18\x48\x89\x50\x18";
+    uint8_t store[] = "\xc4\xc1\x7a\x7f\x45\x10";
+    const uint8_t low_store[] = "\xc5\xfa\x7f\x43\x10";
+    const uint8_t indexed[] = "\xc4\xa1\x7a\x7f\x44\x25\x10";
+    size_t prev, next, off;
+    unsigned int base;
+
+    if (!x86_64_musl_list_geometry(unlink_code, sizeof(unlink_code) - 1,
+                                   &prev, &next) || prev != 16 || next != 24 ||
+        !x86_64_musl_vector_field_store(store, sizeof(store) - 1, 0,
+                                        &base, &off) || base != 13 || off != 16 ||
+        !x86_64_musl_vector_field_store(low_store, sizeof(low_store) - 1, 0,
+                                        &base, &off) || base != 3 || off != 16 ||
+        x86_64_musl_vector_field_store(indexed, sizeof(indexed) - 1, 0,
+                                       &base, &off))
+        return 0;
+    for (size_t len = 0; len < sizeof(store) - 1; len++)
+        if (x86_64_musl_vector_field_store(store, len, 0, &base, &off))
+            return 0;
+
+    store[2] |= 4; /* YMM store spans four words, not just prev/next. */
+    if (x86_64_musl_vector_field_store(store, sizeof(store) - 1, 0,
+                                      &base, &off))
+        return 0;
+    store[2] = 0x72; /* Invalid reserved vvvv. */
+    if (x86_64_musl_vector_field_store(store, sizeof(store) - 1, 0,
+                                      &base, &off))
+        return 0;
+    store[2] = 0x7a;
+    store[1] = 0xc2; /* Wrong opcode map. */
+    if (x86_64_musl_vector_field_store(store, sizeof(store) - 1, 0,
+                                      &base, &off))
+        return 0;
+    store[1] = 0xc1;
+    store[5] = 0xf0; /* Not a positive pthread field. */
+    if (x86_64_musl_vector_field_store(store, sizeof(store) - 1, 0,
+                                      &base, &off))
+        return 0;
+    unlink_code[18] |= 4; /* Do not accept a wider vector load as this form. */
+    if (x86_64_musl_list_geometry(unlink_code, sizeof(unlink_code) - 1,
+                                  &prev, &next))
+        return 0;
+    unlink_code[18] = 0xf9;
+    unlink_code[19] = 0x7e; /* VMOVD writes a GPR: provenance is not preserved. */
+    if (x86_64_musl_list_geometry(unlink_code, sizeof(unlink_code) - 1,
+                                  &prev, &next))
+        return 0;
+    return 1;
+}
+
 static int test_spilled_tls_argument(void)
 {
     uint8_t *code = image + CREATE_OFF;
@@ -1006,6 +1065,10 @@ int main(void)
     }
     if (!test_pthread_geometry()) {
         fprintf(stderr, "x86-64 musl pthread decoder gate failed\n");
+        return 1;
+    }
+    if (!test_vex_thread_list()) {
+        fprintf(stderr, "x86-64 musl VEX thread-list decoder gate failed\n");
         return 1;
     }
     if (!test_spilled_tls_argument()) {

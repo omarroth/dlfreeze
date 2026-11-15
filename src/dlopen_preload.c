@@ -211,18 +211,25 @@ static _Atomic(int (*)(const char *)) real_chdir;
 static _Atomic(int (*)(int)) real_fchdir;
 static _Atomic(int (*)(const char *)) real_chroot;
 
-static __thread int g_trace_depth;
-static __thread int g_symbols_resolving;
-static __thread int g_exec_depth;
-static __thread unsigned int g_wrapped_fork_depth;
-static __thread unsigned int g_loader_observation_depth;
-static __thread unsigned int g_cwd_writer_depth;
-static __thread pid_t g_cwd_recovered_child_pid;
-static __thread unsigned int g_trace_fd_state_depth;
-static __thread int g_trace_failure_active;
-static __thread uint64_t g_trace_fd_state_saved_signal_mask;
-static __thread int g_trace_fd_state_signals_blocked;
-static __thread pid_t g_descriptor_recovered_child_pid;
+/* This helper is installed with LD_PRELOAD, so reserve its small TLS block at
+ * startup. Interposed calls can originate in startup IFUNCs before the native
+ * loader has published the helper's dynamic TLS module in the DTV. A general-
+ * dynamic __tls_get_addr call is not safe at that point (and can return NULL).
+ * Initial-exec access needs neither lazy TLS allocation nor a loader call. */
+#define TRACE_TLS static __thread __attribute__((tls_model("initial-exec")))
+TRACE_TLS int g_trace_depth;
+TRACE_TLS int g_symbols_resolving;
+TRACE_TLS int g_exec_depth;
+TRACE_TLS unsigned int g_wrapped_fork_depth;
+TRACE_TLS unsigned int g_loader_observation_depth;
+TRACE_TLS unsigned int g_cwd_writer_depth;
+TRACE_TLS pid_t g_cwd_recovered_child_pid;
+TRACE_TLS unsigned int g_trace_fd_state_depth;
+TRACE_TLS int g_trace_failure_active;
+TRACE_TLS uint64_t g_trace_fd_state_saved_signal_mask;
+TRACE_TLS int g_trace_fd_state_signals_blocked;
+TRACE_TLS pid_t g_descriptor_recovered_child_pid;
+#undef TRACE_TLS
 static _Atomic int g_symbols_resolved;
 static _Atomic int g_trace_excluded_image;
 static _Atomic uintptr_t g_trace_init_state;

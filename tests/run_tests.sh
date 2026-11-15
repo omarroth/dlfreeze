@@ -3660,8 +3660,12 @@ test_loader_missing_root_replay() {
     local layout="$root/layout" first="$root/first-missing.so" second="$root/second-missing.so"
     local expect actual rc=0
     mkdir -p "$root"
+    # The negative paths deliberately do not exist. BusyBox realpath does
+    # not implement GNU -m, so canonicalize their existing parent instead.
+    root=$(realpath "$root")
+    first="$root/first-missing.so"
     second="$root/absent/$(printf '%0600d' 0)"
-    first=$(realpath -m "$first"); second=$(realpath -m "$second"); plugin=$(realpath -m "$plugin")
+    plugin="$root/plugin.so"
     if ! gcc -Wall -Wextra -Werror -O2 -Iinclude -o "$layout" tests/glibc_error_layout_gate.c ||
        ! run_with_timeout "$layout"; then
         fail "GNU error-layout provenance" "gate failed"
@@ -3738,7 +3742,8 @@ test_loader_probe_replay() {
     echo "--- caller-scoped loader probes ---"
     local root="$BUILD/loader_probes" probe trace log out expected actual rc=0
     local helper="$BUILD/dlfreeze-preload.so"
-    root=$(realpath -m "$root")
+    mkdir -p "$root"
+    root=$(realpath "$root")
     probe="$root/main"; trace="$root/trace"; log="$root/freeze.log"; out="$root/main.frozen"
     rm -rf "$root"
     mkdir -p "$root/providers" "$root/other"
@@ -3957,7 +3962,7 @@ test_bootstrap_cet_isolation() {
     local wrapper="$root/static-cc"
     local safe_build="$root/suppressed" safe_log="$root/suppressed.log"
     local reject_build="$root/rejected" reject_log="$root/rejected.log"
-    local target notes reject_rc=0
+    local target notes bootstrap_cc reject_rc=0
 
     if [ -z "$TEST_REAL_GCC" ] || ! command -v make >/dev/null 2>&1 ||
        ! command -v readelf >/dev/null 2>&1; then
@@ -3965,7 +3970,12 @@ test_bootstrap_cet_isolation() {
         skip "$reject_label" "gcc, make, or readelf is unavailable"
         return
     fi
-    target=$("$TEST_REAL_GCC" -dumpmachine 2>/dev/null || true)
+    # Exercise the production static compiler when available. A host glibc
+    # CRT may itself require x86-64-v3; that unrelated ISA rejection must not
+    # prevent this fixture from reaching the CET property gate.
+    bootstrap_cc=$(test_compiler_available musl-gcc || true)
+    bootstrap_cc=${bootstrap_cc:-$TEST_REAL_GCC}
+    target=$("$bootstrap_cc" -dumpmachine 2>/dev/null || true)
     case "${target%%-*}" in
         x86_64|amd64) ;;
         *)
@@ -3980,7 +3990,7 @@ test_bootstrap_cet_isolation() {
     cat > "$probe_src" <<'C'
 int main(void) { return 0; }
 C
-    if ! "$TEST_REAL_GCC" -static -fcf-protection=full -Wl,-z,shstk \
+    if ! "$bootstrap_cc" -static -fcf-protection=full -Wl,-z,shstk \
             -o "$probe" "$probe_src" >/dev/null 2>&1; then
         skip "$suppress_label" "static CET probe cannot be linked"
         skip "$reject_label" "static CET probe cannot be linked"
@@ -4016,7 +4026,7 @@ exec "$DLFREEZE_CET_REAL_CC" -fcf-protection=full "$@" -O0
 SH
     chmod +x "$wrapper"
 
-    if ! env DLFREEZE_CET_REAL_CC="$TEST_REAL_GCC" \
+    if ! env DLFREEZE_CET_REAL_CC="$bootstrap_cc" \
             make --no-print-directory -f Makefile \
                 BUILD="$safe_build" CC="$TEST_REAL_GCC" \
                 STATIC_CC="$wrapper" \
@@ -4034,7 +4044,7 @@ SH
         pass "$suppress_label"
     fi
 
-    env DLFREEZE_CET_REAL_CC="$TEST_REAL_GCC" \
+    env DLFREEZE_CET_REAL_CC="$bootstrap_cc" \
         DLFREEZE_CET_INJECT_AFTER=1 \
         make --no-print-directory -f Makefile \
             BUILD="$reject_build" CC="$TEST_REAL_GCC" \
@@ -8620,8 +8630,12 @@ test_trace_signal_fairness() {
                     "$helper" --target-busy >"$log" 2>&1 && [ -x "$out" ]; then
                 pass "$mode trace preserves busy-thread $delivery SIGINT and job control"
             else
-                fail "$mode trace busy-thread $delivery SIGINT" "signal protocol failed"
-                tail -n 60 "$log" || true
+                if grep -Fq -- '-t has no ABI-compatible preload helper' "$log"; then
+                    skip "$mode trace busy-thread $delivery SIGINT" "target has no compatible trace helper"
+                else
+                    fail "$mode trace busy-thread $delivery SIGINT" "signal protocol failed"
+                    tail -n 60 "$log" || true
+                fi
                 continue
             fi
             if run_with_timeout env PTY_GATE_TIMEOUT_MS=15000 "$helper" "$driver" -- \
@@ -27918,13 +27932,28 @@ test_indirect_external_access_direct() {
     local startup="$root/startup" late="$root/late"
     local legacy="$root/legacy"
     local out="$root/main.frozen" log="$root/freeze.log"
+    local link_log="$root/link.log"
     local label native actual native_rc rc mode freeze_rc
 
     mkdir -p "$root"
-    if ! gcc -Wall -Wextra -Werror -shared -fPIC \
+    if ! LC_ALL=C gcc -Wall -Wextra -Werror -shared -fPIC \
             -Wl,-soname,libindirect_access.so -o "$library" \
-            tests/indirect_external_access_lib.c tests/indirect_external_access_note.S ||
-       ! gcc -Wall -Wextra -Werror -fPIC -pie -o "$startup" \
+            tests/indirect_external_access_lib.c tests/indirect_external_access_note.S \
+            >"$link_log" 2>&1; then
+        # Older linkers reject the protected-symbol address relocation that
+        # this property permits. Classify only that explicit capability
+        # failure; unrelated compiler/link errors must still fail the test.
+        if grep -Eq 'unsupported GNU_PROPERTY_TYPE.*0xb0008000' "$link_log" &&
+           grep -Eq 'relocation .* against (protected symbol|symbol).*indirect_function' "$link_log"; then
+            skip "indirect external access bindings" "linker cannot implement the GNU property contract"
+        else
+            fail "indirect external access fixtures" "library compile failed"
+            cat "$link_log"
+        fi
+        rm -rf "$root"
+        return
+    fi
+    if ! gcc -Wall -Wextra -Werror -fPIC -pie -o "$startup" \
             tests/indirect_external_access_main.c tests/indirect_external_access_note.S \
             -L"$root" -lindirect_access -Wl,-rpath,'$ORIGIN' ||
        ! gcc -Wall -Wextra -Werror -fPIC -pie -DINDIRECT_LATE_LOAD \
@@ -27991,7 +28020,7 @@ test_indirect_external_access_direct() {
                 capture_output native "$legacy" || native_rc=$?
                 if ! run_freeze "$DLFREEZE" -d -o "$out" "$legacy" \
                         >"$log" 2>&1 ||
-                   ! grep -q 'unsupported direct contract; using extraction' "$log"; then
+                   ! grep -Eq 'unsupported direct contract; using extraction|direct-load is unavailable.*creating an extraction-mode binary' "$log"; then
                     fail "$label" "packer did not select native semantics"
                     tail -n 40 "$log" || true
                 else
