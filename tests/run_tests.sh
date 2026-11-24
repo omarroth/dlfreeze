@@ -5973,7 +5973,7 @@ test_runtime_relocation_vfs_fallthrough() {
     echo "--- runtime-relocation VFS libc fallthrough ---"
     local root="$BUILD/runtime-reloc-vfs" src="$BUILD/runtime_reloc_vfs.c"
     local bin out log captured host_dir actual expect rc=0 freeze_rc=0
-    local preload_src preload_so clean_out clean_log
+    local preload_src preload_so clean_out clean_log audit_expect
     local fault_src fault cc
     local label="runtime-relocation VFS libc fallthrough"
 
@@ -6242,6 +6242,20 @@ C
         fail "LD_PRELOAD extraction fallback" "exit=$rc output=$actual"
     fi
 
+    # The native interpreter may run the audit module's constructor (glibc)
+    # or ignore LD_AUDIT (musl). Compare replay with the same native request.
+    rc=0
+    capture_output audit_expect env LD_PRELOAD= LD_AUDIT="$preload_so" \
+        "$bin" "$captured.host" "$host_dir" || rc=$?
+    if [ "$rc" -ne 0 ] ||
+       [[ "$audit_expect" != "$expect" &&
+          "$audit_expect" != $'policy-preload-ran\n'"$expect" ]]; then
+        fail "LD_AUDIT native control" "exit=$rc output=$audit_expect"
+        rm -rf "$root"
+        rm -f "$src"
+        return
+    fi
+
     actual=""; rc=0
     capture_output actual env -u DLFREEZE_NO_FORK \
         DLFREEZE_SUPERVISED_FALLBACK=1 LD_PRELOAD= \
@@ -6251,7 +6265,7 @@ C
     # never admitted by the in-process loader.  A clean manifest may retry
     # silently through the native loader, including on runtimes which accept
     # but otherwise ignore LD_AUDIT.
-    if [ "$rc" -eq 0 ] && [ "$actual" = "$expect" ]; then
+    if [ "$rc" -eq 0 ] && [ "$actual" = "$audit_expect" ]; then
         pass "LD_AUDIT extraction fallback"
     else
         fail "LD_AUDIT extraction fallback" "exit=$rc output=$actual"
@@ -17341,6 +17355,15 @@ C
 #define F_SEAL_WRITE 0x0008
 #endif
 
+/* Use the Linux ABI flag, not the LP64 libc's possibly zero O_LARGEFILE. */
+#if defined(__aarch64__)
+#define KERNEL_O_LARGEFILE 0400000
+#elif defined(__x86_64__)
+#define KERNEL_O_LARGEFILE 0100000
+#else
+#define KERNEL_O_LARGEFILE O_LARGEFILE
+#endif
+
 static int deny_add_seals(void) {
     struct sock_filter filter[] = {
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
@@ -17372,12 +17395,23 @@ int main(int argc, char **argv) {
     int descriptor_flags;
     int frozen_check;
     int status_flags;
-    int fd;
+    int dirfd, fd;
 
-    frozen_check = argc == 4 && strcmp(argv[3], "frozen") == 0;
-    if ((argc != 3 && !frozen_check) || vfs_startup_probe() != 41)
+    frozen_check = argc == 5 && strcmp(argv[4], "frozen") == 0;
+    if ((argc != 4 && !frozen_check) || vfs_startup_probe() != 41)
         return 2;
-    fd = open(argv[1], O_RDONLY | O_CLOEXEC | O_APPEND | O_NONBLOCK);
+    dirfd = open(argv[3], O_PATH | O_DIRECTORY | O_CLOEXEC);
+    if (dirfd < 0) {
+        perror("open parent");
+        return 3;
+    }
+    fd = openat(dirfd, "data.txt", O_RDONLY | O_CLOEXEC | O_APPEND |
+                O_NONBLOCK | KERNEL_O_LARGEFILE);
+    if (fd < 0) {
+        perror("openat with kernel O_LARGEFILE");
+        return 3;
+    }
+    close(dirfd);
     descriptor_flags = fd < 0 ? -1 : fcntl(fd, F_GETFD);
     status_flags = fd < 0 ? -1 : fcntl(fd, F_GETFL);
     if (fd < 0 || (descriptor_flags & FD_CLOEXEC) == 0 ||
@@ -17492,7 +17526,7 @@ C
     fi
 
     freeze_require_direct "direct startup ELF VFS visibility" "$log" "$out" \
-        -t -f "$root/*" "$bin" "$data" "$lib" || freeze_rc=$?
+        -t -f "$root/*" "$bin" "$data" "$lib" "$root" || freeze_rc=$?
     if [ "$freeze_rc" -eq 77 ]; then
         skip "direct startup ELF VFS visibility" "$DIRECT_FREEZE_REASON"
         rm -rf "$root"
@@ -17506,7 +17540,7 @@ C
     mv "$lib" "${lib}.bak"
     mv "$data" "${data}.bak"
     printf '%s\n' 'host-replacement' > "$data"
-    capture_output actual "$out" "$data" "$lib" frozen || rc=$?
+    capture_output actual "$out" "$data" "$lib" "$root" frozen || rc=$?
     mv "${lib}.bak" "$lib"
     rm -f "$data"
     mv "${data}.bak" "$data"

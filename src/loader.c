@@ -140,6 +140,13 @@ _Static_assert(PROT_BTI == DLFRZ_AARCH64_PROT_BTI,
 #ifndef O_PATH
 #define O_PATH 010000000
 #endif
+/* The Linux open/openat ABI accepts this bit even on LP64, where some libc
+ * headers define O_LARGEFILE as zero. It has no effect on file size there. */
+#if defined(__aarch64__)
+#define LDR_LINUX_O_LARGEFILE 0400000U
+#elif defined(__x86_64__)
+#define LDR_LINUX_O_LARGEFILE 0100000U
+#endif
 #ifndef AT_MINSIGSTKSZ
 #define AT_MINSIGSTKSZ 51
 #endif
@@ -19591,13 +19598,11 @@ static int vfs_regular_open_error(int flags)
 {
     unsigned int known = O_ACCMODE | O_CREAT | O_EXCL | O_TRUNC |
                          O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW | O_PATH |
+                         LDR_LINUX_O_LARGEFILE |
                          (unsigned int)vfs_observable_open_status_mask();
 
 #ifdef O_NOCTTY
     known |= O_NOCTTY;
-#endif
-#ifdef O_LARGEFILE
-    known |= O_LARGEFILE;
 #endif
 #ifdef O_TMPFILE
     known |= O_TMPFILE;
