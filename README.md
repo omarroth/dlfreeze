@@ -206,7 +206,17 @@ and flags in [the package workflow](.github/workflows/ci.yml).
 
 The workflow exposes both archives as CI artifacts on ordinary runs. A
 pushed `v*` tag publishes both verified archives and checksums once the
-test and packaging jobs succeed.
+test and packaging jobs succeed. The annotation on that tag becomes the
+GitHub release notes. To preserve Markdown headings that Git would otherwise
+treat as comments, create the tag with `--cleanup=verbatim`:
+
+```bash
+git tag -a v1.2.3 --cleanup=verbatim -F release-notes.md
+git push origin v1.2.3
+```
+
+Use `-s` instead of `-a` for a signed tag; the signature is not included in
+the published notes. A lightweight tag uses the tagged commit's message.
 
 ## Building
 

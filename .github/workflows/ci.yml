@@ -104,7 +104,16 @@ jobs:
       - name: Verify assets and extract release notes
         run: |
           (cd dist && sha256sum -c dlfreeze-linux-{x86_64,aarch64}.tar.gz.sha256)
-          git for-each-ref --format='%(contents)' "$GITHUB_REF" > release-notes.md
+          git show-ref --verify --quiet "$GITHUB_REF"
+          notes=$(git for-each-ref --format='%(contents)' "$GITHUB_REF")
+          signature=$(git for-each-ref --format='%(contents:signature)' "$GITHUB_REF")
+          # Git includes the signature in contents for signed tags. Publish
+          # only the annotation, without reflowing the Markdown subject/body.
+          if [ -n "$signature" ]; then
+            printf '%s' "${notes%"$signature"}"
+          else
+            printf '%s\n' "$notes"
+          fi > release-notes.md
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
