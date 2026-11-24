@@ -96,11 +96,23 @@ if [ "$runtime" = elf ]; then
 fi
 
 cd "$root"
+plugin=libdlfreeze-release-probe.so
+trace_library_path=
 case "$runtime" in
-    glibc) helper=$gnu_helper ;;
-    musl) helper=$musl_helper ;;
+    # Jammy is the helper's build/ABI baseline, not a direct-loader
+    # baseline. An exact bare name is representable in extraction mode.
+    glibc)
+        helper=$gnu_helper; request=$plugin; freeze_mode=-x; replay=extraction
+        # The interposer is the native dlopen caller, so the executable's
+        # RUNPATH alone does not supply this lookup. Scope the search path to
+        # the trace; replay must find the packed library without it.
+        trace_library_path=$root
+        ;;
+    # Also prove the archive can replay a request that requires direct
+    # loading. An absolute request must never pass via extraction.
+    musl) helper=$musl_helper; request="$root/$plugin"; freeze_mode=-d; replay=direct ;;
 esac
-${CC:-cc} -Wall -Wextra -Werror -fPIC -shared -o plugin.so -x c - <<'C'
+${CC:-cc} -Wall -Wextra -Werror -fPIC -shared -o "$plugin" -x c - <<'C'
 int release_probe(void) { return 42; }
 C
 ${CC:-cc} -Wall -Wextra -Werror -o probe -x c - -ldl <<'C'
@@ -123,16 +135,20 @@ int main(int argc, char **argv)
 }
 C
 ln -s "$tool" ./freeze
-if ! ./freeze -v -t -o ./probe.frozen -- ./probe "$root/plugin.so" > freeze.log 2>&1; then
+if ! LD_LIBRARY_PATH="$trace_library_path" \
+        ./freeze -v "$freeze_mode" -t -o ./probe.frozen -- ./probe "$request" > freeze.log 2>&1; then
     cat freeze.log >&2
     die "$runtime trace failed"
 fi
 grep -Fxq "bootstrap : $bootstrap" freeze.log || die "wrong bootstrap used"
 grep -Fxq "trace helper: $helper" freeze.log || die "wrong $runtime preload helper used"
-[ "$(od -An -tu8 -j "$(($(wc -c < probe.frozen) - 24))" -N8 probe.frozen | tr -d '[:space:]')" != 0 ] ||
-    die "expected direct-load metadata"
-rm ./probe ./plugin.so
+meta_offset=$(od -An -tu8 -j "$(($(wc -c < probe.frozen) - 24))" -N8 probe.frozen | tr -d '[:space:]')
+case "$replay:$meta_offset" in
+    extraction:0|direct:[1-9]*) ;;
+    *) die "expected $replay metadata, got offset $meta_offset" ;;
+esac
+rm ./probe "./$plugin"
 rm -rf ./usr
-[ "$(./probe.frozen "$root/plugin.so")" = 'release trace ok' ] ||
-    die "direct-loaded artifact did not replay without package or source files"
-echo "PASS: $arch release archive froze and replayed a $runtime dlopen workload"
+[ "$(./probe.frozen "$request")" = 'release trace ok' ] ||
+    die "$replay artifact did not replay without package or source files"
+echo "PASS: $arch release archive froze and replayed a $runtime dlopen workload ($replay)"
