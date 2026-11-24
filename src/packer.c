@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
@@ -31,6 +32,17 @@
 #endif
 #ifndef RENAME_EXCHANGE
 #define RENAME_EXCHANGE (1U << 1)
+#endif
+
+#ifndef FICLONE
+#define FICLONE _IOW(0x94, 9, int)
+#endif
+#ifndef SEEK_DATA
+/* Linux lseek ABI; older libc headers omit these two whence values. */
+#define SEEK_DATA 3
+#endif
+#ifndef SEEK_HOLE
+#define SEEK_HOLE 4
 #endif
 
 #ifdef DLFREEZE_PACKER_TRANSACTION_GATE
@@ -883,6 +895,10 @@ static int packed_canonicalize_alias_metadata(
 
 static int packer_pread_exact(int fd, void *buffer, size_t size,
                               uint64_t offset);
+static int packer_pwrite_exact(int fd, const void *buffer, size_t size,
+                               uint64_t offset);
+static int packer_stat_snapshot_matches(const struct stat *before,
+                                        const struct stat *after);
 
 static int validate_copied_elf(FILE *output, const char *path,
                               uint64_t offset, size_t length,
@@ -1110,6 +1126,8 @@ static int size_add_assign(size_t *value, size_t increment)
     return 0;
 }
 
+static int packer_stream_seek(FILE *stream, uint64_t offset);
+
 static int write_pad(FILE *out, size_t *cur, size_t align)
 {
     size_t target;
@@ -1122,6 +1140,14 @@ static int write_pad(FILE *out, size_t *cur, size_t align)
     }
     target = (*cur + align - 1) & ~(align - 1);
     pad = target - *cur;
+    /* This stream is append-only until the footer is written. Large
+     * alignment gaps can be holes without changing any logical bytes. */
+    if (pad >= 4096) {
+        if (packer_stream_seek(out, target) < 0)
+            return -1;
+        *cur = target;
+        return 0;
+    }
     while (pad > 0) {
         char zeros[4096] = {0};
         size_t chunk = pad > sizeof(zeros) ? sizeof(zeros) : pad;
@@ -2264,6 +2290,86 @@ static int validate_output_aliases(const struct pack_options *opts)
     return 0;
 }
 
+/* A reflink is a separate inode with independent contents, not a hardlink.
+ * If cloning isn't available, retain holes in the streaming copy so padding,
+ * sparse inputs and trailing holes don't consume space on every pass. */
+static int clone_transaction_bytes(int src, int dst)
+{
+    int rc;
+
+    do {
+        rc = ioctl(dst, FICLONE, src);
+    } while (rc < 0 && errno == EINTR);
+    if (rc == 0)
+        return 1;
+    switch (errno) {
+    case ENOTTY:
+    case EOPNOTSUPP:
+    case EXDEV:
+    case EINVAL:
+    case ENOSYS:
+    case EPERM:
+    case EACCES:
+        return 0;
+    default:
+        return -1;
+    }
+}
+
+static int copy_transaction_bytes(int src, int dst, off_t size)
+{
+    uint8_t buffer[65536];
+    off_t pos = 0;
+    int sparse = 1;
+
+    /* Also clear any partial destination state before a fallback. */
+    if (ftruncate(dst, 0) < 0 || ftruncate(dst, size) < 0)
+        return -1;
+    while (pos < size) {
+        off_t end = size;
+
+        if (sparse) {
+            off_t data = lseek(src, pos, SEEK_DATA);
+
+            if (data < 0 && errno == ENXIO)
+                break;
+            if (data >= pos && data < size) {
+                off_t hole = lseek(src, data, SEEK_HOLE);
+
+                if (hole > data && hole <= size) {
+                    pos = data;
+                    end = hole;
+                } else if (hole < 0 &&
+                           (errno == EINVAL || errno == EOPNOTSUPP)) {
+                    sparse = 0;
+                } else {
+                    if (hole >= 0 || errno == ENXIO)
+                        errno = ESTALE;
+                    return -1;
+                }
+            } else if (data < 0 &&
+                       (errno == EINVAL || errno == EOPNOTSUPP)) {
+                sparse = 0;
+            } else {
+                if (data >= 0)
+                    errno = ESTALE;
+                return -1;
+            }
+        }
+
+        while (pos < end) {
+            size_t chunk = (uint64_t)(end - pos) < sizeof(buffer)
+                ? (size_t)(end - pos) : sizeof(buffer);
+
+            if (packer_pread_exact(src, buffer, chunk, (uint64_t)pos) < 0 ||
+                packer_pwrite_exact(dst, buffer, chunk, (uint64_t)pos) < 0)
+                return -1;
+            pos += (off_t)chunk;
+        }
+    }
+    return 0;
+}
+
 static int make_transaction_copy(const char *path, const char *suffix,
                                  const struct stat *source_identity,
                                  char copy_path[PATH_MAX],
@@ -2271,11 +2377,13 @@ static int make_transaction_copy(const char *path, const char *suffix,
 {
     struct stat st;
     struct stat completed;
-    char buffer[1 << 16];
+    struct stat source_after;
     int src = -1;
     int dst = -1;
     int identity_valid = 0;
     int rc = -1;
+    int cloned;
+    int saved_errno;
 
     if (!path || !suffix || !source_identity || !copy_path ||
         !copy_identity) {
@@ -2304,49 +2412,39 @@ static int make_transaction_copy(const char *path, const char *suffix,
     if (packer_fchmod_retry(dst, st.st_mode & 0777) < 0)
         goto out;
 
-    for (;;) {
-        ssize_t got = read(src, buffer, sizeof(buffer));
-
-        if (got < 0) {
-            if (errno == EINTR)
-                continue;
-            goto out;
-        }
-        if (got == 0)
-            break;
-        for (ssize_t written = 0; written < got;) {
-            ssize_t n = write(dst, buffer + written, (size_t)(got - written));
-
-            if (n < 0) {
-                if (errno == EINTR)
-                    continue;
-                goto out;
-            }
-            if (n == 0) {
-                errno = EIO;
-                goto out;
-            }
-            written += n;
-        }
-    }
-    if (fsync(dst) < 0 || fstat(dst, &completed) < 0)
+    if (st.st_size < 0) {
+        errno = ESTALE;
         goto out;
-    if (!output_identity_equal(&completed, copy_identity) ||
-        !S_ISREG(completed.st_mode) || completed.st_nlink != 1) {
+    }
+    cloned = clone_transaction_bytes(src, dst);
+    if (cloned < 0 ||
+        (cloned == 0 && copy_transaction_bytes(src, dst, st.st_size) < 0) ||
+        fsync(dst) < 0 || fstat(dst, &completed) < 0 ||
+        fstat(src, &source_after) < 0)
+        goto out;
+    if (!packer_stat_snapshot_matches(&st, &source_after) ||
+        source_after.st_nlink != 1 ||
+        !output_identity_equal(&completed, copy_identity) ||
+        completed.st_nlink != 1 || completed.st_size != st.st_size) {
         errno = ESTALE;
         goto out;
     }
     rc = 0;
 
 out:
-    if (src >= 0 && close(src) < 0 && rc == 0)
-        rc = -1;
-    if (dst >= 0 && close(dst) < 0)
-        rc = -1;
-    if (rc < 0 && identity_valid)
-        discard_owned_transaction(copy_path, copy_identity,
-                                  "failed transaction copy");
-    return rc;
+    saved_errno = rc < 0 ? (errno ? errno : EIO) : 0;
+    if (src >= 0 && close(src) < 0 && !saved_errno)
+        saved_errno = errno;
+    if (dst >= 0 && close(dst) < 0 && !saved_errno)
+        saved_errno = errno;
+    if (saved_errno) {
+        errno = saved_errno;
+        if (identity_valid)
+            discard_owned_transaction(copy_path, copy_identity,
+                                      "failed transaction copy");
+        return -1;
+    }
+    return 0;
 }
 
 struct bounded_elf_sections {
@@ -2384,6 +2482,30 @@ static int packer_pread_exact(int fd, void *buffer, size_t size,
         if (got < 0)
             return -1;
         done += (size_t)got;
+    }
+    return 0;
+}
+
+static int packer_pwrite_exact(int fd, const void *buffer, size_t size,
+                               uint64_t offset)
+{
+    const uint8_t *bytes = buffer;
+    size_t done = 0;
+
+    while (done < size) {
+        size_t chunk = size - done > (size_t)SSIZE_MAX
+            ? (size_t)SSIZE_MAX : size - done;
+        ssize_t wrote = pwrite(fd, bytes + done, chunk,
+                               (off_t)(offset + done));
+
+        if (wrote < 0 && errno == EINTR)
+            continue;
+        if (wrote <= 0) {
+            if (wrote == 0)
+                errno = EIO;
+            return -1;
+        }
+        done += (size_t)wrote;
     }
     return 0;
 }
@@ -6296,6 +6418,48 @@ static int pl_indirect_access_bindings_supported(
     return 1;
 }
 
+/* Rewriting unchanged executable pages breaks copy-on-write sharing and
+ * dirties the page cache. Compare against the private transaction in
+ * bounded windows, coalescing adjacent changed blocks into one write. */
+static int prelink_write_changed(int fd, uint64_t offset,
+                                  const uint8_t *data, size_t size)
+{
+    uint8_t original[65536];
+    const size_t block = 4096;
+
+    while (size != 0) {
+        size_t window = size < sizeof(original) ? size : sizeof(original);
+        size_t dirty = SIZE_MAX;
+
+        if (packer_pread_exact(fd, original, window, offset) < 0)
+            return -1;
+        if (memcmp(original, data, window) != 0) {
+            for (size_t pos = 0; pos < window;) {
+                size_t bytes = window - pos < block ? window - pos : block;
+
+                if (memcmp(original + pos, data + pos, bytes) != 0) {
+                    if (dirty == SIZE_MAX)
+                        dirty = pos;
+                } else if (dirty != SIZE_MAX) {
+                    if (packer_pwrite_exact(fd, data + dirty, pos - dirty,
+                                            offset + dirty) < 0)
+                        return -1;
+                    dirty = SIZE_MAX;
+                }
+                pos += bytes;
+            }
+            if (dirty != SIZE_MAX &&
+                packer_pwrite_exact(fd, data + dirty, window - dirty,
+                                    offset + dirty) < 0)
+                return -1;
+        }
+        size -= window;
+        data += window;
+        offset += window;
+    }
+    return 0;
+}
+
 static enum prelink_result prelink_objects(
     const char *output_path, const struct dlfrz_entry *entries,
     struct dlfrz_lib_meta *metas, const int *startup_aliases,
@@ -6708,6 +6872,8 @@ static enum prelink_result prelink_objects(
     }
 
     /* 4. Write patched segments back to frozen binary */
+    if (fflush(outf) != 0)
+        _exit(PRELINK_ERROR);
     for (int i = 0; i < nobj; i++) {
         const struct dlfrz_lib_meta *m = &metas[i];
             if (m->flags & DLFRZ_FLAG_INTERP) continue;
@@ -6735,9 +6901,10 @@ static enum prelink_result prelink_objects(
                 continue;
             if (!u64_add_checked(entries[i].data_offset, ph.p_offset,
                                  &foff) ||
-                packer_stream_seek(outf, foff) < 0 ||
-                fwrite((void *)(uintptr_t)(base + ph.p_vaddr), 1,
-                       (size_t)ph.p_filesz, outf) != (size_t)ph.p_filesz)
+                prelink_write_changed(
+                    fileno(outf), foff,
+                    (const uint8_t *)(uintptr_t)(base + ph.p_vaddr),
+                    (size_t)ph.p_filesz) < 0)
                 _exit(PRELINK_ERROR);
         }
     }

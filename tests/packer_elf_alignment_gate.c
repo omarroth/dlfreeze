@@ -573,6 +573,83 @@ static int prelink_manifest_bounds_gate(void)
     return !prelink_mapping_span(&meta, &span, &requested);
 }
 
+static int transaction_copy_and_writeback_gate(void)
+{
+    char source_path[PATH_MAX] = {0};
+    char clone_path[PATH_MAX] = {0};
+    char fallback_path[PATH_MAX] = {0};
+    struct stat source_identity, clone_identity, status;
+    uint8_t initial[8192] = {0};
+    uint8_t changed[sizeof(initial)];
+    uint8_t observed[sizeof(initial)];
+    const off_t length = 1024 * 1024;
+    const off_t offset = 65536;
+    int src = -1, clone = -1, fallback = -1;
+    int have_copy = 0;
+    int ok = 0;
+
+    if (!initialize_temp_template(source_path, "dlfreeze-copy-test.XXXXXX") ||
+        !initialize_temp_template(fallback_path,
+                                  "dlfreeze-stream-copy-test.XXXXXX"))
+        goto out;
+    src = mkstemp(source_path);
+    fallback = mkstemp(fallback_path);
+    if (src < 0 || fallback < 0)
+        goto out;
+    initial[3] = 0x42;
+    initial[sizeof(initial) - 1] = 0x51;
+    memcpy(changed, initial, sizeof(initial));
+    changed[4100] = 0x81;
+    if (ftruncate(src, length) < 0 ||
+        packer_pwrite_exact(src, initial, sizeof(initial), offset) < 0 ||
+        fstat(src, &source_identity) < 0)
+        goto out;
+
+    /* Exercise streaming independently of the fixture filesystem's
+     * reflink capability, including the untouched trailing hole. */
+    if (copy_transaction_bytes(src, fallback, length) < 0 ||
+        fstat(fallback, &status) < 0 || status.st_size != length ||
+        !read_exact_at(fallback, observed, sizeof(observed), offset) ||
+        memcmp(observed, initial, sizeof(initial)) != 0 ||
+        !read_exact_at(fallback, observed, sizeof(observed),
+                       length - sizeof(observed)))
+        goto out;
+    for (size_t i = 0; i < sizeof(observed); i++)
+        if (observed[i] != 0)
+            goto out;
+
+    if (make_transaction_copy(source_path, "clone", &source_identity,
+                              clone_path, &clone_identity) < 0)
+        goto out;
+    have_copy = 1;
+    if (output_identity_equal(&source_identity, &clone_identity))
+        goto out;
+    clone = open_owned_transaction(clone_path, O_RDWR, &clone_identity, NULL);
+    if (clone < 0 ||
+        prelink_write_changed(clone, offset, changed, sizeof(changed)) < 0 ||
+        !read_exact_at(clone, observed, sizeof(observed), offset) ||
+        memcmp(observed, changed, sizeof(changed)) != 0 ||
+        !read_exact_at(src, observed, sizeof(observed), offset) ||
+        memcmp(observed, initial, sizeof(initial)) != 0)
+        goto out;
+    ok = 1;
+
+out:
+    if (clone >= 0)
+        close(clone);
+    if (fallback >= 0)
+        close(fallback);
+    if (src >= 0)
+        close(src);
+    if (have_copy)
+        discard_owned_transaction(clone_path, &clone_identity, "fixture");
+    if (fallback >= 0)
+        unlink(fallback_path);
+    if (src >= 0)
+        unlink(source_path);
+    return ok;
+}
+
 int main(void)
 {
     int gate_result;
@@ -611,6 +688,10 @@ int main(void)
     }
     if (!prelink_manifest_bounds_gate()) {
         fprintf(stderr, "prelink manifest bounds admission failed\n");
+        return 1;
+    }
+    if (!transaction_copy_and_writeback_gate()) {
+        fprintf(stderr, "transaction copy or isolated writeback failed\n");
         return 1;
     }
     return 0;
