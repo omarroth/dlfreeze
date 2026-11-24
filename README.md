@@ -19,6 +19,11 @@ must be expressed as ELF, libc, kernel, or traced-resource semantics.
 
 ## Quick start
 
+On x86-64 or arm64 Linux, you can download the matching binary archive from
+[GitHub Releases](https://github.com/omarroth/dlfreeze/releases) instead of
+building from source. See [Installing and repackaging](#installing-and-repackaging)
+for the archive layout.
+
 ```bash
 make
 ```
@@ -155,6 +160,53 @@ remain readable.
 A captured regular file and a dormant library can share their original ELF
 payload when their exact source revisions match. Startup/prelinked sources
 are excluded, so file reads never expose pre-applied relocation bytes.
+
+## Installing and repackaging
+
+GitHub CI builds `dlfreeze-linux-x86_64.tar.gz` and
+`dlfreeze-linux-aarch64.tar.gz` with matching `.tar.gz.sha256` files. The
+archives use paths relative to the installation root, without an extra
+directory to strip:
+
+```text
+usr/bin/dlfreeze
+usr/lib/dlfreeze/dlfreeze-bootstrap
+usr/lib/dlfreeze/dlfreeze-preload.so
+usr/lib/dlfreeze/dlfreeze-preload-static.so
+usr/share/doc/dlfreeze/
+```
+
+Verify and unpack into a staging root for your package manager:
+
+```bash
+archive=dlfreeze-linux-x86_64.tar.gz  # use aarch64 on arm64
+sha256sum -c "$archive.sha256"
+mkdir -p pkgroot
+tar -xzf "$archive" -C pkgroot
+./pkgroot/usr/bin/dlfreeze -h
+```
+
+Keep `bin` and `lib/dlfreeze` under the same prefix. Only the CLI belongs
+on `PATH`; it locates the private files relative to its executable.
+Packaged CLI and bootstrap binaries are statically linked with musl.
+The tracing helpers use the target program's libc: the GNU helper
+requires glibc symbol versions up to 2.34, and the musl helper uses the
+musl ABI. A static CLI does not make tracing or direct loading available
+for every target libc; those modes still validate the target's runtime.
+Frozen executables do not need the package installed to run.
+
+For source-based packaging, use `make DESTDIR="$PWD/pkgroot" install`
+(default `PREFIX=/usr`; override it for a different prefix). To build the
+standard archive and checksum, run `make package` with GNU tar, gzip, and
+a matching `strip` (set `STRIP` for a cross build). This always stages a
+`/usr` tree under `DIST` (default `dist`), regardless of the install prefix.
+Archive metadata is normalized; set `SOURCE_DATE_EPOCH` to choose its
+timestamp. To reproduce the release ABI, use the compiler, libc baseline,
+and flags in [the package workflow](.github/workflows/ci.yml).
+
+The workflow exposes both archives as CI artifacts on ordinary runs. A
+pushed `v*` tag publishes both verified archives and checksums once the
+test and packaging jobs succeed.
 
 ## Building
 

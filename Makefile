@@ -11,6 +11,12 @@ BOOTSTRAP_CPPFLAGS ?=
 
 BUILD    = build
 SRC      = src
+PREFIX   ?= /usr
+DESTDIR  ?=
+DIST     ?= dist
+# Optional notice for the musl runtime linked into release executables.
+MUSL_LICENSE ?=
+STRIP    ?= strip
 BUILD_TRIPLE := $(shell LC_ALL=C $(CC) -dumpmachine 2>/dev/null || uname -m)
 # Compare compiler targets by admitted ELF architecture, not by vendor/libc
 # components of the triple (x86_64-linux-musl and x86_64-linux-gnu are
@@ -77,7 +83,7 @@ TOOL_CC := $(STATIC_CC)
 
 .DEFAULT_GOAL := all
 
-.PHONY: all clean test bench local-verify local-cross prepare-build
+.PHONY: all clean test bench local-verify local-cross prepare-build install package
 
 prepare-build: $(BUILD_STAMP_FILE)
 
@@ -213,6 +219,37 @@ $(PRELOAD): $(SRC)/dlopen_preload.c $(INC)/dynamic_semantics.h $(INC)/linux_sysc
 
 $(PRELOAD_STATIC): $(SRC)/dlopen_preload.c $(INC)/dynamic_semantics.h $(INC)/linux_syscalls.h $(BUILD_STAMP_FILE)
 	$(STATIC_CC) $(CFLAGS) $(ERROR_CFLAGS) $(PRELOAD_STATIC_ARCH_CFLAGS) -U_FORTIFY_SOURCE -shared -fPIC -Wl,-z,defs -o $@ $< -ldl $(LDFLAGS)
+
+# Keep the private helpers relative to the installed executable (see
+# find_sibling in main.c), so the same tree also works under DESTDIR.
+install: all
+	install -d -m 755 "$(DESTDIR)$(PREFIX)/bin" "$(DESTDIR)$(PREFIX)/lib/dlfreeze" "$(DESTDIR)$(PREFIX)/share/doc/dlfreeze"
+	install -m 755 "$(DLFREEZE)" "$(DESTDIR)$(PREFIX)/bin/dlfreeze"
+	install -m 755 "$(BOOTSTRAP)" "$(DESTDIR)$(PREFIX)/lib/dlfreeze/dlfreeze-bootstrap"
+	install -m 644 $(foreach helper,$(PRELOAD_VARIANTS),$(call sh_quote,$(helper))) "$(DESTDIR)$(PREFIX)/lib/dlfreeze/"
+	install -m 644 README.md LICENSE "$(DESTDIR)$(PREFIX)/share/doc/dlfreeze/"
+	@if [ -n "$(MUSL_LICENSE)" ]; then \
+		install -m 644 "$(MUSL_LICENSE)" "$(DESTDIR)$(PREFIX)/share/doc/dlfreeze/LICENSE.musl"; \
+	fi
+
+# GNU tar and gzip are used to normalize archive metadata. Strip only
+# debug info, keeping the bootstrap's loader metadata and unwind sections.
+package: all
+	@case "$(BUILD_ARCH)" in x86_64|aarch64) ;; *) \
+		echo "dlfreeze: unsupported package architecture: $(BUILD_ARCH)" >&2; exit 1;; esac
+	@set -eu; umask 022; \
+	mkdir -p "$(DIST)"; \
+	tmp=$$(mktemp -d "$(DIST)/.dlfreeze-package.XXXXXX"); \
+	trap 'rm -rf "$$tmp"' EXIT; trap 'exit 1' HUP INT TERM; \
+	name="dlfreeze-linux-$(BUILD_ARCH).tar.gz"; \
+	$(MAKE) --no-print-directory install DESTDIR="$$tmp/root" PREFIX=/usr; \
+	$(STRIP) --strip-debug "$$tmp/root/usr/bin/dlfreeze" \
+		"$$tmp/root/usr/lib/dlfreeze/"*; \
+	LC_ALL=C tar --sort=name --format=ustar --mtime="@$${SOURCE_DATE_EPOCH:-0}" \
+		--owner=0 --group=0 --numeric-owner -cf "$$tmp/package.tar" -C "$$tmp/root" usr; \
+	gzip -n -c "$$tmp/package.tar" > "$$tmp/$$name"; \
+	(cd "$$tmp" && sha256sum "$$name" > "$$name.sha256"); \
+	mv "$$tmp/$$name" "$$tmp/$$name.sha256" "$(DIST)/"
 
 # ── test suite ─────────────────────────────────────────────────────
 test: all
