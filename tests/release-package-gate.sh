@@ -70,10 +70,17 @@ done
 needed() {
     readelf -dW "$1" | sed -n '/(NEEDED)/s/.*\[\([^]]*\)\].*/\1/p'
 }
-[ "$(needed "$gnu_helper")" = libc.so.6 ] || die "unexpected glibc helper dependencies"
-case "$(needed "$musl_helper")" in
+# AArch64 glibc exports the stack-protector guard from the interpreter.
+# Accept that already-loaded provider, but no extra runtime libraries.
+gnu_needed=$(needed "$gnu_helper" | sort)
+case "$arch:$gnu_needed" in
+    x86_64:libc.so.6|aarch64:libc.so.6|aarch64:$'ld-linux-aarch64.so.1\nlibc.so.6') ;;
+    *) die "unexpected glibc helper dependencies: $gnu_needed" ;;
+esac
+musl_needed=$(needed "$musl_helper")
+case "$musl_needed" in
     libc.so|libc.musl-"$arch".so.1) ;;
-    *) die "unexpected musl helper dependencies" ;;
+    *) die "unexpected musl helper dependencies: $musl_needed" ;;
 esac
 versions=$(readelf -VW "$gnu_helper" | awk '/Name: GLIBC_/ {print $3}')
 [ -n "$versions" ] || die "missing glibc symbol version requirements"
