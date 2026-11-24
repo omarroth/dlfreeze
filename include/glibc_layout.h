@@ -5342,7 +5342,8 @@ static inline int
 dlfrz_glibc_aarch64_getauxval_leaf_valid(
     const unsigned char *code, size_t code_size, uint64_t code_vaddr,
     uint64_t target_vaddr, uint64_t glro_got_vaddr, uint64_t glro_size,
-    int framed, struct dlfrz_glibc_aarch64_getauxval_leaf *leaf_out)
+    int framed, uint32_t authenticate,
+    struct dlfrz_glibc_aarch64_getauxval_leaf *leaf_out)
 {
     static const uint32_t restore = UINT32_C(0xa8c17bfd);
     static const uint32_t ret = UINT32_C(0xd65f03c0);
@@ -5356,8 +5357,7 @@ dlfrz_glibc_aarch64_getauxval_leaf_valid(
     int64_t page_displacement;
     uint64_t target_page;
     uint64_t got_vaddr;
-    size_t field_index;
-    size_t ret_index;
+    size_t cursor;
     size_t required;
 
     if (target_vaddr < code_vaddr ||
@@ -5365,7 +5365,8 @@ dlfrz_glibc_aarch64_getauxval_leaf_valid(
         (target_vaddr - code_vaddr) % 4U != 0)
         return 0;
     leaf.start = (size_t)(target_vaddr - code_vaddr);
-    required = framed ? 5U * sizeof(uint32_t) : 4U * sizeof(uint32_t);
+    required = (4U + (framed != 0) + (authenticate != 0)) *
+               sizeof(uint32_t);
     if (leaf.start > code_size || required > code_size - leaf.start)
         return 0;
 
@@ -5396,36 +5397,40 @@ dlfrz_glibc_aarch64_getauxval_leaf_valid(
         return 0;
 
     leaf.restore_position = SIZE_MAX;
-    if (!framed) {
-        field_index = 2U;
-        ret_index = 3U;
-        leaf.restore_before_field = 0;
-    } else if (dlfrz_glibc_read_u32(
-                   code + leaf.start + 2U * sizeof(uint32_t)) == restore) {
-        field_index = 3U;
-        ret_index = 4U;
-        leaf.restore_position = leaf.start + 2U * sizeof(uint32_t);
+    /* Consume each operation once. Authentication must use the incoming
+     * SP and saved LR, so it cannot run before the frame is popped. */
+    cursor = leaf.start + 2U * sizeof(uint32_t);
+    if (framed && dlfrz_glibc_read_u32(code + cursor) == restore) {
+        leaf.restore_position = cursor;
         leaf.restore_before_field = 1;
-    } else if (dlfrz_glibc_read_u32(
-                   code + leaf.start + 3U * sizeof(uint32_t)) == restore) {
-        field_index = 2U;
-        ret_index = 4U;
-        leaf.restore_position = leaf.start + 3U * sizeof(uint32_t);
-        leaf.restore_before_field = 0;
-    } else {
-        return 0;
+        cursor += sizeof(uint32_t);
+        if (glro_register == 29U || glro_register == 30U)
+            return 0;
+        if (authenticate && dlfrz_glibc_read_u32(code + cursor) ==
+                                authenticate) {
+            cursor += sizeof(uint32_t);
+            authenticate = 0;
+        }
     }
-    if (leaf.restore_before_field &&
-        (glro_register == 29U || glro_register == 30U))
-        return 0;
-
-    field_load = dlfrz_glibc_read_u32(
-        code + leaf.start + field_index * sizeof(uint32_t));
+    leaf.field_load_position = cursor;
+    field_load = dlfrz_glibc_read_u32(code + cursor);
     if ((field_load & UINT32_C(0xffc00000)) != UINT32_C(0xf9400000) ||
         (field_load & 31U) != 0U ||
-        ((field_load >> 5) & 31U) != glro_register ||
-        dlfrz_glibc_read_u32(
-            code + leaf.start + ret_index * sizeof(uint32_t)) != ret)
+        ((field_load >> 5) & 31U) != glro_register)
+        return 0;
+    cursor += sizeof(uint32_t);
+    if (framed && !leaf.restore_before_field) {
+        if (dlfrz_glibc_read_u32(code + cursor) != restore)
+            return 0;
+        leaf.restore_position = cursor;
+        cursor += sizeof(uint32_t);
+    }
+    if (authenticate) {
+        if (dlfrz_glibc_read_u32(code + cursor) != authenticate)
+            return 0;
+        cursor += sizeof(uint32_t);
+    }
+    if (dlfrz_glibc_read_u32(code + cursor) != ret)
         return 0;
     leaf.field_offset =
         (uint64_t)((field_load >> 10) & UINT32_C(0xfff)) * UINT64_C(8);
@@ -5435,18 +5440,15 @@ dlfrz_glibc_aarch64_getauxval_leaf_valid(
     leaf.end = leaf.start + required;
     leaf.adrp_position = leaf.start;
     leaf.got_load_position = leaf.start + sizeof(uint32_t);
-    leaf.field_load_position =
-        leaf.start + field_index * sizeof(uint32_t);
     if (leaf_out)
         *leaf_out = leaf;
     return 1;
 }
 
 /* Recover AArch64 GLRO HWCAP fields from the public __getauxval control
- * flow.  This deliberately admits only the instruction families observed
- * in supported release fixtures.  In particular PAC prologues, alternate
- * dispatcher orderings, non-adjacent GOT loads, and unbalanced framed
- * epilogues fail closed until separately evidenced. */
+ * flow.  Signed frames must pair PAC{IA,IB}SP with a matching authentication
+ * after restoring the frame. Alternate dispatcher orderings, non-adjacent
+ * GOT loads, and unbalanced framed epilogues fail closed. */
 static inline int
 dlfrz_glibc_aarch64_getauxval_contract_valid(
     const void *data, size_t elf_size, uint64_t glro_size,
@@ -5454,6 +5456,10 @@ dlfrz_glibc_aarch64_getauxval_contract_valid(
     struct dlfrz_glibc_aarch64_getauxval_evidence *evidence_out)
 {
     static const uint32_t bti_c = UINT32_C(0xd503245f);
+    static const uint32_t paciasp = UINT32_C(0xd503233f);
+    static const uint32_t pacibsp = UINT32_C(0xd503237f);
+    static const uint32_t autiasp = UINT32_C(0xd50323bf);
+    static const uint32_t autibsp = UINT32_C(0xd50323ff);
     static const uint32_t frame_push = UINT32_C(0xa9bf7bfd);
     static const uint32_t frame_pointer = UINT32_C(0x910003fd);
     static const uint32_t cmp_hwcap = UINT32_C(0xf100401f);
@@ -5466,6 +5472,7 @@ dlfrz_glibc_aarch64_getauxval_contract_valid(
     const unsigned char *code;
     uint64_t glro_got_vaddr;
     uint64_t targets[2];
+    uint32_t authenticate = 0;
     size_t function_offset;
     size_t cursor = 0;
     size_t scan_size;
@@ -5498,6 +5505,13 @@ dlfrz_glibc_aarch64_getauxval_contract_valid(
     code = view.elf + function_offset;
     if (dlfrz_glibc_read_u32(code) == bti_c)
         cursor += sizeof(uint32_t);
+    if (dlfrz_glibc_read_u32(code + cursor) == paciasp) {
+        authenticate = autiasp;
+        cursor += sizeof(uint32_t);
+    } else if (dlfrz_glibc_read_u32(code + cursor) == pacibsp) {
+        authenticate = autibsp;
+        cursor += sizeof(uint32_t);
+    }
     if (cursor + 2U * sizeof(uint32_t) <= function.st_size &&
         dlfrz_glibc_read_u32(code + cursor) == frame_push &&
         dlfrz_glibc_read_u32(code + cursor + sizeof(uint32_t)) ==
@@ -5505,7 +5519,8 @@ dlfrz_glibc_aarch64_getauxval_contract_valid(
         framed = 1;
         cursor += 2U * sizeof(uint32_t);
     }
-    if (cursor + 4U * sizeof(uint32_t) > function.st_size ||
+    if ((authenticate && !framed) ||
+        cursor + 4U * sizeof(uint32_t) > function.st_size ||
         dlfrz_glibc_read_u32(code + cursor) != cmp_hwcap ||
         !dlfrz_glibc_aarch64_getauxval_branch_target(
             dlfrz_glibc_read_u32(code + cursor + sizeof(uint32_t)),
@@ -5516,7 +5531,11 @@ dlfrz_glibc_aarch64_getauxval_contract_valid(
             dlfrz_glibc_read_u32(
                 code + cursor + 3U * sizeof(uint32_t)),
             function.st_value + cursor + 3U * sizeof(uint32_t),
-            &targets[1]))
+            &targets[1]) ||
+        targets[0] < function.st_value ||
+        targets[1] < function.st_value ||
+        targets[0] - function.st_value < cursor + 4U * sizeof(uint32_t) ||
+        targets[1] - function.st_value < cursor + 4U * sizeof(uint32_t))
         return 0;
 
     scan_size = (size_t)function.st_size;
@@ -5545,10 +5564,12 @@ dlfrz_glibc_aarch64_getauxval_contract_valid(
     if (quartet_count != 1 ||
         !dlfrz_glibc_aarch64_getauxval_leaf_valid(
             code, (size_t)function.st_size, function.st_value,
-            targets[0], glro_got_vaddr, glro_size, framed, &leaves[0]) ||
+            targets[0], glro_got_vaddr, glro_size, framed, authenticate,
+            &leaves[0]) ||
         !dlfrz_glibc_aarch64_getauxval_leaf_valid(
             code, (size_t)function.st_size, function.st_value,
-            targets[1], glro_got_vaddr, glro_size, framed, &leaves[1]))
+            targets[1], glro_got_vaddr, glro_size, framed, authenticate,
+            &leaves[1]))
         return 0;
 
     if ((leaves[0].start < leaves[1].end &&
@@ -6801,8 +6822,10 @@ dlfrz_glibc_dlfcn_hook_offset(enum dlfrz_glibc_layout_id layout, int minor)
         return minor == 35 ? 680 : -1;
     case DLFRZ_GLIBC_AARCH64_2_41:
         return minor == 41 ? 680 : -1;
+    case DLFRZ_GLIBC_AARCH64_2_43:
     case DLFRZ_GLIBC_AARCH64_2_44:
-        return minor == 44 ? 376 : -1;
+        return dlfrz_glibc_layout_release_is_supported(layout, minor)
+            ? 376 : -1;
     case DLFRZ_GLIBC_X86_2_17:
     case DLFRZ_GLIBC_X86_2_29:
     case DLFRZ_GLIBC_X86_RTLD_544_4000:
@@ -6810,7 +6833,6 @@ dlfrz_glibc_dlfcn_hook_offset(enum dlfrz_glibc_layout_id layout, int minor)
     case DLFRZ_GLIBC_AARCH64_2_31:
     case DLFRZ_GLIBC_AARCH64_RTLD_672_4520:
     case DLFRZ_GLIBC_AARCH64_2_40_LEGACY:
-    case DLFRZ_GLIBC_AARCH64_2_43:
     case DLFRZ_GLIBC_LAYOUT_UNKNOWN:
         return -1;
     }
@@ -6842,8 +6864,10 @@ dlfrz_glibc_find_object_offset(enum dlfrz_glibc_layout_id layout, int minor)
         return minor == 35 ? 664 : -1;
     case DLFRZ_GLIBC_AARCH64_2_41:
         return minor == 41 ? 672 : -1;
+    case DLFRZ_GLIBC_AARCH64_2_43:
     case DLFRZ_GLIBC_AARCH64_2_44:
-        return minor == 44 ? 360 : -1;
+        return dlfrz_glibc_layout_release_is_supported(layout, minor)
+            ? 360 : -1;
     case DLFRZ_GLIBC_X86_2_17:
     case DLFRZ_GLIBC_X86_2_29:
     case DLFRZ_GLIBC_X86_RTLD_544_4000:
@@ -6851,7 +6875,6 @@ dlfrz_glibc_find_object_offset(enum dlfrz_glibc_layout_id layout, int minor)
     case DLFRZ_GLIBC_AARCH64_2_31:
     case DLFRZ_GLIBC_AARCH64_RTLD_672_4520:
     case DLFRZ_GLIBC_AARCH64_2_40_LEGACY:
-    case DLFRZ_GLIBC_AARCH64_2_43:
     case DLFRZ_GLIBC_LAYOUT_UNKNOWN:
         return -1;
     }
@@ -6870,6 +6893,7 @@ dlfrz_glibc_direct_thread_layout_is_supported(
     case DLFRZ_GLIBC_AARCH64_2_35_LARGE:
     case DLFRZ_GLIBC_AARCH64_2_35:
     case DLFRZ_GLIBC_AARCH64_2_41:
+    case DLFRZ_GLIBC_AARCH64_2_43:
     case DLFRZ_GLIBC_AARCH64_2_44:
     case DLFRZ_GLIBC_X86_RTLD_896_4336:
     case DLFRZ_GLIBC_X86_2_34:
@@ -6881,7 +6905,6 @@ dlfrz_glibc_direct_thread_layout_is_supported(
     case DLFRZ_GLIBC_AARCH64_2_27:
     case DLFRZ_GLIBC_AARCH64_2_31:
     case DLFRZ_GLIBC_AARCH64_RTLD_672_4520:
-    case DLFRZ_GLIBC_AARCH64_2_43:
     case DLFRZ_GLIBC_AARCH64_2_40_LEGACY:
     case DLFRZ_GLIBC_X86_2_17:
     case DLFRZ_GLIBC_X86_2_29:

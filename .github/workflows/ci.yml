@@ -66,6 +66,20 @@ jobs:
               fi
             '
 
+      - name: Verify arm64 direct loading on newer glibc
+        if: matrix.arch == 'aarch64'
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          docker run --rm --platform "linux/$PLATFORM" \
+            -v "$PWD":/source:ro -v "$PWD/dist":/dist:ro -e ARCH \
+            ubuntu:26.04 bash -euc '
+              apt-get update
+              apt-get install -y --no-install-recommends build-essential
+              bash /source/tests/release-package-gate.sh "/dist/dlfreeze-linux-$ARCH.tar.gz" "$ARCH" glibc-direct
+            '
+
       - name: Verify the same archive on musl
         env:
           PLATFORM: ${{ matrix.platform }}

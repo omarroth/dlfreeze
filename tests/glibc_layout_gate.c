@@ -2032,13 +2032,55 @@ static int aarch64_getauxval_mutation_gate(const uint8_t *image,
             goto out;
     }
 
-    /* PAC is intentionally outside the evidenced entry grammar. */
+    /* The signing key and epilogue must agree. For an unsigned function,
+     * inserting a lone signing instruction must not create a valid frame. */
     memcpy(mutant, image, image_size);
-    instruction = UINT32_C(0xd503233f); /* PACIASP */
-    memcpy(mutant + function_offset, &instruction, sizeof(instruction));
-    if (dlfrz_glibc_aarch64_getauxval_contract_valid(
-            mutant, image_size, glro_size, NULL, NULL))
-        goto out;
+    {
+        size_t entry = function_offset;
+        uint32_t signing;
+
+        if (dlfrz_glibc_read_u32(mutant + entry) == UINT32_C(0xd503245f))
+            entry += sizeof(uint32_t);
+        signing = dlfrz_glibc_read_u32(mutant + entry);
+        instruction = signing == UINT32_C(0xd503233f)
+            ? UINT32_C(0xd503237f) : UINT32_C(0xd503233f);
+        memcpy(mutant + entry, &instruction, sizeof(instruction));
+        if (dlfrz_glibc_aarch64_getauxval_contract_valid(
+                mutant, image_size, glro_size, NULL, NULL))
+            goto out;
+        if (signing == UINT32_C(0xd503233f) ||
+            signing == UINT32_C(0xd503237f)) {
+            size_t restore = evidence.restore_file_offsets[0];
+            size_t field = evidence.field_load_file_offsets[0];
+            size_t auth;
+            uint32_t pop;
+
+            if (restore == SIZE_MAX)
+                goto out;
+            auth = restore + sizeof(uint32_t);
+            if (dlfrz_glibc_read_u32(image + auth) !=
+                    signing + UINT32_C(0x80)) {
+                if (field != auth)
+                    goto out;
+                auth += sizeof(uint32_t);
+            }
+            if (dlfrz_glibc_read_u32(image + auth) !=
+                    signing + UINT32_C(0x80))
+                goto out;
+            memcpy(mutant, image, image_size);
+            instruction = UINT32_C(0xd503201f); /* NOP */
+            memcpy(mutant + auth, &instruction, sizeof(instruction));
+            if (dlfrz_glibc_aarch64_getauxval_contract_valid(
+                    mutant, image_size, glro_size, NULL, NULL))
+                goto out;
+            memcpy(mutant + restore, image + auth, sizeof(instruction));
+            pop = dlfrz_glibc_read_u32(image + restore);
+            memcpy(mutant + auth, &pop, sizeof(pop));
+            if (dlfrz_glibc_aarch64_getauxval_contract_valid(
+                    mutant, image_size, glro_size, NULL, NULL))
+                goto out;
+        }
+    }
     valid = 1;
 
 out:
@@ -2140,7 +2182,9 @@ static void aarch64_aux_put_word(struct aarch64_aux_fixture *fixture,
 /* MODE zero is the observed optional-BTI frameless family.  MODE one is
  * the observed framed, restore-before-field family.  MODE two exercises the
  * equally balanced restore-after-field grammar and deliberately keeps the
- * GLRO pointer in x29 until that restore. */
+ * GLRO pointer in x29 until that restore. Modes three and four exercise
+ * signed frames with both authentication keys and both field orders,
+ * including a separate BTI landing pad. */
 static int aarch64_aux_fixture_init(struct aarch64_aux_fixture *fixture,
                                     int mode)
 {
@@ -2155,9 +2199,11 @@ static int aarch64_aux_fixture_init(struct aarch64_aux_fixture *fixture,
     size_t cursor;
     size_t leaf[2];
     size_t function_size;
-    unsigned int glro_register = mode == 2 ? 29U : 0U;
+    int signed_frame = mode >= 3;
+    int restore_first = mode == 1 || mode == 3;
+    unsigned int glro_register = mode != 0 && !restore_first ? 29U : 0U;
 
-    if (!fixture || mode < 0 || mode > 2)
+    if (!fixture || mode < 0 || mode > 4)
         return 0;
     memset(fixture, 0, sizeof(*fixture));
     memcpy(ehdr.e_ident, ELFMAG, SELFMAG);
@@ -2222,7 +2268,7 @@ static int aarch64_aux_fixture_init(struct aarch64_aux_fixture *fixture,
     dynamic[7].d_un.d_val = sizeof(relocation);
     dynamic[8].d_tag = DT_NULL;
 
-    function_size = mode == 0 ? 128U : 148U;
+    function_size = mode == 0 ? 128U : signed_frame ? 152U : 148U;
     symbols[1].st_name = 1;
     symbols[1].st_info = ELF64_ST_INFO(STB_GLOBAL, STT_FUNC);
     symbols[1].st_other = STV_DEFAULT;
@@ -2259,11 +2305,22 @@ static int aarch64_aux_fixture_init(struct aarch64_aux_fixture *fixture,
         leaf[0] = 96U;
         leaf[1] = 112U;
     } else {
+        if (signed_frame) {
+            if (mode == 4) {
+                aarch64_aux_put_word(
+                    fixture, cursor, UINT32_C(0xd503245f));
+                cursor += sizeof(uint32_t);
+            }
+            aarch64_aux_put_word(
+                fixture, cursor, mode == 3 ? UINT32_C(0xd503233f)
+                                           : UINT32_C(0xd503237f));
+            cursor += sizeof(uint32_t);
+        }
         aarch64_aux_put_word(fixture, cursor, UINT32_C(0xa9bf7bfd));
         cursor += sizeof(uint32_t);
         aarch64_aux_put_word(fixture, cursor, UINT32_C(0x910003fd));
         cursor += sizeof(uint32_t);
-        leaf[0] = 108U;
+        leaf[0] = signed_frame ? 104U : 108U;
         leaf[1] = 128U;
     }
     aarch64_aux_put_word(fixture, cursor, UINT32_C(0xf100401f));
@@ -2289,20 +2346,30 @@ static int aarch64_aux_fixture_init(struct aarch64_aux_fixture *fixture,
             aarch64_aux_ldr(glro_register, 0,
                             AARCH64_AUX_GOT_VADDR & UINT64_C(0xfff)));
         position += sizeof(uint32_t);
-        if (mode == 1) {
+        if (restore_first) {
             aarch64_aux_put_word(
                 fixture, position, UINT32_C(0xa8c17bfd));
             position += sizeof(uint32_t);
+            if (signed_frame) {
+                aarch64_aux_put_word(
+                    fixture, position, UINT32_C(0xd50323bf));
+                position += sizeof(uint32_t);
+            }
         }
         aarch64_aux_put_word(
             fixture, position,
             aarch64_aux_ldr(0, glro_register,
                             i == 0 ? UINT64_C(96) : UINT64_C(256)));
         position += sizeof(uint32_t);
-        if (mode == 2) {
+        if (mode != 0 && !restore_first) {
             aarch64_aux_put_word(
                 fixture, position, UINT32_C(0xa8c17bfd));
             position += sizeof(uint32_t);
+            if (signed_frame) {
+                aarch64_aux_put_word(
+                    fixture, position, UINT32_C(0xd50323ff));
+                position += sizeof(uint32_t);
+            }
         }
         aarch64_aux_put_word(
             fixture, position, UINT32_C(0xd65f03c0));
@@ -2315,7 +2382,7 @@ static int aarch64_getauxval_contract_selftest(void)
     struct aarch64_aux_fixture fixture;
     struct dlfrz_glibc_getauxval_contract contract;
 
-    for (int mode = 0; mode < 3; mode++) {
+    for (int mode = 0; mode <= 4; mode++) {
         if (!aarch64_aux_fixture_init(&fixture, mode) ||
             !dlfrz_glibc_aarch64_getauxval_contract_valid(
                 fixture.image, sizeof(fixture.image), 400,
@@ -4495,6 +4562,10 @@ static int selftest(void)
         dlfrz_glibc_dlfcn_hook_offset(
             DLFRZ_GLIBC_AARCH64_2_41, 41) != 680 ||
         dlfrz_glibc_dlfcn_hook_offset(
+            DLFRZ_GLIBC_AARCH64_2_43, 43) != 376 ||
+        dlfrz_glibc_dlfcn_hook_offset(
+            DLFRZ_GLIBC_AARCH64_2_43, 44) != -1 ||
+        dlfrz_glibc_dlfcn_hook_offset(
             DLFRZ_GLIBC_AARCH64_2_44, 44) != 376 ||
         dlfrz_glibc_dlfcn_hook_offset(
             DLFRZ_GLIBC_X86_2_29, 33) != -1 ||
@@ -4513,6 +4584,10 @@ static int selftest(void)
         dlfrz_glibc_find_object_offset(
             DLFRZ_GLIBC_AARCH64_2_35_LARGE, 35) != 664 ||
         dlfrz_glibc_find_object_offset(
+            DLFRZ_GLIBC_AARCH64_2_43, 43) != 360 ||
+        dlfrz_glibc_find_object_offset(
+            DLFRZ_GLIBC_AARCH64_2_43, 44) != -1 ||
+        dlfrz_glibc_find_object_offset(
             DLFRZ_GLIBC_AARCH64_2_44, 44) != 360 ||
         dlfrz_glibc_direct_thread_layout_is_supported(
             DLFRZ_GLIBC_AARCH64_2_31) ||
@@ -4530,7 +4605,7 @@ static int selftest(void)
             DLFRZ_GLIBC_AARCH64_RTLD_672_4520) ||
         dlfrz_glibc_direct_thread_layout_is_supported(
             DLFRZ_GLIBC_AARCH64_2_40_LEGACY) ||
-        dlfrz_glibc_direct_thread_layout_is_supported(
+        !dlfrz_glibc_direct_thread_layout_is_supported(
             DLFRZ_GLIBC_AARCH64_2_43) ||
         dlfrz_glibc_direct_thread_layout_is_supported(
             DLFRZ_GLIBC_X86_2_17) ||
