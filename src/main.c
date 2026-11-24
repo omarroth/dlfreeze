@@ -819,9 +819,13 @@ static int supervise_trace_child(
             wait_failed = 1;
             break;
         }
-        if (WIFSTOPPED(status)) {
-            int stop_signal = WSTOPSIG(status);
-            unsigned int event = (unsigned int)status >> 16;
+        /* TRACESYSGOOD sets bit 7 of the stop signal. Older libc wait
+         * macros multiply the low wait-status word in the supplied type;
+         * a signed argument can overflow for that synthetic stop. */
+        unsigned int wait_bits = (unsigned int)status;
+        if (WIFSTOPPED(wait_bits)) {
+            int stop_signal = WSTOPSIG(wait_bits);
+            unsigned int event = wait_bits >> 16;
 
             /* A cooperative pre-exec PTRACE_TRACEME stop is distinguishable
              * from application job control because tracing has not started
