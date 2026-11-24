@@ -573,6 +573,57 @@ static int prelink_manifest_bounds_gate(void)
     return !prelink_mapping_span(&meta, &span, &requested);
 }
 
+static int self_relocating_bootstrap_gate(void)
+{
+    char path[PATH_MAX];
+    Elf64_Ehdr ehdr;
+    Elf64_Phdr phdr[2] = {{0}};
+    Elf64_Dyn dynamic[2] = {{.d_tag = DT_DEBUG}, {.d_tag = DT_NULL}};
+    const uint64_t dynamic_offset = 256;
+    int fd, ok = 0;
+
+    if (!initialize_temp_template(path, "dlfreeze-self-reloc.XXXXXX"))
+        return 0;
+    fd = mkstemp(path);
+    if (fd < 0)
+        return 0;
+    initialize_ehdr(&ehdr, 2);
+    phdr[0].p_type = PT_LOAD;
+    phdr[0].p_flags = PF_R | PF_W | PF_X;
+    phdr[0].p_vaddr = UINT64_C(0x40000000);
+    phdr[0].p_filesz = TEST_BOOTSTRAP_SIZE;
+    phdr[0].p_memsz = TEST_BOOTSTRAP_SIZE;
+    phdr[0].p_align = 4096;
+    phdr[1].p_type = PT_DYNAMIC;
+    phdr[1].p_offset = dynamic_offset;
+    phdr[1].p_vaddr = phdr[0].p_vaddr + dynamic_offset;
+    phdr[1].p_filesz = sizeof(dynamic);
+    phdr[1].p_memsz = sizeof(dynamic);
+    phdr[1].p_align = 8;
+    if (ftruncate(fd, TEST_BOOTSTRAP_SIZE) < 0 ||
+        packer_pwrite_exact(fd, &ehdr, sizeof(ehdr), 0) < 0 ||
+        packer_pwrite_exact(fd, phdr, sizeof(phdr), ehdr.e_phoff) < 0 ||
+        packer_pwrite_exact(fd, dynamic, sizeof(dynamic), dynamic_offset) < 0 ||
+        elf_check_static_fd(fd, TEST_BOOTSTRAP_SIZE) != 0)
+        goto out;
+
+    dynamic[0].d_tag = DT_NEEDED;
+    if (packer_pwrite_exact(fd, dynamic, sizeof(dynamic), dynamic_offset) < 0 ||
+        elf_check_static_fd(fd, TEST_BOOTSTRAP_SIZE) == 0)
+        goto out;
+    dynamic[0].d_tag = DT_DEBUG;
+    dynamic[1].d_tag = DT_DEBUG; /* Missing terminator. */
+    if (packer_pwrite_exact(fd, dynamic, sizeof(dynamic), dynamic_offset) < 0 ||
+        elf_check_static_fd(fd, TEST_BOOTSTRAP_SIZE) == 0)
+        goto out;
+    ok = 1;
+
+out:
+    close(fd);
+    unlink(path);
+    return ok;
+}
+
 static int transaction_copy_and_writeback_gate(void)
 {
     char source_path[PATH_MAX] = {0};
@@ -692,6 +743,10 @@ int main(void)
     }
     if (!transaction_copy_and_writeback_gate()) {
         fprintf(stderr, "transaction copy or isolated writeback failed\n");
+        return 1;
+    }
+    if (!self_relocating_bootstrap_gate()) {
+        fprintf(stderr, "self-relocating bootstrap admission failed\n");
         return 1;
     }
     return 0;

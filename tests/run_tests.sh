@@ -431,7 +431,7 @@ test_packer_elf_alignment_gate() {
 
     if gcc -std=c11 -O2 -g -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
             -ffunction-sections -fdata-sections -Wl,--gc-sections \
-            -o "$helper" tests/packer_elf_alignment_gate.c &&
+            -o "$helper" tests/packer_elf_alignment_gate.c src/elf_parser.c &&
        run_with_timeout_seconds 8 "$helper"; then
         pass "packer unaligned ELF tables and failed-mutation transaction"
     else
@@ -5974,9 +5974,7 @@ test_runtime_relocation_vfs_fallthrough() {
     local root="$BUILD/runtime-reloc-vfs" src="$BUILD/runtime_reloc_vfs.c"
     local bin out log captured host_dir actual expect rc=0 freeze_rc=0
     local preload_src preload_so clean_out clean_log
-    local limit_probe_src limit_probe
-    local cc forced=0 saw_prelinked=0 limit
-    local limits=(512 768 1024 1536 2048 3072 4096 6144 8192 12288)
+    local fault_src fault cc
     local label="runtime-relocation VFS libc fallthrough"
 
     rm -rf "$root"
@@ -5989,8 +5987,8 @@ test_runtime_relocation_vfs_fallthrough() {
     host_dir="$root/host-dir"
     preload_src="$root/preload.c"
     preload_so="$root/preload.so"
-    limit_probe_src="$root/limit-probe.c"
-    limit_probe="$root/limit-probe"
+    fault_src="$root/prelink-fault.c"
+    fault="$root/prelink-fault"
     clean_out="$root/program.clean.frozen"
     clean_log="$root/clean-freeze.log"
     printf 'captured-runtime-reloc\n' >"$captured"
@@ -6044,27 +6042,54 @@ unsigned int la_version(unsigned int version) {
 }
 C
 
-    cat >"$limit_probe_src" <<'C'
+    cat >"$fault_src" <<'C'
 #define _GNU_SOURCE
 #include <errno.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
 #include <stddef.h>
 #include <sys/mman.h>
-#include <sys/resource.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
 
-int main(void) {
-    const size_t mapping_size = 64U * 1024U * 1024U;
-    struct rlimit limit = { 512U * 1024U, 512U * 1024U };
-    void *mapping;
-
-    if (setrlimit(RLIMIT_DATA, &limit) != 0)
+int main(int argc, char **argv) {
+    /* The packer uses fixed anonymous mappings only for optional prelink.
+     * The filter is applied to the freeze, not to the resulting artifact. */
+    struct sock_filter code[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_mmap, 0, 3),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[3])),
+        BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, MAP_FIXED_NOREPLACE, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOMEM),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_fprog filter = {
+        .len = sizeof(code) / sizeof(code[0]),
+        .filter = code,
+    };
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 ||
+        prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &filter) != 0)
         return 77;
-    errno = 0;
-    mapping = mmap(NULL, mapping_size, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (mapping == MAP_FAILED)
-        return errno == ENOMEM ? 0 : 77;
-    (void)munmap(mapping, mapping_size);
-    return 77;
+    if (argc > 1) {
+        execv(argv[1], argv + 1);
+        return 126;
+    }
+    void *p = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED)
+        return 1;
+    if (munmap(p, 4096) != 0)
+        return 1;
+    void *fixed = mmap(p, 4096, PROT_READ,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    if (fixed != MAP_FAILED) {
+        munmap(fixed, 4096);
+        return 1;
+    }
+    return errno == ENOMEM ? 0 : 1;
 }
 C
 
@@ -6075,8 +6100,7 @@ C
     fi
     if ! "$cc" -fPIE -pie -o "$bin" "$src" ||
        ! "$cc" -shared -fPIC -o "$preload_so" "$preload_src" ||
-       ! gcc -Wall -Wextra -Werror -O2 -o "$limit_probe" \
-            "$limit_probe_src"; then
+       ! gcc -Wall -Wextra -Werror -O2 -o "$fault" "$fault_src"; then
         fail "$label" "fixture compile failed"
         rm -rf "$root"
         rm -f "$src"
@@ -6084,10 +6108,13 @@ C
     fi
 
     rc=0
-    run_with_timeout "$limit_probe" >/dev/null 2>&1 || rc=$?
+    run_with_timeout "$fault" >/dev/null 2>&1 || rc=$?
     if [ "$rc" -ne 0 ]; then
-        skip "$label" \
-            "RLIMIT_DATA does not constrain anonymous mappings"
+        if [ "$rc" -eq 77 ]; then
+            skip "$label" "seccomp filter unavailable"
+        else
+            fail "$label" "prelink fault injection control exit=$rc"
+        fi
         rm -rf "$root"
         rm -f "$src"
         return
@@ -6102,54 +6129,22 @@ C
         return
     fi
 
-    # RLIMIT_DATA covers the prelink child's anonymous fixed mappings on
-    # Linux.  Packing/tracing mainly maps executable files and has a smaller
-    # data working set, while prelink additionally allocates every object's
-    # image plus guard pages.  Probe a bounded set of limits so this stays
-    # portable across libc/architectures.
-    for limit in "${limits[@]}"; do
-        rm -f "$out" "$log"
-        set +e
-        (
-            ulimit -d "$limit" || exit 125
-            run_freeze "$DLFREEZE" -d -t -f "$captured" -o "$out" -- \
-                "$bin" "$captured" "$host_dir"
-        ) >"$log" 2>&1
-        freeze_rc=$?
-        set -e
-        if [ "$freeze_rc" -eq 0 ] &&
-           grep -Eq 'pre-linked[[:space:]]*:[[:space:]]*yes' "$log" &&
-           grep -Eq \
-               'mode[[:space:]]*:[[:space:]]*direct-load \(in-process loader\)' \
-               "$log"; then
-            saw_prelinked=1
-        fi
-        if [ "$freeze_rc" -eq 0 ] &&
-           grep -Fq 'dlfreeze: pre-linker resource/address miss' "$log" &&
-           grep -Eq \
-               'pre-linked[[:space:]]*:[[:space:]]*no \(resource/address miss; using runtime relocation\)' \
-               "$log" &&
-           grep -Eq \
-               'mode[[:space:]]*:[[:space:]]*direct-load \(in-process loader\)' \
-               "$log"; then
-            forced=1
-            break
-        fi
-    done
-
-    if [ "$forced" -eq 0 ]; then
+    # Inject the same kernel failure in both freezes. An RLIMIT_DATA value
+    # that works with DATA may allow prelinking once DATA is removed.
+    run_freeze "$fault" "$DLFREEZE" -d -t -f "$captured" -o "$out" -- \
+        "$bin" "$captured" "$host_dir" >"$log" 2>&1 || freeze_rc=$?
+    if [ "$freeze_rc" -ne 0 ] ||
+       ! grep -Fq 'dlfreeze: pre-linker resource/address miss' "$log" ||
+       ! grep -Eq \
+           'pre-linked[[:space:]]*:[[:space:]]*no \(resource/address miss; using runtime relocation\)' \
+           "$log" ||
+       ! grep -Eq \
+           'mode[[:space:]]*:[[:space:]]*direct-load \(in-process loader\)' \
+           "$log"; then
         if grep -Eq \
                'direct-load is unavailable for runtime .*creating an extraction-mode binary|captured files require a supported direct-load runtime' \
                "$log" 2>/dev/null; then
             skip "$label" "target runtime does not support direct load"
-        elif [ "$saw_prelinked" -eq 1 ]; then
-            # RLIMIT_DATA is only a best-effort way to exercise this fallback
-            # path: some libc/kernel combinations keep the prelinker's fixed
-            # file mappings outside the constrained accounting.  A verified
-            # prelinked artifact proves setup itself worked; do not turn an
-            # unavailable fault-injection mechanism into a product failure.
-            skip "$label" \
-                "RLIMIT_DATA could not force runtime relocation"
         else
             fail "$label" "could not produce a clean non-prelinked artifact"
             tail -n 40 "$log" || true
@@ -6207,17 +6202,13 @@ C
         fail "LD_AUDIT direct-only refusal" "exit=$rc output=$actual"
     fi
 
-    # Reuse the admitted RLIMIT_DATA value to produce the same original ELF
+    # Use the same injected mapping failure to produce the original ELF
     # payload without captured DATA.  The early direct refusal must remain a
     # clean failure so the bootstrap can delegate these variables to the
     # native interpreter through extraction.
-    set +e
-    (
-        ulimit -d "$limit" || exit 125
-        run_freeze "$DLFREEZE" -d -o "$clean_out" -- "$bin"
-    ) >"$clean_log" 2>&1
-    freeze_rc=$?
-    set -e
+    freeze_rc=0
+    run_freeze "$fault" "$DLFREEZE" -d -o "$clean_out" -- "$bin" \
+        >"$clean_log" 2>&1 || freeze_rc=$?
     if [ "$freeze_rc" -ne 0 ] ||
        ! grep -Fq 'dlfreeze: pre-linker resource/address miss' "$clean_log" ||
        ! grep -Eq \

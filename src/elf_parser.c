@@ -181,24 +181,36 @@ static int elf64_section_headers_valid(const struct elf64_header_source *source,
     return 1;
 }
 
-static int elf64_dynamic_terminated(const uint8_t *data, size_t size,
+static int elf64_dynamic_terminated(const struct elf64_header_source *source,
                                     const Elf64_Phdr *dynamic)
 {
     size_t count;
 
     if (dynamic->p_filesz < sizeof(Elf64_Dyn) ||
         dynamic->p_filesz % sizeof(Elf64_Dyn) != 0 ||
-        !range_in_file(dynamic->p_offset, dynamic->p_filesz, size))
+        !range_in_file(dynamic->p_offset, dynamic->p_filesz, source->size))
         return 0;
     count = (size_t)(dynamic->p_filesz / sizeof(Elf64_Dyn));
-    for (size_t i = 0; i < count; i++) {
-        Elf64_Dyn item;
+    for (size_t i = 0; i < count;) {
+        Elf64_Dyn entries[16];
+        size_t batch = count - i;
 
-        memcpy(&item,
-               data + dynamic->p_offset + i * sizeof(Elf64_Dyn),
-               sizeof(item));
-        if (item.d_tag == DT_NULL)
-            return 1;
+        if (batch > sizeof(entries) / sizeof(entries[0]))
+            batch = sizeof(entries) / sizeof(entries[0]);
+        if (!elf64_read_headers(source,
+                                dynamic->p_offset + i * sizeof(entries[0]),
+                                entries, batch * sizeof(entries[0])))
+            return 0;
+        for (size_t j = 0; j < batch; j++) {
+            if (entries[j].d_tag == DT_NULL)
+                return 1;
+            /* No interpreter is involved in the fd-only bootstrap check.
+             * A self-relocating static ELF can still have PT_DYNAMIC; what
+             * it cannot have is a dependency for an external loader. */
+            if (!source->data && entries[j].d_tag == DT_NEEDED)
+                return 0;
+        }
+        i += batch;
     }
     return 0;
 }
@@ -337,8 +349,8 @@ static int elf64_image_open(const struct elf64_header_source *source,
                 !elf64_interp_valid(data, size, ph))
                 goto fail;
         } else if (ph->p_type == PT_DYNAMIC) {
-            if (!data || ++dynamic_count != 1 || ph->p_filesz > ph->p_memsz ||
-                !elf64_dynamic_terminated(data, size, ph))
+            if (++dynamic_count != 1 || ph->p_filesz > ph->p_memsz ||
+                !elf64_dynamic_terminated(source, ph))
                 goto fail;
             dynamic_phdr = ph;
         } else if (ph->p_type == PT_TLS) {

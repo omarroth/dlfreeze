@@ -54,8 +54,8 @@ int elf_parse_fd(int fd, struct elf_info *info);
 int elf_parse_fd_range(int fd, uint64_t offset, size_t length,
                        struct elf_info *info);
 
-/* Validate a static ELF at offset zero using bounded reads of its headers
- * only. No mapping or allocation proportional to the ELF file is needed. */
+/* Validate a self-contained ELF (no PT_INTERP or DT_NEEDED) at offset zero
+ * using bounded reads, including optional self-relocation metadata. */
 int elf_check_static_fd(int fd, size_t length);
 
 /* Return nonzero when every runtime-checked DT_VERNEED requirement associated
