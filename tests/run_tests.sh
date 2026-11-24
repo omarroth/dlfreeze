@@ -18634,6 +18634,23 @@ C
     if [ "$rc" -ne 0 ] || [ ! -x "$frozen_bin" ]; then
         actual=$(<"$BUILD/zig_cc_frozen.log")
         fail "$label" "frozen zig cc failed (exit=$rc output=$actual)"
+        # Keep the original result authoritative. A short diagnostic rerun
+        # records whether discovery failed at the executable path, the
+        # directory descriptor, or the file opened relative to it.
+        if command -v strace >/dev/null 2>&1 &&
+           command -v timeout >/dev/null 2>&1; then
+            local syscall_log="$BUILD/zig_cc_syscalls.log"
+            local diagnostic_bin="$BUILD/zig_cc_diagnostic"
+            run_with_timeout_seconds 20 env DLFREEZE_NO_FORK=1 \
+                strace -f -y -e trace=%file -o "$syscall_log" \
+                "$out" cc "$src" -o "$diagnostic_bin" >/dev/null 2>&1 || true
+            if [ -s "$syscall_log" ]; then
+                echo "--- Zig replay executable/resource lookup ---"
+                awk '/execve\(|\/proc\/(self|thread-self)\/exe|lib\/zig|std\/std\.zig|O_PATH|EPROTO|EACCES/' \
+                    "$syscall_log" | tail -n 80
+            fi
+            rm -f "$syscall_log" "$diagnostic_bin"
+        fi
     else
         rc=0
         capture_output actual "$frozen_bin" || rc=$?
