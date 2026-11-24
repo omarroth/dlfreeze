@@ -605,7 +605,7 @@ static int run_rtld_field_provenance_gate(void)
     code[4] = UINT32_C(0xd65f03c0);
     ok &= expect_result(
         "AArch64 reachable callee-saved private field",
-        glibc_aarch64_pthread_rtld_field(
+        glibc_aarch64_rtld_field_access(
             (const uint8_t *)code, sizeof(code), function_vaddr,
             got_vaddr, 0x1070, 4),
         1);
@@ -616,7 +616,7 @@ static int run_rtld_field_provenance_gate(void)
     bad[3] = private_field_load(0, 9, 0x1070, 4);
     ok &= expect_result(
         "AArch64 call clobbers caller-saved private base",
-        glibc_aarch64_pthread_rtld_field(
+        glibc_aarch64_rtld_field_access(
             (const uint8_t *)bad, sizeof(bad), function_vaddr,
             got_vaddr, 0x1070, 4),
         0);
@@ -625,7 +625,7 @@ static int run_rtld_field_provenance_gate(void)
     bad[2] = UINT32_C(0xaa1f03f5); /* MOV X21,XZR. */
     ok &= expect_result(
         "AArch64 private base must remain live",
-        glibc_aarch64_pthread_rtld_field(
+        glibc_aarch64_rtld_field_access(
             (const uint8_t *)bad, sizeof(bad), function_vaddr,
             got_vaddr, 0x1070, 4),
         0);
@@ -634,7 +634,7 @@ static int run_rtld_field_provenance_gate(void)
     bad[2] = UINT32_C(0x14000002); /* B from word 2 to word 4. */
     ok &= expect_result(
         "AArch64 branch-skipped field is rejected",
-        glibc_aarch64_pthread_rtld_field(
+        glibc_aarch64_rtld_field_access(
             (const uint8_t *)bad, sizeof(bad), function_vaddr,
             got_vaddr, 0x1070, 4),
         0);
@@ -648,7 +648,7 @@ static int run_rtld_field_provenance_gate(void)
     bad[4] = UINT32_C(0xd65f03c0);
     ok &= expect_result(
         "AArch64 unreachable GOT pair is rejected",
-        glibc_aarch64_pthread_rtld_field(
+        glibc_aarch64_rtld_field_access(
             (const uint8_t *)bad, sizeof(bad), function_vaddr,
             got_vaddr, 0x1070, 4),
         0);
@@ -661,7 +661,7 @@ static int run_rtld_field_provenance_gate(void)
     bad[3] = UINT32_C(0xd65f03c0);
     ok &= expect_result(
         "AArch64 prefetch has no pointer-field width",
-        glibc_aarch64_pthread_rtld_field(
+        glibc_aarch64_rtld_field_access(
             (const uint8_t *)bad, sizeof(bad), function_vaddr,
             got_vaddr, 0x20, 8),
         0);

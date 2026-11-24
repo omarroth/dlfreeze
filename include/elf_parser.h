@@ -54,6 +54,10 @@ int elf_parse_fd(int fd, struct elf_info *info);
 int elf_parse_fd_range(int fd, uint64_t offset, size_t length,
                        struct elf_info *info);
 
+/* Validate a static ELF at offset zero using bounded reads of its headers
+ * only. No mapping or allocation proportional to the ELF file is needed. */
+int elf_check_static_fd(int fd, size_t length);
+
 /* Return nonzero when every runtime-checked DT_VERNEED requirement associated
  * with provider_name has an exact DT_VERDEF name/hash match in provider.
  * Only weak requirements may be absent, matching GNU ld.so semantics. */

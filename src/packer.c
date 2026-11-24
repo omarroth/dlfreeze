@@ -887,7 +887,7 @@ static int packer_pread_exact(int fd, void *buffer, size_t size,
 static int validate_copied_elf(FILE *output, const char *path,
                               uint64_t offset, size_t length,
                               int expected_class, uint16_t expected_machine,
-                              uint32_t entry_flags)
+                              uint32_t entry_flags, int static_bootstrap)
 {
     Elf64_Ehdr header;
     struct elf_info info;
@@ -917,7 +917,13 @@ static int validate_copied_elf(FILE *output, const char *path,
         errno = ENOEXEC;
         return -1;
     }
-    if (elf_parse_fd_range(fd, offset, length, &info) < 0) {
+    /* The bootstrap is always static and precedes the payload. Reading only
+     * its ELF headers keeps validation independent of debug-section size
+     * and available data-segment memory. */
+    if (static_bootstrap && offset == 0 &&
+        elf_check_static_fd(fd, length) == 0)
+        return 0;
+    if (static_bootstrap || elf_parse_fd_range(fd, offset, length, &info) < 0) {
         fprintf(stderr, "dlfreeze: copied ELF input is malformed: %s\n",
                 path ? path : "(null)");
         errno = EINVAL;
@@ -6879,7 +6885,7 @@ out:
 }
 
 /* ---- canonical mapped-payload ELF ABI ---------------------------- */
-static int phdr_has_payload_note(const uint8_t *image, size_t image_size,
+static int phdr_has_payload_note(int fd, size_t image_size,
                                  const Elf64_Phdr *ph)
 {
     static const unsigned char owner[] = "DLFREEZE";
@@ -6897,7 +6903,8 @@ static int phdr_has_payload_note(const uint8_t *image, size_t image_size,
         Elf64_Nhdr note;
         size_t name_off, desc_off;
 
-        memcpy(&note, image + pos, sizeof(note));
+        if (packer_pread_exact(fd, &note, sizeof(note), pos) < 0)
+            return -1;
         pos += sizeof(note);
         name_off = pos;
         if (note.n_namesz > end - pos)
@@ -6921,11 +6928,52 @@ static int phdr_has_payload_note(const uint8_t *image, size_t image_size,
 
         if (note.n_type == payload_note_type &&
             note.n_namesz == sizeof(owner) - 1 &&
-            note.n_descsz == sizeof(descriptor) - 1 &&
-            memcmp(image + name_off, owner, sizeof(owner) - 1) == 0 &&
-            memcmp(image + desc_off, descriptor,
-                   sizeof(descriptor) - 1) == 0)
-            return 1;
+            note.n_descsz == sizeof(descriptor) - 1) {
+            uint8_t name[sizeof(owner) - 1];
+            uint8_t desc[sizeof(descriptor) - 1];
+
+            if (packer_pread_exact(fd, name, sizeof(name), name_off) < 0 ||
+                packer_pread_exact(fd, desc, sizeof(desc), desc_off) < 0)
+                return -1;
+            if (memcmp(name, owner, sizeof(name)) == 0 &&
+                memcmp(desc, descriptor, sizeof(desc)) == 0)
+                return 1;
+        }
+    }
+    return 0;
+}
+
+/* Only writable file-backed LOAD bytes can host the live descriptor.
+ * Keep enough overlap for a descriptor straddling two read windows. */
+static int find_live_loader_info(int fd, const Elf64_Phdr *load,
+                                 size_t *offset)
+{
+    uint8_t chunk[16384];
+    struct dlfrz_loader_info empty = {0};
+    size_t pos = (size_t)load->p_offset;
+    size_t remaining = (size_t)load->p_filesz;
+
+    memcpy(empty.magic, DLFRZ_LOADER_MAGIC, sizeof(empty.magic));
+    while (remaining >= sizeof(empty)) {
+        size_t read_size = remaining < sizeof(chunk) ? remaining : sizeof(chunk);
+        size_t candidates = read_size - sizeof(empty) + 1;
+
+        if (packer_pread_exact(fd, chunk, read_size, pos) < 0)
+            return -1;
+        for (size_t i = 0; i < candidates; i++) {
+            if (chunk[i] != empty.magic[0] ||
+                memcmp(chunk + i, &empty, sizeof(empty)) != 0)
+                continue;
+            if (*offset != SIZE_MAX && *offset != pos + i) {
+                fprintf(stderr,
+                        "dlfreeze: multiple live DLFRZLDR sentinels found\n");
+                errno = EINVAL;
+                return -1;
+            }
+            *offset = pos + i;
+        }
+        pos += candidates;
+        remaining -= candidates;
     }
     return 0;
 }
@@ -7000,8 +7048,9 @@ static int patch_elf_for_mapped_payload_inplace(
     FILE *f = output_fd >= 0 ? fdopen(output_fd, "r+b") : NULL;
     struct stat st;
     Elf64_Ehdr ehdr;
-    uint8_t *phdr_table;
+    uint8_t *phdr_table = NULL;
     size_t phdr_table_size;
+    size_t loader_info_off = SIZE_MAX;
 
     if (!f) {
         int saved_errno = errno ? errno : EIO;
@@ -7022,20 +7071,9 @@ static int patch_elf_for_mapped_payload_inplace(
         return -1;
     }
 
-    /* Read enough of the bootstrap to get ELF + phdr + scan for sentinel */
-    /* We need to read the full bootstrap to find DLFRZLDR in .data */
-    uint8_t *hdr = malloc(bootstrap_sz);
-    if (!hdr) { fclose(f); return -1; }
-    if (fread(hdr, 1, bootstrap_sz, f) != bootstrap_sz) {
-        free(hdr); fclose(f); return -1;
-    }
-
-    if (bootstrap_sz < sizeof(ehdr)) {
-        fprintf(stderr, "dlfreeze: invalid bootstrap ELF header\n");
-        free(hdr); fclose(f); return -1;
-    }
-    memcpy(&ehdr, hdr, sizeof(ehdr));
-    if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0 ||
+    if (bootstrap_sz < sizeof(ehdr) ||
+        packer_pread_exact(output_fd, &ehdr, sizeof(ehdr), 0) < 0 ||
+        memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0 ||
         ehdr.e_ident[EI_CLASS] != ELFCLASS64 ||
         ehdr.e_ident[EI_DATA] != ELFDATA2LSB ||
         ehdr.e_ident[EI_VERSION] != EV_CURRENT ||
@@ -7050,16 +7088,20 @@ static int patch_elf_for_mapped_payload_inplace(
         (size_t)ehdr.e_phnum >
             (bootstrap_sz - (size_t)ehdr.e_phoff) / sizeof(Elf64_Phdr)) {
         fprintf(stderr, "dlfreeze: invalid bootstrap ELF header\n");
-        free(hdr); fclose(f); return -1;
+        goto fail;
     }
-    phdr_table = hdr + (size_t)ehdr.e_phoff;
     phdr_table_size = (size_t)ehdr.e_phnum * ehdr.e_phentsize;
+    phdr_table = malloc(phdr_table_size);
+    if (!phdr_table ||
+        packer_pread_exact(output_fd, phdr_table, phdr_table_size,
+                           ehdr.e_phoff) < 0)
+        goto fail;
 
     /* --- Find the highest VA used by existing PT_LOAD segments --- */
     if (total_sz < payload_off || payload_off < bootstrap_sz ||
         (payload_off & (PAYLOAD_ALIGN - 1)) != 0) {
         fprintf(stderr, "dlfreeze: invalid bootstrap payload layout\n");
-        free(hdr); fclose(f); return -1;
+        goto fail;
     }
 
     uint64_t max_va = 0;
@@ -7072,7 +7114,7 @@ static int patch_elf_for_mapped_payload_inplace(
         if (!packer_phdr_read(phdr_table, phdr_table_size, (size_t)i,
                               ehdr.e_phentsize, &ph)) {
             fprintf(stderr, "dlfreeze: invalid bootstrap program header\n");
-            free(hdr); fclose(f); return -1;
+            goto fail;
         }
         if (ph.p_type == PT_LOAD) {
             if (ph.p_filesz > ph.p_memsz ||
@@ -7080,25 +7122,28 @@ static int patch_elf_for_mapped_payload_inplace(
                 ph.p_filesz > bootstrap_sz - (size_t)ph.p_offset ||
                 ph.p_vaddr > UINT64_MAX - ph.p_memsz) {
                 fprintf(stderr, "dlfreeze: invalid bootstrap PT_LOAD range\n");
-                free(hdr); fclose(f); return -1;
+                goto fail;
             }
             if (found_load && ph.p_vaddr < previous_load_vaddr) {
                 fprintf(stderr,
                         "dlfreeze: bootstrap PT_LOAD entries are unordered\n");
-                free(hdr); fclose(f); return -1;
+                goto fail;
             }
             found_load = 1;
             previous_load_vaddr = ph.p_vaddr;
             last_load_index = i;
             uint64_t end = ph.p_vaddr + ph.p_memsz;
             if (end > max_va) max_va = end;
+            if ((ph.p_flags & PF_W) &&
+                find_live_loader_info(output_fd, &ph, &loader_info_off) < 0)
+                goto fail;
         }
     }
 
     /* Payload VA: next page-aligned address after the last PT_LOAD */
     if (!found_load || max_va > UINT64_MAX - (PAYLOAD_ALIGN - 1)) {
         fprintf(stderr, "dlfreeze: bootstrap address space is exhausted\n");
-        free(hdr); fclose(f); return -1;
+        goto fail;
     }
     uint64_t payload_vaddr = ALIGN_UP(max_va, PAYLOAD_ALIGN);
     size_t payload_filesz = total_sz - payload_off;
@@ -7108,12 +7153,16 @@ static int patch_elf_for_mapped_payload_inplace(
     int payload_slot_index = -1;
     for (int i = 0; i < ehdr.e_phnum; i++) {
         Elf64_Phdr ph;
+        int has_note;
 
         if (!packer_phdr_read(phdr_table, phdr_table_size, (size_t)i,
                               ehdr.e_phentsize, &ph)) {
-            free(hdr); fclose(f); return -1;
+            goto fail;
         }
-        if (phdr_has_payload_note(hdr, bootstrap_sz, &ph)) {
+        has_note = phdr_has_payload_note(output_fd, bootstrap_sz, &ph);
+        if (has_note < 0)
+            goto fail;
+        if (has_note) {
             ph.p_type   = PT_LOAD;
             ph.p_flags  = PF_R;
             ph.p_offset = payload_off;
@@ -7124,7 +7173,7 @@ static int patch_elf_for_mapped_payload_inplace(
             ph.p_align  = PAYLOAD_ALIGN;
             if (!packer_phdr_write(phdr_table, phdr_table_size, (size_t)i,
                                    ehdr.e_phentsize, &ph)) {
-                free(hdr); fclose(f); return -1;
+                goto fail;
             }
             found_payload_slot = 1;
             payload_slot_index = i;
@@ -7135,14 +7184,14 @@ static int patch_elf_for_mapped_payload_inplace(
         fprintf(stderr,
                 "dlfreeze: reserved payload PT_NOTE is missing from the "
                 "bootstrap\n");
-        free(hdr); fclose(f); return -1;
+        goto fail;
     }
 
     if (!place_payload_phdr_after_loads(
             phdr_table, phdr_table_size, ehdr.e_phentsize,
             (uint16_t)payload_slot_index, (uint16_t)last_load_index)) {
         fprintf(stderr, "dlfreeze: invalid bootstrap program-header order\n");
-        free(hdr); fclose(f); return -1;
+        goto fail;
     }
 
     /* --- Zero section-header table if not already set by symtab --- */
@@ -7152,73 +7201,28 @@ static int patch_elf_for_mapped_payload_inplace(
         ehdr.e_shstrndx  = 0;
     }
 
-    /* --- Patch the DLFRZLDR sentinel in a writable PT_LOAD. ---
-     * The marker bytes may also occur in notes, debug data, or other
-     * file-only metadata.  Patching the first raw match can leave the live
-     * descriptor at zero: the ordinary EOF-footer path still works, while a
-     * rewritten image fails because it needs the in-memory descriptor. */
-    const char sentinel[] = "DLFRZLDR";
-    size_t loader_info_off = SIZE_MAX;
-    for (size_t i = 0; i + sizeof(struct dlfrz_loader_info) <= bootstrap_sz; i++) {
-        if (memcmp(hdr + i, sentinel, 8) == 0) {
-            /* Verify this is our struct (followed by three zero uint64s) */
-            uint64_t v1, v2, v3;
-            int in_writable_load = 0;
-
-            memcpy(&v1, hdr + i + 8, 8);
-            memcpy(&v2, hdr + i + 16, 8);
-            memcpy(&v3, hdr + i + 24, 8);
-            if (v1 != 0 || v2 != 0 || v3 != 0)
-                continue;
-            for (int p = 0; p < ehdr.e_phnum; p++) {
-                Elf64_Phdr ph;
-
-                if (!packer_phdr_read(phdr_table, phdr_table_size,
-                                      (size_t)p, ehdr.e_phentsize, &ph) ||
-                    ph.p_type != PT_LOAD || !(ph.p_flags & PF_W) ||
-                    ph.p_offset > i ||
-                    i - (size_t)ph.p_offset > ph.p_filesz ||
-                    sizeof(struct dlfrz_loader_info) >
-                        ph.p_filesz - (i - (size_t)ph.p_offset))
-                    continue;
-                in_writable_load = 1;
-                break;
-            }
-            if (!in_writable_load)
-                continue;
-            if (loader_info_off != SIZE_MAX) {
-                fprintf(stderr,
-                        "dlfreeze: multiple live DLFRZLDR sentinels found\n");
-                free(hdr); fclose(f); return -1;
-            }
-            loader_info_off = i;
-        }
-    }
     if (loader_info_off == SIZE_MAX) {
         fprintf(stderr, "dlfreeze: live DLFRZLDR sentinel not found\n");
-        free(hdr); fclose(f); return -1;
+        goto fail;
     }
     if (payload_filesz == 0 ||
         payload_vaddr > UINT64_MAX - (uint64_t)payload_filesz) {
         fprintf(stderr, "dlfreeze: payload mapping is unrepresentable\n");
-        free(hdr); fclose(f); return -1;
+        goto fail;
     }
-    {
-        uint64_t foff = payload_off;
-        uint64_t mapped_filesz = payload_filesz;
-
-        memcpy(hdr + loader_info_off + 8, &payload_vaddr, 8);
-        memcpy(hdr + loader_info_off + 16, &mapped_filesz, 8);
-        memcpy(hdr + loader_info_off + 24, &foff, 8);
-    }
-
-    memcpy(hdr, &ehdr, sizeof(ehdr));
-
-    /* --- Write modified header back --- */
-    rewind(f);
-    if (fwrite(hdr, 1, bootstrap_sz, f) != bootstrap_sz) {
-        free(hdr); fclose(f); return -1;
-    }
+    struct dlfrz_loader_info info = {
+        .payload_vaddr = payload_vaddr,
+        .payload_filesz = payload_filesz,
+        .payload_foff = payload_off,
+    };
+    memcpy(info.magic, DLFRZ_LOADER_MAGIC, sizeof(info.magic));
+    if (packer_stream_seek(f, 0) < 0 ||
+        fwrite(&ehdr, 1, sizeof(ehdr), f) != sizeof(ehdr) ||
+        packer_stream_seek(f, ehdr.e_phoff) < 0 ||
+        fwrite(phdr_table, 1, phdr_table_size, f) != phdr_table_size ||
+        packer_stream_seek(f, loader_info_off) < 0 ||
+        fwrite(&info, 1, sizeof(info), f) != sizeof(info))
+        goto fail;
 
     {
         int saved_errno = 0;
@@ -7229,13 +7233,23 @@ static int patch_elf_for_mapped_payload_inplace(
             saved_errno = errno ? errno : EIO;
         if (fclose(f) != 0 && !saved_errno)
             saved_errno = errno ? errno : EIO;
-        free(hdr);
+        free(phdr_table);
         if (saved_errno) {
             errno = saved_errno;
             return -1;
         }
     }
     return 0;
+
+fail:
+    {
+        int saved_errno = errno ? errno : EINVAL;
+
+        free(phdr_table);
+        fclose(f);
+        errno = saved_errno;
+    }
+    return -1;
 }
 
 static int patch_elf_for_mapped_payload(const char *path,
@@ -9824,7 +9838,7 @@ int pack_frozen(const struct pack_options *opts)
     if (fflush(out) != 0 ||
         validate_copied_elf(out, opts->bootstrap_path, 0, bootstrap_sz,
                             opts->deps->target_ei_class,
-                            opts->deps->target_e_machine, 0) < 0)
+                            opts->deps->target_e_machine, 0, 1) < 0)
         goto fail;
 
     /* total entries: main-exe + interpreter? + libs + data files */
@@ -10209,7 +10223,7 @@ int pack_frozen(const struct pack_options *opts)
                 out, src_paths[i], entries[i].data_offset,
                 (size_t)entries[i].data_size,
                 opts->deps->target_ei_class,
-                opts->deps->target_e_machine, entries[i].flags) < 0)
+                opts->deps->target_e_machine, entries[i].flags, 0) < 0)
             goto fail2;
     }
 

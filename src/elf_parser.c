@@ -74,6 +74,34 @@ static int range_in_file(uint64_t offset, uint64_t length, size_t size)
     return offset <= size && length <= size - offset;
 }
 
+struct elf64_header_source {
+    const uint8_t *data;
+    size_t size;
+    int fd;
+};
+
+static int elf64_read_headers(const struct elf64_header_source *source,
+                              uint64_t offset, void *out, size_t length)
+{
+    if (!range_in_file(offset, length, source->size))
+        return 0;
+    if (source->data) {
+        memcpy(out, source->data + offset, length);
+        return 1;
+    }
+    for (size_t done = 0; done < length;) {
+        ssize_t n = pread(source->fd, (uint8_t *)out + done,
+                          length - done, (off_t)(offset + done));
+
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            return 0;
+        done += (size_t)n;
+    }
+    return 1;
+}
+
 static int power_of_two_or_zero(uint64_t value)
 {
     return value == 0 || (value & (value - 1)) == 0;
@@ -86,12 +114,13 @@ static int segment_coordinates_are_congruent(const Elf64_Phdr *phdr)
                phdr->p_vaddr % phdr->p_align;
 }
 
-static int elf64_section_headers_valid(const uint8_t *data, size_t size,
+static int elf64_section_headers_valid(const struct elf64_header_source *source,
                                        const Elf64_Ehdr *ehdr)
 {
     Elf64_Shdr section_zero;
     size_t count;
     size_t stride;
+    size_t size = source->size;
     size_t string_index = SIZE_MAX;
 
     if (ehdr->e_shoff == 0) {
@@ -105,8 +134,9 @@ static int elf64_section_headers_valid(const uint8_t *data, size_t size,
         return 0;
     stride = ehdr->e_shentsize;
 
-    memcpy(&section_zero, data + ehdr->e_shoff, sizeof(section_zero));
-    if (section_zero.sh_type != SHT_NULL)
+    if (!elf64_read_headers(source, ehdr->e_shoff, &section_zero,
+                            sizeof(section_zero)) ||
+        section_zero.sh_type != SHT_NULL)
         return 0;
     if (ehdr->e_shnum == 0) {
         if (section_zero.sh_size == 0 || section_zero.sh_size > SIZE_MAX)
@@ -135,10 +165,9 @@ static int elf64_section_headers_valid(const uint8_t *data, size_t size,
     for (size_t i = 0; i < count; i++) {
         Elf64_Shdr section;
 
-        memcpy(&section,
-               data + ehdr->e_shoff + i * stride,
-               sizeof(section));
-        if (!power_of_two_or_zero(section.sh_addralign))
+        if (!elf64_read_headers(source, ehdr->e_shoff + i * stride,
+                                &section, sizeof(section)) ||
+            !power_of_two_or_zero(section.sh_addralign))
             return 0;
         if (section.sh_type != SHT_NOBITS &&
             !range_in_file(section.sh_offset, section.sh_size, size))
@@ -193,9 +222,11 @@ static int elf64_interp_valid(const uint8_t *data, size_t size,
  * dynamic parser.  File-backed headers are copied into aligned storage before
  * typed access, so a malicious e_phoff/e_shoff cannot create undefined
  * unaligned loads. */
-static int elf64_image_open(const uint8_t *data, size_t size,
+static int elf64_image_open(const struct elf64_header_source *source,
                             struct elf64_image *image)
 {
+    const uint8_t *data = source->data;
+    size_t size = source->size;
     Elf64_Ehdr ehdr;
     size_t phdr_bytes;
     unsigned int interp_count = 0;
@@ -208,9 +239,8 @@ static int elf64_image_open(const uint8_t *data, size_t size,
     const Elf64_Phdr *dynamic_phdr = NULL;
 
     memset(image, 0, sizeof(*image));
-    if (!data || size < sizeof(ehdr))
+    if (!elf64_read_headers(source, 0, &ehdr, sizeof(ehdr)))
         return -1;
-    memcpy(&ehdr, data, sizeof(ehdr));
 
     if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0 ||
         ehdr.e_ident[EI_CLASS] != ELFCLASS64 ||
@@ -233,13 +263,14 @@ static int elf64_image_open(const uint8_t *data, size_t size,
 
     phdr_bytes = (size_t)ehdr.e_phnum * sizeof(Elf64_Phdr);
     if (!range_in_file(ehdr.e_phoff, phdr_bytes, size) ||
-        !elf64_section_headers_valid(data, size, &ehdr))
+        !elf64_section_headers_valid(source, &ehdr))
         return -1;
 
     image->phdr = malloc(phdr_bytes);
     if (!image->phdr)
         return -1;
-    memcpy(image->phdr, data + ehdr.e_phoff, phdr_bytes);
+    if (!elf64_read_headers(source, ehdr.e_phoff, image->phdr, phdr_bytes))
+        goto fail;
     image->ehdr = ehdr;
     image->phnum = ehdr.e_phnum;
     image->load_index = calloc(image->phnum, sizeof(*image->load_index));
@@ -302,11 +333,11 @@ static int elf64_image_open(const uint8_t *data, size_t size,
                     translation->widest_index = widest_index;
             }
         } else if (ph->p_type == PT_INTERP) {
-            if (++interp_count != 1 || ph->p_filesz > ph->p_memsz ||
+            if (!data || ++interp_count != 1 || ph->p_filesz > ph->p_memsz ||
                 !elf64_interp_valid(data, size, ph))
                 goto fail;
         } else if (ph->p_type == PT_DYNAMIC) {
-            if (++dynamic_count != 1 || ph->p_filesz > ph->p_memsz ||
+            if (!data || ++dynamic_count != 1 || ph->p_filesz > ph->p_memsz ||
                 !elf64_dynamic_terminated(data, size, ph))
                 goto fail;
             dynamic_phdr = ph;
@@ -867,6 +898,9 @@ static int elf64_rela_has_tpoff(const uint8_t *data, size_t size,
 
 static int parse_elf64(const uint8_t *data, size_t size, struct elf_info *info)
 {
+    const struct elf64_header_source source = {
+        .data = data, .size = size, .fd = -1,
+    };
     struct elf64_image image;
     struct dynamic_string_table dyn_strtab;
     const Elf64_Phdr *dynamic_phdr = NULL;
@@ -878,7 +912,7 @@ static int parse_elf64(const uint8_t *data, size_t size, struct elf_info *info)
 
     memset(&dyn_strtab, 0, sizeof(dyn_strtab));
 
-    if (elf64_image_open(data, size, &image) < 0)
+    if (elf64_image_open(&source, &image) < 0)
         return -1;
 
     info->ei_class = ELFCLASS64;
@@ -1206,6 +1240,26 @@ static int file_identity_unchanged(const struct stat *before,
            before->st_mtim.tv_nsec == after->st_mtim.tv_nsec &&
            before->st_ctim.tv_sec == after->st_ctim.tv_sec &&
            before->st_ctim.tv_nsec == after->st_ctim.tv_nsec;
+}
+
+int elf_check_static_fd(int fd, size_t length)
+{
+    const struct elf64_header_source source = { .size = length, .fd = fd };
+    struct elf64_image image;
+    struct stat before, after;
+
+    if (fd < 0 || fstat(fd, &before) < 0 || before.st_size < 0 ||
+        length > (uintmax_t)before.st_size ||
+        elf64_image_open(&source, &image) < 0)
+        return -1;
+    elf64_image_close(&image);
+    if (fstat(fd, &after) < 0)
+        return -1;
+    if (!file_identity_unchanged(&before, &after)) {
+        errno = ESTALE;
+        return -1;
+    }
+    return 0;
 }
 
 /* A MAP_PRIVATE file mapping can still raise SIGBUS when another process
