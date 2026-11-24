@@ -4,7 +4,7 @@
 set -euo pipefail
 export LC_ALL=C
 
-archive=$(realpath "${1:?usage: release-package-gate.sh ARCHIVE ARCH glibc|musl|elf}")
+archive=$(realpath "${1:?usage: release-package-gate.sh ARCHIVE ARCH glibc|glibc-direct|musl|elf}")
 arch=${2:?missing package architecture}
 runtime=${3:?missing runtime}
 case "$arch" in
@@ -12,7 +12,7 @@ case "$arch" in
     aarch64) machine=AArch64; min_alignment=65536 ;;
     *) echo "unknown package architecture: $arch" >&2; exit 1 ;;
 esac
-case "$runtime" in glibc|musl|elf) ;; *) exit 1 ;; esac
+case "$runtime" in glibc|glibc-direct|musl|elf) ;; *) exit 1 ;; esac
 
 die() { echo "release package: $*" >&2; exit 1; }
 root=$(mktemp -d)
@@ -99,8 +99,8 @@ cd "$root"
 plugin=libdlfreeze-release-probe.so
 trace_library_path=
 case "$runtime" in
-    # Jammy is the helper's build/ABI baseline, not a direct-loader
-    # baseline. An exact bare name is representable in extraction mode.
+    # Exercise the portable extraction path separately from direct loading.
+    # An exact bare name is representable in extraction mode.
     glibc)
         helper=$gnu_helper; request=$plugin; freeze_mode=-x; replay=extraction
         # The interposer is the native dlopen caller, so the executable's
@@ -110,6 +110,7 @@ case "$runtime" in
         ;;
     # Also prove the archive can replay a request that requires direct
     # loading. An absolute request must never pass via extraction.
+    glibc-direct) helper=$gnu_helper; request="$root/$plugin"; freeze_mode=-d; replay=direct ;;
     musl) helper=$musl_helper; request="$root/$plugin"; freeze_mode=-d; replay=direct ;;
 esac
 ${CC:-cc} -Wall -Wextra -Werror -fPIC -shared -o "$plugin" -x c - <<'C'

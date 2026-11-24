@@ -6867,6 +6867,7 @@ dlfrz_glibc_direct_thread_layout_is_supported(
     enum dlfrz_glibc_layout_id layout)
 {
     switch (layout) {
+    case DLFRZ_GLIBC_AARCH64_2_35_LARGE:
     case DLFRZ_GLIBC_AARCH64_2_35:
     case DLFRZ_GLIBC_AARCH64_2_41:
     case DLFRZ_GLIBC_AARCH64_2_44:
@@ -6879,7 +6880,6 @@ dlfrz_glibc_direct_thread_layout_is_supported(
         return 1;
     case DLFRZ_GLIBC_AARCH64_2_27:
     case DLFRZ_GLIBC_AARCH64_2_31:
-    case DLFRZ_GLIBC_AARCH64_2_35_LARGE:
     case DLFRZ_GLIBC_AARCH64_RTLD_672_4520:
     case DLFRZ_GLIBC_AARCH64_2_43:
     case DLFRZ_GLIBC_AARCH64_2_40_LEGACY:

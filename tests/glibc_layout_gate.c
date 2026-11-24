@@ -4524,7 +4524,7 @@ static int selftest(void)
             DLFRZ_GLIBC_AARCH64_2_44) ||
         dlfrz_glibc_direct_thread_layout_is_supported(
             DLFRZ_GLIBC_AARCH64_2_27) ||
-        dlfrz_glibc_direct_thread_layout_is_supported(
+        !dlfrz_glibc_direct_thread_layout_is_supported(
             DLFRZ_GLIBC_AARCH64_2_35_LARGE) ||
         dlfrz_glibc_direct_thread_layout_is_supported(
             DLFRZ_GLIBC_AARCH64_RTLD_672_4520) ||

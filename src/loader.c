@@ -11264,15 +11264,17 @@ static int aarch64_musl_gpr_writes(uint32_t insn, uint32_t *writes_out)
         return 1;
     }
 
-    /* Unsigned-offset and unscaled single-register loads/stores. */
+    /* Unsigned-offset and unscaled single-register loads/stores.
+     * Sign-extending loads can set opc[1] without opc[0] (e.g. LDRSW).
+     * Conservatively count any non-store transfer as a destination write. */
     if ((insn & 0x3b000000u) == 0x39000000u) {
-        if (insn & (1u << 22))
+        if (insn & (3u << 22))
             RECORD_WRITE(insn & 0x1f);
         *writes_out = writes;
         return 1;
     }
     if ((insn & 0x3b000000u) == 0x38000000u) {
-        if (insn & (1u << 22))
+        if (insn & (3u << 22))
             RECORD_WRITE(insn & 0x1f);
         /* Treat every indexed form conservatively as base writeback. */
         if (((insn >> 10) & 3) != 0)
@@ -28159,45 +28161,79 @@ static int glibc_aarch64_private_field_at(
            base == expected_base;
 }
 
+/* Compilers schedule GOT loads after unrelated instructions, or keep a GOT
+ * page in a callee-saved register and reuse it across calls. Follow only
+ * real edges from a reachable ADRP while its page register is still live.
+ * Then prove the field access from the exact relocation-backed GOT load. */
+static int glibc_aarch64_rtld_access_from_page(
+    const uint8_t *code, size_t length, uint64_t function_vaddr,
+    uint64_t got_vaddr, size_t position, size_t expected_offset,
+    size_t expected_width, int word_pair)
+{
+    unsigned char seen[GLIBC_PRIVATE_CFG_LIMIT];
+    uint16_t queue[2 * GLIBC_PRIVATE_CFG_LIMIT + 1];
+    size_t head = 0;
+    size_t tail = 0;
+    uint32_t adrp = read_u32_le(code + position);
+    unsigned int page_reg = adrp & 31U;
+    uint64_t page;
+    uint64_t slot;
+
+    if (page_reg == 31U || function_vaddr > UINT64_MAX - position ||
+        !glibc_aarch64_adrp_page(adrp, function_vaddr + position, &page) ||
+        got_vaddr < page || (slot = got_vaddr - page) > 4095U * 8 ||
+        (slot & 7U) != 0 ||
+        !glibc_private_offset_reachable(
+            code, length, position, glibc_aarch64_private_instruction))
+        return 0;
+    ldr_memset(seen, 0, length);
+    queue[tail++] = (uint16_t)(position + 4);
+    while (head < tail) {
+        struct glibc_private_instruction decoded;
+        size_t pos = queue[head++];
+        uint32_t encoded;
+
+        if (seen[pos])
+            continue;
+        seen[pos] = 1;
+        if (!glibc_aarch64_private_instruction(code, length, pos, &decoded))
+            continue;
+        encoded = read_u32_le(code + pos);
+        if ((encoded & UINT32_C(0xffc00000)) == UINT32_C(0xf9400000) &&
+            ((encoded >> 5) & 31U) == page_reg && (encoded & 31U) != 31U &&
+            ((encoded >> 10) & UINT32_C(0xfff)) * UINT64_C(8) == slot) {
+            unsigned int rtld_reg = encoded & 31U;
+
+            if (word_pair ? glibc_private_register_pair_path(
+                    code, length, decoded.end, rtld_reg, expected_offset,
+                    glibc_aarch64_private_instruction,
+                    glibc_aarch64_private_field_at)
+                : glibc_private_register_field_path(
+                    code, length, decoded.end, rtld_reg, expected_offset,
+                    expected_width, glibc_aarch64_private_instruction,
+                    glibc_aarch64_private_field_at))
+                return 1;
+        }
+        if (!(decoded.writes & (UINT32_C(1) << page_reg)) &&
+            !glibc_private_enqueue_successors(
+                &decoded, length, queue, sizeof(queue) / sizeof(queue[0]),
+                &tail))
+            return 0;
+    }
+    return 0;
+}
+
 static int glibc_aarch64_rtld_field_access(
     const uint8_t *code, size_t length, uint64_t function_vaddr,
     uint64_t got_vaddr, size_t expected_offset, size_t expected_width)
 {
-    for (size_t got_position = 0; got_position + 8 <= length;
-         got_position += 4) {
-        uint32_t adrp = read_u32_le(code + got_position);
-        uint32_t got_load = read_u32_le(code + got_position + 4);
-        unsigned int page_register;
-        unsigned int rtld_register;
-        uint64_t page;
-        uint64_t got_offset;
-
-        if ((adrp & UINT32_C(0x9f000000)) != UINT32_C(0x90000000) ||
-            (got_load & UINT32_C(0xffc00000)) !=
-                UINT32_C(0xf9400000))
-            continue;
-        page_register = adrp & 31U;
-        if (((got_load >> 5) & 31U) != page_register ||
-            function_vaddr > UINT64_MAX - got_position ||
-            !glibc_aarch64_adrp_page(
-                adrp, function_vaddr + got_position, &page))
-            continue;
-        got_offset = ((got_load >> 10) & UINT32_C(0xfff)) * UINT64_C(8);
-        if (page > UINT64_MAX - got_offset ||
-            page + got_offset != got_vaddr)
-            continue;
-        rtld_register = got_load & 31U;
-        if (rtld_register != 31U &&
-            glibc_private_offset_reachable(
-                code, length, got_position,
-                glibc_aarch64_private_instruction) &&
-            glibc_private_register_field_path(
-                code, length, got_position + 8, rtld_register,
-                expected_offset, expected_width,
-                glibc_aarch64_private_instruction,
-                glibc_aarch64_private_field_at))
+    if (length > GLIBC_PRIVATE_CFG_LIMIT)
+        return 0;
+    for (size_t pos = 0; pos + 8 <= length; pos += 4)
+        if (glibc_aarch64_rtld_access_from_page(
+                code, length, function_vaddr, got_vaddr, pos, expected_offset,
+                expected_width, 0))
             return 1;
-    }
     return 0;
 }
 
@@ -28205,87 +28241,17 @@ static int glibc_aarch64_rtld_word_pair_access(
     const uint8_t *code, size_t length, uint64_t function_vaddr,
     uint64_t got_vaddr, size_t first_offset)
 {
-    if (first_offset > SIZE_MAX - sizeof(size_t))
+    if (length > GLIBC_PRIVATE_PAIR_LIMIT ||
+        first_offset > SIZE_MAX - sizeof(size_t))
         return 0;
-    for (size_t got_position = 0; got_position + 8 <= length;
-         got_position += 4) {
-        uint32_t adrp = read_u32_le(code + got_position);
-        uint32_t got_load = read_u32_le(code + got_position + 4);
-        unsigned int page_register;
-        unsigned int rtld_register;
-        uint64_t page;
-        uint64_t got_offset;
-
-        if ((adrp & UINT32_C(0x9f000000)) != UINT32_C(0x90000000) ||
-            (got_load & UINT32_C(0xffc00000)) !=
-                UINT32_C(0xf9400000))
-            continue;
-        page_register = adrp & 31U;
-        if (((got_load >> 5) & 31U) != page_register ||
-            function_vaddr > UINT64_MAX - got_position ||
-            !glibc_aarch64_adrp_page(
-                adrp, function_vaddr + got_position, &page))
-            continue;
-        got_offset = ((got_load >> 10) & UINT32_C(0xfff)) * UINT64_C(8);
-        if (page > UINT64_MAX - got_offset ||
-            page + got_offset != got_vaddr)
-            continue;
-        rtld_register = got_load & 31U;
-        if (rtld_register == 31U)
-            continue;
-        if (glibc_private_offset_reachable(
-                code, length, got_position,
-                glibc_aarch64_private_instruction) &&
-            glibc_private_register_pair_path(
-                code, length, got_position + 8, rtld_register,
-                first_offset, glibc_aarch64_private_instruction,
-                glibc_aarch64_private_field_at))
+    for (size_t pos = 0; pos + 8 <= length; pos += 4)
+        if (glibc_aarch64_rtld_access_from_page(
+                code, length, function_vaddr, got_vaddr, pos, first_offset,
+                sizeof(size_t), 1))
             return 1;
-    }
     return 0;
 }
 
-static int glibc_aarch64_pthread_rtld_field(
-    const uint8_t *code, size_t length, uint64_t function_vaddr,
-    uint64_t got_vaddr, size_t expected_offset, size_t expected_width)
-{
-    for (size_t got_position = 0; got_position + 8 <= length;
-         got_position += 4) {
-        uint32_t adrp = read_u32_le(code + got_position);
-        uint32_t got_load = read_u32_le(code + got_position + 4);
-        unsigned int page_register;
-        unsigned int rtld_register;
-        uint64_t page;
-        uint64_t got_offset;
-
-        if ((adrp & UINT32_C(0x9f000000)) != UINT32_C(0x90000000) ||
-            (got_load & UINT32_C(0xffc00000)) !=
-                UINT32_C(0xf9400000))
-            continue;
-        page_register = adrp & 31U;
-        if (((got_load >> 5) & 31U) != page_register ||
-            function_vaddr > UINT64_MAX - got_position ||
-            !glibc_aarch64_adrp_page(
-                adrp, function_vaddr + got_position, &page))
-            continue;
-        got_offset = ((got_load >> 10) & UINT32_C(0xfff)) * UINT64_C(8);
-        if (page > UINT64_MAX - got_offset ||
-            page + got_offset != got_vaddr)
-            continue;
-        rtld_register = got_load & 31U;
-        if (rtld_register != 31U &&
-            glibc_private_offset_reachable(
-                code, length, got_position,
-                glibc_aarch64_private_instruction) &&
-            glibc_private_register_field_path(
-                code, length, got_position + 8, rtld_register,
-                expected_offset, expected_width,
-                glibc_aarch64_private_instruction,
-                glibc_aarch64_private_field_at))
-            return 1;
-    }
-    return 0;
-}
 #endif
 
 /* The kernel clear-child-tid word was the pthread TID in traditional NPTL.
@@ -29174,7 +29140,7 @@ static int glibc_target_pthread_rtld_field(
         code, length, function_vaddr, got_vaddr,
         expected_offset, expected_width);
 #elif defined(__aarch64__)
-    return glibc_aarch64_pthread_rtld_field(
+    return glibc_aarch64_rtld_field_access(
         code, length, function_vaddr, got_vaddr,
         expected_offset, expected_width);
 #else

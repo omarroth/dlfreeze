@@ -61,6 +61,9 @@ jobs:
                 CFLAGS="-Wall -Wextra -O2 -g -D_GNU_SOURCE -Iinclude -march=$CPU" \
                 LDFLAGS="$RELEASE_LDFLAGS" package
               bash /source/tests/release-package-gate.sh "/dist/dlfreeze-linux-$ARCH.tar.gz" "$ARCH" glibc
+              if [ "$ARCH" = aarch64 ]; then
+                bash /source/tests/release-package-gate.sh "/dist/dlfreeze-linux-$ARCH.tar.gz" "$ARCH" glibc-direct
+              fi
             '
 
       - name: Verify the same archive on musl

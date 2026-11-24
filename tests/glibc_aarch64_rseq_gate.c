@@ -367,6 +367,69 @@ static int test_file_backed_consumers(void)
     return 1;
 }
 
+static int test_rtld_got_paths(void)
+{
+    const uintptr_t address = 0x10000;
+    const uintptr_t got_slot = 0x20120;
+    uint32_t code[] = {
+        encode_adrp(address, got_slot, 28),
+        encode_mov(9, 11), /* scheduling gap */
+        encode_ldr64(0, 28, 0x120),
+        encode_ldr64(9, 0, 24), /* the first field still needs to pass */
+        UINT32_C(0x94000000), /* bl: preserves x28 */
+        UINT32_C(0x14000002), /* b to the second load */
+        encode_mov(28, 11), /* unreachable clobber */
+        encode_ldr64(1, 28, 0x120),
+        UINT32_C(0xa9438c22), /* ldp x2, x3, [x1,#56] */
+        encode_ldr64(1, 1, 24),
+        UINT32_C(0xd65f03c0), /* ret */
+    };
+    const uint8_t *bytes = (const uint8_t *)code;
+
+    if (!glibc_aarch64_rtld_field_access(
+            bytes, sizeof(code), address, got_slot, 24, sizeof(uint64_t)) ||
+        !glibc_aarch64_rtld_word_pair_access(
+            bytes, sizeof(code), address, got_slot, 56)) {
+        fprintf(stderr, "scheduled or reused rtld GOT load was rejected\n");
+        return 0;
+    }
+    code[5] = UINT32_C(0xd503201f); /* fall through the page clobber */
+    if (glibc_aarch64_rtld_word_pair_access(
+            bytes, sizeof(code), address, got_slot, 56)) {
+        fprintf(stderr, "clobbered rtld GOT page was accepted\n");
+        return 0;
+    }
+    code[6] = UINT32_C(0xb980017c); /* ldrsw x28,[x11] */
+    if (glibc_aarch64_rtld_word_pair_access(
+            bytes, sizeof(code), address, got_slot, 56)) {
+        fprintf(stderr, "sign-extending rtld GOT page clobber was accepted\n");
+        return 0;
+    }
+    code[5] = UINT32_C(0x14000002);
+    code[7] = encode_ldr64(1, 28, 0x128);
+    if (glibc_aarch64_rtld_word_pair_access(
+            bytes, sizeof(code), address, got_slot, 56)) {
+        fprintf(stderr, "wrong rtld GOT slot was accepted\n");
+        return 0;
+    }
+    code[0] = encode_adrp(address, got_slot, 10);
+    code[2] = encode_ldr64(0, 10, 0x120);
+    code[7] = encode_ldr64(1, 10, 0x120);
+    if (glibc_aarch64_rtld_word_pair_access(
+            bytes, sizeof(code), address, got_slot, 56)) {
+        fprintf(stderr, "caller-clobbered rtld GOT page was accepted\n");
+        return 0;
+    }
+    code[0] = UINT32_C(0x14000002); /* jump over the page definition */
+    code[1] = encode_adrp(address + 4, got_slot, 10);
+    if (glibc_aarch64_rtld_field_access(
+            bytes, sizeof(code), address, got_slot, 24, sizeof(uint64_t))) {
+        fprintf(stderr, "rtld GOT load without a page definition was accepted\n");
+        return 0;
+    }
+    return 1;
+}
+
 static void emit_initial_thread_completion(uint32_t *code, size_t offset)
 {
     memset(code, 0, 8 * sizeof(*code));
@@ -519,7 +582,7 @@ int main(int argc, char **argv)
     if (argc == 2 && strcmp(argv[1], "--rseq") == 0)
         return test_rseq_control_flow() ? 0 : 1;
     if (argc == 2 && strcmp(argv[1], "--file-backed") == 0)
-        return test_file_backed_consumers() ? 0 : 1;
+        return test_file_backed_consumers() && test_rtld_got_paths() ? 0 : 1;
     if (argc == 2 && strcmp(argv[1], "--initial-thread") == 0)
         return test_initial_thread_completion_word() ? 0 : 1;
     if (argc == 2 && strcmp(argv[1], "--tunable") == 0)
@@ -531,6 +594,7 @@ int main(int argc, char **argv)
         return 2;
     }
     if (!test_rseq_control_flow() || !test_file_backed_consumers() ||
+        !test_rtld_got_paths() ||
         !test_initial_thread_completion_word() ||
         !test_tunable_scalar_control_flow())
         return 1;
